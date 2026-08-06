@@ -78,6 +78,32 @@ EXPR_TOKEN_RE = re.compile(r"(?<![\w.])[A-Za-z_]\w*")
 # Colour combiners that use only the shade colour, never a texel.
 SHADE_ONLY_COMBINERS = {"G_CC_SHADE", "G_CC_SHADEFADEA"}
 
+# BLEND lerps the texel over the *shade colour* using the texel's own alpha,
+# all within the polygon. The result is opaque: where the texture is
+# transparent the shade colour shows, not whatever is behind the surface.
+#
+# Mario's eyes, mustache, cap logo and overall buttons are all BLEND. Treating
+# their alpha as see-through cuts holes in his face; treating them as a plain
+# multiply turns a yellow button on blue denim black. Neither is right -- the
+# texture has to be composited over the light colour.
+BLEND_COMBINERS = {"G_CC_BLENDRGBA", "G_CC_BLENDRGBFADEA",
+                   "G_CC_BLENDRGBDECALA"}
+
+# DECAL outputs the texel directly and leans on the blender for transparency.
+DECAL_COMBINERS = {"G_CC_DECALRGB", "G_CC_DECALRGBA",
+                   "G_CC_DECALFADE", "G_CC_DECALFADEA"}
+
+
+def combiner_kind(combiner):
+    """How a group's texture and shade colour combine."""
+    if combiner in BLEND_COMBINERS:
+        return "blend"
+    if combiner in DECAL_COMBINERS:
+        return "decal"
+    if combiner in SHADE_ONLY_COMBINERS:
+        return "shade"
+    return "modulate"
+
 
 def _split_args(text):
     """Split a top-level comma list, ignoring commas inside nested parens."""
@@ -264,6 +290,7 @@ class MeshBuilder:
         self._tile = (32, 32)
         self._wrap = ("wrap", "wrap")
         self._light = None
+        self._combiner = None
         # Texture state persists across display lists, so a part that draws
         # untextured has to actively say so -- via gsSPTexture(..., G_OFF) or
         # a shade-only combine mode. Without tracking that, the last texture
@@ -278,12 +305,13 @@ class MeshBuilder:
         # mode said; actor parts set G_LIGHTING outside the lists walked here.
         lighting = self._lighting or self._light is not None
         return (texture, self._layer, lighting, self._cull,
-                self._tile, self._wrap, self._light)
+                self._tile, self._wrap, self._light, self._combiner)
 
     def _flush_group(self):
         count = len(self.triangles) - self._group_start
         if count > 0:
-            texture, layer, lighting, cull, tile, wrap, light = self._pending_state
+            (texture, layer, lighting, cull, tile, wrap, light,
+             combiner) = self._pending_state
             entry = self.level.lights.get(light) if light else None
             self.groups.append({
                 "texture": texture,
@@ -297,6 +325,8 @@ class MeshBuilder:
                 "light": light,
                 "light_diffuse": entry["diffuse"] if entry else None,
                 "light_ambient": entry["ambient"] if entry else None,
+                "combiner": combiner,
+                "combiner_kind": combiner_kind(combiner),
                 "first": self._group_start,
                 "count": count,
             })
@@ -317,8 +347,14 @@ class MeshBuilder:
         if entry is None:
             return None
         tile_w, tile_h = self._tile
-        # S10.5 texel coordinates -> normalised UV. V is flipped because the
-        # N64 runs its texture origin from the top.
+        # S10.5 texel coordinates -> normalised UV, left in the N64's own
+        # convention: origin top-left, V increasing downward.
+        #
+        # That matches glTF exactly, so the actor exporter uses these as-is.
+        # Panda3D's native texture coordinates run from the bottom-left, so
+        # sm64py/level.py flips V when it builds geometry directly. Flipping
+        # here instead would silently mirror every actor texture -- the giveaway
+        # was Mario's cap logo reading as a W.
         key = (entry, tile_w, tile_h, self.bone)
         index = self._emitted.get(key)
         if index is None:
@@ -326,7 +362,7 @@ class MeshBuilder:
             self.positions.append(entry[0:3])
             self.uvs.append((
                 entry[3] / 32.0 / max(tile_w, 1),
-                1.0 - entry[4] / 32.0 / max(tile_h, 1),
+                entry[4] / 32.0 / max(tile_h, 1),
             ))
             self.colors.append(entry[5:9])
             self.vertex_bones.append(self.bone)
@@ -367,6 +403,7 @@ class MeshBuilder:
                 if args:
                     self._texture_on = "G_OFF" not in args[-1]
             elif cmd == "gsDPSetCombineMode":
+                self._combiner = args[0].strip() if args else None
                 # Shade-only modes sample no texel at all.
                 self._texture_on = not any(
                     a.strip() in SHADE_ONLY_COMBINERS for a in args

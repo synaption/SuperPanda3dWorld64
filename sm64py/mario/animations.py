@@ -150,8 +150,41 @@ NON_LOOPING = {
 }
 
 
+# Clips whose playback rate follows Mario's speed, and the divisor each uses.
+#
+# The original scales these per frame rather than playing them at a fixed
+# rate, which is what makes a run cycle keep up with a 32-unit stride instead
+# of looking like a slow-motion walk.
+SPEED_SCALED = {
+    ANIM_START_TIPTOE: 4.0,
+    ANIM_TIPTOE: 1.0,
+    ANIM_WALKING: 4.0,
+    ANIM_RUNNING: 4.0,
+}
+
+# Slowest an animation is allowed to crawl along at.
+MIN_PLAY_RATE = 1.0 / 16.0
+
+
+def play_rate(m, anim_id):
+    """Playback multiplier for a clip, given Mario's current speed."""
+    if anim_id == ANIM_CRAWLING:
+        return max(m.intended_mag * 2.0, MIN_PLAY_RATE)
+
+    divisor = SPEED_SCALED.get(anim_id)
+    if divisor is None:
+        return 1.0
+
+    # The original drives this from whichever is larger: how fast Mario is
+    # actually going, or how hard the stick is pushed.
+    speed = max(abs(m.forward_vel), m.intended_mag, 4.0)
+    return max(speed / divisor, MIN_PLAY_RATE)
+
+
 def resolve(m):
-    """Return (clip_name, should_loop) for Mario's current action."""
+    """Return (clip_name, should_loop, play_rate) for Mario's current action."""
     entry = ACTION_ANIMATIONS.get(m.action, ANIM_A_POSE)
     anim_id = entry(m) if callable(entry) else entry
-    return anim_name(anim_id), anim_id not in NON_LOOPING
+    return (anim_name(anim_id),
+            anim_id not in NON_LOOPING,
+            play_rate(m, anim_id))

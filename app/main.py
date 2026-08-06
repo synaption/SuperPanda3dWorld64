@@ -186,19 +186,22 @@ class Game(ShowBase):
         if self.mario_actor is None:
             return
 
-        name, loop = animations.resolve(self.mario)
-        if name == self._current_anim:
-            return
+        name, loop, rate = animations.resolve(self.mario)
 
         if self.mario_actor.get_anim_control(name) is None:
             # Not every action has a clip exported; keep the previous pose.
             return
 
-        self._current_anim = name
-        if loop:
-            self.mario_actor.loop(name)
-        else:
-            self.mario_actor.play(name)
+        if name != self._current_anim:
+            self._current_anim = name
+            if loop:
+                self.mario_actor.loop(name)
+            else:
+                self.mario_actor.play(name)
+
+        # Reapplied every frame, not just on a change: the walk and run cycles
+        # follow Mario's current speed rather than a fixed cadence.
+        self.mario_actor.set_play_rate(rate, name)
 
     # -- input ---------------------------------------------------------------
 

@@ -66,6 +66,12 @@ FRAME_RATE = 30.0
 ACTOR_SCALE = {"mario": 0.25}
 DEFAULT_SCALE = 0.25
 
+# Parts the game only draws under some runtime condition, and which therefore
+# should not be in the default model. Mario's wings sit under a GEO_ASM hook
+# (geo_mario_rotate_wing_cap_wings) that only emits them while the wing cap is
+# active; exported unconditionally they stick out of his head at all times.
+DEFAULT_EXCLUDE = {"mario": r"cap_wings"}
+
 
 # -- maths ------------------------------------------------------------------
 
@@ -413,18 +419,90 @@ def _write_scene(glb, joints, animated, positions, normals, colors, uvs,
             _write_animation(glb, name, anim, joints, animated, scale)
 
 
+_composite_cache = {}
+
+
+def composite_over(image_path, rgb):
+    """Flatten a texture onto a solid colour, as a BLEND combiner does.
+
+    Returns PNG bytes with no alpha channel, or None if it cannot be built.
+    The N64 lerps the texel over the shade colour inside the polygon, so the
+    result is opaque -- baking that here is the only way to say the same thing
+    in glTF, where baseColorFactor can only multiply.
+    """
+    key = (image_path, rgb)
+    if key in _composite_cache:
+        return _composite_cache[key]
+
+    result = None
+    try:
+        import io
+
+        from PIL import Image
+
+        with Image.open(image_path) as source:
+            texture = source.convert("RGBA")
+        backdrop = Image.new("RGBA", texture.size, tuple(rgb) + (255,))
+        flattened = Image.alpha_composite(backdrop, texture).convert("RGB")
+
+        buffer = io.BytesIO()
+        flattened.save(buffer, format="PNG", optimize=True)
+        result = buffer.getvalue()
+    except Exception:
+        result = None
+
+    _composite_cache[key] = result
+    return result
+
+
+_transparency_cache = {}
+
+
+def has_transparency(image_path):
+    """Whether an image actually contains see-through pixels."""
+    if not image_path or not os.path.exists(image_path):
+        return False
+    if image_path in _transparency_cache:
+        return _transparency_cache[image_path]
+
+    result = False
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as image:
+            if "A" in image.getbands():
+                result = image.getchannel("A").getextrema()[0] < 255
+    except Exception:
+        # Without PIL, fall back on the N64 format in the filename: the 16-bit
+        # RGBA format carries one alpha bit, so assume those may be cut out.
+        result = ".rgba16." in os.path.basename(image_path)
+
+    _transparency_cache[image_path] = result
+    return result
+
+
 def _material_for(glb, group, textures, embed_textures, cache):
     symbol = group.get("texture")
     light = group.get("light")
+    kind = group.get("combiner_kind", "modulate")
+    diffuse = group.get("light_diffuse")
+    image_path = group.get("image") or textures.get(symbol)
+
+    # A BLEND group flattens its texture onto the light colour, so that pairing
+    # identifies the baked image and belongs in the cache key.
+    flattened = None
+    if kind == "blend" and diffuse and image_path and os.path.exists(image_path):
+        flattened = composite_over(image_path, diffuse)
+
     key = (symbol, group["layer"], group.get("wrap_s"), group.get("wrap_t"),
-           light)
+           light, kind, flattened is not None)
     if key in cache:
         return cache[key]
 
-    # Solid-coloured parts carry their colour on the bound light, not on the
-    # vertices, so it becomes the material's base colour.
-    diffuse = group.get("light_diffuse")
-    if diffuse:
+    # Solid-coloured parts carry their colour on the bound light rather than on
+    # their vertices, so it becomes the material's base colour. Once a texture
+    # has been flattened onto that colour, applying it again would double it.
+    if diffuse and (kind != "blend" or flattened is None):
         base_color = [diffuse[0] / 255.0, diffuse[1] / 255.0,
                       diffuse[2] / 255.0, 1.0]
     else:
@@ -439,13 +517,21 @@ def _material_for(glb, group, textures, embed_textures, cache):
         },
         "doubleSided": not group.get("cull", True),
     }
-    if group["layer"] in ("ALPHA", "TRANSPARENT", "TRANSPARENT_DECAL"):
-        material["alphaMode"] = "BLEND"
 
-    image_path = group.get("image") or textures.get(symbol)
+    if group["layer"] in ("TRANSPARENT", "TRANSPARENT_DECAL"):
+        material["alphaMode"] = "BLEND"
+    elif flattened is None and kind != "shade" and has_transparency(image_path):
+        # Genuinely cut-out alpha, as opposed to alpha blended onto a shade
+        # colour. RGBA5551 carries a single alpha bit, so a mask is exact.
+        material["alphaMode"] = "MASK"
+        material["alphaCutoff"] = 0.5
+
     if embed_textures and image_path and os.path.exists(image_path):
-        with open(image_path, "rb") as fh:
-            image = glb.add_image(fh.read(), name=symbol)
+        if flattened is not None:
+            image = glb.add_image(flattened, name=f"{symbol}_on_{light}")
+        else:
+            with open(image_path, "rb") as fh:
+                image = glb.add_image(fh.read(), name=symbol)
 
         wrap = {"wrap": 10497, "mirror": 33648, "clamp": 33071}
         glb.json["samplers"].append({
@@ -537,7 +623,9 @@ def main(argv):
     parser.add_argument("--anims", default="none",
                         help="'none', 'all', or a comma-separated list")
     parser.add_argument("--exclude-dl", default=None,
-                        help="regex of display lists to skip, e.g. 'wings'")
+                        help="regex of display lists to skip; overrides the "
+                             "per-actor default. Pass '' to keep everything, "
+                             "which for Mario means the wing-cap wings.")
     parser.add_argument("--no-textures", action="store_true")
     args = parser.parse_args(argv[1:])
 
@@ -559,7 +647,9 @@ def main(argv):
     scale = args.scale if args.scale is not None else ACTOR_SCALE.get(
         args.actor, DEFAULT_SCALE
     )
-    exclude = re.compile(args.exclude_dl) if args.exclude_dl else None
+    pattern = (args.exclude_dl if args.exclude_dl is not None
+               else DEFAULT_EXCLUDE.get(args.actor))
+    exclude = re.compile(pattern) if pattern else None
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     stats = export(

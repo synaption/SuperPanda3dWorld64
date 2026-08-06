@@ -30,6 +30,18 @@ be re-run when the level data changes.
 
 Requires `panda3d` and `numpy`.
 
+### Ursina version
+
+An Ursina front end is also available. It shares the exact movement, collision,
+level rendering, actor, fixed-timestep, and camera code with the Panda3D app:
+
+```bash
+python3 -m pip install ursina
+python3 ursina/main.py
+```
+
+The converted assets and controls are the same as for `app/main.py`.
+
 Building under WSL and running from Windows against the same files works: the
 converters record texture paths relative to the project rather than absolute,
 and paths handed to Panda3D loaders go through `Filename.from_os_specific`,
@@ -72,6 +84,7 @@ tools/
   glb.py                 minimal glTF 2.0 / GLB writer
   export_actor_gltf.py   actor -> rigged, animated .glb
 app/main.py        the runnable game
+ursina/main.py     the Ursina front end
 ```
 
 ## Notes on the port
@@ -127,9 +140,13 @@ python3 tools/export_actor_gltf.py --actor mario --anims all -o mario.glb
 python3 tools/export_actor_gltf.py --actor mario --anims all \
     --scale 0.0025 -o mario_metres.glb
 
-# drop the wing-cap wings
-python3 tools/export_actor_gltf.py --actor mario --exclude-dl wings -o mario.glb
+# keep everything, including the wing-cap wings
+python3 tools/export_actor_gltf.py --actor mario --exclude-dl '' -o mario.glb
 ```
+
+Parts the game only draws conditionally are left out by default. Mario's wings
+sit under a `GEO_ASM` hook that only emits them while the wing cap is active,
+so exporting them unconditionally leaves them stuck to his head at all times.
 
 Mario comes out as 30 joints (20 of them animated), 514 vertices, 760
 triangles, and 209 animations.
@@ -159,6 +176,33 @@ broken export. In Blender, scrub any action to see him assemble.
 
 Runtime-driven joints (`geo_mario_tilt_torso`, head look, wing flap) export as
 identity, since the engine drives those rather than the animation data.
+
+**UV origin differs by target.** The N64 puts the texture origin at the
+top-left with V increasing downward, and glTF does exactly the same — so actor
+UVs export unflipped. Panda3D's own texture coordinates start at the
+bottom-left, so `sm64py/level.py` flips V when it builds geometry directly.
+Flipping in the converter instead silently mirrors every actor texture; the
+giveaway was Mario's cap logo reading as a W.
+
+**The combiner decides how texture and shade meet.** Getting this wrong on
+Mario's face produced three different failures in turn:
+
+- `MODULATE*` multiplies texel by shade. Applying that to the others
+  multiplies a yellow button by blue denim and comes out black.
+- `BLEND*` lerps the texel over the *shade colour*, within the polygon, using
+  the texel's own alpha. The result is **opaque**: where the texture is
+  transparent the shade colour shows through, not whatever is behind the
+  surface. Treating that alpha as see-through cuts holes through his face.
+- `SHADE*` samples no texel at all.
+
+Mario's eyes, mustache, cap logo and overall buttons are all `BLEND`. glTF's
+`baseColorFactor` can only multiply, so "texture over a colour" cannot be
+expressed directly — the exporter composites each such texture onto its light
+colour and emits the flattened result as an opaque texture. That is what the
+hardware produced, just baked ahead of time.
+
+Genuine cut-out alpha still occurs elsewhere and is emitted as `MASK` with a
+0.5 cutoff; RGBA5551 carries a single alpha bit, so a mask is exact there.
 
 **Solid colours come from lights, not vertices.** Mario's shirt and overalls
 carry no texture and no useful vertex colour — the colour is on the light group
@@ -192,11 +236,15 @@ Checked against the reference numbers, not just eyeballed:
 
 ## Not done yet
 
-- **Animation blending.** Clips are swapped on action change with no crossfade,
-  and the game's per-animation timing (start frame, loop points, playback rate)
-  is ignored — Panda3D just plays each clip at its own 30 fps. Actions whose
-  original animation depends on finer state (punch variants, ledge climbs) fall
-  back to a near-enough clip.
+- **Animation blending.** Clips are swapped on action change with no crossfade.
+  Playback *rate* now follows Mario's speed the way the original does, but the
+  per-animation start frame and loop points in the headers are still ignored.
+  Actions whose original animation depends on finer state (punch variants,
+  ledge climbs) fall back to a near-enough clip.
+- **Tiptoe and walk cycles are unreachable on a keyboard.** The clip is chosen
+  from whichever is larger, Mario's speed or how far the stick is pushed, and a
+  key is always full deflection — so it selects the run cycle immediately. That
+  is faithful; it just needs an analog stick to show.
 - **The camera** is a following camera, not a port. The original is a large state
   machine with per-area modes and hand-authored triggers. Mario's control feel
   depends on the camera's yaw, which is wired up correctly, but the camera's own

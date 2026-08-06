@@ -89,7 +89,8 @@ def _decode_normals(raw):
     return normals / lengths
 
 
-def _build_geom(positions, colors, uvs, triangles, lighting):
+def _build_geom(positions, colors, uvs, triangles, lighting,
+                coordinate_transform=to_panda):
     if lighting:
         fmt = GeomVertexFormat.get_v3n3c4t2()
     else:
@@ -106,12 +107,14 @@ def _build_geom(positions, colors, uvs, triangles, lighting):
     normals = _decode_normals(colors) if lighting else None
 
     for i, ((x, y, z), (u, v)) in enumerate(zip(positions, uvs)):
-        px, py, pz = to_panda(float(x), float(y), float(z))
+        px, py, pz = coordinate_transform(float(x), float(y), float(z))
         vertex.add_data3(px, py, pz)
-        texcoord.add_data2(float(u), float(v))
+        # Converter output keeps the N64's top-left UV origin; Panda3D's own
+        # texture coordinates start at the bottom-left, so V flips here.
+        texcoord.add_data2(float(u), 1.0 - float(v))
 
         if lighting:
-            nx, ny, nz = to_panda(*normals[i])
+            nx, ny, nz = coordinate_transform(*normals[i])
             normal.add_data3(nx, ny, nz)
             # Lighting supplies the shade; alpha still comes from the vertex.
             color.add_data4(1.0, 1.0, 1.0, colors[i][3] / 255.0)
@@ -129,7 +132,8 @@ def _build_geom(positions, colors, uvs, triangles, lighting):
     return geom
 
 
-def load_level_geometry(npz_path, materials_path=None, name="castle_grounds"):
+def load_level_geometry(npz_path, materials_path=None, name="castle_grounds",
+                        coordinate_transform=to_panda):
     """Load a parsed level mesh into a NodePath, one child per material group.
 
     Groups are kept separate so each can carry its own texture and render
@@ -174,7 +178,8 @@ def load_level_geometry(npz_path, materials_path=None, name="castle_grounds"):
 
         lighting = bool(group.get("lighting"))
         geom = _build_geom(
-            positions[used], colors[used], uvs[used], remap[tris], lighting
+            positions[used], colors[used], uvs[used], remap[tris], lighting,
+            coordinate_transform,
         )
 
         node = GeomNode(f"{group['layer']}_{index}")
@@ -206,7 +211,8 @@ def load_level_geometry(npz_path, materials_path=None, name="castle_grounds"):
     return root
 
 
-def load_collision_geometry(npz_path, name="collision"):
+def load_collision_geometry(npz_path, name="collision",
+                            coordinate_transform=to_panda):
     """Build a debug mesh of the collision triangles.
 
     Useful as an overlay: it shows exactly what the physics sees, which is
@@ -241,6 +247,7 @@ def load_collision_geometry(npz_path, name="collision"):
         np.zeros((len(positions), 2), dtype=np.float32),
         np.array(triangles, dtype=np.int32),
         lighting=False,
+        coordinate_transform=coordinate_transform,
     )
     node = GeomNode(name)
     node.add_geom(geom)
