@@ -30,6 +30,9 @@ SPAWN = (-1328.0, 260.0, 4664.0)
 SPAWN_YAW = 180.0
 DEATH_PLANE = -4000.0
 TICK_DT = 1.0 / 30.0
+# The exported model already uses the SM64 facing convention.  Adding the
+# glTF coordinate-system half-turn here makes the actor face its own rear.
+MODEL_YAW_OFFSET = 0.0
 ACTION_NAMES = {v: k for k, v in vars(C).items() if k.startswith("ACT_")}
 
 
@@ -54,24 +57,16 @@ ACTOR_VERTEX_SHADER = """
 #version 330
 uniform mat4 mvp;
 uniform mat4 model;
-uniform mat4 bones[30];
 in vec3 in_position;
 in vec3 in_normal;
 in vec2 in_uv;
 in vec4 in_color;
-in vec4 in_joints;
-in vec4 in_weights;
 out vec2 uv;
 out vec4 vertex_color;
 out vec3 normal;
 void main() {
-    mat4 skin = bones[int(in_joints.x)] * in_weights.x
-              + bones[int(in_joints.y)] * in_weights.y
-              + bones[int(in_joints.z)] * in_weights.z
-              + bones[int(in_joints.w)] * in_weights.w;
-    vec4 local = skin * vec4(in_position, 1.0);
-    gl_Position = mvp * local;
-    normal = mat3(model) * mat3(skin) * in_normal;
+    gl_Position = mvp * vec4(in_position, 1.0);
+    normal = mat3(model) * in_normal;
     uv = in_uv;
     vertex_color = in_color;
 }
@@ -132,7 +127,10 @@ def uniform_matrix(uniform, matrix):
 
 
 def make_texture(ctx, image):
-    image = image.convert("RGBA").transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+    # The converted F3D UVs and exported glTF UVs already account for the
+    # source images' top-left origin.  Flipping the pixels here inverted the
+    # hat emblem, moustache, Peach window, and every other directional image.
+    image = image.convert("RGBA")
     texture = ctx.texture(image.size, 4, image.tobytes())
     texture.build_mipmaps()
     texture.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
@@ -206,19 +204,25 @@ class MarioRenderer:
         self.actor = GLBActor(MARIO_MODEL)
         self.draws = []
         texture_cache = {}
+        attrs = self.actor.primitives[0]["attributes"]
+        self.base_positions = self.actor.accessor(attrs["POSITION"]).astype("f4")
+        self.base_normals = self.actor.accessor(attrs["NORMAL"]).astype("f4")
+        self.uvs = self.actor.accessor(attrs["TEXCOORD_0"]).astype("f4")
+        self.colors = self.actor.accessor(attrs["COLOR_0"]).astype("f4")
+        # Mario's lit display lists use these bytes for packed normals.  His
+        # actual shirt/skin/overall colours are the material base factors.
+        self.colors[:] = 1.0
+        self.joints = self.actor.accessor(attrs["JOINTS_0"]).astype("i4")
+        self.weights = self.actor.accessor(attrs["WEIGHTS_0"]).astype("f4")
+        packed = np.hstack((self.base_positions, self.base_normals,
+                            self.uvs, self.colors)).astype("f4")
+        self.vbo = ctx.buffer(packed.tobytes(), dynamic=True)
         for primitive in self.actor.primitives:
-            attrs = primitive["attributes"]
-            pos = self.actor.accessor(attrs["POSITION"]).astype("f4")
-            normal = self.actor.accessor(attrs["NORMAL"]).astype("f4")
-            uv = self.actor.accessor(attrs["TEXCOORD_0"]).astype("f4")
-            col = self.actor.accessor(attrs["COLOR_0"]).astype("f4")
-            joints = self.actor.accessor(attrs["JOINTS_0"]).astype("f4")
-            weights = self.actor.accessor(attrs["WEIGHTS_0"]).astype("f4")
-            packed = np.hstack((pos, normal, uv, col, joints, weights)).astype("f4")
-            vbo = ctx.buffer(packed.tobytes())
             indices = self.actor.accessor(primitive["indices"]).astype("u4").ravel()
             ibo = ctx.buffer(indices.tobytes())
-            vao = ctx.vertex_array(program, [(vbo, "3f 3f 2f 4f 4f 4f", "in_position", "in_normal", "in_uv", "in_color", "in_joints", "in_weights")], ibo)
+            vao = ctx.vertex_array(program, [(self.vbo, "3f 3f 2f 4f",
+                                   "in_position", "in_normal", "in_uv",
+                                   "in_color")], ibo)
             factor, tex_index = self.actor.material(primitive["material"])
             texture = None
             if tex_index is not None:
@@ -235,10 +239,29 @@ class MarioRenderer:
             self.clip, self.clip_time = clip, 0.0
         self.clip_time += dt * rate
         bones = self.actor.bone_matrices(clip, self.clip_time, loop)
-        model = model_matrix(position, yaw)
+        # These actors are rigidly segmented (one weight is 1.0), but perform
+        # the general four-weight calculation so the loader remains correct
+        # for any future exported actor.
+        hom = np.column_stack((self.base_positions,
+                               np.ones(len(self.base_positions), dtype="f4")))
+        skinned_positions = np.zeros_like(self.base_positions)
+        skinned_normals = np.zeros_like(self.base_normals)
+        for slot in range(4):
+            weight = self.weights[:, slot:slot+1]
+            if not np.any(weight):
+                continue
+            matrices = bones[self.joints[:, slot]]
+            skinned_positions += np.einsum("nij,nj->ni", matrices, hom)[:, :3] * weight
+            skinned_normals += np.einsum("nij,nj->ni", matrices[:, :3, :3],
+                                         self.base_normals) * weight
+        lengths = np.linalg.norm(skinned_normals, axis=1, keepdims=True)
+        skinned_normals /= np.maximum(lengths, 1e-8)
+        packed = np.hstack((skinned_positions, skinned_normals,
+                            self.uvs, self.colors)).astype("f4")
+        self.vbo.write(packed.tobytes())
+        model = model_matrix(position, yaw + MODEL_YAW_OFFSET)
         uniform_matrix(program["model"], model)
         uniform_matrix(program["mvp"], vp @ model)
-        program["bones"].write(bones.transpose(0, 2, 1).astype("f4").tobytes())
         program["lit"].value = True
         # SM64 actor display lists mix winding across mirrored body parts.
         # Panda's glTF loader accounts for that; render them two-sided here.
@@ -280,6 +303,9 @@ class Game:
         self.prev_yaw = self.mario.gfx_angle[1]
         self.show_collision = False
         self.running = True
+        self.desired_stick = (0.0, 0.0)
+        self.desired_buttons = 0
+        self.pressed_latch = 0
 
     def input(self, events, dt):
         for event in events:
@@ -291,14 +317,26 @@ class Game:
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE: self.running = False
                 if event.key == pygame.K_F3: self.show_collision = not self.show_collision
+                if event.key == pygame.K_SPACE: self.pressed_latch |= C.A_BUTTON
+                if event.key in (pygame.K_LSHIFT, pygame.K_RSHIFT):
+                    self.pressed_latch |= C.B_BUTTON
+                if event.key in (pygame.K_LCTRL, pygame.K_RCTRL):
+                    self.pressed_latch |= C.Z_TRIG
             elif event.type == pygame.MOUSEMOTION and any(event.buttons):
                 self.camera.rotate(event.rel[0] * 0.25)
                 self.camera.tilt(-event.rel[1] * 0.003)
         keys = pygame.key.get_pressed()
-        self.controller.set_stick(float(keys[pygame.K_a] or keys[pygame.K_LEFT]) - float(keys[pygame.K_d] or keys[pygame.K_RIGHT]),
-                                  float(keys[pygame.K_s] or keys[pygame.K_DOWN]) - float(keys[pygame.K_w] or keys[pygame.K_UP]))
-        buttons = (C.A_BUTTON if keys[pygame.K_SPACE] else 0) | (C.B_BUTTON if keys[pygame.K_LSHIFT] else 0) | (C.Z_TRIG if keys[pygame.K_LCTRL] else 0)
-        self.controller.set_buttons(buttons)
+        self.desired_stick = (
+            float(keys[pygame.K_a] or keys[pygame.K_LEFT])
+            - float(keys[pygame.K_d] or keys[pygame.K_RIGHT]),
+            float(keys[pygame.K_s] or keys[pygame.K_DOWN])
+            - float(keys[pygame.K_w] or keys[pygame.K_UP]),
+        )
+        self.desired_buttons = (
+            (C.A_BUTTON if keys[pygame.K_SPACE] else 0)
+            | (C.B_BUTTON if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] else 0)
+            | (C.Z_TRIG if keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL] else 0)
+        )
         if keys[pygame.K_q]: self.camera.rotate(-150 * dt)
         if keys[pygame.K_e]: self.camera.rotate(150 * dt)
         return keys
@@ -308,6 +346,12 @@ class Game:
         steps = 0
         while self.accumulator >= TICK_DT and steps < 8:
             self.prev_pos, self.prev_yaw = list(self.mario.gfx_pos), self.mario.gfx_angle[1]
+            # Controller edges belong to simulation frames, not render
+            # frames.  Sampling here prevents a press from being cleared by
+            # several fast render frames before physics gets to see it.
+            self.controller.set_stick(*self.desired_stick)
+            self.controller.set_buttons(self.desired_buttons | self.pressed_latch)
+            self.pressed_latch = 0
             self.mario.camera_yaw = self.camera.mario_yaw
             execute_action(self.mario)
             self.accumulator -= TICK_DT

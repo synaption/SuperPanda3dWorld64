@@ -54,7 +54,9 @@ from sm64py.camera import FollowCamera
 from sm64py.level import (
     load_collision_geometry,
     load_level_geometry,
+    preload,
     use_linear_textures,
+    use_mipmaps,
 )
 from sm64py.mario import Controller, MarioState, execute_action
 from sm64py.mario import animations
@@ -73,6 +75,11 @@ SPAWN_YAW = 180.0
 DEATH_PLANE = -4000.0
 MODEL_YAW_OFFSET = 0.0
 ACTION_NAMES = {v: k for k, v in vars(C).items() if k.startswith("ACT_")}
+
+# Assigning to a Text only marks it dirty; the glyph geometry is rebuilt in
+# the following cull traversal. Rebuilding it every frame is measurable, and
+# the readout is unreadable at 60 Hz anyway.
+HUD_INTERVAL = 0.1
 
 
 def panda_path(path):
@@ -96,6 +103,10 @@ class Game(Entity):
             coordinate_transform=to_ursina,
         )
         self.level.reparent_to(scene)
+        # One node per material group is how the loader keeps render state
+        # separate; groups sharing a state can still be merged. The level
+        # never moves, so this is free.
+        self.level.flatten_strong()
 
         self.collision_view = load_collision_geometry(
             os.path.join(CASTLE_GROUNDS, "collision.npz"),
@@ -129,7 +140,12 @@ class Game(Entity):
         self._dragging = False
         self._mouse_anchor = None
         self._accumulator = 0.0
+        self._hud_timer = 0.0
         self._reset_interpolation()
+
+        # Everything is in the scene graph by now, so get it onto the GPU
+        # before the first frame rather than during play.
+        preload(scene, application.base.win.get_gsg())
 
     def _setup_lighting(self):
         ambient = AmbientLight("ambient")
@@ -166,6 +182,7 @@ class Game(Entity):
 
         actor = Actor(panda_path(MARIO_MODEL))
         use_linear_textures(actor)
+        use_mipmaps(actor)
         actor.reparent_to(holder)
         actor.set_pos(0, 0, 0)
         actor.set_h(MODEL_YAW_OFFSET)
@@ -257,7 +274,10 @@ class Game(Entity):
         self.mario_node.set_pos(*to_ursina(*pos))
         self.mario_node.set_h(s16_to_degrees(yaw))
         self._update_animation()
-        if self._show_debug:
+
+        self._hud_timer -= dt
+        if self._show_debug and self._hud_timer <= 0.0:
+            self._hud_timer = HUD_INTERVAL
             self._update_hud()
 
     def _apply_camera(self):

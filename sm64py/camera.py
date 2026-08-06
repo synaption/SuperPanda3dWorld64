@@ -9,7 +9,9 @@ is measured against.  Those are the parts implemented here.
 
 import math
 
-from .math_util import atan2s, coss, degrees_to_s16, s16, sins, to_panda
+from .math_util import (
+    atan2s, coss_f, degrees_to_s16, s16, sins_f, to_panda,
+)
 from .surfaces import WallCollisionData
 
 # Distance and height the camera prefers to sit at behind Mario.  The height
@@ -27,6 +29,15 @@ YAW_RATE = 8.0
 HEIGHT_RATE = 6.0
 
 
+def _wrap_angle(value):
+    """Wrap a float binary angle into [-0x8000, 0x8000), keeping the fraction.
+
+    s16() does the same thing but truncates to an integer, which is what the
+    simulation wants and the camera does not.
+    """
+    return (value + 0x8000) % 0x10000 - 0x8000
+
+
 def _blend(rate, dt):
     """Frame-rate independent smoothing factor.
 
@@ -42,7 +53,13 @@ class FollowCamera:
         self.surfaces = surfaces
         self.mario = mario
 
-        self.yaw = s16(mario.face_angle[1] + 0x8000)
+        # Kept as a float in binary-angle units.  Rounding it to whole s16
+        # units each frame would truncate any easing step smaller than one
+        # unit to zero, so a slow pan stalls outright and then jumps: easing
+        # 30 degrees at 60 fps moved on only 53 of 239 frames, and never
+        # finished arriving.  Gameplay still sees a whole-unit angle through
+        # the mario_yaw property.
+        self.yaw = float(s16(mario.face_angle[1] + 0x8000))
         self.pitch = 0.06
         self.distance = DEFAULT_DISTANCE
         self.height = DEFAULT_HEIGHT
@@ -71,8 +88,8 @@ class FollowCamera:
             self.target_yaw = s16(m.face_angle[1] + 0x8000)
 
         # Ease the yaw toward its target on the short way round.
-        delta = s16(self.target_yaw - self.yaw)
-        self.yaw = s16(self.yaw + delta * _blend(YAW_RATE, dt))
+        delta = _wrap_angle(self.target_yaw - self.yaw)
+        self.yaw = _wrap_angle(self.yaw + delta * _blend(YAW_RATE, dt))
 
         focus_x = pos[0]
         focus_y = pos[1] + 120.0
@@ -89,9 +106,9 @@ class FollowCamera:
 
         horizontal = self.distance * math.cos(self.pitch)
         desired = [
-            self.focus[0] + horizontal * sins(self.yaw),
+            self.focus[0] + horizontal * sins_f(self.yaw),
             self.focus[1] + self.height + self.distance * math.sin(self.pitch),
-            self.focus[2] + horizontal * coss(self.yaw),
+            self.focus[2] + horizontal * coss_f(self.yaw),
         ]
 
         self.pos = self._resolve_collisions(desired)
@@ -129,8 +146,12 @@ class FollowCamera:
 
         Stick-up must send Mario away from the camera, and the camera sits
         behind him, so this is the camera's yaw turned around.
+
+        Rounded to a whole binary angle even though the camera tracks a float
+        one: this feeds the movement code, which is meant to see the same
+        quantised angle the original does.
         """
-        return s16(self.yaw + 0x8000)
+        return s16(round(self.yaw) + 0x8000)
 
     def apply_to(self, node):
         """Point a Panda3D camera node at Mario from the current position."""

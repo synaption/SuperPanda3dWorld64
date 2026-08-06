@@ -33,6 +33,23 @@ def coss(angle):
     return _SINE_TABLE[((int(angle) + 0x4000) & 0xFFFF) >> 4]
 
 
+def sins_f(angle):
+    """sins() without the table, for angles that are not gameplay state.
+
+    The 4096-entry table is deliberate everywhere it affects simulation, but
+    it only resolves 0.088 degrees.  Anything used purely to place the render
+    camera wants real trig instead: at a 1500-unit orbit radius one table step
+    is 2.3 units, so a slow pan visibly jumps between entries rather than
+    sweeping.  Takes the same binary-angle units, as a float.
+    """
+    return math.sin(angle * math.tau / 65536.0)
+
+
+def coss_f(angle):
+    """coss() without the table.  See sins_f()."""
+    return math.cos(angle * math.tau / 65536.0)
+
+
 def atan2s(z, x):
     """Binary angle of the vector (x, z), keeping the engine's argument order.
 

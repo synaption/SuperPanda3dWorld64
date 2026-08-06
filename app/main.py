@@ -42,7 +42,9 @@ from sm64py.camera import FollowCamera  # noqa: E402
 from sm64py.level import (  # noqa: E402
     load_collision_geometry,
     load_level_geometry,
+    preload,
     use_linear_textures,
+    use_mipmaps,
 )
 from sm64py.mario import Controller, MarioState, execute_action  # noqa: E402
 from sm64py.mario import animations  # noqa: E402
@@ -87,10 +89,20 @@ DEATH_PLANE = -4000.0
 
 ACTION_NAMES = {v: k for k, v in vars(C).items() if k.startswith("ACT_")}
 
+# How often the debug readout is rebuilt, in seconds. Assigning to an
+# OnscreenText only marks it dirty; the glyph geometry is regenerated inside
+# the following cull traversal, which measured ~0.4 ms per frame and spiked
+# far higher. The numbers are unreadable at 60 Hz anyway.
+HUD_INTERVAL = 0.1
+
 loadPrcFileData("", "window-title SM64 movement in Panda3D")
 loadPrcFileData("", "framebuffer-multisample 1")
 loadPrcFileData("", "multisamples 4")
-loadPrcFileData("", "sync-video 1")
+# Vsync removes tearing but ties the frame to the refresh, so any frame that
+# overruns waits for the next one and shows up as a stutter. Set MARIO_VSYNC=0
+# to free-run, which is how the ModernGL front end is configured and what
+# makes the two comparable.
+loadPrcFileData("", f"sync-video {os.environ.get('MARIO_VSYNC', '1')}")
 
 
 class Game(ShowBase):
@@ -104,6 +116,10 @@ class Game(ShowBase):
 
         self.level = load_level_geometry(os.path.join(CASTLE_GROUNDS, "mesh.npz"))
         self.level.reparent_to(self.render)
+        # The loader keeps one node per material group so each can carry its
+        # own state; groups sharing a state can still be merged, which halves
+        # the node count here. The level never moves, so this is free.
+        self.level.flatten_strong()
 
         self.collision_view = load_collision_geometry(
             os.path.join(CASTLE_GROUNDS, "collision.npz")
@@ -131,7 +147,12 @@ class Game(ShowBase):
         self._accumulator = 0.0
         self._show_debug = True
         self._mouse_anchor = None
+        self._hud_timer = 0.0
         self._reset_interpolation()
+
+        # Everything is in the scene graph by now, so get it onto the GPU
+        # before the first frame rather than during play.
+        preload(self.render, self.win.get_gsg())
 
         self.task_mgr.add(self._update, "update")
 
@@ -178,6 +199,7 @@ class Game(ShowBase):
 
         actor = Actor(panda_path(MARIO_MODEL))
         use_linear_textures(actor)
+        use_mipmaps(actor)
         actor.reparent_to(self.render)
         # The model faces +Y in Panda3D once loaded, while yaw 0 in the game
         # means facing +Z, which maps to -Y. Hence the half turn.
@@ -334,7 +356,9 @@ class Game(ShowBase):
         self.mario_node.set_h(s16_to_degrees(yaw))
         self._update_animation()
 
-        if self._show_debug:
+        self._hud_timer -= dt
+        if self._show_debug and self._hud_timer <= 0.0:
+            self._hud_timer = HUD_INTERVAL
             self._update_hud()
 
         return task.cont

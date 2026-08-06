@@ -105,6 +105,32 @@ def use_linear_textures(node):
             texture.set_format(replacement)
 
 
+def use_mipmaps(node):
+    """Give a node's textures the same filtering the level geometry gets.
+
+    Textures that arrive embedded in a .glb keep the loader's defaults, which
+    means no mipmaps: Mario's face and buttons are 512x512 drawn over a few
+    dozen pixels, so minification samples them almost at random and the detail
+    crawls as he moves. Requesting a mipmap minfilter is enough -- Panda3D
+    generates the chain on upload.
+    """
+    for texture in node.find_all_textures():
+        texture.set_minfilter(SamplerState.FT_linear_mipmap_linear)
+        texture.set_magfilter(SamplerState.FT_linear)
+        texture.set_anisotropic_degree(4)
+
+
+def preload(node, gsg):
+    """Upload a node's textures and vertex buffers before gameplay starts.
+
+    Panda3D prepares a texture the first frame it is actually drawn, so
+    scenery that only becomes visible when the camera swings pays its upload
+    cost mid-gameplay as a dropped frame. Doing it up front costs well under a
+    millisecond here and removes that class of hitch entirely.
+    """
+    node.prepare_scene(gsg)
+
+
 def _decode_normals(raw):
     """Vertex bytes are signed normals when G_LIGHTING is on."""
     signed = raw.astype(np.int16)
