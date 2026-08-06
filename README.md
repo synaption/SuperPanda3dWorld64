@@ -42,6 +42,18 @@ python3 ursina/main.py
 
 The converted assets and controls are the same as for `app/main.py`.
 
+### ModernGL version
+
+The standalone ModernGL front end uses pygame for its window and input, reads
+the converted level directly, and GPU-skins Mario without Panda3D or Ursina:
+
+```bash
+python3 -m pip install moderngl pygame pillow numpy
+python3 modernGL/main.py
+```
+
+The controls and converted assets are shared with the other front ends.
+
 Building under WSL and running from Windows against the same files works: the
 converters record texture paths relative to the project rather than absolute,
 and paths handed to Panda3D loaders go through `Filename.from_os_specific`,
@@ -77,6 +89,7 @@ sm64py/
     actions.py     the action state machine
     animations.py  which animation clip each action plays
 tools/
+  check_anim_grounding.py  verify grounded actions keep their feet on the floor
   parse_collision.py     collision.inc.c -> npz
   parse_f3d.py           F3D display lists -> textured mesh
   geo_layout.py          geo layouts -> actor node tree
@@ -85,6 +98,7 @@ tools/
   export_actor_gltf.py   actor -> rigged, animated .glb
 app/main.py        the runnable game
 ursina/main.py     the Ursina front end
+modernGL/main.py   the ModernGL + pygame front end
 ```
 
 ## Notes on the port
@@ -169,6 +183,17 @@ report 20 parts.
 draw time. The exporter bakes that in by default, giving a ~154-unit Mario that
 matches the level and collision units.
 
+**Clips need a start frame.** Animation headers carry a start frame, and the
+exporter writes it to a `*_clips.json` sidecar because glTF has nowhere to put
+it. It is not cosmetic: the single-jump landing clip starts at frame 22 of 38,
+and its unplayed lead-in frames are a deep crouch — play it from zero and Mario
+sinks knee-deep through the floor on every landing.
+
+`tools/check_anim_grounding.py` guards this. It poses every grounded action and
+reports any whose lowest vertex sits below the floor, which is what a grounded
+action pointing at an airborne clip looks like. Airborne actions are exempt, as
+is the ledge grab, which hangs below its position by design.
+
 **Rest pose is meaningless.** SM64 joints point down their own limb, so the
 unposed model splays along +X. Every animation supplies rotations for all 20
 joints, so it only resolves once posed — that is normal for this data, not a
@@ -212,6 +237,18 @@ lists, so a part that draws untextured has to actively say so via
 `gsSPTexture(..., G_OFF)` or a shade-only combiner; without tracking that, the
 last texture bound leaks onto every solid part after it.
 
+**Textures must not be sRGB-decoded.** Panda3D's glTF loader flags
+`baseColorTexture` as sRGB, which the spec asks for — but nothing here
+re-encodes, and every other texture in the project is loaded raw, so the decode
+lands once and is never undone. `sm64py.level.use_linear_textures` swaps those
+formats back before the Actor is parented.
+
+The symptom is a colour *split*, not an overall shift: a material's
+`baseColorFactor` is used as written while its texture is darkened. Mario's
+composited face rendered orange at (253, 136, 49) beside untextured parts at
+the intended (254, 193, 121) — which is exactly sRGB-to-linear applied once,
+and how the bug was identified.
+
 **Panda3D needs the mesh under the skeleton.** The skinned mesh node has to be
 a *child* of the skeleton root, not a sibling. Panda3D's glTF loader builds its
 Character from the joint hierarchy and only adopts geometry sitting underneath
@@ -237,10 +274,9 @@ Checked against the reference numbers, not just eyeballed:
 ## Not done yet
 
 - **Animation blending.** Clips are swapped on action change with no crossfade.
-  Playback *rate* now follows Mario's speed the way the original does, but the
-  per-animation start frame and loop points in the headers are still ignored.
-  Actions whose original animation depends on finer state (punch variants,
-  ledge climbs) fall back to a near-enough clip.
+  Playback rate and start frame now follow the original; the loop points in the
+  headers are still ignored. Actions whose original animation depends on finer
+  state (second punch, ledge climbs) fall back to a near-enough clip.
 - **Tiptoe and walk cycles are unreachable on a keyboard.** The clip is chosen
   from whichever is larger, Mario's speed or how far the stick is pushed, and a
   key is always full deflection — so it selects the run cycle immediately. That

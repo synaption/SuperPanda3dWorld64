@@ -79,6 +79,32 @@ def _load_texture(path, wrap_s, wrap_t):
     return texture
 
 
+# sRGB texture formats and the plain equivalents to swap them for.
+_LINEAR_EQUIVALENT = {
+    Texture.F_srgb: Texture.F_rgb,
+    Texture.F_srgb_alpha: Texture.F_rgba,
+}
+
+
+def use_linear_textures(node):
+    """Strip sRGB decoding from a node's textures.
+
+    Panda3D's glTF loader flags baseColorTexture as sRGB, which the spec asks
+    for. Nothing here re-encodes though, and every other texture in the project
+    is loaded raw, so that decode gets applied once and never undone.
+
+    It shows up as a colour split rather than an overall shift: a material's
+    baseColorFactor is used as written while its texture is darkened, so
+    Mario's composited face rendered orange (253, 136, 49) next to the
+    untextured parts beside it at the intended (254, 193, 121) -- which is
+    exactly sRGB-to-linear applied once.
+    """
+    for texture in node.find_all_textures():
+        replacement = _LINEAR_EQUIVALENT.get(texture.get_format())
+        if replacement is not None:
+            texture.set_format(replacement)
+
+
 def _decode_normals(raw):
     """Vertex bytes are signed normals when G_LIGHTING is on."""
     signed = raw.astype(np.int16)

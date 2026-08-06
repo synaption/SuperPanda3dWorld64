@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import json
 import math
 import os
 import re
@@ -652,6 +653,24 @@ def main(argv):
     exclude = re.compile(pattern) if pattern else None
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+
+    # Playback metadata the glTF itself has nowhere to put. The start frame
+    # matters: several clips are authored with lead-in frames the game never
+    # shows, and playing from zero drops Mario through the floor mid-landing.
+    if animations:
+        clips = {
+            name: {
+                "frames": anim.frame_count,
+                "start_frame": anim.start_frame,
+                "loop_start": anim.loop_start,
+                "loop_end": anim.loop_end,
+            }
+            for name, anim in animations.items()
+        }
+        sidecar = os.path.splitext(args.out)[0] + "_clips.json"
+        with open(sidecar, "w", encoding="utf-8") as fh:
+            json.dump(clips, fh, indent=2, sort_keys=True)
+
     stats = export(
         actor_dir=actor_dir, anim_dir=anim_dir, reference=args.reference,
         hd_pack=hd_pack, out_path=args.out, root_layout=root_layout,

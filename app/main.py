@@ -39,7 +39,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from sm64py import surfaces  # noqa: E402
 from sm64py.camera import FollowCamera  # noqa: E402
-from sm64py.level import load_collision_geometry, load_level_geometry  # noqa: E402
+from sm64py.level import (  # noqa: E402
+    load_collision_geometry,
+    load_level_geometry,
+    use_linear_textures,
+)
 from sm64py.mario import Controller, MarioState, execute_action  # noqa: E402
 from sm64py.mario import animations  # noqa: E402
 from sm64py.mario import constants as C  # noqa: E402
@@ -50,6 +54,7 @@ ASSETS = os.path.abspath(
 )
 CASTLE_GROUNDS = os.path.join(ASSETS, "castle_grounds")
 MARIO_MODEL = os.path.join(ASSETS, "mario", "mario.glb")
+MARIO_CLIPS = os.path.join(ASSETS, "mario", "mario_clips.json")
 
 
 def panda_path(path):
@@ -112,6 +117,7 @@ class Game(ShowBase):
         self.mario.spawn(*SPAWN, SPAWN_YAW)
 
         self._current_anim = None
+        animations.load_clip_metadata(MARIO_CLIPS)
         self.mario_node, self.mario_actor = self._build_mario()
         self.follow_camera = FollowCamera(self.surfaces, self.mario)
 
@@ -171,6 +177,7 @@ class Game(ShowBase):
             return root, None
 
         actor = Actor(panda_path(MARIO_MODEL))
+        use_linear_textures(actor)
         actor.reparent_to(self.render)
         # The model faces +Y in Panda3D once loaded, while yaw 0 in the game
         # means facing +Z, which maps to -Y. Hence the half turn.
@@ -194,10 +201,13 @@ class Game(ShowBase):
 
         if name != self._current_anim:
             self._current_anim = name
+            # Several clips carry lead-in frames the game never shows, so
+            # playback starts where the animation header says it does.
+            start = animations.start_frame(name)
             if loop:
-                self.mario_actor.loop(name)
+                self.mario_actor.loop(name, fromFrame=start)
             else:
-                self.mario_actor.play(name)
+                self.mario_actor.play(name, fromFrame=start)
 
         # Reapplied every frame, not just on a change: the walk and run cycles
         # follow Mario's current speed rather than a fixed cadence.

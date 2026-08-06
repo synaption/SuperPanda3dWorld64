@@ -8,6 +8,8 @@ switches between tiptoe, walk and run by speed, and the rising and falling
 halves of a double jump are different clips -- so entries may be a callable.
 """
 
+import json
+
 from . import constants as C
 
 # -- animation ids ----------------------------------------------------------
@@ -18,8 +20,14 @@ ANIM_FAST_LONGJUMP = 0x13
 ANIM_SLOW_LONGJUMP = 0x14
 ANIM_A_POSE = 0x0E
 ANIM_IDLE_ON_LEDGE = 0x33
+ANIM_GROUND_POUND_LANDING = 0x3A
 ANIM_START_GROUND_POUND = 0x3C
 ANIM_GROUND_POUND = 0x3D
+ANIM_GENERAL_LAND = 0x57
+ANIM_FIRST_PUNCH = 0x67
+ANIM_SECOND_PUNCH = 0x68
+ANIM_FIRST_PUNCH_FAST = 0x69
+ANIM_SLIDEFLIP_LAND = 0xBE
 ANIM_WALKING = 0x48
 ANIM_LAND_FROM_DOUBLE_JUMP = 0x4B
 ANIM_DOUBLE_JUMP_FALL = 0x4C
@@ -86,8 +94,8 @@ ACTION_ANIMATIONS = {
     C.ACT_START_CROUCHING: ANIM_START_CROUCHING,
     C.ACT_CROUCHING: ANIM_CROUCHING,
     C.ACT_STOP_CROUCHING: ANIM_STOP_CROUCHING,
-    C.ACT_PUNCHING: ANIM_AIR_KICK,
-    C.ACT_GROUND_POUND_LAND: ANIM_GROUND_POUND,
+    C.ACT_PUNCHING: ANIM_FIRST_PUNCH,
+    C.ACT_GROUND_POUND_LAND: ANIM_GROUND_POUND_LANDING,
     C.ACT_BUTT_SLIDE_STOP: ANIM_STOP_SLIDE,
 
     # moving
@@ -100,7 +108,7 @@ ACTION_ANIMATIONS = {
     C.ACT_BUTT_SLIDE: ANIM_SLIDE,
     C.ACT_STOMACH_SLIDE: ANIM_DIVE,
     C.ACT_DIVE_SLIDE: ANIM_DIVE,
-    C.ACT_MOVE_PUNCHING: ANIM_AIR_KICK,
+    C.ACT_MOVE_PUNCHING: ANIM_FIRST_PUNCH_FAST,
 
     # landings
     C.ACT_JUMP_LAND: ANIM_LAND_FROM_SINGLE_JUMP,
@@ -113,8 +121,8 @@ ACTION_ANIMATIONS = {
     C.ACT_TRIPLE_JUMP_LAND_STOP: ANIM_TRIPLE_JUMP_LAND,
     C.ACT_BACKFLIP_LAND: ANIM_TRIPLE_JUMP_LAND,
     C.ACT_BACKFLIP_LAND_STOP: ANIM_TRIPLE_JUMP_LAND,
-    C.ACT_SIDE_FLIP_LAND: ANIM_LAND_FROM_SINGLE_JUMP,
-    C.ACT_SIDE_FLIP_LAND_STOP: ANIM_LAND_FROM_SINGLE_JUMP,
+    C.ACT_SIDE_FLIP_LAND: ANIM_SLIDEFLIP_LAND,
+    C.ACT_SIDE_FLIP_LAND_STOP: ANIM_SLIDEFLIP_LAND,
     C.ACT_LONG_JUMP_LAND: ANIM_LAND_FROM_SINGLE_JUMP,
     C.ACT_LONG_JUMP_LAND_STOP: ANIM_LAND_FROM_SINGLE_JUMP,
 
@@ -147,7 +155,14 @@ NON_LOOPING = {
     ANIM_TURNING_PART1, ANIM_TURNING_PART2, ANIM_AIR_KICK,
     ANIM_BACKWARD_AIR_KB, ANIM_SOFT_BACK_KB, ANIM_STOP_SLIDE,
     ANIM_FAST_LONGJUMP, ANIM_SLOW_LONGJUMP,
+    ANIM_GROUND_POUND_LANDING, ANIM_SLIDEFLIP_LAND, ANIM_GENERAL_LAND,
+    ANIM_FIRST_PUNCH, ANIM_SECOND_PUNCH, ANIM_FIRST_PUNCH_FAST,
 }
+
+# Actions whose animation is authored below Mario's logical position on
+# purpose, so a grounding check should not flag them. Hanging from a ledge is
+# the obvious one: his position is the ledge top and his body dangles beneath.
+EXPECTED_BELOW_GROUND = {C.ACT_LEDGE_GRAB}
 
 
 # Clips whose playback rate follows Mario's speed, and the divisor each uses.
@@ -179,6 +194,31 @@ def play_rate(m, anim_id):
     # actually going, or how hard the stick is pushed.
     speed = max(abs(m.forward_vel), m.intended_mag, 4.0)
     return max(speed / divisor, MIN_PLAY_RATE)
+
+
+_clip_metadata = {}
+
+
+def load_clip_metadata(path):
+    """Load the sidecar the exporter writes next to a .glb.
+
+    It carries the per-clip start frame and loop points, which glTF has no
+    place for. The start frame is not cosmetic: several clips have lead-in
+    frames the game never shows, and playing them from zero sinks Mario
+    through the floor during a landing.
+    """
+    global _clip_metadata
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            _clip_metadata = json.load(fh)
+    except (OSError, ValueError):
+        _clip_metadata = {}
+    return _clip_metadata
+
+
+def start_frame(clip_name):
+    entry = _clip_metadata.get(clip_name)
+    return int(entry.get("start_frame", 0)) if entry else 0
 
 
 def resolve(m):
