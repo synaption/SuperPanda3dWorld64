@@ -333,17 +333,26 @@ re-investigated:
 - **Clips are not bound lazily.** The glTF loader binds all 209 up front; a
   clip's first play costs 0.002 ms. No pre-binding pass is needed.
 
-### Comparing against the ModernGL front end
+### Vsync is off by default
 
-The two are not configured the same way, so "ModernGL feels smoother" is partly
-not a Panda3D result. `modernGL/main.py` free-runs with `clock.tick(240)` and
-never requests vsync; `app/main.py` sets `sync-video 1`. Under vsync a frame
-that overruns its refresh interval waits for the next one, which reads as a
-stutter; free-running just shows the frame late. Set `MARIO_VSYNC=0` to make
-the comparison fair:
+This is what actually cleared up the microstutters, and it turned out not to be
+a Panda3D overhead problem at all — the two front ends were simply not
+configured the same way. `modernGL/main.py` free-runs with `clock.tick(240)` and
+never requests vsync, while Panda3D defaults it on. Under vsync a frame that
+overruns its refresh interval waits for the whole next one, which is a visible
+hitch; free-running just shows that frame late and carries on.
+
+So both Panda3D front ends now set `sync-video 0`. To put it back:
 
 ```sh
-MARIO_VSYNC=0 python3 app/main.py
+MARIO_VSYNC=1 python3 app/main.py
+```
+
+The tradeoff is tearing, and an uncapped frame rate that will spin the GPU as
+fast as it can. If that becomes a problem, cap it rather than re-enabling vsync:
+
+```sh
+python3 app/main.py    # with: clock-mode limited / clock-frame-rate 120
 ```
 
 ## Not done yet

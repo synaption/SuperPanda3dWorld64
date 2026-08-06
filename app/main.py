@@ -98,11 +98,11 @@ HUD_INTERVAL = 0.1
 loadPrcFileData("", "window-title SM64 movement in Panda3D")
 loadPrcFileData("", "framebuffer-multisample 1")
 loadPrcFileData("", "multisamples 4")
-# Vsync removes tearing but ties the frame to the refresh, so any frame that
-# overruns waits for the next one and shows up as a stutter. Set MARIO_VSYNC=0
-# to free-run, which is how the ModernGL front end is configured and what
-# makes the two comparable.
-loadPrcFileData("", f"sync-video {os.environ.get('MARIO_VSYNC', '1')}")
+# Off by default: vsync removes tearing, but it ties each frame to the refresh,
+# so a frame that overruns its interval waits for the next one and reads as a
+# stutter. Turning it off was what cleared up the microstutters here, and it is
+# how the ModernGL front end has always run. Set MARIO_VSYNC=1 to put it back.
+loadPrcFileData("", f"sync-video {os.environ.get('MARIO_VSYNC', '0')}")
 
 
 class Game(ShowBase):
