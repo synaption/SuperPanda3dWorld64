@@ -43,8 +43,16 @@ ARRAY_RE = re.compile(
 
 COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
 CMD_START_RE = re.compile(r"\b(gs[A-Za-z0-9_]+)\s*\(")
+GEO_CMD_START_RE = re.compile(r"\b(GEO_[A-Z0-9_]+)\s*\(")
 INCLUDE_TEXTURE_RE = re.compile(
     r"const\s+u8\s+(\w+)\s*\[\s*\]\s*=\s*\{\s*#include\s+\"([^\"]+)\"", re.S
+)
+
+# Solid-coloured actor parts get their colour from a light group rather than
+# from vertex colours or a texture: gdSPDefLights1(ambient_rgb, diffuse_rgb,
+# direction).  Without these, Mario's shirt and overalls come out untinted.
+LIGHTS_RE = re.compile(
+    r"const\s+Lights1\s+(\w+)\s*=\s*gdSPDefLights1\s*\(([^)]*)\)", re.S
 )
 
 VERTEX_CACHE_SIZE = 32
@@ -66,6 +74,9 @@ F3D_CONSTANTS = {
 # Identifiers only where one can actually start -- the lookbehind keeps the
 # "x70" inside a literal like 0x70 from being mistaken for a symbol.
 EXPR_TOKEN_RE = re.compile(r"(?<![\w.])[A-Za-z_]\w*")
+
+# Colour combiners that use only the shade colour, never a texel.
+SHADE_ONLY_COMBINERS = {"G_CC_SHADE", "G_CC_SHADEFADEA"}
 
 
 def _split_args(text):
@@ -110,10 +121,10 @@ def _u8(token):
     return _eval(token) & 0xFF
 
 
-def _scan_commands(body):
+def _scan_commands(body, start_re=CMD_START_RE):
     """Yield (name, args) pairs, matching parentheses properly."""
     out = []
-    for match in CMD_START_RE.finditer(body):
+    for match in start_re.finditer(body):
         name = match.group(1)
         start = match.end()
         depth, i = 1, start
@@ -147,6 +158,27 @@ def build_texture_map(reference):
     return mapping
 
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def as_project_relative(path):
+    """Store paths relative to the project when possible.
+
+    The converted assets get read back on whatever machine runs the game, and
+    this project is likely to be built under WSL and run from Windows against
+    the same files. An absolute path baked in at conversion time would not
+    resolve there, and the texture would silently go missing.
+    """
+    path = os.path.abspath(path)
+    try:
+        relative = os.path.relpath(path, PROJECT_ROOT)
+    except ValueError:  # different drive on Windows
+        return path
+    if relative.startswith(os.pardir):
+        return path
+    return relative.replace(os.sep, "/")
+
+
 def resolve_textures(symbol_to_include, hd_pack):
     """Point each texture symbol at a PNG in the HD pack, where one exists."""
     resolved = {}
@@ -158,7 +190,7 @@ def resolve_textures(symbol_to_include, hd_pack):
                 break
         candidate = os.path.join(hd_pack, "gfx", png)
         if os.path.exists(candidate):
-            resolved[symbol] = candidate
+            resolved[symbol] = as_project_relative(candidate)
     return resolved
 
 
@@ -168,6 +200,7 @@ class Level:
     def __init__(self):
         self.vertices = {}
         self.display_lists = {}
+        self.lights = {}
 
     def add_source(self, path):
         try:
@@ -175,6 +208,14 @@ class Level:
                 source = fh.read()
         except OSError:
             return
+
+        for name, body in LIGHTS_RE.findall(source):
+            values = [_eval(a) & 0xFF for a in _split_args(body)]
+            if len(values) >= 6:
+                self.lights[name] = {
+                    "ambient": tuple(values[0:3]),
+                    "diffuse": tuple(values[3:6]),
+                }
 
         for kind, name, body in ARRAY_RE.findall(source):
             if kind == "Vtx":
@@ -210,23 +251,40 @@ class MeshBuilder:
         self._emitted = {}
         self._group_start = 0
 
+        # Set by the actor exporter before running each part's display list.
+        # It joins the dedup key so a vertex shared between two parts becomes
+        # two vertices, one per bone -- required for rigid skinning.
+        self.bone = 0
+        self.vertex_bones = []
+
         self._texture = None
         self._layer = "OPAQUE"
         self._lighting = False
         self._cull = True
         self._tile = (32, 32)
         self._wrap = ("wrap", "wrap")
+        self._light = None
+        # Texture state persists across display lists, so a part that draws
+        # untextured has to actively say so -- via gsSPTexture(..., G_OFF) or
+        # a shade-only combine mode. Without tracking that, the last texture
+        # bound leaks onto every solid-coloured part after it.
+        self._texture_on = True
 
     # -- material tracking --------------------------------------------------
 
     def _state(self):
-        return (self._texture, self._layer, self._lighting, self._cull,
-                self._tile, self._wrap)
+        texture = self._texture if self._texture_on else None
+        # A bound light group means the part is lit, whatever the geometry
+        # mode said; actor parts set G_LIGHTING outside the lists walked here.
+        lighting = self._lighting or self._light is not None
+        return (texture, self._layer, lighting, self._cull,
+                self._tile, self._wrap, self._light)
 
     def _flush_group(self):
         count = len(self.triangles) - self._group_start
         if count > 0:
-            texture, layer, lighting, cull, tile, wrap = self._pending_state
+            texture, layer, lighting, cull, tile, wrap, light = self._pending_state
+            entry = self.level.lights.get(light) if light else None
             self.groups.append({
                 "texture": texture,
                 "layer": layer,
@@ -236,6 +294,9 @@ class MeshBuilder:
                 "tile_height": tile[1],
                 "wrap_s": wrap[0],
                 "wrap_t": wrap[1],
+                "light": light,
+                "light_diffuse": entry["diffuse"] if entry else None,
+                "light_ambient": entry["ambient"] if entry else None,
                 "first": self._group_start,
                 "count": count,
             })
@@ -258,7 +319,7 @@ class MeshBuilder:
         tile_w, tile_h = self._tile
         # S10.5 texel coordinates -> normalised UV. V is flipped because the
         # N64 runs its texture origin from the top.
-        key = (entry, tile_w, tile_h)
+        key = (entry, tile_w, tile_h, self.bone)
         index = self._emitted.get(key)
         if index is None:
             index = len(self.positions)
@@ -268,6 +329,7 @@ class MeshBuilder:
                 1.0 - entry[4] / 32.0 / max(tile_h, 1),
             ))
             self.colors.append(entry[5:9])
+            self.vertex_bones.append(self.bone)
             self._emitted[key] = index
         return index
 
@@ -298,6 +360,17 @@ class MeshBuilder:
                     return
             elif cmd == "gsDPSetTextureImage":
                 self._texture = args[-1]
+            elif cmd == "gsSPLight":
+                self._set_light(args)
+            elif cmd == "gsSPTexture":
+                # Last argument is G_ON / G_OFF.
+                if args:
+                    self._texture_on = "G_OFF" not in args[-1]
+            elif cmd == "gsDPSetCombineMode":
+                # Shade-only modes sample no texel at all.
+                self._texture_on = not any(
+                    a.strip() in SHADE_ONLY_COMBINERS for a in args
+                )
             elif cmd == "gsDPSetTileSize":
                 self._set_tile_size(args)
             elif cmd == "gsDPSetTile":
@@ -322,6 +395,15 @@ class MeshBuilder:
             return
         lrs, lrt = _eval(args[3]), _eval(args[4])
         self._tile = ((lrs >> 2) + 1, (lrt >> 2) + 1)
+
+    def _set_light(self, args):
+        # gsSPLight(&group.l, 1) binds the diffuse light; slot 2 is the
+        # ambient half of the same group, so only slot 1 needs reading.
+        if len(args) < 2 or _eval(args[1]) != 1:
+            return
+        symbol = args[0].lstrip("&").split(".")[0].strip()
+        if symbol:
+            self._light = symbol
 
     def _set_tile(self, args):
         # cm_t is arg 6 and cm_s is arg 9 in the gsDPSetTile argument order.

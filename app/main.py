@@ -20,12 +20,14 @@ import math
 import os
 import sys
 
+from direct.actor.Actor import Actor
 from direct.showbase.ShowBase import ShowBase
 from direct.gui.OnscreenText import OnscreenText
 from panda3d.core import (
     AmbientLight,
     ClockObject,
     DirectionalLight,
+    Filename,
     Fog,
     TextNode,
     Vec4,
@@ -39,11 +41,33 @@ from sm64py import surfaces  # noqa: E402
 from sm64py.camera import FollowCamera  # noqa: E402
 from sm64py.level import load_collision_geometry, load_level_geometry  # noqa: E402
 from sm64py.mario import Controller, MarioState, execute_action  # noqa: E402
+from sm64py.mario import animations  # noqa: E402
 from sm64py.mario import constants as C  # noqa: E402
 from sm64py.math_util import s16, s16_to_degrees, to_panda  # noqa: E402
 
-ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets")
+ASSETS = os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets")
+)
 CASTLE_GROUNDS = os.path.join(ASSETS, "castle_grounds")
+MARIO_MODEL = os.path.join(ASSETS, "mario", "mario.glb")
+
+
+def panda_path(path):
+    """Convert an OS path into the form Panda3D's loaders expect.
+
+    Panda3D uses its own path syntax rather than the platform's, so a native
+    string has to be translated before any loader sees it. It matters most on
+    Windows, where a drive path becomes /c/... and a UNC share becomes
+    /hosts/server/share/...; handing a loader the raw string instead makes it
+    treat the path as relative and search the model path in vain.
+    """
+    return Filename.from_os_specific(os.path.abspath(path))
+
+# Yaw correction between the model's facing and Mario's game-side yaw.
+# It works out to zero: the model faces -Y in Panda3D, and game yaw 0 means
+# facing +Z, which to_panda also maps to -Y. Kept named so the coincidence is
+# on purpose rather than something to rediscover.
+MODEL_YAW_OFFSET = 0.0
 
 # The game ticks at 30 Hz; all movement constants assume it.
 TICK_RATE = 30.0
@@ -87,7 +111,8 @@ class Game(ShowBase):
         self.mario = MarioState(self.surfaces, self.controller)
         self.mario.spawn(*SPAWN, SPAWN_YAW)
 
-        self.mario_node = self._build_mario_placeholder()
+        self._current_anim = None
+        self.mario_node, self.mario_actor = self._build_mario()
         self.follow_camera = FollowCamera(self.surfaces, self.mario)
 
         self.camLens.set_fov(45)
@@ -125,34 +150,55 @@ class Game(ShowBase):
         fog.set_linear_range(9000, 20000)
         self.render.set_fog(fog)
 
-    def _build_mario_placeholder(self):
-        """A stand-in body.
+    def _build_mario(self):
+        """Load the converted actor, or fall back to a marker if it is missing.
 
-        Mario's real model is a rigged F3D hierarchy with its own animation
-        format; until that is imported this is a readable proxy that makes
-        position, facing and height unambiguous.
+        The .glb comes out of tools/export_actor_gltf.py already at game
+        units, so no scaling is needed here.
         """
-        root = self.render.attach_new_node("mario")
+        if not os.path.exists(MARIO_MODEL):
+            print(f"Mario model not found at {MARIO_MODEL}; using a marker.")
+            print("Build it with:")
+            print("  python3 tools/export_actor_gltf.py --actor mario "
+                  "--anims all -o assets/mario/mario.glb")
+            marker = self.loader.load_model("models/box")
+            marker.set_scale(50, 50, 150)
+            marker.set_pos(-25, -25, 0)
+            marker.set_texture_off(1)
+            marker.set_color(0.85, 0.20, 0.20, 1)
+            root = self.render.attach_new_node("mario")
+            marker.reparent_to(root)
+            return root, None
 
-        def block(parent, scale, pos, color):
-            node = self.loader.load_model("models/box")
-            node.reparent_to(parent)
-            node.set_scale(*scale)
-            node.set_pos(*pos)
-            node.set_texture_off(1)
-            node.set_color(*color)
-            return node
+        actor = Actor(panda_path(MARIO_MODEL))
+        actor.reparent_to(self.render)
+        # The model faces +Y in Panda3D once loaded, while yaw 0 in the game
+        # means facing +Z, which maps to -Y. Hence the half turn.
+        actor.set_h(MODEL_YAW_OFFSET)
 
-        body = root.attach_new_node("body")
-        # Box model is a unit cube anchored at a corner, hence the offsets.
-        block(body, (60, 40, 70), (-30, -20, 0), (0.85, 0.20, 0.20, 1))
-        block(body, (60, 40, 45), (-30, -20, 70), (0.20, 0.35, 0.80, 1))
-        block(body, (46, 46, 40), (-23, -23, 115), (0.95, 0.78, 0.62, 1))
-        block(body, (52, 52, 16), (-26, -26, 150), (0.85, 0.20, 0.20, 1))
-        # Nose, so facing is obvious at a glance.
-        block(body, (14, 26, 14), (-7, -46, 125), (0.95, 0.78, 0.62, 1))
+        holder = self.render.attach_new_node("mario")
+        actor.reparent_to(holder)
+        actor.set_pos(0, 0, 0)
+        return holder, actor
 
-        return root
+    def _update_animation(self):
+        """Play whatever clip the current action calls for."""
+        if self.mario_actor is None:
+            return
+
+        name, loop = animations.resolve(self.mario)
+        if name == self._current_anim:
+            return
+
+        if self.mario_actor.get_anim_control(name) is None:
+            # Not every action has a clip exported; keep the previous pose.
+            return
+
+        self._current_anim = name
+        if loop:
+            self.mario_actor.loop(name)
+        else:
+            self.mario_actor.play(name)
 
     # -- input ---------------------------------------------------------------
 
@@ -273,6 +319,7 @@ class Game(ShowBase):
 
         self.mario_node.set_pos(*to_panda(*pos))
         self.mario_node.set_h(s16_to_degrees(yaw))
+        self._update_animation()
 
         if self._show_debug:
             self._update_hud()

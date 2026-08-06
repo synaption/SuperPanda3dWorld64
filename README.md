@@ -19,6 +19,9 @@ python3 tools/parse_collision.py \
 python3 tools/parse_f3d.py reference/Render96ex/levels/castle_grounds 1 \
     assets/castle_grounds/mesh.npz
 
+python3 tools/export_actor_gltf.py --actor mario --anims all \
+    -o assets/mario/mario.glb
+
 python3 app/main.py
 ```
 
@@ -26,6 +29,13 @@ The converters read from `reference/` and write to `assets/`. They only need to
 be re-run when the level data changes.
 
 Requires `panda3d` and `numpy`.
+
+Building under WSL and running from Windows against the same files works: the
+converters record texture paths relative to the project rather than absolute,
+and paths handed to Panda3D loaders go through `Filename.from_os_specific`,
+which is what turns a UNC share into the `/hosts/server/share/...` form Panda3D
+expects. Passing a native path string straight to a loader makes it search the
+model path and fail with "not found on model path".
 
 ### Controls
 
@@ -53,9 +63,14 @@ sm64py/
     state.py       per-frame state, controller sampling, geometry queries
     steps.py       quarter-step integration, gravity, ledge grabs
     actions.py     the action state machine
+    animations.py  which animation clip each action plays
 tools/
-  parse_collision.py   collision.inc.c -> npz
-  parse_f3d.py         F3D display lists -> textured mesh
+  parse_collision.py     collision.inc.c -> npz
+  parse_f3d.py           F3D display lists -> textured mesh
+  geo_layout.py          geo layouts -> actor node tree
+  sm64_anim.py           animation tables -> per-frame joint rotations
+  glb.py                 minimal glTF 2.0 / GLB writer
+  export_actor_gltf.py   actor -> rigged, animated .glb
 app/main.py        the runnable game
 ```
 
@@ -99,6 +114,70 @@ symbols through that. A vertex's four bytes are a colour when `G_LIGHTING` is of
 and a normal when it is on, so the parser records the mode per material group and
 the loader interprets them accordingly.
 
+## Exporting actors for Blender
+
+`tools/export_actor_gltf.py` turns a decomp actor into a rigged, animated
+`.glb`. It is dependency-free apart from numpy — the glTF is written directly.
+
+```bash
+# every animation, game units, HD textures embedded
+python3 tools/export_actor_gltf.py --actor mario --anims all -o mario.glb
+
+# metres, for a Blender scene that works at human scale
+python3 tools/export_actor_gltf.py --actor mario --anims all \
+    --scale 0.0025 -o mario_metres.glb
+
+# drop the wing-cap wings
+python3 tools/export_actor_gltf.py --actor mario --exclude-dl wings -o mario.glb
+```
+
+Mario comes out as 30 joints (20 of them animated), 514 vertices, 760
+triangles, and 209 animations.
+
+**Why the conversion is exact.** These actors are rigidly segmented, not
+smooth-skinned: each body part is its own display list authored in its joint's
+local space. Every vertex therefore binds to exactly one joint with weight 1.0,
+which is precisely what the hardware did when it multiplied each part by that
+joint's matrix. Nothing is approximated or re-rigged.
+
+**Joint order is implicit.** It is not stored anywhere — it is the order
+animated parts are visited walking the geo layout depth-first, and the
+animation index table is read in lockstep with that walk. The exporter
+cross-checks the two and warns if they disagree. They agree here: the
+hierarchy yields 20 animated joints and all 209 animation tables independently
+report 20 parts.
+
+**Scale.** The actor's geo wraps the body in `GEO_SCALE(0x00, 16384)`, and
+`0x10000` means 1.0 — so Mario is authored at 4x and shrunk to a quarter at
+draw time. The exporter bakes that in by default, giving a ~154-unit Mario that
+matches the level and collision units.
+
+**Rest pose is meaningless.** SM64 joints point down their own limb, so the
+unposed model splays along +X. Every animation supplies rotations for all 20
+joints, so it only resolves once posed — that is normal for this data, not a
+broken export. In Blender, scrub any action to see him assemble.
+
+Runtime-driven joints (`geo_mario_tilt_torso`, head look, wing flap) export as
+identity, since the engine drives those rather than the animation data.
+
+**Solid colours come from lights, not vertices.** Mario's shirt and overalls
+carry no texture and no useful vertex colour — the colour is on the light group
+bound by `gsSPLight`, so the parser reads `gdSPDefLights1` and uses its diffuse
+value as the material's base colour. Texture state also persists across display
+lists, so a part that draws untextured has to actively say so via
+`gsSPTexture(..., G_OFF)` or a shade-only combiner; without tracking that, the
+last texture bound leaks onto every solid part after it.
+
+**Panda3D needs the mesh under the skeleton.** The skinned mesh node has to be
+a *child* of the skeleton root, not a sibling. Panda3D's glTF loader builds its
+Character from the joint hierarchy and only adopts geometry sitting underneath
+it — as a sibling the mesh loads and renders but never binds, so the Actor
+animates nothing.
+
+The app maps 48 actions onto 33 clips (`sm64py/mario/animations.py`), including
+the speed-dependent tiptoe/walk/run split and the rise/fall halves of a double
+jump.
+
 ## Verified behaviour
 
 Checked against the reference numbers, not just eyeballed:
@@ -113,9 +192,11 @@ Checked against the reference numbers, not just eyeballed:
 
 ## Not done yet
 
-- **Mario's model and animations.** He is a placeholder body. The real model is a
-  rigged F3D hierarchy with its own animation format; the geometry parser handles
-  static display lists but not the bone hierarchy or animation data.
+- **Animation blending.** Clips are swapped on action change with no crossfade,
+  and the game's per-animation timing (start frame, loop points, playback rate)
+  is ignored — Panda3D just plays each clip at its own 30 fps. Actions whose
+  original animation depends on finer state (punch variants, ledge climbs) fall
+  back to a near-enough clip.
 - **The camera** is a following camera, not a port. The original is a large state
   machine with per-area modes and hand-authored triggers. Mario's control feel
   depends on the camera's yaw, which is wired up correctly, but the camera's own

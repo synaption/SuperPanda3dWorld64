@@ -39,6 +39,22 @@ _WRAP_MODES = {
 
 _texture_cache = {}
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def resolve_asset(path):
+    """Turn a stored texture path into one that exists on this machine.
+
+    Converter output records project-relative paths so the same assets work
+    whether they were built under WSL and are being run from Windows or the
+    other way round.
+    """
+    if not path:
+        return None
+    if os.path.isabs(path):
+        return path
+    return os.path.join(PROJECT_ROOT, path.replace("/", os.sep))
+
 
 def _load_texture(path, wrap_s, wrap_t):
     key = (path, wrap_s, wrap_t)
@@ -165,7 +181,7 @@ def load_level_geometry(npz_path, materials_path=None, name="castle_grounds"):
         node.add_geom(geom)
         np_group = root.attach_new_node(node)
 
-        image = group.get("image")
+        image = resolve_asset(group.get("image"))
         if image and os.path.exists(image):
             texture = _load_texture(image, group.get("wrap_s", "wrap"),
                                     group.get("wrap_t", "wrap"))
