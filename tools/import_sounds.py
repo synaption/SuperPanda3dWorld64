@@ -148,6 +148,14 @@ def wanted_samples():
     return wanted
 
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _as_project_relative(path):
+    relative = os.path.relpath(os.path.abspath(path), PROJECT_ROOT)
+    return path if relative.startswith(os.pardir) else relative.replace(os.sep, "/")
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", default=DEFAULT_SOURCE,
@@ -178,10 +186,12 @@ def main(argv):
         written += 1
 
     # Record where these came from, so the game can say whether it is playing
-    # real samples or the synthesised stand-ins rather than guessing.
+    # real samples or the synthesised stand-ins rather than guessing. Written
+    # relative to the project where possible: this file is tracked, and an
+    # absolute path would commit one machine's home directory.
     with open(os.path.join(output, audio.SOURCE_MARKER), "w",
               encoding="utf-8") as fh:
-        fh.write(source + "\n")
+        fh.write(_as_project_relative(source) + "\n")
 
     unique = sorted(set(wanted.values()))
     print(f"{written} samples written to {output}")

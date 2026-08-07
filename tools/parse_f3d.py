@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 
 import numpy as np
@@ -218,6 +219,41 @@ def resolve_textures(symbol_to_include, hd_pack):
         if os.path.exists(candidate):
             resolved[symbol] = as_project_relative(candidate)
     return resolved
+
+
+def collect_textures(groups, out_dir, hd_pack):
+    """Copy the textures this level actually uses in beside the mesh.
+
+    Without this the converted level points back into the HD texture pack,
+    which is 12 GB of third-party material that cannot be tracked -- so a fresh
+    clone parses fine and then draws the whole castle grounds untextured. Only
+    the images the level references get copied: 21 of them, 2.8 MB, against the
+    thousands in the pack.
+
+    The pack's own directory structure is preserved rather than flattened,
+    because two of these are both called `0.rgba16.png`.
+    """
+    prefix = os.path.join(os.path.abspath(hd_pack), "gfx") + os.sep
+    copied = {}
+    for group in groups:
+        source = group.get("image")
+        if not source:
+            continue
+        if source in copied:
+            group["image"] = copied[source]
+            continue
+
+        absolute = os.path.abspath(os.path.join(PROJECT_ROOT, source))
+        if not absolute.startswith(prefix):
+            continue
+        relative = absolute[len(prefix):].replace(os.sep, "/")
+        destination = os.path.join(out_dir, "textures", relative)
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        shutil.copyfile(absolute, destination)
+
+        copied[source] = as_project_relative(destination)
+        group["image"] = copied[source]
+    return copied
 
 
 class Level:
@@ -540,7 +576,9 @@ def main(argv):
     n_vtx, n_dl, n_tex = mesh.pop("_counts")
     groups = mesh.pop("groups")
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    os.makedirs(out_dir, exist_ok=True)
+    copied = collect_textures(groups, out_dir, hd_pack) if hd_pack else {}
     np.savez_compressed(args.out, **mesh)
     with open(os.path.splitext(args.out)[0] + "_materials.json", "w",
               encoding="utf-8") as fh:
@@ -549,6 +587,11 @@ def main(argv):
     textured = sum(1 for g in groups if g["image"])
     print(f"parsed {n_vtx} vertex arrays, {n_dl} display lists, "
           f"{n_tex} textures resolved from the HD pack")
+    if copied:
+        size = sum(os.path.getsize(os.path.join(PROJECT_ROOT, p))
+                   for p in set(copied.values()))
+        print(f"copied {len(copied)} used textures ({size / 1e6:.1f} MB) "
+              f"into {os.path.join(out_dir, 'textures')}")
     print(f"roots: {len(roots)}")
     print(f"{len(mesh['positions'])} vertices, {len(mesh['triangles'])} triangles, "
           f"{len(groups)} material groups ({textured} textured) -> {args.out}")

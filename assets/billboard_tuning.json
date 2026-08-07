@@ -1,0 +1,11 @@
+{
+  "base": {
+    "cancel_parent": true,
+    "enabled": true,
+    "heading_offset": 0.0,
+    "pitch": 0.0,
+    "roll": 0.0,
+    "scale": 4.0
+  },
+  "per_actor": {}
+}
