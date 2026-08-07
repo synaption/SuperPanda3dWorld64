@@ -217,3 +217,75 @@ NOT_SLIPPERY_TYPES = {
     SURFACE_HARD_NOT_SLIPPERY,
     SURFACE_SWITCH,
 }
+
+
+# -- water ------------------------------------------------------------------
+
+ACT_WATER_IDLE = 0x380022C0
+ACT_WATER_ACTION_END = 0x300022C2
+ACT_WATER_PLUNGE = 0x300022E2
+ACT_BREASTSTROKE = 0x300024D0
+ACT_SWIMMING_END = 0x300024D1
+ACT_FLUTTER_KICK = 0x300024D2
+ACT_WATER_JUMP = 0x01000889
+
+# A stroke starts at minimum strength and gains a little each time the player
+# chains another straight out of the last, up to the cap.
+MIN_SWIM_STRENGTH = 160
+MAX_SWIM_STRENGTH = 280
+SWIM_STRENGTH_GAIN = 10
+
+PARTICLE_WATER_SPLASH = 1 << 6
+PARTICLE_IDLE_WATER_WAVE = 1 << 7
+
+
+# -- sound ------------------------------------------------------------------
+#
+# Sound IDs are packed the way the audio engine expects: the bank picks the
+# sample set, and the priority decides what a full channel drops. Nothing here
+# plays audio -- actions append IDs to MarioState.sound_events and the front
+# end decides what, if anything, to do with them.
+
+
+def sound_arg_load(bank, play_flags, sound_id, priority, flags2):
+    return ((bank << 28) | (play_flags << 24) | (sound_id << 16)
+            | (priority << 8) | (flags2 << 4) | SOUND_STATUS_STARTING)
+
+
+SOUND_STATUS_STARTING = 1
+
+SOUND_BANK_ACTION = 0
+SOUND_BANK_MOVING = 1
+SOUND_BANK_VOICE = 2
+
+# Terrain-dependent: the low bits of the sound ID are replaced at play time
+# with the floor's terrain, so one ID covers grass, sand, snow, stone and water.
+SOUND_ACTION_TERRAIN_JUMP = sound_arg_load(0, 4, 0x00, 0x80, 8)
+SOUND_ACTION_TERRAIN_LANDING = sound_arg_load(0, 4, 0x08, 0x80, 8)
+SOUND_ACTION_TERRAIN_STEP = sound_arg_load(0, 6, 0x10, 0x80, 8)
+SOUND_ACTION_TERRAIN_BODY_HIT_GROUND = sound_arg_load(0, 4, 0x18, 0x80, 8)
+SOUND_ACTION_TERRAIN_STEP_TIPTOE = sound_arg_load(0, 6, 0x20, 0x80, 8)
+SOUND_ACTION_TERRAIN_HEAVY_LANDING = sound_arg_load(0, 4, 0x60, 0x80, 8)
+
+SOUND_ACTION_SWIM = sound_arg_load(0, 4, 0x33, 0x80, 8)
+SOUND_ACTION_SWIM_FAST = sound_arg_load(0, 4, 0x47, 0xA0, 8)
+SOUND_ACTION_WATER_PLUNGE = sound_arg_load(0, 4, 0x30, 0xC0, 8)
+SOUND_ACTION_SURFACE_BREAK = sound_arg_load(0, 4, 0x31, 0x60, 8)
+
+SOUND_MARIO_YAH_WAH_HOO = sound_arg_load(2, 4, 0x00, 0x80, 8)
+SOUND_MARIO_HOOHOO = sound_arg_load(2, 4, 0x03, 0x80, 8)
+SOUND_MARIO_YAHOO = sound_arg_load(2, 4, 0x04, 0x80, 8)
+SOUND_MARIO_HAHA = sound_arg_load(2, 4, 0x11, 0x80, 8)
+SOUND_MARIO_OOOF = sound_arg_load(2, 4, 0x05, 0x80, 8)
+SOUND_MARIO_ATTACKED = sound_arg_load(2, 4, 0x0F, 0xFF, 8)
+SOUND_MARIO_PANTING = sound_arg_load(2, 4, 0x18, 0x80, 8)
+
+# Terrain codes the terrain-dependent sounds above are combined with.
+SOUND_TERRAIN_DEFAULT = 0
+SOUND_TERRAIN_GRASS = 1
+SOUND_TERRAIN_WATER = 2
+SOUND_TERRAIN_STONE = 3
+SOUND_TERRAIN_SPOOKY = 4
+SOUND_TERRAIN_SNOW = 5
+SOUND_TERRAIN_ICE = 6
+SOUND_TERRAIN_SAND = 7

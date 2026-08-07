@@ -112,7 +112,13 @@ def main(argv):
     for action, entry in sorted(A.ACTION_ANIMATIONS.items()):
         if action & C.ACT_FLAG_AIR or action in A.EXPECTED_BELOW_GROUND:
             continue
+        # Swimming holds Mario off the ground by definition, so the floor is
+        # not where these clips belong and has nothing to say about them.
+        if action & C.ACT_FLAG_SWIMMING:
+            continue
         if callable(entry):
+            continue
+        if entry in A.SUBMERGED_ANIMS:
             continue
 
         clip = A.anim_name(entry)

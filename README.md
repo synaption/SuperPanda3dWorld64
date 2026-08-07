@@ -7,7 +7,8 @@ based on the render96 recomp.
 
 Current state: the castle grounds load and render from the decomp data, and
 Mario's movement — walking, slopes, jumps, the jump chain, dives, slides, ledge
-grabs, wall bonks — runs on a port of the original physics.
+grabs, wall bonks — runs on a port of the original physics. The moat and lake
+are swimmable, and actions raise the original sound events.
 
 ## Running
 
@@ -22,6 +23,9 @@ python3 tools/parse_f3d.py reference/Render96ex/levels/castle_grounds 1 \
 python3 tools/export_actor_gltf.py --actor mario --anims all \
     -o assets/mario/mario.glb
 
+# optional: real audio, if you have an extracted asset tree
+python3 tools/import_sounds.py
+
 python3 app/main.py
 ```
 
@@ -29,37 +33,6 @@ The converters read from `reference/` and write to `assets/`. They only need to
 be re-run when the level data changes.
 
 Requires `panda3d` and `numpy`.
-
-### Ursina version
-
-An Ursina front end is also available. It shares the exact movement, collision,
-level rendering, actor, fixed-timestep, and camera code with the Panda3D app:
-
-```bash
-python3 -m pip install ursina
-python3 ursina/main.py
-```
-
-The converted assets and controls are the same as for `app/main.py`.
-
-### ModernGL version
-
-The standalone ModernGL front end uses pygame for its window and input, reads
-the converted level directly, and GPU-skins Mario without Panda3D or Ursina:
-
-```bash
-python3 -m pip install moderngl pygame pillow numpy
-python3 modernGL/main.py
-```
-
-The controls and converted assets are shared with the other front ends.
-
-Building under WSL and running from Windows against the same files works: the
-converters record texture paths relative to the project rather than absolute,
-and paths handed to Panda3D loaders go through `Filename.from_os_specific`,
-which is what turns a UNC share into the `/hosts/server/share/...` form Panda3D
-expects. Passing a native path string straight to a loader makes it search the
-model path and fail with "not found on model path".
 
 ### Controls
 
@@ -82,12 +55,14 @@ sm64py/
   surfaces.py      collision triangles, spatial partition, floor/ceil/wall queries
   level.py         converted mesh -> Panda3D geometry
   camera.py        following camera
+  audio.py         sound events -> Panda3D, plus placeholder sample synthesis
   mario/
     constants.py   action ids, action flags, input bits, surface types
     state.py       per-frame state, controller sampling, geometry queries
     steps.py       quarter-step integration, gravity, ledge grabs
     actions.py     the action state machine
     animations.py  which animation clip each action plays
+    water.py       the submerged action group
 tools/
   check_anim_grounding.py  verify grounded actions keep their feet on the floor
   parse_collision.py     collision.inc.c -> npz
@@ -96,9 +71,8 @@ tools/
   sm64_anim.py           animation tables -> per-frame joint rotations
   glb.py                 minimal glTF 2.0 / GLB writer
   export_actor_gltf.py   actor -> rigged, animated .glb
+  import_sounds.py       extracted AIFF samples -> assets/sounds/*.wav
 app/main.py        the runnable game
-ursina/main.py     the Ursina front end
-modernGL/main.py   the ModernGL + pygame front end
 ```
 
 ## Notes on the port
@@ -192,7 +166,25 @@ sinks knee-deep through the floor on every landing.
 `tools/check_anim_grounding.py` guards this. It poses every grounded action and
 reports any whose lowest vertex sits below the floor, which is what a grounded
 action pointing at an airborne clip looks like. Airborne actions are exempt, as
-is the ledge grab, which hangs below its position by design.
+is the ledge grab, which hangs below its position by design, and the submerged
+group, which is off the ground by definition.
+
+**Loop points turned out to be a non-issue.** This was listed here as an
+outstanding gap. It is not one: `loop_end` in an animation header *is* the frame
+count, and all 209 of Mario's clips have `loop_start` 0 and `loop_end` equal to
+their length. The exporter was reading both correctly all along and there is
+nothing to honour. `start_frame` is the field that actually varies — 18 clips
+have a non-zero one.
+
+**The swim stroke is timed to its clip.** Breaststroke runs a 14-frame action
+timer and `SWIM_PART1` is exactly 13 frames, so it plays through once per stroke
+with no rate scaling — the clip and the action were authored to the same length.
+Re-pressing A during the arm sweep rewinds the clip mid-action rather than
+changing clip, so a held stroke reads as one continuous cycle instead of visibly
+retriggering; that needed a way for an action to ask for a restart without the
+clip name changing (`MarioState.anim_reset`). Above forward speed 14 the flutter
+kick stops re-asserting its clip altogether and whatever is playing keeps
+running, so `animations.resolve` can return `None` meaning "leave it alone".
 
 **Rest pose is meaningless.** SM64 joints point down their own limb, so the
 unposed model splays along +X. Every animation supplies rotations for all 20
@@ -271,6 +263,112 @@ Checked against the reference numbers, not just eyeballed:
 - Spawn floor height at the level's `MARIO_POS` resolves to exactly 260.0.
 - Parsed collision matches the level header counts (490 vertices, 879 triangles).
 
+## Water
+
+Water is not collision. It is a set of axis-aligned boxes the collision data
+carries — castle grounds has two, the moat and the lake, both with their
+surface at y = -81 — so "underwater" is a comparison against a height looked up
+by (x, z), not anything the surface engine reports. `find_water_level` does that
+lookup; the boxes were already being parsed into the `.npz` and were simply
+going unused.
+
+Below the surface Mario runs on the submerged action group, which steps
+differently from the ground: no quarter-stepping, no gravity, walls tested
+higher up his body, and a hard floor-to-ceiling headroom requirement. Buoyancy
+pulls him toward the surface when he is near it and lets him sink when he is
+not. Both bodies of water are genuinely swimmable — the moat runs to a median
+430 units deep, the lake to 1067.
+
+**Swimming is the only place pitch and roll are drawn.** On land Mario stays
+upright however steep the slope, and the port threw both angles away. Swimming
+aims his whole body along his heading, so `sync_graphics` now carries all three
+and the front end applies `set_hpr` instead of `set_h`, interpolating each the
+short way round.
+
+**The surface drifts, it does not spin.** Rotating the UVs was the obvious way
+to animate it and the wrong one: rotation moves every point by its distance from
+the centre of rotation, so one corner of a 15000-unit water box crawls while the
+opposite corner races. Worse, the centre is wherever UV (0.5, 0.5) lands, which
+for these boxes is off in a corner rather than the middle. Measured, that drove
+the moat surface at 1531-2429 world units/sec against Mario's 960-unit/sec
+sprint -- the water outran him by up to 2.5x. It now translates instead, at a
+flat 25 units/sec that is uniform across the sheet and expressed in units the
+rest of the game uses.
+
+**Underwater needs fog, not just a surface.** The water is a single flat sheet
+with nothing behind it, so a camera below the waterline renders identically to
+one above it. Dropping the fog range from 9000-20000 down to 200-4200 and
+recolouring it green-blue is what actually sells being submerged. The test is on
+the camera, not on Mario: swimming just under the surface leaves the camera in
+open air looking down through it, and tinting the whole world in that case looks
+wrong.
+
+**The stick is mirrored, and only the yaw cancels it.** This port deliberately
+feeds `stick_y` with the opposite sign to the original, and the heading formula
+plus the camera rotation undo that. Anything reading `stick_y` as a *scalar*
+has nothing to undo it: the swim pitch and the water-jump test both had to flip.
+Measured rather than reasoned about — holding forward gave +39° of pitch and
+floated Mario upward, when pushing forward should dive.
+
+## Sound
+
+The decomp names every noise Mario makes -- 467 packed sound IDs, with the
+terrain folded into the low bits so one constant covers grass, sand, snow,
+stone and water -- but ships no audio. Its samples come out of a ROM at build
+time, exactly as the textures do. `sm64pcbuilder2` extracts them, so:
+
+```bash
+python3 tools/import_sounds.py
+```
+
+pulls the 15 samples the port actually plays out of
+`reference/sm64pcbuilder2/assets/US/sound/samples/` and converts them to WAV in
+`assets/sounds/` (which is gitignored -- nothing is redistributed). Without
+that step the game synthesises crude stand-ins instead and says so at startup,
+so the two are never confused:
+
+```
+Audio: AudioManager ready, 57 samples
+       imported from .../US/sound/samples
+```
+
+If the game is silent, `python3 tools/check_sound.py` separates the three
+things that can be wrong -- no audio device, samples that failed to load, or
+samples that load but never play -- and then plays them all out loud, so a
+silent run there points at your audio output rather than at the game.
+
+**Sample paths are converted, not passed raw.** Panda3D's loaders take its own
+path syntax rather than the platform's, and the difference only shows on
+Windows: a native `C:\...\assets\sounds\x.wav` is read as a *relative* path,
+the model path is searched in vain, and the loader hands back a silent sound
+instead of failing. On Linux the raw path is already in the right form, so the
+bug is invisible there -- which is how it survived being tested. A sound that
+loads with zero length is now treated as missing and reported once.
+
+**Actions never play anything.** They append real IDs to
+`MarioState.sound_events` and the front end drains it once a tick, so the
+simulation runs identically with no audio device attached -- the normal case
+under WSL.
+
+**The sample bank is not ordered by terrain code.** Its file `02` is stone
+while terrain code 2 is water, and it carries a metal step that no terrain code
+selects, so the import maps by name. Lining the two up numerically would have
+put the wrong sound underfoot on four of the eight surfaces. SM64 has no water
+*step* sample at all -- stepping in shallow water uses the splash.
+
+**Footsteps come from the animation, not from distance travelled.** They fire
+on the two frames of each cycle a foot lands on -- 10 and 49 walking, 9 and 45
+running, and so on -- which are the original's own numbers. Because the clip is
+played back at speed/4, the cadence then follows Mario's speed with no constant
+to tune: 3.1 steps/sec walking, 6.7 running, measured against 3.12 and 6.67
+predicted from the clip lengths.
+
+Driving them from distance instead was an approximation, and a bad one. It
+fired every 52 units, which at a running 960 units/sec is 18 footfalls a second
+-- nearly three times too fast. The simulation tracks its own animation frame
+for this rather than asking the renderer, so footfalls stay in step whether or
+not anything is being drawn.
+
 ## Performance
 
 Measured with an offscreen buffer, so the numbers below are CPU-side. The
@@ -345,7 +443,10 @@ hitch; free-running just shows that frame late and carries on.
 So both Panda3D front ends now set `sync-video 0`. To put it back:
 
 ```sh
-MARIO_VSYNC=1 python3 app/main.py
+MARIO_VSYNC=1 # optional: real audio, if you have an extracted asset tree
+python3 tools/import_sounds.py
+
+python3 app/main.py
 ```
 
 The tradeoff is tearing, and an uncapped frame rate that will spin the GPU as
@@ -358,9 +459,9 @@ python3 app/main.py    # with: clock-mode limited / clock-frame-rate 120
 ## Not done yet
 
 - **Animation blending.** Clips are swapped on action change with no crossfade.
-  Playback rate and start frame now follow the original; the loop points in the
-  headers are still ignored. Actions whose original animation depends on finer
-  state (second punch, ledge climbs) fall back to a near-enough clip.
+  Playback rate and start frame follow the original. Actions whose animation
+  depends on finer state (second punch, ledge climbs) fall back to a
+  near-enough clip.
 - **Tiptoe and walk cycles are unreachable on a keyboard.** The clip is chosen
   from whichever is larger, Mario's speed or how far the stick is pushed, and a
   key is always full deflection — so it selects the run cycle immediately. That
@@ -369,8 +470,11 @@ python3 app/main.py    # with: clock-mode limited / clock-frame-rate 120
   machine with per-area modes and hand-authored triggers. Mario's control feel
   depends on the camera's yaw, which is wired up correctly, but the camera's own
   behaviour is an approximation.
-- **Water, objects, and the moving-texture system.** No water surfaces, no coins,
-  trees, or warps; the level's special objects are parsed out to
-  `collision_objects.json` but nothing consumes them yet.
-- **Swimming, and most cutscene/automatic actions** (poles, hanging, cannons).
-- **Sound.**
+- **Objects.** No coins, trees, or warps; the level's special objects are parsed
+  out to `collision_objects.json` but nothing consumes them yet.
+- **Most cutscene and automatic actions** (poles, hanging, cannons), and the
+  parts of swimming that need systems this port does not have: drowning and the
+  breath meter (no health), metal-cap water walking, and carrying an object
+  while swimming.
+- **Real audio samples.** See below — the event system is in, the samples
+  cannot be.

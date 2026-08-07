@@ -54,6 +54,14 @@ ANIM_TRIPLE_JUMP_LAND = 0xC0
 ANIM_TRIPLE_JUMP = 0xC1
 ANIM_IDLE_HEAD_CENTER = 0xC5
 ANIM_START_TIPTOE = 0xCA
+ANIM_DROWNING_PART1 = 0xA5
+ANIM_WATER_DYING = 0xA7
+ANIM_FALL_FROM_WATER = 0xA9
+ANIM_SWIM_PART1 = 0xAA
+ANIM_SWIM_PART2 = 0xAB
+ANIM_FLUTTERKICK = 0xAC
+ANIM_WATER_ACTION_END = 0xAD
+ANIM_WATER_IDLE = 0xB2
 
 
 def anim_name(anim_id):
@@ -143,6 +151,21 @@ ACTION_ANIMATIONS = {
     C.ACT_SOFT_BONK: ANIM_SOFT_BACK_KB,
     C.ACT_BACKWARD_AIR_KB: ANIM_BACKWARD_AIR_KB,
     C.ACT_LEDGE_GRAB: ANIM_IDLE_ON_LEDGE,
+
+    # submerged
+    #
+    # The stroke is two clips, not one: PART1 is the arms sweeping out and
+    # PART2 the glide as they recover. Breaststroke runs a 14-frame timer and
+    # PART1 is exactly 13 frames, so it plays through once per stroke with no
+    # rate scaling -- the clip and the action were authored to the same length.
+    C.ACT_BREASTSTROKE: ANIM_SWIM_PART1,
+    C.ACT_SWIMMING_END: ANIM_SWIM_PART2,
+    C.ACT_FLUTTER_KICK: ANIM_FLUTTERKICK,
+    C.ACT_WATER_IDLE: ANIM_WATER_IDLE,
+    C.ACT_WATER_ACTION_END: ANIM_WATER_ACTION_END,
+    # Plunging keeps the falling pose until he settles.
+    C.ACT_WATER_PLUNGE: ANIM_GENERAL_FALL,
+    C.ACT_WATER_JUMP: ANIM_FALL_FROM_WATER,
 }
 
 # Clips that should hold on their last frame rather than repeat.
@@ -157,6 +180,19 @@ NON_LOOPING = {
     ANIM_FAST_LONGJUMP, ANIM_SLOW_LONGJUMP,
     ANIM_GROUND_POUND_LANDING, ANIM_SLIDEFLIP_LAND, ANIM_GENERAL_LAND,
     ANIM_FIRST_PUNCH, ANIM_SECOND_PUNCH, ANIM_FIRST_PUNCH_FAST,
+    # The stroke halves each play once through and are re-triggered by the
+    # action, not by looping: letting PART1 repeat would restart the arm sweep
+    # in the middle of the glide.
+    ANIM_SWIM_PART1, ANIM_SWIM_PART2, ANIM_WATER_ACTION_END,
+    ANIM_FALL_FROM_WATER, ANIM_WATER_DYING,
+}
+
+# Swimming holds Mario off the ground by definition, so a grounding check has
+# nothing to say about these.
+SUBMERGED_ANIMS = {
+    ANIM_SWIM_PART1, ANIM_SWIM_PART2, ANIM_FLUTTERKICK, ANIM_WATER_IDLE,
+    ANIM_WATER_ACTION_END, ANIM_FALL_FROM_WATER, ANIM_WATER_DYING,
+    ANIM_DROWNING_PART1,
 }
 
 # Actions whose animation is authored below Mario's logical position on
@@ -221,8 +257,99 @@ def start_frame(clip_name):
     return int(entry.get("start_frame", 0)) if entry else 0
 
 
+def frame_count(clip_name):
+    entry = _clip_metadata.get(clip_name)
+    return int(entry.get("frames", 0)) if entry else 0
+
+
+def loop_range(clip_name):
+    """(loop_start, loop_end) for a clip, falling back to its full length.
+
+    Animation headers carry their own loop points, and for most clips they
+    span the whole thing. Where they do not, repeating the entire clip
+    replays a lead-in that was only ever meant to play once.
+    """
+    entry = _clip_metadata.get(clip_name)
+    if not entry:
+        return 0, 0
+    frames = int(entry.get("frames", 0))
+    start = int(entry.get("loop_start", 0))
+    end = int(entry.get("loop_end", frames)) or frames
+    return start, min(end, frames) if frames else end
+
+
+# Above this speed the flutter kick stops re-asserting its clip, so whatever
+# was already playing keeps running -- Mario streamlines instead of kicking.
+FLUTTER_KICK_ANIM_SPEED = 14.0
+
+
+# The two frames of each cycle a foot lands on. These are the original's own
+# numbers, and they are why the cadence comes out right without tuning: the
+# clip is played back at speed/4, so the interval between footfalls follows
+# Mario's speed automatically. Both frames sit at roughly 1/8 and 5/8 through
+# their clip, one per foot.
+STEP_FRAMES = {
+    ANIM_WALKING: (10, 49),
+    ANIM_RUNNING: (9, 45),
+    ANIM_TIPTOE: (14, 72),
+    ANIM_START_TIPTOE: (7, 22),
+    ANIM_CRAWLING: (26, 79),
+}
+
+
+def advance_frame(m):
+    """Advance the playing clip and report whether a foot just landed.
+
+    The simulation tracks its own animation frame rather than asking the
+    renderer, so footfalls stay in step with the clip whether or not anything
+    is being drawn.
+    """
+    entry = ACTION_ANIMATIONS.get(m.action, ANIM_A_POSE)
+    anim_id = entry(m) if callable(entry) else entry
+
+    steps = STEP_FRAMES.get(anim_id)
+    length = frame_count(anim_name(anim_id))
+    if steps is None or length <= 0:
+        m.anim_frame = 0.0
+        return False
+
+    rate = play_rate(m, anim_id)
+    previous = m.anim_frame
+    current = previous + rate
+    m.anim_frame = current % length
+
+    # A footfall counts if it falls in the span just covered. The span can be
+    # longer than a whole cycle at speed, so it is walked rather than tested
+    # as a single interval.
+    for frame in steps:
+        for turn in range(int(current // length) + 1):
+            if previous < frame + turn * length <= current:
+                return True
+    return False
+
+
+def action_frame_count(m):
+    """Length of the clip the current action plays, in frames.
+
+    Actions that run until their animation finishes need this, and asking here
+    rather than being told by the renderer keeps the simulation self-contained.
+    Returns 0 when no metadata has been loaded, which makes such an action end
+    immediately rather than hang.
+    """
+    entry = ACTION_ANIMATIONS.get(m.action, ANIM_A_POSE)
+    anim_id = entry(m) if callable(entry) else entry
+    return frame_count(anim_name(anim_id))
+
+
 def resolve(m):
-    """Return (clip_name, should_loop, play_rate) for Mario's current action."""
+    """Clip to play for the current action.
+
+    Returns (clip_name, should_loop, play_rate), or None when the action
+    deliberately leaves the current clip alone.
+    """
+    if m.action == C.ACT_FLUTTER_KICK and m.forward_vel >= FLUTTER_KICK_ANIM_SPEED:
+        return None
+
     entry = ACTION_ANIMATIONS.get(m.action, ANIM_A_POSE)
     anim_id = entry(m) if callable(entry) else entry
     return (anim_name(anim_id),

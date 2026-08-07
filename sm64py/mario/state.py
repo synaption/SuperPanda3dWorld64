@@ -5,6 +5,10 @@ import math
 from ..math_util import atan2s, coss, s16, sins
 from . import constants as C
 
+# Stand-in water height for areas with no water at all. Far below any real
+# collision, so "is Mario underwater" tests are simply false there.
+NO_WATER = -11000.0
+
 
 class Controller:
     """One frame of controller input, in N64 units.
@@ -85,8 +89,24 @@ class MarioState:
         self.ceil_height = 0.0
         self.floor_height = 0.0
         self.floor_angle = 0
-        self.water_level = -11000.0
+        self.water_level = NO_WATER
 
+        # How hard the current swim stroke pulls. Chaining strokes builds it
+        # up; letting go drops it back to the minimum. The engine keeps this
+        # in a file-level static, which works because there is only ever one
+        # Mario -- here it lives on him.
+        self.swim_strength = C.MIN_SWIM_STRENGTH
+
+
+        # Sound IDs the actions raised this frame. Actions never play anything
+        # themselves, so the simulation stays independent of whether the front
+        # end has audio at all. Drained once per frame by the front end.
+        self.sound_events = []
+
+        # Set by an action that wants its clip restarted from the top even
+        # though the clip itself has not changed, which is how a held stroke
+        # reads as one continuous cycle. Cleared once the front end acts on it.
+        self.anim_reset = False
         self.peak_height = 0.0
         self.quicksand_depth = 0.0
         self.squish_timer = 0
@@ -275,7 +295,11 @@ class MarioState:
             self.floor_height, self.floor = self.surfaces.find_floor(*self.pos)
 
         self.ceil_height, self.ceil = self.find_ceil(self.pos, self.floor_height)
-        self.water_level = -11000.0
+
+        # Resolved before the tests below, two of which read it. Areas with no
+        # water leave this far underground so those tests stay false.
+        level = self.surfaces.find_water_level(self.pos[0], self.pos[2])
+        self.water_level = NO_WATER if level is None else level
 
         if self.floor is not None:
             self.floor_angle = atan2s(self.floor.normal[2], self.floor.normal[0])
@@ -317,4 +341,12 @@ class MarioState:
 
     def sync_graphics(self):
         self.gfx_pos = list(self.pos)
-        self.gfx_angle = [0, self.face_angle[1], 0]
+        # On land only the yaw is drawn: Mario stays upright however steep the
+        # slope. Swimming aims his whole body along the direction he is
+        # heading, so pitch and roll are drawn too. The pitch is negated
+        # because a positive face pitch means swimming upward.
+        if self.action & C.ACT_FLAG_SWIMMING:
+            self.gfx_angle = [-self.face_angle[0], self.face_angle[1],
+                              self.face_angle[2]]
+        else:
+            self.gfx_angle = [0, self.face_angle[1], 0]

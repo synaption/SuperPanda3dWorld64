@@ -37,9 +37,11 @@ from panda3d.core import (
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from sm64py import surfaces  # noqa: E402
+from sm64py import audio, surfaces  # noqa: E402
 from sm64py.camera import FollowCamera  # noqa: E402
 from sm64py.level import (  # noqa: E402
+    animate_water,
+    build_water_surface,
     load_collision_geometry,
     load_level_geometry,
     preload,
@@ -57,6 +59,10 @@ ASSETS = os.path.abspath(
 CASTLE_GROUNDS = os.path.join(ASSETS, "castle_grounds")
 MARIO_MODEL = os.path.join(ASSETS, "mario", "mario.glb")
 MARIO_CLIPS = os.path.join(ASSETS, "mario", "mario_clips.json")
+SOUNDS = os.path.join(ASSETS, "sounds")
+
+SKY_COLOUR = (0.32, 0.60, 0.86)
+UNDERWATER_COLOUR = (0.06, 0.28, 0.36)
 
 
 def panda_path(path):
@@ -110,7 +116,7 @@ class Game(ShowBase):
         ShowBase.__init__(self)
 
         self.disable_mouse()
-        self.set_background_color(0.32, 0.60, 0.86)
+        self.set_background_color(*SKY_COLOUR)
 
         self.surfaces = surfaces.load(os.path.join(CASTLE_GROUNDS, "collision.npz"))
 
@@ -120,6 +126,9 @@ class Game(ShowBase):
         # own state; groups sharing a state can still be merged, which halves
         # the node count here. The level never moves, so this is free.
         self.level.flatten_strong()
+
+        self.water = build_water_surface(self.surfaces)
+        self.water.reparent_to(self.render)
 
         self.collision_view = load_collision_geometry(
             os.path.join(CASTLE_GROUNDS, "collision.npz")
@@ -154,6 +163,8 @@ class Game(ShowBase):
         # before the first frame rather than during play.
         preload(self.render, self.win.get_gsg())
 
+        self._setup_audio()
+
         self.task_mgr.add(self._update, "update")
 
     # -- scene ---------------------------------------------------------------
@@ -172,10 +183,43 @@ class Game(ShowBase):
         # The level mesh carries baked vertex colour, so keep lighting off it.
         self.level.set_light_off()
 
-        fog = Fog("distance")
-        fog.set_color(0.32, 0.60, 0.86)
-        fog.set_linear_range(9000, 20000)
-        self.render.set_fog(fog)
+        self.air_fog = Fog("distance")
+        self.air_fog.set_color(*SKY_COLOUR)
+        self.air_fog.set_linear_range(9000, 20000)
+
+        # Underwater the view closes in hard and goes green-blue. This is what
+        # sells being submerged far more than the surface quad does -- without
+        # it the camera below the waterline looks identical to the camera above
+        # it, since the water is a single flat sheet with nothing behind it.
+        self.water_fog = Fog("underwater")
+        self.water_fog.set_color(*UNDERWATER_COLOUR)
+        self.water_fog.set_linear_range(200, 4200)
+
+        self._camera_submerged = None
+        self._apply_camera_medium(False)
+
+    def _apply_camera_medium(self, submerged):
+        """Swap fog and sky for whichever side of the surface the camera is on."""
+        if submerged == self._camera_submerged:
+            return
+        self._camera_submerged = submerged
+        if submerged:
+            self.render.set_fog(self.water_fog)
+            self.set_background_color(*UNDERWATER_COLOUR)
+        else:
+            self.render.set_fog(self.air_fog)
+            self.set_background_color(*SKY_COLOUR)
+
+    def _update_camera_medium(self):
+        """Is the camera itself under the water surface?
+
+        Tested against the camera rather than Mario: swimming just below the
+        surface leaves the camera in open air looking down through it, and
+        tinting the whole world in that case looks wrong.
+        """
+        x, y, z = self.follow_camera.pos
+        level = self.surfaces.find_water_level(x, z)
+        self._apply_camera_medium(level is not None and y < level)
 
     def _build_mario(self):
         """Load the converted actor, or fall back to a marker if it is missing.
@@ -215,13 +259,25 @@ class Game(ShowBase):
         if self.mario_actor is None:
             return
 
-        name, loop, rate = animations.resolve(self.mario)
+        resolved = animations.resolve(self.mario)
+        if resolved is None:
+            # The action asked to keep whatever is already playing.
+            self.mario.anim_reset = False
+            return
+        name, loop, rate = resolved
 
         if self.mario_actor.get_anim_control(name) is None:
             # Not every action has a clip exported; keep the previous pose.
+            self.mario.anim_reset = False
             return
 
-        if name != self._current_anim:
+        # An action can ask for its clip to restart without the clip itself
+        # changing, which is how a held swim stroke reads as one continuous
+        # cycle instead of visibly retriggering.
+        restart = self.mario.anim_reset
+        self.mario.anim_reset = False
+
+        if name != self._current_anim or restart:
             self._current_anim = name
             # Several clips carry lead-in frames the game never shows, so
             # playback starts where the animation header says it does.
@@ -283,6 +339,42 @@ class Game(ShowBase):
             self.collision_view.hide()
             self.level.show()
 
+    def _setup_audio(self):
+        """Prepare the sound bank, synthesising stand-in samples if needed.
+
+        The decomp has no audio -- its samples come out of a ROM at build
+        time, exactly as the textures do -- so placeholders are generated once
+        into assets/sounds/. Replace them with real files of the same name to
+        get real audio. Failing to set any of this up is not fatal: the sound
+        bank then does nothing, which is the usual outcome under WSL.
+        """
+        try:
+            written = audio.generate_placeholders(SOUNDS, audio.USED_SOUNDS)
+            if written:
+                print(f"Synthesised {len(written)} placeholder sounds in {SOUNDS}")
+        except OSError as exc:
+            print(f"Could not write placeholder sounds: {exc}")
+
+        manager = self.sfxManagerList[0] if self.sfxManagerList else None
+        self.sounds = audio.SoundBank(SOUNDS, manager)
+
+        # Always report the outcome. Silent audio is otherwise indistinguishable
+        # from audio that was never wired up, and under WSL the difference is
+        # usually the device, not the code.
+        if self.sounds.enabled:
+            count = len([f for f in os.listdir(SOUNDS) if f.endswith(".wav")]) \
+                if os.path.isdir(SOUNDS) else 0
+            source = audio.imported_from(SOUNDS)
+            print(f"Audio: {type(manager).__name__} ready, {count} samples")
+            if source:
+                print(f"       imported from {source}")
+            else:
+                print("       synthesised placeholders -- run "
+                      "tools/import_sounds.py for the real ones.")
+        else:
+            print("Audio: no usable device, running silent. "
+                  "(Under WSL this is normal.)")
+
     def _setup_hud(self):
         self.hud = OnscreenText(
             text="",
@@ -328,11 +420,14 @@ class Game(ShowBase):
         while self._accumulator >= TICK_DT and steps < 8:
             # Remember where Mario was so the render can interpolate out of it.
             self._prev_pos = list(self.mario.gfx_pos)
-            self._prev_yaw = self.mario.gfx_angle[1]
+            self._prev_angle = list(self.mario.gfx_angle)
 
             self._poll_controller()
             self.mario.camera_yaw = self.follow_camera.mario_yaw
             execute_action(self.mario)
+            # Drained inside the tick loop, not after it: a frame that runs
+            # two ticks would otherwise drop the first tick's sounds.
+            self.sounds.play_events(self.mario)
             self._accumulator -= TICK_DT
             steps += 1
 
@@ -346,14 +441,20 @@ class Game(ShowBase):
         # judders on a faster display. Draw a blend between the last two ticks
         # instead, positioned by however much time is left in the accumulator.
         alpha = min(max(self._accumulator / TICK_DT, 0.0), 1.0)
-        pos, yaw = self._interpolated_transform(alpha)
+        pos, angle = self._interpolated_transform(alpha)
 
         self.follow_camera.update(dt, target_pos=pos,
                                   recenter=self.keys["cam_center"])
         self.follow_camera.apply_to(self.camera)
 
+        animate_water(self.water, self.clock.get_frame_time())
+        self._update_camera_medium()
+
         self.mario_node.set_pos(*to_panda(*pos))
-        self.mario_node.set_h(s16_to_degrees(yaw))
+        # Panda3D takes heading, pitch, roll; the port stores pitch, yaw, roll.
+        self.mario_node.set_hpr(s16_to_degrees(angle[1]),
+                                s16_to_degrees(angle[0]),
+                                s16_to_degrees(angle[2]))
         self._update_animation()
 
         self._hud_timer -= dt
@@ -369,14 +470,20 @@ class Game(ShowBase):
             self._prev_pos[i] + (current[i] - self._prev_pos[i]) * alpha
             for i in range(3)
         ]
-        # Turn the short way round, so crossing the angle wrap does not spin.
-        delta = s16(self.mario.gfx_angle[1] - self._prev_yaw)
-        return pos, self._prev_yaw + delta * alpha
+        # All three angles, because swimming pitches and rolls him; on land the
+        # other two are simply zero. Each turns the short way round, so
+        # crossing the angle wrap does not spin.
+        angle = [
+            self._prev_angle[i]
+            + s16(self.mario.gfx_angle[i] - self._prev_angle[i]) * alpha
+            for i in range(3)
+        ]
+        return pos, angle
 
     def _reset_interpolation(self):
         """Drop the blend after a teleport, so Mario does not streak across."""
         self._prev_pos = list(self.mario.gfx_pos)
-        self._prev_yaw = self.mario.gfx_angle[1]
+        self._prev_angle = list(self.mario.gfx_angle)
         self._accumulator = 0.0
 
     def _update_camera_input(self, dt):

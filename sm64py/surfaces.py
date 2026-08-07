@@ -105,7 +105,8 @@ class WallCollisionData:
 class SurfaceSet:
     """All static collision for one level area."""
 
-    def __init__(self, vertices, tri_verts, tri_type, tri_force):
+    def __init__(self, vertices, tri_verts, tri_type, tri_force,
+                 water_boxes=None):
         verts = np.asarray(vertices, dtype=np.int64)
         idx = np.asarray(tri_verts, dtype=np.int64)
 
@@ -115,10 +116,39 @@ class SurfaceSet:
         self.type = np.asarray(tri_type, dtype=np.int32)
         self.force = np.asarray(tri_force, dtype=np.int32)
 
+        # Each row is (id, x1, z1, x2, z2, y). The bounds are not stored in any
+        # particular order, so normalise them once rather than at every query.
+        boxes = np.zeros((0, 6), dtype=np.int32) if water_boxes is None \
+            else np.asarray(water_boxes, dtype=np.int32).reshape(-1, 6)
+        self.water_boxes = boxes
+        self._water_min_x = np.minimum(boxes[:, 1], boxes[:, 3])
+        self._water_max_x = np.maximum(boxes[:, 1], boxes[:, 3])
+        self._water_min_z = np.minimum(boxes[:, 2], boxes[:, 4])
+        self._water_max_z = np.maximum(boxes[:, 2], boxes[:, 4])
+        self._water_y = boxes[:, 5]
+
         self._build_normals()
         self._build_flags()
         self._build_partition()
         self._surface_cache = {}
+
+    # -- water --------------------------------------------------------------
+
+    def find_water_level(self, x, z):
+        """Height of the water surface over (x, z), or None if there is none.
+
+        Water is stored as axis-aligned boxes rather than as collision, so this
+        is a plain containment test. The first containing box wins, matching
+        how the engine walks the list -- overlapping boxes are a level-data
+        error, not something to resolve here.
+        """
+        if len(self.water_boxes) == 0:
+            return None
+        inside = ((x >= self._water_min_x) & (x <= self._water_max_x)
+                  & (z >= self._water_min_z) & (z <= self._water_max_z))
+        if not inside.any():
+            return None
+        return float(self._water_y[int(np.argmax(inside))])
 
     # -- construction -------------------------------------------------------
 
@@ -393,5 +423,6 @@ def load(npz_path):
     """Load a SurfaceSet from a file produced by tools/parse_collision.py."""
     data = np.load(npz_path)
     return SurfaceSet(
-        data["vertices"], data["tri_verts"], data["tri_type"], data["tri_force"]
+        data["vertices"], data["tri_verts"], data["tri_type"], data["tri_force"],
+        data["water_boxes"] if "water_boxes" in data else None,
     )

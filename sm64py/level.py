@@ -263,6 +263,94 @@ def load_level_geometry(npz_path, materials_path=None, name="castle_grounds",
     return root
 
 
+# The water surface texture, and how the original animates it.
+WATER_TEXTURE = os.path.join(
+    "reference", "RENDER96-HD-TEXTURE-PACK", "gfx", "textures", "segment2",
+    "segment2.11C58.rgba16.png")
+
+# Alpha the moving-texture data gives the water quads (0x96 of 0xFF).
+WATER_ALPHA = 0x96 / 255.0
+
+# How many times the texture repeats across a water box. The original sizes
+# its UVs per quad rather than per box; repeating on a fixed world scale keeps
+# the wave size consistent whatever the box measures.
+WATER_UV_SCALE = 1.0 / 2048.0
+
+# How fast the surface drifts, in world units per second, and which way.
+#
+# Expressed as a speed across the world rather than as a spin, because the two
+# are not interchangeable here. Rotating the UVs moves every point by its
+# distance from the centre of rotation, so one corner of a 15000-unit water box
+# crawls while the opposite corner races -- and the centre is wherever UV
+# (0.5, 0.5) happens to land, which for these boxes is off in a corner rather
+# than the middle. That drove the moat at 1531-2429 units/sec against Mario's
+# 960-unit/sec sprint. Translating instead moves the whole sheet at one honest,
+# checkable speed. The two bodies drift apart so they do not read as one sheet.
+WATER_DRIFT_SPEED = 25.0
+WATER_DRIFT_DIRECTION = ((0.60, 0.80), (-0.80, 0.60))
+
+
+def build_water_surface(surfaces, name="water", coordinate_transform=to_panda):
+    """Build a quad for each water box, ready to have its UVs animated.
+
+    Water is not part of the level mesh -- it is the axis-aligned boxes the
+    collision data carries, drawn as a flat sheet at each box's height. The
+    returned node has one child per box, each tagged with the rotation rate to
+    spin its texture at.
+    """
+    root = NodePath(name)
+    texture = None
+    image = resolve_asset(WATER_TEXTURE)
+    if image and os.path.exists(image):
+        texture = _load_texture(image, "wrap", "wrap")
+
+    for i, box in enumerate(surfaces.water_boxes):
+        _, x1, z1, x2, z2, y = (int(v) for v in box)
+        lo_x, hi_x = min(x1, x2), max(x1, x2)
+        lo_z, hi_z = min(z1, z2), max(z1, z2)
+
+        corners = [(lo_x, lo_z), (hi_x, lo_z), (hi_x, hi_z), (lo_x, hi_z)]
+        positions = np.array([(x, y, z) for x, z in corners], dtype=np.float32)
+        uvs = np.array([(x * WATER_UV_SCALE, z * WATER_UV_SCALE)
+                        for x, z in corners], dtype=np.float32)
+        colors = np.full((4, 4), 255, dtype=np.uint8)
+        colors[:, 3] = int(WATER_ALPHA * 255)
+        triangles = np.array([(0, 1, 2), (0, 2, 3)], dtype=np.int32)
+
+        geom = _build_geom(positions, colors, uvs, triangles, lighting=False,
+                           coordinate_transform=coordinate_transform)
+        node = GeomNode(f"{name}_{i}")
+        node.add_geom(geom)
+        quad = root.attach_new_node(node)
+
+        if texture is not None:
+            quad.set_texture(TextureStage.get_default(), texture)
+        quad.set_transparency(TransparencyAttrib.M_alpha)
+        quad.set_light_off()
+        # Seen from underneath as well, which is most of the time while swimming.
+        quad.set_two_sided(True)
+        # Drawn after the opaque world so it composites over the lakebed.
+        quad.set_bin("transparent", 40 + i)
+        quad.set_tag("water_box", str(i))
+        direction = WATER_DRIFT_DIRECTION[i % len(WATER_DRIFT_DIRECTION)]
+        quad.set_tag("drift", f"{direction[0]},{direction[1]}")
+
+    return root
+
+
+def animate_water(node, elapsed):
+    """Drift each water quad's texture. Call once per frame with the clock."""
+    stage = TextureStage.get_default()
+    # World units the sheet has travelled, converted into texture repeats.
+    distance = WATER_DRIFT_SPEED * elapsed * WATER_UV_SCALE
+    for quad in node.get_children():
+        tag = quad.get_tag("drift")
+        if not tag:
+            continue
+        dx, dy = (float(v) for v in tag.split(","))
+        quad.set_tex_offset(stage, dx * distance, dy * distance)
+
+
 def load_collision_geometry(npz_path, name="collision",
                             coordinate_transform=to_panda):
     """Build a debug mesh of the collision triangles.

@@ -32,12 +32,68 @@ def action(action_id, anim=None):
 # -- transitions ------------------------------------------------------------
 
 
+# Sounds raised on entering an action. Terrain-dependent ids get the floor
+# folded in when they are played, so one entry covers every ground type.
+#
+# Actions never play anything themselves -- they append to sound_events and
+# the front end decides what to do with it, so the simulation is identical
+# whether or not there is an audio device.
+_ENTRY_SOUNDS = {
+    C.ACT_JUMP: (C.SOUND_ACTION_TERRAIN_JUMP, C.SOUND_MARIO_YAH_WAH_HOO),
+    C.ACT_DOUBLE_JUMP: (C.SOUND_ACTION_TERRAIN_JUMP, C.SOUND_MARIO_YAH_WAH_HOO),
+    C.ACT_TRIPLE_JUMP: (C.SOUND_ACTION_TERRAIN_JUMP, C.SOUND_MARIO_YAHOO),
+    C.ACT_BACKFLIP: (C.SOUND_ACTION_TERRAIN_JUMP, C.SOUND_MARIO_YAH_WAH_HOO),
+    C.ACT_SIDE_FLIP: (C.SOUND_ACTION_TERRAIN_JUMP, C.SOUND_MARIO_YAH_WAH_HOO),
+    C.ACT_LONG_JUMP: (C.SOUND_ACTION_TERRAIN_JUMP, C.SOUND_MARIO_YAHOO),
+    C.ACT_WALL_KICK_AIR: (C.SOUND_MARIO_YAH_WAH_HOO,),
+    C.ACT_DIVE: (C.SOUND_MARIO_YAH_WAH_HOO,),
+    C.ACT_JUMP_LAND: (C.SOUND_ACTION_TERRAIN_LANDING,),
+    C.ACT_FREEFALL_LAND: (C.SOUND_ACTION_TERRAIN_LANDING,),
+    C.ACT_DOUBLE_JUMP_LAND: (C.SOUND_ACTION_TERRAIN_LANDING,),
+    C.ACT_TRIPLE_JUMP_LAND: (C.SOUND_ACTION_TERRAIN_HEAVY_LANDING,),
+    C.ACT_BACKFLIP_LAND: (C.SOUND_ACTION_TERRAIN_LANDING,),
+    C.ACT_SIDE_FLIP_LAND: (C.SOUND_ACTION_TERRAIN_LANDING,),
+    C.ACT_LONG_JUMP_LAND: (C.SOUND_ACTION_TERRAIN_LANDING,),
+    C.ACT_GROUND_POUND_LAND: (C.SOUND_ACTION_TERRAIN_HEAVY_LANDING,),
+    C.ACT_SOFT_BONK: (C.SOUND_MARIO_OOOF,),
+    C.ACT_AIR_HIT_WALL: (C.SOUND_MARIO_OOOF,),
+    C.ACT_WATER_PLUNGE: (C.SOUND_ACTION_WATER_PLUNGE,),
+}
+
+
+# Below this he is creeping, and the quieter tiptoe sound is used.
+TIPTOE_SPEED = 8.0
+
+
+def step_sounds(m):
+    """Raise a footfall on the frames of the walk cycle a foot lands on.
+
+    Driven by the animation rather than by distance travelled. Distance was an
+    approximation and a poor one: it fired every 52 units, which at a running
+    960 units/sec is 18 footfalls a second against the original's 6.7 -- nearly
+    three times too fast. Playing the clip at speed/4 makes the cadence follow
+    Mario's speed on its own, with no constant to tune.
+    """
+    from . import animations
+    if not animations.advance_frame(m):
+        return
+    m.sound_events.append(
+        C.SOUND_ACTION_TERRAIN_STEP_TIPTOE if abs(m.forward_vel) < TIPTOE_SPEED
+        else C.SOUND_ACTION_TERRAIN_STEP
+    )
+
+
 def set_mario_action(m, act, action_arg=0):
     group = act & C.ACT_GROUP_MASK
     if group == C.ACT_GROUP_MOVING:
         act = _set_action_moving(m, act, action_arg)
     elif group == C.ACT_GROUP_AIRBORNE:
         act = _set_action_airborne(m, act, action_arg)
+
+    # Raised before the action changes, so a landing sound still sees the
+    # floor Mario landed on rather than whatever he moves to next.
+    if act != m.action:
+        m.sound_events.extend(_ENTRY_SOUNDS.get(act, ()))
 
     m.flags &= ~(C.MARIO_ACTION_SOUND_PLAYED | C.MARIO_MARIO_SOUND_PLAYED)
 
@@ -513,6 +569,7 @@ def act_walking(m):
 
     m.action_state = 0
     update_walking_speed(m)
+    step_sounds(m)
 
     result = perform_ground_step(m)
     if result == C.GROUND_STEP_LEFT_GROUND:
@@ -1152,6 +1209,15 @@ def act_ledge_grab(m):
 def execute_action(m):
     """Run Mario for one frame. Returns the action that ended up running."""
     m.update_inputs()
+
+    # Actions raise sounds by appending to this; whatever ran last frame has
+    # been consumed by now.
+    m.sound_events.clear()
+
+    # Falling below the surface interrupts whatever he was doing. Checked here
+    # rather than inside every land action, since it applies to all of them.
+    from .water import check_common_water_cancels
+    check_common_water_cancels(m)
 
     # An action returning True changed action and wants the new one to run
     # immediately, so transitions resolve within a single frame.
