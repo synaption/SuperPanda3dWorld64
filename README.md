@@ -72,6 +72,7 @@ tools/
   sm64_anim.py           animation tables -> per-frame joint rotations
   glb.py                 minimal glTF 2.0 / GLB writer
   export_actor_gltf.py   actor -> rigged, animated .glb
+  workbench.py           look at / measure one asset, interactively or headless
   import_sounds.py       extracted AIFF samples -> assets/sounds/*.wav
 app/main.py        the runnable game
 ```
@@ -370,6 +371,87 @@ fired every 52 units, which at a running 960 units/sec is 18 footfalls a second
 for this rather than asking the renderer, so footfalls stay in step whether or
 not anything is being drawn.
 
+## The asset workbench
+
+`tools/workbench.py` draws one asset, alone, against a key-coloured background,
+with any part of it hideable. That isolation is the whole point: every wrong
+conclusion drawn about the models in this project came from measuring something
+that was not isolated. Counting how many pixels a scuttlebug covered to check
+its billboards measured mostly leg geometry, which swings with the viewing
+angle for reasons that have nothing to do with billboards -- the numbers looked
+fine whether the fix worked or not.
+
+```bash
+# look at it
+python3 tools/workbench.py assets/actors/scuttlebug.glb
+
+# measure it, with no screen -- for CI, or for an agent
+python3 tools/workbench.py assets/actors/goomba.glb --headless --orbit 8 --json
+
+# measure one part of it
+python3 tools/workbench.py assets/actors/scuttlebug.glb \
+    --headless --isolate 'billboard_' --orbit 8
+
+# gate a build: non-zero exit if any check fails
+python3 tools/workbench.py assets/actors/goomba.glb --orbit 8 --frame 0 \
+    --billboard --expect
+```
+
+Note the `--frame 0`: an SM64 actor unposed is in its bind pose, which is not a
+pose at all, and both checks are meaningless there.
+
+Interactive mode orbits, tilts, cycles clips, toggles wireframe, and prints a
+measurement on demand. `--list-parts` shows what `--isolate` and `--hide` can
+match; `--compare` sizes an asset against another (usually Mario).
+
+**Isolating a skinned actor is not hiding nodes.** All its parts live in one
+GeomNode, so hiding by node name hides everything or nothing -- collapsing the
+*joint* is what removes its vertices. And it has to keep the ancestors of a
+match alive, because collapsing a joint takes its whole subtree with it: the
+first version flattened the parents of the very parts it was asked to show and
+measured an empty screen.
+
+**Interactive keys.** Arrows orbit and tilt; `space` pauses the spin and
+`[` `]` change its speed; `0`-`9` jump straight to a clip and `n`/`p` step
+through them; `b` turns on cross-fading so switching clips shows the
+*transition* rather than a cut; `w` wireframe, `t` two-sided, `m` prints a
+measurement.
+
+**Billboard settings can be adjusted here and saved for the game to read.**
+`,` `.` select a setting and `-` `=` change it, with the current values shown on
+screen; `g` makes changes an override for this actor alone rather than global;
+`k` measures how well the billboards are tracking right now; `y` sweeps the
+settings and applies whatever measures best; `s` `l` `r` save, reload and reset;
+`d` prints what the geometry says about them. The same things from the command
+line:
+
+```bash
+# what the geometry says: parents, extents, the rotation that needs cancelling
+python3 tools/workbench.py assets/actors/goomba.glb --probe --frame 0
+
+# try a setting without committing to it
+python3 tools/workbench.py assets/actors/goomba.glb --billboard \
+    --isolate 'billboard_4$' --set cancel_parent=off --orbit 12 --json
+
+# let the measurement choose, and keep it
+python3 tools/workbench.py assets/actors/goomba.glb --tune --save-tuning
+```
+
+`--tune` is for telling regimes apart, not for micro-optimising: a working
+setting measures about fourteen times better than a broken one, so anything
+within a tenth of the best counts as the same answer and the plainest of them
+wins. Without that it cheerfully picked a 135-degree pitch on two percent of
+pixel-quantisation noise. Run against the goomba it now lands on all-zeroes,
+which is what ships.
+
+**Two checks ship with it.** `billboard` orbits the asset and compares its
+narrowest silhouette against its widest -- something that turns to face you
+holds its width, something that only pretends to collapses toward a line.
+`grounded` catches an asset whose origin straddles z=0 instead of sitting on
+it, which is what a rigged model in its bind pose does, and is exactly why
+enemies loaded as plain geometry looked half-sunk and tipped over. Every SM64
+actor fails `grounded` unposed; that is the check working, not a false alarm.
+
 ## Objects
 
 Trees and enemies run on the same fixed 30 Hz tick as Mario and use the same
@@ -429,30 +511,71 @@ by the *behaviour*, not the geo layout -- `bhvTree` is `BILLBOARD()`/`CYLBOARD()
 even though the tree's geo has no `GEO_BILLBOARD` in it at all. Those are plain
 static geometry, so Panda3D's own `set_billboard_axis()` handles them, and the
 trees now turn to face the camera instead of standing as flat cards that vanish
-edge-on as you walk past.
+edge-on as you walk past. Since nothing in the *asset* says to do this, the
+workbench needs `--billboard-axis` to reproduce it: without that flag the tree
+draws nothing from 5 of 8 angles, which is the asset being honest rather than a
+regression.
 
-**Part-level billboards inside an actor are not solved.** The scuttlebug draws
-its eyes and mandibles as `GEO_BILLBOARD` quads. glTF has no billboard concept,
-so they export as ordinary geometry and collapse to thin lines edge-on. Two
-things are now known about why the obvious fixes do not work:
+**Billboard quads are single-sided, and that was most of the problem.** Once a
+quad is turned to face the camera it is invisible from behind, and measured on
+the goomba's face in isolation it drew *nothing at all* from 4 of 8 angles
+around an orbit. Drawing both faces takes that to 8 of 8. The original never
+gets to see the back of one, so this costs nothing.
+
+**Part-level billboards are driven from `sm64py/billboard.py`.** The goomba's
+face and most of a scuttlebug's body are `GEO_BILLBOARD` quads that the original
+rebuilds every frame to point at the camera. glTF has no billboard concept, so
+they export as ordinary geometry and collapse to thin lines edge-on; the
+exporter makes each one a joint, and the renderer takes those joints over.
+
+Three separate things were wrong, and the first two produced code that read
+perfectly and did nothing:
 
 - Panda3D's billboard *effect* acts on a node's transform, and this geometry is
   skinned to character joints, so it has nothing to act on.
-- Making each billboard its own joint and driving it with `control_joint` gets
-  closer but is not enough on its own. Those joints inherit a fixed non-identity
-  rotation from their parent chain -- measured at pitch -90, roll +/-90 -- so
-  setting a heading on the joint rotates it about the wrong axis entirely. It
-  has to be set relative to the world, and the quad's authored facing has to be
-  accounted for on top of that.
+- `Actor.control_joint` returns a NodePath parented to the **model root**, not
+  into the joint hierarchy. So `set_hpr(some_other_node, ...)` is not a way to
+  escape the joint's parents -- Panda3D solves that against the scene-graph
+  parent, which is the model root, and it comes out identical to the plain local
+  call. It never sees the joint chain at all.
+- The joint chain's rotation is still applied inside the `Character`, on top of
+  whatever is set on that node. On the goomba it is `(98.4, 4.9, -90.7)`, and
+  that quarter turn of roll means a local *heading* comes out as net *pitch* --
+  so heading tipped the quad up and down instead of turning it about vertical.
+  No value of it could ever have worked, which is why five rounds of tuning a
+  constant all failed.
 
-The exporter already emits them as `billboard_N` joints and the renderer takes
-them over, so the mechanism is in place; the orientation is what is still wrong.
+The fix composes the wanted world rotation against the inverse of the parent
+joint's measured net rotation: `net = local * parent`, so `local = world *
+parent^-1`. Measured one quad at a time around a 12-point orbit, the width each
+holds goes from 0.06 of its widest to 0.84 (goomba face) and from 0.08–0.10 to
+0.71–0.80 (scuttlebug). The remainder is perspective -- these quads sit off the
+axis they orbit -- and shows as a smooth swell, not a collapse.
+
+`pitch` and `roll` are settings but both sit at zero, and it is worth saying why
+they cannot help: a flat quad facing the camera has the same silhouette however
+it is spun about its own normal. That they made no difference was read as a
+mystery for a long time; it is just geometry.
+
+**The parent rotation only exists once the actor is posed.** In the rest pose
+every joint is identity, so it has to be cancelled per frame rather than baked
+into a constant -- and an exposed joint reports identity until the character has
+been evaluated at least once, which made the first frame of every measurement
+quietly wrong until `claim()` started forcing an update.
+
+**Settings live in `assets/billboard_tuning.json`**, read by the game and
+written by the workbench, with per-actor overrides. They are a file rather than
+constants in source because every previous value here was reasoned out and
+wrong, and the only thing that reliably told them apart was measuring.
 
 **A warning about measuring this.** Counting how many pixels the enemy covers
 across a camera orbit does *not* verify billboarding: the leg geometry dominates
-the count and swings with the viewing angle for unrelated reasons. The same trap
-applies to counting canopy pixels for the trees, where neighbouring trees drift
-in and out of frame. Both need the target isolated, or simply looking at it.
+the count and swings with the viewing angle for unrelated reasons. Nor does
+measuring a scuttlebug's three billboards together -- the bounding box then
+tracks how far apart they are rather than how wide each one is, and reported the
+broken setting as *better* than the fixed one. One quad at a time, isolated.
+`tools/check_billboards.py` does both halves: that the joints actually move when
+the camera does, and that each quad holds its width alone.
 
 ## Performance
 

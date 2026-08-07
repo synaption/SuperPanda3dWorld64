@@ -19,6 +19,7 @@ from panda3d.core import (
     TransparencyAttrib,
 )
 
+from . import billboard
 from .math_util import s16_to_degrees, to_panda
 
 # Render layers, in the order the geo layout draws them.
@@ -361,7 +362,8 @@ class ObjectRenderer:
     render states.
     """
 
-    def __init__(self, model_dir, loader, parent, coordinate_transform=to_panda):
+    def __init__(self, model_dir, loader, parent, coordinate_transform=to_panda,
+                 tuning=None):
         self.model_dir = model_dir
         self.loader = loader
         self.parent = parent
@@ -370,6 +372,9 @@ class ObjectRenderer:
         self.nodes = []
         self.actors = []
         self.billboards = []
+        # Read from disk so the asset workbench can be used to adjust how these
+        # aim without editing source. See sm64py/billboard.py.
+        self.tuning = tuning if tuning is not None else billboard.Tuning.load()
 
     def _static_source(self, model):
         """Load a model once, keeping it off-screen as a template to instance."""
@@ -416,7 +421,13 @@ class ObjectRenderer:
             actor.loop(clips[0])
             actor.set_play_rate(getattr(obj, "anim_rate", 1.0), clips[0])
             self.actors.append((obj, actor, clips[0]))
-            self._claim_billboards(obj, actor)
+            if self._claim_billboards(obj, actor):
+                # Billboard quads are single-sided, so once one is turned to
+                # face the camera it is invisible from half of every orbit --
+                # measured at 4 of 8 angles drawing nothing at all. The
+                # original never sees the back of one; here the cheapest
+                # honest fix is to draw both faces.
+                actor.set_two_sided(True)
         else:
             # Nothing to animate, so share one copy between every instance.
             actor.cleanup()
@@ -438,23 +449,12 @@ class ObjectRenderer:
     def _claim_billboards(self, obj, actor):
         """Take control of any joint the exporter marked as a billboard.
 
-        SM64 draws parts of some actors -- most of a scuttlebug's body -- as
-        quads it turns to face the camera every frame. glTF has no billboard
-        concept, so they arrive as ordinary geometry and collapse to thin lines
-        edge-on. Panda3D's own billboard effect is no help either: it acts on a
-        node's transform, and this geometry is skinned to character joints.
-
-        Driving the joint does work. The exporter makes each billboard a joint
-        of its own, and control_joint hands over its transform so the sync
-        below can aim it.
+        All the reasoning about how these have to be driven, and the settings
+        that drive them, live in sm64py/billboard.py.
         """
-        for joint in actor.get_joints():
-            name = joint.get_name()
-            if not name.startswith("billboard_"):
-                continue
-            controlled = actor.control_joint(None, "modelRoot", name)
-            if controlled is not None:
-                self.billboards.append((obj, controlled))
+        rigs = billboard.claim(actor, actor_name=obj.model, owner=obj)
+        self.billboards.extend(rigs)
+        return len(rigs)
 
     def build(self, object_set):
         """Create a node for every object. Call once, after they are spawned."""
@@ -482,21 +482,13 @@ class ObjectRenderer:
         self._aim_billboards(camera_pos)
 
     def _aim_billboards(self, camera_pos):
-        """Turn each billboard joint to face the camera.
-
-        The joint transform is in the actor's own space, so the object's
-        heading has to come back out of the world-space bearing to the camera
-        -- otherwise the billboards counter-rotate as the enemy turns.
-        """
+        """Turn every billboard joint to face the camera."""
         if camera_pos is None or not self.billboards:
             return
-        cam_x, cam_y, cam_z = self.transform(*camera_pos)
-        for obj, joint in self.billboards:
-            if not obj.active:
-                continue
-            x, y, _ = self.transform(*obj.draw_pos)
-            bearing = math.degrees(math.atan2(cam_x - x, cam_y - y))
-            joint.set_h(-bearing - s16_to_degrees(obj.draw_yaw))
+        target = self.transform(*camera_pos)
+        for rig in self.billboards:
+            if rig.owner is None or rig.owner.active:
+                rig.aim(self.parent, target, self.tuning)
 
 
 def load_collision_geometry(npz_path, name="collision",
