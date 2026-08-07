@@ -3,10 +3,14 @@
 # converters at them; nothing here is required to read or review the code.
 /reference/
 
-# Converted level data. Regenerate with tools/parse_collision.py and
-# tools/parse_f3d.py -- these are derived from reference/, so they are build
-# output rather than source.
-/assets/
+# assets/ IS tracked -- see README, "Assets". It holds only what the game
+# actually loads (~8.5 MB), so a clone runs without the 12 GB of reference
+# material. Everything in it is derived from Nintendo's game data; see the
+# note there before publishing this repository anywhere.
+#
+# Converter scratch that is not loaded at runtime:
+/assets/**/*.tmp
+/assets/**/*.bak
 
 # Python
 __pycache__/

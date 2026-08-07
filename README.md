@@ -8,9 +8,56 @@ based on the render96 recomp.
 Current state: the castle grounds load and render from the decomp data, and
 Mario's movement — walking, slopes, jumps, the jump chain, dives, slides, ledge
 grabs, wall bonks — runs on a port of the original physics. The moat and lake
-are swimmable, and actions raise the original sound events.
+are swimmable, actions raise the original sound events and play real samples,
+and the level's trees stand alongside a few goombas and scuttlebugs that can be
+stomped, punched, and run away from.
 
 ## Running
+
+```bash
+python3 app/main.py
+```
+
+Requires `panda3d` and `numpy`. Everything the game loads is committed under
+`assets/`, so a clone runs without the 12 GB of reference material.
+
+## Assets
+
+`assets/` holds the converted game data — about 8.5 MB, and only what is
+actually loaded:
+
+```
+assets/
+  billboard_tuning.json          how billboarded parts aim (see "Objects")
+  castle_grounds/
+    collision.npz                490 vertices, 879 triangles, 2 water boxes
+    collision_objects.json       special objects, including the 26 trees
+    mesh.npz                     1350 vertices, 785 triangles
+    mesh_materials.json          45 material groups, 44 of them textured
+    textures/                    the 21 PNGs those groups reference (2.9 MB)
+  mario/          mario.glb + mario_clips.json   (209 animations)
+  actors/         goomba, scuttlebug, tree, each with a clips sidecar
+  sounds/         57 WAVs, plus .source recording where they came from
+```
+
+The textures are copied in by `parse_f3d.py` rather than referenced in place.
+They used to point back into `reference/RENDER96-HD-TEXTURE-PACK/`, which is 12
+GB of third-party material that cannot be tracked — so a fresh clone parsed
+fine and then drew the entire castle grounds untextured. Only the images the
+level actually uses get copied: 21 of them, against the thousands in the pack.
+Their directory structure is preserved rather than flattened, because two of
+them are both called `0.rgba16.png`.
+
+> All of this is derived from Nintendo's game data — the geometry and animation
+> from the decomp, the audio extracted from a ROM, the textures from a
+> community HD pack. It is committed here so the project is runnable and
+> reviewable. That is a different thing from being redistributable; consider it
+> before publishing this repository anywhere public.
+
+### Regenerating it
+
+Only needed when the source data changes. All of these read from `reference/`
+and write into `assets/`.
 
 ```bash
 python3 tools/parse_collision.py \
@@ -23,16 +70,8 @@ python3 tools/parse_f3d.py reference/Render96ex/levels/castle_grounds 1 \
 python3 tools/export_actor_gltf.py --actor mario --anims all \
     -o assets/mario/mario.glb
 
-# optional: real audio, if you have an extracted asset tree
 python3 tools/import_sounds.py
-
-python3 app/main.py
 ```
-
-The converters read from `reference/` and write to `assets/`. They only need to
-be re-run when the level data changes.
-
-Requires `panda3d` and `numpy`.
 
 ### Controls
 
@@ -46,6 +85,7 @@ Requires `panda3d` and `numpy`.
 | `R` | re-centre the camera behind Mario |
 | `F3` | toggle the collision overlay |
 | `F1` | toggle the debug readout |
+| `Esc` | quit |
 
 ## Layout
 
@@ -56,6 +96,7 @@ sm64py/
   level.py         converted mesh -> Panda3D geometry
   camera.py        following camera
   objects.py       trees and enemies: spawning, behaviour, stepping
+  billboard.py     aiming billboarded actor parts at the camera, and its settings
   audio.py         sound events -> Panda3D, plus placeholder sample synthesis
   mario/
     constants.py   action ids, action flags, input bits, surface types
@@ -65,17 +106,22 @@ sm64py/
     animations.py  which animation clip each action plays
     water.py       the submerged action group
 tools/
-  check_anim_grounding.py  verify grounded actions keep their feet on the floor
   parse_collision.py     collision.inc.c -> npz
-  parse_f3d.py           F3D display lists -> textured mesh
+  parse_f3d.py           F3D display lists -> textured mesh + its textures
   geo_layout.py          geo layouts -> actor node tree
   sm64_anim.py           animation tables -> per-frame joint rotations
   glb.py                 minimal glTF 2.0 / GLB writer
   export_actor_gltf.py   actor -> rigged, animated .glb
-  workbench.py           look at / measure one asset, interactively or headless
   import_sounds.py       extracted AIFF samples -> assets/sounds/*.wav
+  workbench.py           look at / measure one asset, interactively or headless
+  check_anim_grounding.py  grounded actions keep their feet on the floor
+  check_billboards.py      billboarded parts track the camera and hold width
+  check_movement.py        the movement figures quoted under "Verified behaviour"
+  check_sound.py           why the game is silent, layer by layer
 app/main.py        the runnable game
 ```
+
+The four `check_*` scripts all run headless and print what they measured.
 
 ## Notes on the port
 
@@ -113,9 +159,10 @@ handedness, so yaws stay yaws and no winding needs fixing.
 **Textures** come from the HD pack. The decomp's own texture arrays are generated
 from a ROM at build time and are not present, but each `#include` path maps
 one-to-one onto a PNG in `RENDER96-HD-TEXTURE-PACK/gfx/`, so the parser resolves
-symbols through that. A vertex's four bytes are a colour when `G_LIGHTING` is off
-and a normal when it is on, so the parser records the mode per material group and
-the loader interprets them accordingly.
+symbols through that and copies the ones the level uses into `assets/`. A
+vertex's four bytes are a colour when `G_LIGHTING` is off and a normal when it
+is on, so the parser records the mode per material group and the loader
+interprets them accordingly.
 
 ## Exporting actors for Blender
 
@@ -255,15 +302,45 @@ jump.
 
 ## Verified behaviour
 
-Checked against the reference numbers, not just eyeballed:
+`python3 tools/check_movement.py` measures all of this and prints it. It is a
+script rather than prose because these numbers were prose, and one of them had
+quietly stopped being true:
 
-- Walking accelerates to exactly 32.0 and caps there.
-- A standing jump starts at 42.0 vertical velocity; releasing A during the ascent
-  cuts the rise (242 units held vs 96 released).
-- The jump chain runs single -> double -> triple with the right heights
-  (68 / 88 / 561 units), and the triple only triggers above speed 20.
-- Spawn floor height at the level's `MARIO_POS` resolves to exactly 260.0.
-- Parsed collision matches the level header counts (490 vertices, 879 triangles).
+```
+walking on flat ground
+  settles into a sawtooth between 31.01 and 32.35, mean 31.68
+  reaches it after 37 ticks
+
+standing jump
+  A held      252.0 units
+  A released  106.5 units
+
+jump chain (running)
+  jump 1      102.6 units
+  jump 2      140.6 units
+  jump 3      630.0 units
+
+converted level
+  490 vertices, 879 triangles, 2 water boxes
+  floor under the spawn point: 260.0
+```
+
+**Walking does not cap at a flat 32.0**, which is what this said for a long
+time. `update_walking_speed` approaches its target and then decrements past it,
+so the settled speed oscillates between 31.01 and 32.35 around the 32.0 target.
+That sawtooth is the original's behaviour, not drift in the port — but "caps at
+exactly 32.0" was wrong, and nothing was checking.
+
+Releasing A during the ascent cuts the rise to well under half. The triple jump
+only triggers above forward speed 20, which is why jump 3 clears 630 units while
+the two below it stay near 100.
+
+The measurements run on a synthetic flat floor rather than on the level, so
+terrain cannot confuse them. Two things about that floor fail quietly if you get
+them wrong, and both did while writing the script: wound the wrong way every
+triangle is a ceiling and Mario drops through a floor that looks perfectly fine
+in the data; made wider than ±32768 it wraps, because collision samples truncate
+to `s16`.
 
 ## Water
 
@@ -325,9 +402,11 @@ python3 tools/import_sounds.py
 
 pulls the 15 samples the port actually plays out of
 `reference/sm64pcbuilder2/assets/US/sound/samples/` and converts them to WAV in
-`assets/sounds/` (which is gitignored -- nothing is redistributed). Without
-that step the game synthesises crude stand-ins instead and says so at startup,
-so the two are never confused:
+`assets/sounds/` -- 57 files once the terrain variants are expanded, which is
+exactly what the action code can raise, with nothing spare. Those are committed
+(see "Assets"), so this step is only needed to regenerate them. Without any
+samples at all the game synthesises crude stand-ins and says so at startup, so
+the two are never confused:
 
 ```
 Audio: AudioManager ready, 57 samples
@@ -651,10 +730,7 @@ hitch; free-running just shows that frame late and carries on.
 So both Panda3D front ends now set `sync-video 0`. To put it back:
 
 ```sh
-MARIO_VSYNC=1 # optional: real audio, if you have an extracted asset tree
-python3 tools/import_sounds.py
-
-python3 app/main.py
+MARIO_VSYNC=1 python3 app/main.py
 ```
 
 The tradeoff is tearing, and an uncapped frame rate that will spin the GPU as
@@ -678,11 +754,13 @@ python3 app/main.py    # with: clock-mode limited / clock-frame-rate 120
   machine with per-area modes and hand-authored triggers. Mario's control feel
   depends on the camera's yaw, which is wired up correctly, but the camera's own
   behaviour is an approximation.
-- **Objects.** No coins, trees, or warps; the level's special objects are parsed
-  out to `collision_objects.json` but nothing consumes them yet.
+- **Objects are a thin slice.** Trees, goombas and scuttlebugs run; there are no
+  coins, no warps, and no other enemies. `collision_objects.json` carries more
+  presets than anything consumes.
+- **Scuttlebug legs render as thin wire quads.** Fifteen of its animated parts
+  carry flat `LAYER_ALPHA` display lists that the geo does not billboard, so
+  unlike its body they have nothing to turn toward the camera.
 - **Most cutscene and automatic actions** (poles, hanging, cannons), and the
   parts of swimming that need systems this port does not have: drowning and the
   breath meter (no health), metal-cap water walking, and carrying an object
   while swimming.
-- **Real audio samples.** See below — the event system is in, the samples
-  cannot be.
