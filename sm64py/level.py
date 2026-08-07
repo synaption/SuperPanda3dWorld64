@@ -1,6 +1,7 @@
 """Build Panda3D geometry from the converted level data."""
 
 import json
+import math
 import os
 
 import numpy as np
@@ -18,7 +19,7 @@ from panda3d.core import (
     TransparencyAttrib,
 )
 
-from .math_util import to_panda
+from .math_util import s16_to_degrees, to_panda
 
 # Render layers, in the order the geo layout draws them.
 LAYER_ORDER = [
@@ -349,6 +350,153 @@ def animate_water(node, elapsed):
             continue
         dx, dy = (float(v) for v in tag.split(","))
         quad.set_tex_offset(stage, dx * distance, dy * distance)
+
+
+class ObjectRenderer:
+    """Draws an ObjectSet, one node per object.
+
+    Static models are instanced from a single loaded copy rather than reloaded
+    per object: the level places 26 trees, and each one loaded separately would
+    be 26 copies of the same geometry and texture in memory and 26 unrelated
+    render states.
+    """
+
+    def __init__(self, model_dir, loader, parent, coordinate_transform=to_panda):
+        self.model_dir = model_dir
+        self.loader = loader
+        self.parent = parent
+        self.transform = coordinate_transform
+        self._sources = {}
+        self.nodes = []
+        self.actors = []
+        self.billboards = []
+
+    def _static_source(self, model):
+        """Load a model once, keeping it off-screen as a template to instance."""
+        if model in self._sources:
+            return self._sources[model]
+
+        from panda3d.core import Filename
+        path = os.path.join(self.model_dir, model + ".glb")
+        node = None
+        if os.path.exists(path):
+            node = self.loader.load_model(
+                Filename.from_os_specific(os.path.abspath(path)))
+            if node is not None:
+                use_linear_textures(node)
+                use_mipmaps(node)
+        self._sources[model] = node
+        return node
+
+    def _build_one(self, obj, index):
+        """An Actor if the model animates, a cheap instance if it does not.
+
+        This distinction is not just about motion. A rigged model loaded as
+        plain geometry sits in its bind pose, and an SM64 bind pose is not a
+        pose at all -- the joints point down their own limbs, so the goomba
+        straddles the ground plane instead of standing on it and reads as
+        tipped over. Driving it through an Actor with its clip playing is what
+        puts it upright.
+        """
+        from panda3d.core import Filename
+        from direct.actor.Actor import Actor
+
+        path = os.path.join(self.model_dir, obj.model + ".glb")
+        if not os.path.exists(path):
+            return None
+
+        holder = self.parent.attach_new_node(f"{obj.model}_{index}")
+        actor = Actor(Filename.from_os_specific(os.path.abspath(path)))
+        clips = actor.get_anim_names()
+
+        if clips:
+            use_linear_textures(actor)
+            use_mipmaps(actor)
+            actor.reparent_to(holder)
+            actor.loop(clips[0])
+            actor.set_play_rate(getattr(obj, "anim_rate", 1.0), clips[0])
+            self.actors.append((obj, actor, clips[0]))
+            self._claim_billboards(obj, actor)
+        else:
+            # Nothing to animate, so share one copy between every instance.
+            actor.cleanup()
+            actor.remove_node()
+            source = self._static_source(obj.model)
+            if source is None:
+                holder.remove_node()
+                return None
+            source.instance_to(holder)
+
+        # Whole-object billboards are plain geometry, so the node effect works
+        # here -- unlike the skinned parts handled by _claim_billboards.
+        if obj.billboard == "axis":
+            holder.set_billboard_axis()
+
+        holder.set_scale(obj.draw_scale)
+        return holder
+
+    def _claim_billboards(self, obj, actor):
+        """Take control of any joint the exporter marked as a billboard.
+
+        SM64 draws parts of some actors -- most of a scuttlebug's body -- as
+        quads it turns to face the camera every frame. glTF has no billboard
+        concept, so they arrive as ordinary geometry and collapse to thin lines
+        edge-on. Panda3D's own billboard effect is no help either: it acts on a
+        node's transform, and this geometry is skinned to character joints.
+
+        Driving the joint does work. The exporter makes each billboard a joint
+        of its own, and control_joint hands over its transform so the sync
+        below can aim it.
+        """
+        for joint in actor.get_joints():
+            name = joint.get_name()
+            if not name.startswith("billboard_"):
+                continue
+            controlled = actor.control_joint(None, "modelRoot", name)
+            if controlled is not None:
+                self.billboards.append((obj, controlled))
+
+    def build(self, object_set):
+        """Create a node for every object. Call once, after they are spawned."""
+        for index, obj in enumerate(object_set.objects):
+            holder = self._build_one(obj, index)
+            if holder is not None:
+                self.nodes.append((obj, holder))
+        self.sync()
+        return len(self.nodes)
+
+    def sync(self, camera_pos=None):
+        """Push every object's position, facing and visibility to its node."""
+        for obj, node in self.nodes:
+            if not obj.active:
+                node.hide()
+                continue
+            node.show()
+            node.set_pos(*self.transform(*obj.draw_pos))
+            node.set_h(s16_to_degrees(obj.draw_yaw))
+
+        # Walk cycles keep pace with how fast the object is actually moving.
+        for obj, actor, clip in self.actors:
+            actor.set_play_rate(getattr(obj, "anim_rate", 1.0), clip)
+
+        self._aim_billboards(camera_pos)
+
+    def _aim_billboards(self, camera_pos):
+        """Turn each billboard joint to face the camera.
+
+        The joint transform is in the actor's own space, so the object's
+        heading has to come back out of the world-space bearing to the camera
+        -- otherwise the billboards counter-rotate as the enemy turns.
+        """
+        if camera_pos is None or not self.billboards:
+            return
+        cam_x, cam_y, cam_z = self.transform(*camera_pos)
+        for obj, joint in self.billboards:
+            if not obj.active:
+                continue
+            x, y, _ = self.transform(*obj.draw_pos)
+            bearing = math.degrees(math.atan2(cam_x - x, cam_y - y))
+            joint.set_h(-bearing - s16_to_degrees(obj.draw_yaw))
 
 
 def load_collision_geometry(npz_path, name="collision",

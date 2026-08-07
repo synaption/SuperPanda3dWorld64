@@ -16,6 +16,7 @@ Controls:
     Escape                    quit
 """
 
+import json
 import math
 import os
 import sys
@@ -37,9 +38,10 @@ from panda3d.core import (
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from sm64py import audio, surfaces  # noqa: E402
+from sm64py import audio, objects, surfaces  # noqa: E402
 from sm64py.camera import FollowCamera  # noqa: E402
 from sm64py.level import (  # noqa: E402
+    ObjectRenderer,
     animate_water,
     build_water_surface,
     load_collision_geometry,
@@ -60,6 +62,20 @@ CASTLE_GROUNDS = os.path.join(ASSETS, "castle_grounds")
 MARIO_MODEL = os.path.join(ASSETS, "mario", "mario.glb")
 MARIO_CLIPS = os.path.join(ASSETS, "mario", "mario_clips.json")
 SOUNDS = os.path.join(ASSETS, "sounds")
+ACTORS = os.path.join(ASSETS, "actors")
+LEVEL_OBJECTS = os.path.join(CASTLE_GROUNDS, "collision_objects.json")
+
+# Enemies the level does not place itself. Castle grounds has no goombas or
+# scuttlebugs in the original, so these are placed by hand -- out across the
+# field rather than on top of the spawn, so they are something to walk toward
+# instead of something already standing on you.
+ENEMY_SPAWNS = [
+    (objects.Goomba, -300.0, 300.0, 2600.0),
+    (objects.Goomba, -2400.0, 300.0, 2900.0),
+    (objects.Goomba, 900.0, 300.0, 3400.0),
+    (objects.Scuttlebug, -2900.0, 300.0, 2100.0),
+    (objects.Scuttlebug, 400.0, 300.0, 1900.0),
+]
 
 SKY_COLOUR = (0.32, 0.60, 0.86)
 UNDERWATER_COLOUR = (0.06, 0.28, 0.36)
@@ -130,6 +146,13 @@ class Game(ShowBase):
         self.water = build_water_surface(self.surfaces)
         self.water.reparent_to(self.render)
 
+        self.objects = objects.ObjectSet(self.surfaces)
+        self._spawn_objects()
+        self.interactions = objects.Interactions(self.objects)
+        self.object_renderer = ObjectRenderer(ACTORS, self.loader, self.render)
+        drawn = self.object_renderer.build(self.objects)
+        print(f"Objects: {len(self.objects.objects)} spawned, {drawn} drawn")
+
         self.collision_view = load_collision_geometry(
             os.path.join(CASTLE_GROUNDS, "collision.npz")
         )
@@ -166,6 +189,14 @@ class Game(ShowBase):
         self._setup_audio()
 
         self.task_mgr.add(self._update, "update")
+
+    def _spawn_objects(self):
+        """Trees come from the level data; the enemies are placed by hand."""
+        if os.path.exists(LEVEL_OBJECTS):
+            with open(LEVEL_OBJECTS, "r", encoding="utf-8") as fh:
+                self.objects.load_special_objects(json.load(fh))
+        for cls, x, y, z in ENEMY_SPAWNS:
+            self.objects.spawn(cls, x, y, z)
 
     # -- scene ---------------------------------------------------------------
 
@@ -425,6 +456,10 @@ class Game(ShowBase):
             self._poll_controller()
             self.mario.camera_yaw = self.follow_camera.mario_yaw
             execute_action(self.mario)
+            self.objects.update(self.mario)
+            # After both have moved, so a stomp is judged on where they
+            # actually ended up rather than where they started.
+            self.interactions.resolve(self.mario)
             # Drained inside the tick loop, not after it: a frame that runs
             # two ticks would otherwise drop the first tick's sounds.
             self.sounds.play_events(self.mario)
@@ -448,6 +483,7 @@ class Game(ShowBase):
         self.follow_camera.apply_to(self.camera)
 
         animate_water(self.water, self.clock.get_frame_time())
+        self.object_renderer.sync(self.follow_camera.pos)
         self._update_camera_medium()
 
         self.mario_node.set_pos(*to_panda(*pos))
@@ -518,6 +554,9 @@ class Game(ShowBase):
             f"vel      fwd {m.forward_vel:6.2f}   y {m.vel[1]:7.2f}\n"
             f"yaw      {s16_to_degrees(m.face_angle[1]):7.1f} deg\n"
             f"floor    {floor_type}  height {m.floor_height:8.1f}\n"
+            f"enemies  {sum(1 for o in self.objects.objects if o.active and o.model != 'tree')} left"
+            f"   defeated {self.interactions.defeated}"
+            f"   hits {self.interactions.hits_taken}\n"
             f"fps      {self.clock.get_average_frame_rate():5.1f}\n"
             f"\nWASD move   Space jump   Shift dive   Ctrl crouch\n"
             f"Q/E camera  R recentre    F3 collision  F1 hud"

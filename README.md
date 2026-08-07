@@ -55,6 +55,7 @@ sm64py/
   surfaces.py      collision triangles, spatial partition, floor/ceil/wall queries
   level.py         converted mesh -> Panda3D geometry
   camera.py        following camera
+  objects.py       trees and enemies: spawning, behaviour, stepping
   audio.py         sound events -> Panda3D, plus placeholder sample synthesis
   mario/
     constants.py   action ids, action flags, input bits, surface types
@@ -368,6 +369,90 @@ fired every 52 units, which at a running 960 units/sec is 18 footfalls a second
 -- nearly three times too fast. The simulation tracks its own animation frame
 for this rather than asking the renderer, so footfalls stay in step whether or
 not anything is being drawn.
+
+## Objects
+
+Trees and enemies run on the same fixed 30 Hz tick as Mario and use the same
+surface queries, so they stand on the same floors and stop at the same walls.
+They are far simpler than he is -- one velocity, one yaw, gravity, and a small
+state machine -- because that is all the originals are. Nothing in
+`sm64py/objects.py` touches Panda3D; objects carry a position, a yaw and the
+name of the clip they want, so the simulation still runs headless.
+
+**Trees come from the level.** The 26 bubble trees were already being parsed
+into `collision_objects.json` and simply going unused. They are instanced from
+one loaded model rather than loaded per tree.
+
+**The enemies are placed by hand.** Castle grounds has no goombas or
+scuttlebugs in the original, so `ENEMY_SPAWNS` in `app/main.py` puts a few on
+open ground near the spawn.
+
+**Sizes come from hitboxes, not from eye.** Mario's hitbox is 160 tall, a
+regular goomba's is 50 scaled by 1.5, and a scuttlebug's is 70 -- so they
+should stand at about 0.47x and 0.44x his height. Measured in game: 0.46x.
+
+Getting there needed the comparison done against a *posed* Mario. His bind
+pose reports 80 units tall with its origin in the middle of him, because SM64
+joints point down their own limbs and the rest pose is not a pose at all --
+posed to his idle clip he is 149.9, which is the number to size against.
+
+**Rigged objects have to be Actors, not instanced geometry.** Loading one as
+plain geometry leaves it in that same meaningless bind pose, straddling the
+ground plane rather than standing on it, which reads in game as a half-sunk
+enemy lying on its side. Only models with no animations at all -- the trees --
+are instanced from a single shared copy.
+
+**Interactions** are resolved after both have moved, so a stomp is judged on
+where they ended up rather than where they started. Landing on top while
+falling defeats an enemy and bounces Mario at 42; touching one in an attacking
+action defeats it outright; anything else knocks him back. A hit sets an
+invincibility timer -- without one the knockback leaves him inside the enemy
+that hit him and the same touch re-triggers every tick, costing three or four
+hits for walking into one goomba once.
+
+**Not every actor wants the quarter scale.** Mario's geo wraps his body in
+`GEO_SCALE(0x00, 16384)` and the exporter bakes that in. The tree has no
+`GEO_SCALE` at all, and `geo_layout.py` already applies the ones that exist, so
+applying the quarter again left the trees and both enemies at a quarter of
+their intended size. `ACTOR_SCALE` is now per-actor.
+
+**Animations are per-actor.** Only Mario keeps his in a shared `assets/anims`;
+every other actor keeps its own beside its model. Reading the shared directory
+for them does not fail cleanly -- the tables are positional, so Mario's
+20-joint animations get applied to whatever hierarchy the actor has, which
+warned for the goomba and crashed outright on the scuttlebug's 42 joints. The
+animation header regex also had to stop requiring array brackets, since only
+Mario declares his as `struct Animation anim_00[]`.
+
+**Billboards come from two different places.** A whole-object billboard is set
+by the *behaviour*, not the geo layout -- `bhvTree` is `BILLBOARD()`/`CYLBOARD()`
+even though the tree's geo has no `GEO_BILLBOARD` in it at all. Those are plain
+static geometry, so Panda3D's own `set_billboard_axis()` handles them, and the
+trees now turn to face the camera instead of standing as flat cards that vanish
+edge-on as you walk past.
+
+**Part-level billboards inside an actor are not solved.** The scuttlebug draws
+its eyes and mandibles as `GEO_BILLBOARD` quads. glTF has no billboard concept,
+so they export as ordinary geometry and collapse to thin lines edge-on. Two
+things are now known about why the obvious fixes do not work:
+
+- Panda3D's billboard *effect* acts on a node's transform, and this geometry is
+  skinned to character joints, so it has nothing to act on.
+- Making each billboard its own joint and driving it with `control_joint` gets
+  closer but is not enough on its own. Those joints inherit a fixed non-identity
+  rotation from their parent chain -- measured at pitch -90, roll +/-90 -- so
+  setting a heading on the joint rotates it about the wrong axis entirely. It
+  has to be set relative to the world, and the quad's authored facing has to be
+  accounted for on top of that.
+
+The exporter already emits them as `billboard_N` joints and the renderer takes
+them over, so the mechanism is in place; the orientation is what is still wrong.
+
+**A warning about measuring this.** Counting how many pixels the enemy covers
+across a camera orbit does *not* verify billboarding: the leg geometry dominates
+the count and swings with the viewing angle for unrelated reasons. The same trap
+applies to counting canopy pixels for the trees, where neighbouring trees drift
+in and out of frame. Both need the target isolated, or simply looking at it.
 
 ## Performance
 

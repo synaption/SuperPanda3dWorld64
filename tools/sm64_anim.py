@@ -20,8 +20,13 @@ import re
 # Header fields, in order:
 # flags, y_trans_divisor, start_frame, loop_start, loop_end, num_parts,
 # values symbol, indices symbol, length
+# The array brackets are optional: Mario's animations are declared as
+# `struct Animation anim_00[]`, while every other actor declares a single
+# `struct Animation goomba_seg8_anim_0801DA34`. Requiring the brackets matches
+# nothing for those actors, and the export then silently produces a model with
+# no animations at all rather than failing.
 ANIM_HEADER_RE = re.compile(
-    r"const\s+struct\s+Animation\s+(\w+)\s*\[\s*\]\s*=\s*\{(.*?)\}\s*;", re.S
+    r"const\s+struct\s+Animation\s+(\w+)\s*(?:\[\s*\])?\s*=\s*\{(.*?)\}\s*;", re.S
 )
 ARRAY_RE = re.compile(
     r"const\s+(u16|s16)\s+(\w+)\s*\[\s*\]\s*=\s*\{(.*?)\}\s*;", re.S

@@ -43,6 +43,10 @@ from parse_f3d import Level, MeshBuilder, build_texture_map, resolve_textures
 # Commands that place a transform in the chain, and so become joints.
 TRANSFORM_KINDS = {
     "GEO_ANIMATED_PART",
+    # A billboard carries no transform of its own, but making it a joint is
+    # what gives the renderer something it can rotate. Its geometry is skinned,
+    # so a node-level billboard effect cannot touch it -- driving the joint can.
+    "GEO_BILLBOARD", "GEO_BILLBOARD_WITH_PARAMS",
     "GEO_ROTATION_NODE", "GEO_ROTATION_NODE_WITH_DL",
     "GEO_TRANSLATE_NODE", "GEO_TRANSLATE_NODE_WITH_DL",
     "GEO_TRANSLATE_ROTATE", "GEO_TRANSLATE_ROTATE_WITH_DL",
@@ -64,7 +68,11 @@ FRAME_RATE = 30.0
 # 0x10000 means 1.0 -- so Mario is authored at 4x and shrunk to a quarter at
 # draw time.  Exporting at 0.25 lands the model in the same units as the
 # level and the collision data (~154 units tall).
-ACTOR_SCALE = {"mario": 0.25}
+# Actors whose geo wraps the body in GEO_SCALE(0x00, 16384) are authored at 4x
+# and shrink to a quarter at draw time. Actors without it -- the tree is one --
+# are already at world scale, and applying the quarter anyway leaves them a
+# quarter of the size the level was built around.
+ACTOR_SCALE = {"mario": 0.25, "goomba": 1.0, "scuttlebug": 1.0, "tree": 1.0}
 DEFAULT_SCALE = 0.25
 
 # Parts the game only draws under some runtime condition, and which therefore
@@ -179,7 +187,10 @@ def collect_joints(root, names=None):
                 joint.name = f"fixed_{index}"
     else:
         for index, joint in enumerate(joints):
-            if joint.name in TRANSFORM_KINDS:
+            if joint.name.startswith("GEO_BILLBOARD"):
+                # Named so the renderer can find them without a sidecar.
+                joint.name = f"billboard_{index}"
+            elif joint.name in TRANSFORM_KINDS:
                 joint.name = f"joint_{index}"
 
     return joints
@@ -631,8 +642,16 @@ def main(argv):
     args = parser.parse_args(argv[1:])
 
     actor_dir = os.path.join(args.reference, "actors", args.actor)
-    anim_dir = os.path.join(args.reference, "assets", "anims")
     root_layout = args.root_layout or f"{args.actor}_geo_body"
+
+    # Mario's animations live in a shared assets/anims directory; every other
+    # actor keeps its own beside its model. Using the shared one for them does
+    # not fail cleanly -- the tables are read positionally, so Mario's 20-joint
+    # animations get applied to whatever hierarchy the actor has and either
+    # warn about the joint count or run off the end of the index table.
+    actor_anims = os.path.join(actor_dir, "anims")
+    anim_dir = (actor_anims if os.path.isdir(actor_anims)
+                else os.path.join(args.reference, "assets", "anims"))
 
     animations = {}
     if args.anims != "none" and os.path.isdir(anim_dir):
