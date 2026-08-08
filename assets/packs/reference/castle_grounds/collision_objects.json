@@ -1,0 +1,249 @@
+[
+  {
+    "preset": "special_level_geo_03",
+    "pos": [
+      0,
+      2867,
+      -3924
+    ],
+    "yaw": 0
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      -1333,
+      711,
+      1881
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      -6220,
+      468,
+      3458
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      -5069,
+      350,
+      3221
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      -2566,
+      438,
+      2626
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      -1900,
+      401,
+      2868
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      6399,
+      494,
+      -1680
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      767,
+      498,
+      2598
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      1476,
+      189,
+      3280
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      3153,
+      206,
+      469
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      6178,
+      219,
+      167
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      -6510,
+      260,
+      1411
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      5457,
+      528,
+      -3259
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      5868,
+      698,
+      -4453
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      6408,
+      869,
+      -5314
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      -4711,
+      342,
+      433
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      1132,
+      365,
+      1977
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      -5506,
+      364,
+      -661
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      -6269,
+      402,
+      -2145
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      -5600,
+      440,
+      -2627
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      1919,
+      268,
+      1157
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      -5957,
+      517,
+      -3447
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      -2021,
+      633,
+      1468
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      -109,
+      613,
+      3008
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      5774,
+      413,
+      -1114
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      5954,
+      526,
+      -2846
+    ]
+  },
+  {
+    "preset": "special_bubble_tree",
+    "pos": [
+      -5204,
+      296,
+      811
+    ]
+  },
+  {
+    "preset": "special_metal_door_warp",
+    "pos": [
+      3292,
+      -511,
+      -2931
+    ],
+    "yaw": 160,
+    "param": 2
+  },
+  {
+    "preset": "special_castle_door_warp",
+    "pos": [
+      -76,
+      803,
+      -3155
+    ],
+    "yaw": 0,
+    "param": 0
+  },
+  {
+    "preset": "special_castle_door_warp",
+    "pos": [
+      77,
+      803,
+      -3155
+    ],
+    "yaw": 128,
+    "param": 1
+  }
+]

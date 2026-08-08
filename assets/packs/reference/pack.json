@@ -1,0 +1,14 @@
+{
+  "name": "reference",
+  "title": "Decomp reference pack",
+  "licence": "proprietary -- Nintendo",
+  "redistributable": false,
+  "tracked": false,
+  "summary": "Converted from the Render96ex decomp, the Render96 HD texture pack, and audio samples extracted from a Super Mario 64 ROM. Kept for fidelity checks against the original. Not committed and not redistributable; see assets/packs/open for the pack that ships.",
+  "sources": {
+    "geometry, collision, rigs, animation": "Render96ex decomp (github.com/Render96/Render96ex)",
+    "textures": "Render96 HD texture pack",
+    "audio": "samples extracted from a US ROM via sm64pcbuilder2"
+  },
+  "regenerate": "See wiki/Assets.md -- tools/parse_collision.py, tools/parse_f3d.py, tools/export_actor_gltf.py, tools/import_sounds.py"
+}

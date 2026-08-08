@@ -1,0 +1,1256 @@
+{
+  "anim_00": {
+    "frames": 34,
+    "loop_end": 34,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_01": {
+    "frames": 80,
+    "loop_end": 80,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_02": {
+    "frames": 1,
+    "loop_end": 1,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_03": {
+    "frames": 64,
+    "loop_end": 64,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_04": {
+    "frames": 33,
+    "loop_end": 33,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_05": {
+    "frames": 90,
+    "loop_end": 90,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_06": {
+    "frames": 12,
+    "loop_end": 12,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_07": {
+    "frames": 1,
+    "loop_end": 1,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_08": {
+    "frames": 20,
+    "loop_end": 20,
+    "loop_start": 0,
+    "start_frame": 1
+  },
+  "anim_09": {
+    "frames": 52,
+    "loop_end": 52,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_0A": {
+    "frames": 36,
+    "loop_end": 36,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_0B": {
+    "frames": 17,
+    "loop_end": 17,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_0C": {
+    "frames": 17,
+    "loop_end": 17,
+    "loop_start": 0,
+    "start_frame": 16
+  },
+  "anim_0D": {
+    "frames": 112,
+    "loop_end": 112,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_0E": {
+    "frames": 1,
+    "loop_end": 1,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_0F": {
+    "frames": 1,
+    "loop_end": 1,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_10": {
+    "frames": 18,
+    "loop_end": 18,
+    "loop_start": 0,
+    "start_frame": 1
+  },
+  "anim_11": {
+    "frames": 16,
+    "loop_end": 16,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_12": {
+    "frames": 18,
+    "loop_end": 18,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_13": {
+    "frames": 23,
+    "loop_end": 23,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_14": {
+    "frames": 15,
+    "loop_end": 15,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_15": {
+    "frames": 15,
+    "loop_end": 15,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_16": {
+    "frames": 100,
+    "loop_end": 100,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_17": {
+    "frames": 76,
+    "loop_end": 76,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_18": {
+    "frames": 100,
+    "loop_end": 100,
+    "loop_start": 0,
+    "start_frame": 42
+  },
+  "anim_19": {
+    "frames": 86,
+    "loop_end": 86,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_1A": {
+    "frames": 17,
+    "loop_end": 17,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_1B": {
+    "frames": 64,
+    "loop_end": 64,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_1C": {
+    "frames": 10,
+    "loop_end": 10,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_1D": {
+    "frames": 35,
+    "loop_end": 35,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_1E": {
+    "frames": 30,
+    "loop_end": 30,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_1F": {
+    "frames": 21,
+    "loop_end": 21,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_20": {
+    "frames": 96,
+    "loop_end": 96,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_21": {
+    "frames": 35,
+    "loop_end": 35,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_22": {
+    "frames": 27,
+    "loop_end": 27,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_23": {
+    "frames": 100,
+    "loop_end": 100,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_24": {
+    "frames": 120,
+    "loop_end": 120,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_25": {
+    "frames": 100,
+    "loop_end": 100,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_26": {
+    "frames": 94,
+    "loop_end": 94,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_27": {
+    "frames": 112,
+    "loop_end": 112,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_28": {
+    "frames": 15,
+    "loop_end": 15,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_29": {
+    "frames": 10,
+    "loop_end": 10,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_2A": {
+    "frames": 40,
+    "loop_end": 40,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_2B": {
+    "frames": 40,
+    "loop_end": 40,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_2C": {
+    "frames": 80,
+    "loop_end": 80,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_2D": {
+    "frames": 1,
+    "loop_end": 1,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_2E": {
+    "frames": 47,
+    "loop_end": 47,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_2F": {
+    "frames": 100,
+    "loop_end": 100,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_30": {
+    "frames": 90,
+    "loop_end": 90,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_31": {
+    "frames": 140,
+    "loop_end": 140,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_32": {
+    "frames": 96,
+    "loop_end": 96,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_33": {
+    "frames": 50,
+    "loop_end": 50,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_34": {
+    "frames": 16,
+    "loop_end": 16,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_35": {
+    "frames": 54,
+    "loop_end": 54,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_36": {
+    "frames": 46,
+    "loop_end": 46,
+    "loop_start": 0,
+    "start_frame": 10
+  },
+  "anim_37": {
+    "frames": 100,
+    "loop_end": 100,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_38": {
+    "frames": 12,
+    "loop_end": 12,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_39": {
+    "frames": 155,
+    "loop_end": 155,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_3A": {
+    "frames": 6,
+    "loop_end": 6,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_3B": {
+    "frames": 16,
+    "loop_end": 16,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_3C": {
+    "frames": 11,
+    "loop_end": 11,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_3D": {
+    "frames": 11,
+    "loop_end": 11,
+    "loop_start": 0,
+    "start_frame": 10
+  },
+  "anim_3E": {
+    "frames": 155,
+    "loop_end": 155,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_3F": {
+    "frames": 61,
+    "loop_end": 61,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_40": {
+    "frames": 19,
+    "loop_end": 19,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_41": {
+    "frames": 10,
+    "loop_end": 10,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_42": {
+    "frames": 16,
+    "loop_end": 16,
+    "loop_start": 0,
+    "start_frame": 2
+  },
+  "anim_43": {
+    "frames": 2,
+    "loop_end": 2,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_44": {
+    "frames": 15,
+    "loop_end": 15,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_45": {
+    "frames": 1,
+    "loop_end": 1,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_46": {
+    "frames": 14,
+    "loop_end": 14,
+    "loop_start": 0,
+    "start_frame": 1
+  },
+  "anim_47": {
+    "frames": 11,
+    "loop_end": 11,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_48": {
+    "frames": 77,
+    "loop_end": 77,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_49": {
+    "frames": 16,
+    "loop_end": 16,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_4A": {
+    "frames": 8,
+    "loop_end": 8,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_4B": {
+    "frames": 18,
+    "loop_end": 18,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_4C": {
+    "frames": 9,
+    "loop_end": 9,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_4D": {
+    "frames": 12,
+    "loop_end": 12,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_4E": {
+    "frames": 38,
+    "loop_end": 38,
+    "loop_start": 0,
+    "start_frame": 22
+  },
+  "anim_4F": {
+    "frames": 21,
+    "loop_end": 21,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_50": {
+    "frames": 6,
+    "loop_end": 6,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_51": {
+    "frames": 14,
+    "loop_end": 14,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_52": {
+    "frames": 11,
+    "loop_end": 11,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_53": {
+    "frames": 25,
+    "loop_end": 25,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_54": {
+    "frames": 30,
+    "loop_end": 30,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_55": {
+    "frames": 152,
+    "loop_end": 152,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_56": {
+    "frames": 1,
+    "loop_end": 1,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_57": {
+    "frames": 24,
+    "loop_end": 24,
+    "loop_start": 0,
+    "start_frame": 9
+  },
+  "anim_58": {
+    "frames": 20,
+    "loop_end": 20,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_59": {
+    "frames": 37,
+    "loop_end": 37,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_5A": {
+    "frames": 38,
+    "loop_end": 38,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_5B": {
+    "frames": 10,
+    "loop_end": 10,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_5C": {
+    "frames": 20,
+    "loop_end": 20,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_5D": {
+    "frames": 19,
+    "loop_end": 19,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_5E": {
+    "frames": 155,
+    "loop_end": 155,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_5F": {
+    "frames": 60,
+    "loop_end": 60,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_60": {
+    "frames": 50,
+    "loop_end": 50,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_61": {
+    "frames": 147,
+    "loop_end": 147,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_62": {
+    "frames": 10,
+    "loop_end": 10,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_63": {
+    "frames": 33,
+    "loop_end": 33,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_64": {
+    "frames": 18,
+    "loop_end": 18,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_65": {
+    "frames": 21,
+    "loop_end": 21,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_66": {
+    "frames": 26,
+    "loop_end": 26,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_67": {
+    "frames": 5,
+    "loop_end": 5,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_68": {
+    "frames": 4,
+    "loop_end": 4,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_69": {
+    "frames": 10,
+    "loop_end": 10,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_6A": {
+    "frames": 13,
+    "loop_end": 13,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_6B": {
+    "frames": 11,
+    "loop_end": 11,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_6C": {
+    "frames": 27,
+    "loop_end": 27,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_6D": {
+    "frames": 18,
+    "loop_end": 18,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_6E": {
+    "frames": 16,
+    "loop_end": 16,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_6F": {
+    "frames": 10,
+    "loop_end": 10,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_70": {
+    "frames": 10,
+    "loop_end": 10,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_71": {
+    "frames": 24,
+    "loop_end": 24,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_72": {
+    "frames": 72,
+    "loop_end": 72,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_73": {
+    "frames": 72,
+    "loop_end": 72,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_74": {
+    "frames": 24,
+    "loop_end": 24,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_75": {
+    "frames": 24,
+    "loop_end": 24,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_76": {
+    "frames": 100,
+    "loop_end": 100,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_77": {
+    "frames": 100,
+    "loop_end": 100,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_78": {
+    "frames": 149,
+    "loop_end": 149,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_79": {
+    "frames": 53,
+    "loop_end": 53,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_7A": {
+    "frames": 6,
+    "loop_end": 6,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_7B": {
+    "frames": 30,
+    "loop_end": 30,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_7C": {
+    "frames": 30,
+    "loop_end": 30,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_7D": {
+    "frames": 40,
+    "loop_end": 40,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_7E": {
+    "frames": 90,
+    "loop_end": 90,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_7F": {
+    "frames": 64,
+    "loop_end": 64,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_80": {
+    "frames": 64,
+    "loop_end": 64,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_81": {
+    "frames": 50,
+    "loop_end": 50,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_82": {
+    "frames": 67,
+    "loop_end": 67,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_83": {
+    "frames": 59,
+    "loop_end": 59,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_84": {
+    "frames": 64,
+    "loop_end": 64,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_85": {
+    "frames": 40,
+    "loop_end": 40,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_86": {
+    "frames": 40,
+    "loop_end": 40,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_87": {
+    "frames": 50,
+    "loop_end": 50,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_88": {
+    "frames": 20,
+    "loop_end": 20,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_89": {
+    "frames": 20,
+    "loop_end": 20,
+    "loop_start": 0,
+    "start_frame": 20
+  },
+  "anim_8A": {
+    "frames": 40,
+    "loop_end": 40,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_8B": {
+    "frames": 37,
+    "loop_end": 37,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_8C": {
+    "frames": 8,
+    "loop_end": 8,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_8D": {
+    "frames": 14,
+    "loop_end": 14,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_8E": {
+    "frames": 1,
+    "loop_end": 1,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_8F": {
+    "frames": 20,
+    "loop_end": 20,
+    "loop_start": 0,
+    "start_frame": 1
+  },
+  "anim_90": {
+    "frames": 15,
+    "loop_end": 15,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_91": {
+    "frames": 8,
+    "loop_end": 8,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_92": {
+    "frames": 116,
+    "loop_end": 116,
+    "loop_start": 0,
+    "start_frame": 27
+  },
+  "anim_93": {
+    "frames": 10,
+    "loop_end": 10,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_94": {
+    "frames": 1,
+    "loop_end": 1,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_95": {
+    "frames": 5,
+    "loop_end": 5,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_96": {
+    "frames": 10,
+    "loop_end": 10,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_97": {
+    "frames": 6,
+    "loop_end": 6,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_98": {
+    "frames": 90,
+    "loop_end": 90,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_99": {
+    "frames": 92,
+    "loop_end": 92,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_9A": {
+    "frames": 8,
+    "loop_end": 8,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_9B": {
+    "frames": 8,
+    "loop_end": 8,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_9C": {
+    "frames": 64,
+    "loop_end": 64,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_9D": {
+    "frames": 26,
+    "loop_end": 26,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_9E": {
+    "frames": 50,
+    "loop_end": 50,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_9F": {
+    "frames": 16,
+    "loop_end": 16,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_A0": {
+    "frames": 10,
+    "loop_end": 10,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_A1": {
+    "frames": 24,
+    "loop_end": 24,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_A2": {
+    "frames": 23,
+    "loop_end": 23,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_A3": {
+    "frames": 30,
+    "loop_end": 30,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_A4": {
+    "frames": 30,
+    "loop_end": 30,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_A5": {
+    "frames": 80,
+    "loop_end": 80,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_A6": {
+    "frames": 70,
+    "loop_end": 70,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_A7": {
+    "frames": 40,
+    "loop_end": 40,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_A8": {
+    "frames": 50,
+    "loop_end": 50,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_A9": {
+    "frames": 20,
+    "loop_end": 20,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_AA": {
+    "frames": 13,
+    "loop_end": 13,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_AB": {
+    "frames": 10,
+    "loop_end": 10,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_AC": {
+    "frames": 24,
+    "loop_end": 24,
+    "loop_start": 0,
+    "start_frame": 8
+  },
+  "anim_AD": {
+    "frames": 25,
+    "loop_end": 25,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_AE": {
+    "frames": 11,
+    "loop_end": 11,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_AF": {
+    "frames": 25,
+    "loop_end": 25,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_B0": {
+    "frames": 5,
+    "loop_end": 5,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_B1": {
+    "frames": 28,
+    "loop_end": 28,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_B2": {
+    "frames": 30,
+    "loop_end": 30,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_B3": {
+    "frames": 83,
+    "loop_end": 83,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_B4": {
+    "frames": 24,
+    "loop_end": 24,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_B5": {
+    "frames": 20,
+    "loop_end": 20,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_B6": {
+    "frames": 20,
+    "loop_end": 20,
+    "loop_start": 0,
+    "start_frame": 19
+  },
+  "anim_B7": {
+    "frames": 40,
+    "loop_end": 40,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_B8": {
+    "frames": 50,
+    "loop_end": 50,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_B9": {
+    "frames": 25,
+    "loop_end": 25,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_BA": {
+    "frames": 20,
+    "loop_end": 20,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_BB": {
+    "frames": 97,
+    "loop_end": 97,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_BC": {
+    "frames": 1,
+    "loop_end": 1,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_BD": {
+    "frames": 18,
+    "loop_end": 18,
+    "loop_start": 0,
+    "start_frame": 1
+  },
+  "anim_BE": {
+    "frames": 10,
+    "loop_end": 10,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_BF": {
+    "frames": 24,
+    "loop_end": 24,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_C0": {
+    "frames": 32,
+    "loop_end": 32,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_C1": {
+    "frames": 36,
+    "loop_end": 36,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_C2": {
+    "frames": 90,
+    "loop_end": 90,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_C3": {
+    "frames": 30,
+    "loop_end": 30,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_C4": {
+    "frames": 30,
+    "loop_end": 30,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_C5": {
+    "frames": 30,
+    "loop_end": 30,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_C6": {
+    "frames": 50,
+    "loop_end": 50,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_C7": {
+    "frames": 50,
+    "loop_end": 50,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_C8": {
+    "frames": 20,
+    "loop_end": 20,
+    "loop_start": 0,
+    "start_frame": 6
+  },
+  "anim_C9": {
+    "frames": 21,
+    "loop_end": 21,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_CA": {
+    "frames": 30,
+    "loop_end": 30,
+    "loop_start": 0,
+    "start_frame": 25
+  },
+  "anim_CB": {
+    "frames": 17,
+    "loop_end": 17,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_CC": {
+    "frames": 1,
+    "loop_end": 1,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_CD": {
+    "frames": 63,
+    "loop_end": 63,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_CE": {
+    "frames": 18,
+    "loop_end": 18,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_CF": {
+    "frames": 42,
+    "loop_end": 42,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_D0": {
+    "frames": 14,
+    "loop_end": 14,
+    "loop_start": 0,
+    "start_frame": 0
+  }
+}

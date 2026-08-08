@@ -1,0 +1,1084 @@
+[
+  {
+    "texture": "outside_09000000",
+    "layer": "OPAQUE",
+    "lighting": false,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": null,
+    "light_diffuse": null,
+    "light_ambient": null,
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 0,
+    "count": 30,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.00000.rgba16.png"
+  },
+  {
+    "texture": "outside_09006000",
+    "layer": "OPAQUE",
+    "lighting": false,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "clamp",
+    "wrap_t": "clamp",
+    "light": null,
+    "light_diffuse": null,
+    "light_ambient": null,
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 30,
+    "count": 2,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.06000.rgba16.png"
+  },
+  {
+    "texture": "outside_0900A000",
+    "layer": "OPAQUE",
+    "lighting": false,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": null,
+    "light_diffuse": null,
+    "light_ambient": null,
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 32,
+    "count": 10,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.0A000.rgba16.png"
+  },
+  {
+    "texture": "outside_09007800",
+    "layer": "OPAQUE",
+    "lighting": false,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": null,
+    "light_diffuse": null,
+    "light_ambient": null,
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 42,
+    "count": 56,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.07800.rgba16.png"
+  },
+  {
+    "texture": "outside_09003000",
+    "layer": "OPAQUE",
+    "lighting": false,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "clamp",
+    "light": null,
+    "light_diffuse": null,
+    "light_ambient": null,
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 98,
+    "count": 64,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.03000.rgba16.png"
+  },
+  {
+    "texture": "outside_09009000",
+    "layer": "OPAQUE",
+    "lighting": false,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": null,
+    "light_diffuse": null,
+    "light_ambient": null,
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 162,
+    "count": 10,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.09000.rgba16.png"
+  },
+  {
+    "texture": "outside_09004800",
+    "layer": "OPAQUE",
+    "lighting": false,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 64,
+    "wrap_s": "clamp",
+    "wrap_t": "wrap",
+    "light": null,
+    "light_diffuse": null,
+    "light_ambient": null,
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 172,
+    "count": 24,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.04800.rgba16.png"
+  },
+  {
+    "texture": "outside_09002000",
+    "layer": "OPAQUE",
+    "lighting": false,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 64,
+    "wrap_s": "wrap",
+    "wrap_t": "clamp",
+    "light": null,
+    "light_diffuse": null,
+    "light_ambient": null,
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 196,
+    "count": 8,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.02000.rgba16.png"
+  },
+  {
+    "texture": "outside_09001000",
+    "layer": "OPAQUE",
+    "lighting": false,
+    "cull": true,
+    "tile_width": 64,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": null,
+    "light_diffuse": null,
+    "light_ambient": null,
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 204,
+    "count": 122,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.01000.rgba16.png"
+  },
+  {
+    "texture": "outside_09006800",
+    "layer": "OPAQUE",
+    "lighting": false,
+    "cull": true,
+    "tile_width": 64,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": null,
+    "light_diffuse": null,
+    "light_ambient": null,
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 326,
+    "count": 14,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.06800.rgba16.png"
+  },
+  {
+    "texture": null,
+    "layer": "OPAQUE",
+    "lighting": false,
+    "cull": true,
+    "tile_width": 64,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": null,
+    "light_diffuse": null,
+    "light_ambient": null,
+    "combiner": "G_CC_SHADE",
+    "combiner_kind": "shade",
+    "first": 340,
+    "count": 16,
+    "image": null
+  },
+  {
+    "texture": "outside_0900B000",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 16,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_07006ED8",
+    "light_diffuse": [
+      255,
+      255,
+      255
+    ],
+    "light_ambient": [
+      102,
+      102,
+      102
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 356,
+    "count": 2,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.0B000.rgba16.png"
+  },
+  {
+    "texture": "outside_0900B000",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 16,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_07006EF0",
+    "light_diffuse": [
+      196,
+      196,
+      208
+    ],
+    "light_ambient": [
+      78,
+      78,
+      83
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 358,
+    "count": 2,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.0B000.rgba16.png"
+  },
+  {
+    "texture": "outside_09004000",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_07006ED8",
+    "light_diffuse": [
+      255,
+      255,
+      255
+    ],
+    "light_ambient": [
+      102,
+      102,
+      102
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 360,
+    "count": 39,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.04000.rgba16.png"
+  },
+  {
+    "texture": "outside_09008000",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_07006ED8",
+    "light_diffuse": [
+      255,
+      255,
+      255
+    ],
+    "light_ambient": [
+      102,
+      102,
+      102
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 399,
+    "count": 39,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.08000.rgba16.png"
+  },
+  {
+    "texture": "outside_09009000",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_07006F08",
+    "light_diffuse": [
+      137,
+      137,
+      138
+    ],
+    "light_ambient": [
+      54,
+      54,
+      55
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 438,
+    "count": 8,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.09000.rgba16.png"
+  },
+  {
+    "texture": "outside_09009800",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_07006ED8",
+    "light_diffuse": [
+      255,
+      255,
+      255
+    ],
+    "light_ambient": [
+      102,
+      102,
+      102
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 446,
+    "count": 13,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.09800.rgba16.png"
+  },
+  {
+    "texture": "outside_09009800",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_07006F08",
+    "light_diffuse": [
+      137,
+      137,
+      138
+    ],
+    "light_ambient": [
+      54,
+      54,
+      55
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 459,
+    "count": 2,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.09800.rgba16.png"
+  },
+  {
+    "texture": "outside_09009800",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_07006ED8",
+    "light_diffuse": [
+      255,
+      255,
+      255
+    ],
+    "light_ambient": [
+      102,
+      102,
+      102
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 461,
+    "count": 4,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.09800.rgba16.png"
+  },
+  {
+    "texture": "outside_0900B400",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_07006ED8",
+    "light_diffuse": [
+      255,
+      255,
+      255
+    ],
+    "light_ambient": [
+      102,
+      102,
+      102
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 465,
+    "count": 2,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.0B400.rgba16.png"
+  },
+  {
+    "texture": "outside_0900B400",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_07006F20",
+    "light_diffuse": [
+      114,
+      114,
+      140
+    ],
+    "light_ambient": [
+      45,
+      45,
+      56
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 467,
+    "count": 2,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.0B400.rgba16.png"
+  },
+  {
+    "texture": "outside_09003800",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_07006ED8",
+    "light_diffuse": [
+      255,
+      255,
+      255
+    ],
+    "light_ambient": [
+      102,
+      102,
+      102
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 469,
+    "count": 17,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.03800.rgba16.png"
+  },
+  {
+    "texture": "outside_09002000",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 64,
+    "wrap_s": "wrap",
+    "wrap_t": "clamp",
+    "light": "castle_grounds_seg7_lights_07006ED8",
+    "light_diffuse": [
+      255,
+      255,
+      255
+    ],
+    "light_ambient": [
+      102,
+      102,
+      102
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 486,
+    "count": 7,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.02000.rgba16.png"
+  },
+  {
+    "texture": "outside_09002000",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 64,
+    "wrap_s": "wrap",
+    "wrap_t": "clamp",
+    "light": "castle_grounds_seg7_lights_07006F38",
+    "light_diffuse": [
+      103,
+      103,
+      105
+    ],
+    "light_ambient": [
+      41,
+      41,
+      42
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 493,
+    "count": 8,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.02000.rgba16.png"
+  },
+  {
+    "texture": "outside_09002000",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 64,
+    "wrap_s": "wrap",
+    "wrap_t": "clamp",
+    "light": "castle_grounds_seg7_lights_07006F50",
+    "light_diffuse": [
+      216,
+      216,
+      216
+    ],
+    "light_ambient": [
+      86,
+      86,
+      86
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 501,
+    "count": 2,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.02000.rgba16.png"
+  },
+  {
+    "texture": "outside_09002000",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 64,
+    "wrap_s": "wrap",
+    "wrap_t": "clamp",
+    "light": "castle_grounds_seg7_lights_07006ED8",
+    "light_diffuse": [
+      255,
+      255,
+      255
+    ],
+    "light_ambient": [
+      102,
+      102,
+      102
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 503,
+    "count": 48,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.02000.rgba16.png"
+  },
+  {
+    "texture": "outside_09002000",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 64,
+    "wrap_s": "wrap",
+    "wrap_t": "clamp",
+    "light": "castle_grounds_seg7_lights_07006F68",
+    "light_diffuse": [
+      88,
+      88,
+      98
+    ],
+    "light_ambient": [
+      35,
+      35,
+      39
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 551,
+    "count": 4,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.02000.rgba16.png"
+  },
+  {
+    "texture": "outside_09002000",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 64,
+    "wrap_s": "wrap",
+    "wrap_t": "clamp",
+    "light": "castle_grounds_seg7_lights_07006F08",
+    "light_diffuse": [
+      137,
+      137,
+      138
+    ],
+    "light_ambient": [
+      54,
+      54,
+      55
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 555,
+    "count": 3,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.02000.rgba16.png"
+  },
+  {
+    "texture": "outside_09002000",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 64,
+    "wrap_s": "wrap",
+    "wrap_t": "clamp",
+    "light": "castle_grounds_seg7_lights_07006ED8",
+    "light_diffuse": [
+      255,
+      255,
+      255
+    ],
+    "light_ambient": [
+      102,
+      102,
+      102
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 558,
+    "count": 1,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.02000.rgba16.png"
+  },
+  {
+    "texture": "outside_09004800",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 64,
+    "wrap_s": "clamp",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_07006F80",
+    "light_diffuse": [
+      48,
+      219,
+      2
+    ],
+    "light_ambient": [
+      19,
+      87,
+      0
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 559,
+    "count": 59,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.04800.rgba16.png"
+  },
+  {
+    "texture": "outside_09006800",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 64,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_07006F38",
+    "light_diffuse": [
+      103,
+      103,
+      105
+    ],
+    "light_ambient": [
+      41,
+      41,
+      42
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 618,
+    "count": 5,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.06800.rgba16.png"
+  },
+  {
+    "texture": "outside_09006800",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 64,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_07006F08",
+    "light_diffuse": [
+      137,
+      137,
+      138
+    ],
+    "light_ambient": [
+      54,
+      54,
+      55
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 623,
+    "count": 2,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.06800.rgba16.png"
+  },
+  {
+    "texture": "castle_grounds_seg7_texture_07000000",
+    "layer": "ALPHA",
+    "lighting": true,
+    "cull": false,
+    "tile_width": 32,
+    "tile_height": 64,
+    "wrap_s": "wrap",
+    "wrap_t": "clamp",
+    "light": "castle_grounds_seg7_lights_07006F08",
+    "light_diffuse": [
+      137,
+      137,
+      138
+    ],
+    "light_ambient": [
+      54,
+      54,
+      55
+    ],
+    "combiner": "G_CC_MODULATERGBA",
+    "combiner_kind": "modulate",
+    "first": 625,
+    "count": 30,
+    "image": "assets/castle_grounds/textures/levels/castle_grounds/0.rgba16.png"
+  },
+  {
+    "texture": "outside_0900BC00",
+    "layer": "TRANSPARENT_DECAL",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "clamp",
+    "wrap_t": "clamp",
+    "light": "castle_grounds_seg7_lights_07006F08",
+    "light_diffuse": [
+      137,
+      137,
+      138
+    ],
+    "light_ambient": [
+      54,
+      54,
+      55
+    ],
+    "combiner": "G_CC_MODULATEIA",
+    "combiner_kind": "modulate",
+    "first": 655,
+    "count": 52,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.0BC00.ia16.png"
+  },
+  {
+    "texture": "outside_0900A800",
+    "layer": "ALPHA",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "clamp",
+    "wrap_t": "clamp",
+    "light": "castle_grounds_seg7_lights_07006F08",
+    "light_diffuse": [
+      137,
+      137,
+      138
+    ],
+    "light_ambient": [
+      54,
+      54,
+      55
+    ],
+    "combiner": "G_CC_MODULATERGBA",
+    "combiner_kind": "modulate",
+    "first": 707,
+    "count": 40,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.0A800.rgba16.png"
+  },
+  {
+    "texture": "castle_grounds_seg7_texture_07001000",
+    "layer": "ALPHA",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 64,
+    "tile_height": 32,
+    "wrap_s": "clamp",
+    "wrap_t": "clamp",
+    "light": "castle_grounds_seg7_lights_07006F08",
+    "light_diffuse": [
+      137,
+      137,
+      138
+    ],
+    "light_ambient": [
+      54,
+      54,
+      55
+    ],
+    "combiner": "G_CC_MODULATERGBA",
+    "combiner_kind": "modulate",
+    "first": 747,
+    "count": 2,
+    "image": "assets/castle_grounds/textures/levels/castle_grounds/1.rgba16.png"
+  },
+  {
+    "texture": "castle_grounds_seg7_texture_07002000",
+    "layer": "ALPHA",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 64,
+    "tile_height": 32,
+    "wrap_s": "clamp",
+    "wrap_t": "clamp",
+    "light": "castle_grounds_seg7_lights_07006F08",
+    "light_diffuse": [
+      137,
+      137,
+      138
+    ],
+    "light_ambient": [
+      54,
+      54,
+      55
+    ],
+    "combiner": "G_CC_MODULATERGBA",
+    "combiner_kind": "modulate",
+    "first": 749,
+    "count": 2,
+    "image": "assets/castle_grounds/textures/levels/castle_grounds/2.rgba16.png"
+  },
+  {
+    "texture": "outside_09006000",
+    "layer": "OPAQUE_DECAL",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "clamp",
+    "wrap_t": "clamp",
+    "light": "castle_grounds_seg7_lights_07006F08",
+    "light_diffuse": [
+      137,
+      137,
+      138
+    ],
+    "light_ambient": [
+      54,
+      54,
+      55
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 751,
+    "count": 2,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.06000.rgba16.png"
+  },
+  {
+    "texture": "outside_09003000",
+    "layer": "OPAQUE_DECAL",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "clamp",
+    "light": "castle_grounds_seg7_lights_07006F08",
+    "light_diffuse": [
+      137,
+      137,
+      138
+    ],
+    "light_ambient": [
+      54,
+      54,
+      55
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 753,
+    "count": 6,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.03000.rgba16.png"
+  },
+  {
+    "texture": "outside_09004800",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 64,
+    "wrap_s": "clamp",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_0700BCD8",
+    "light_diffuse": [
+      153,
+      153,
+      172
+    ],
+    "light_ambient": [
+      61,
+      61,
+      68
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 759,
+    "count": 6,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.04800.rgba16.png"
+  },
+  {
+    "texture": "outside_09004800",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 32,
+    "tile_height": 64,
+    "wrap_s": "clamp",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_0700BCF0",
+    "light_diffuse": [
+      220,
+      220,
+      227
+    ],
+    "light_ambient": [
+      88,
+      88,
+      90
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 765,
+    "count": 4,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.04800.rgba16.png"
+  },
+  {
+    "texture": "outside_09001000",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 64,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_0700BD08",
+    "light_diffuse": [
+      255,
+      255,
+      255
+    ],
+    "light_ambient": [
+      102,
+      102,
+      102
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 769,
+    "count": 10,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.01000.rgba16.png"
+  },
+  {
+    "texture": "outside_09001000",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 64,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_0700BD20",
+    "light_diffuse": [
+      196,
+      196,
+      208
+    ],
+    "light_ambient": [
+      78,
+      78,
+      83
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 779,
+    "count": 2,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.01000.rgba16.png"
+  },
+  {
+    "texture": "outside_09001000",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 64,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_0700BD38",
+    "light_diffuse": [
+      173,
+      173,
+      188
+    ],
+    "light_ambient": [
+      69,
+      69,
+      75
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 781,
+    "count": 2,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.01000.rgba16.png"
+  },
+  {
+    "texture": "outside_09001000",
+    "layer": "OPAQUE",
+    "lighting": true,
+    "cull": true,
+    "tile_width": 64,
+    "tile_height": 32,
+    "wrap_s": "wrap",
+    "wrap_t": "wrap",
+    "light": "castle_grounds_seg7_lights_0700BCF0",
+    "light_diffuse": [
+      220,
+      220,
+      227
+    ],
+    "light_ambient": [
+      88,
+      88,
+      90
+    ],
+    "combiner": "G_CC_MODULATERGB",
+    "combiner_kind": "modulate",
+    "first": 783,
+    "count": 2,
+    "image": "assets/castle_grounds/textures/textures/outside/castle_grounds_textures.01000.rgba16.png"
+  }
+]
