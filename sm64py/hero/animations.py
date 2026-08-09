@@ -112,18 +112,19 @@ MIN_PLAY_RATE = 1.0 / 16.0
 # Nothing plays faster than this, however fast he is moving -- and this is the
 # knob to turn if the legs look wrong.
 #
-# It exists because the two things a locomotion clip has to satisfy are in
-# conflict here, and cannot both be had. Planting the feet means playing one
-# cycle per stride covered, which at his top speed of 30 units a frame works
-# out at better than three cycles a second: his stride is a human one, 267
-# units, and Mario's speed was never meant for a character this size. Three
-# cycles a second reads as legs whirring rather than a person running, however
-# correct the foot contact is.
+# 1.0 means "exactly as authored in Blender": his run cycle is 42 frames at
+# 30 fps, a slow, heavy 1.4 seconds, and at this cap that is what plays. It is
+# the floor of the scale rather than a tuned number -- there is no speeding up
+# left to remove.
 #
-# So the cadence wins and the contact gives. Above 2.0 the feet slide; below it
-# -- which is all of walking and the first half of running -- they do not, and
-# the divisors above still govern.
-MAX_PLAY_RATE = 2.0
+# The reason a cap is needed at all is that the two things a locomotion clip
+# should do cannot both be had here. Planting the feet means one cycle per
+# stride covered, and at his top speed of 30 units a frame that is better than
+# three cycles a second, because his stride is a human 267 units and Mario's
+# speed was never meant for a character this size. So the cadence wins and the
+# foot contact gives: he slides at speed. The divisors above still govern while
+# he is moving slowly enough for the cap not to bind.
+MAX_PLAY_RATE = 1.0
 
 
 def play_rate(m, clip):
