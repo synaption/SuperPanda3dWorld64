@@ -88,17 +88,24 @@ class GravityComponent:
         magnitude = (self.gravity_constant * self.mass_self * other.mass_self) / distance
         return (delta / distance) * magnitude
 
-    def accumulate_gravity(self, bodies, planets_attract_each_other=True):
-        """Add the pull of every other body to this tick's force list."""
+    def accumulate_gravity(self, bodies, planets_attract_each_other=False):
+        """Add the pull of every other body to this tick's force list.
+
+        With `planets_attract_each_other` off -- the original's default -- a
+        planet feels nothing at all, not merely nothing from other planets.
+        The variable's tooltip is explicit: "Disables gravity between planets
+        if False. If False, only player will be affected by gravity." Letting
+        planets still feel the *player* would be wrong twice over: the demo
+        level gives nothing an orbital velocity, so any mutual attraction
+        collapses the system, and at these constants a mass-1 player drags a
+        mass-3 planet around at metres per second.
+        """
         total = LVector3d(0, 0, 0)
+        if self.is_planet and not planets_attract_each_other:
+            self.gravity_force = total
+            return
         for other in bodies:
             if other is self:
-                continue
-            if (
-                not planets_attract_each_other
-                and self.is_planet
-                and other.is_planet
-            ):
                 continue
             force = self.gravitational_force_toward(other)
             self.list_forces.append(force)
@@ -131,7 +138,7 @@ class GravityComponent:
 class GravityWorld:
     """The set of "PhysicsObject" actors, and the tick that advances them."""
 
-    def __init__(self, planets_attract_each_other=True):
+    def __init__(self, planets_attract_each_other=False):
         self.bodies = []
         self.planets_attract_each_other = planets_attract_each_other
 

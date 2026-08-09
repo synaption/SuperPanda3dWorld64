@@ -283,7 +283,7 @@ class OuterWildsApp(ShowBase):
             "zero-g     {}".format("on" if world.player.is_zero_g else "OFF"),
             "n-body     {}".format(
                 "planets attract" if world.gravity.planets_attract_each_other
-                else "player only"
+                else "planets static (as shipped)"
             ),
             "",
             "WASD thrust   space/ctrl up-down   shift brake",

@@ -8,6 +8,8 @@ python3 -m ow.main              # fly the demo system
 python3 -m ow.main --selftest   # headless physics checks, no window needed
 ```
 
+`python3 ow/main.py` works as well, from any directory.
+
 ## Controls
 
 | | |
@@ -18,7 +20,7 @@ python3 -m ow.main --selftest   # headless physics checks, no window needed
 | mouse | look |
 | `Q` + mouse | roll instead of yaw |
 | `R` | snap the camera to where you are actually pointing |
-| `F1` / `F2` / `F3` | toggle HUD / zero-g / planets attracting each other |
+| `F1` / `F2` / `F3` | toggle HUD / zero-g / mutual planet gravity (see below) |
 | `Esc` | release the mouse, then quit |
 
 The original binds only a gamepad for movement (`Gamepad_Left2D`); `Space`,
@@ -40,6 +42,26 @@ floaty, momentum-heavy feel.
 Thrust is queued as a *force* onto the player's own `GravityComponent`, into
 the same list gravity uses, so one integrator sums jetpack and gravity rather
 than having two systems fight over the velocity.
+
+### Planets do not attract each other
+
+`bPlanetsAttractEachOther` is **false** in the Unreal class defaults, with no
+override anywhere in the demo level, and its tooltip spells out the intent:
+
+> Disables gravity between planets if False. If False, only player will be
+> affected by gravity.
+
+So the solar system is scenery: the planets hold station and only the player
+falls. That is not a shortcut, it is load-bearing — nothing in the level is
+given an orbital velocity, so switching mutual attraction on makes the whole
+system collapse inward (kilometres of drift within a minute, planets reaching
+180 m/s). `F3` toggles it if you want to watch that happen; the self-test
+covers both states.
+
+Note the flag means *planets feel nothing at all*, not merely nothing from
+other planets. Letting a planet still feel the player would have it dragged
+around at metres per second, since the player's mass of 1 is the same order as
+a planet's 1–8.
 
 ### Gravity is deliberately not inverse-square
 
@@ -100,9 +122,9 @@ Panda is right-handed, so level positions have Y negated on import.
 
 Four, all noted in the code at the point they matter:
 
-1. **Fixed 60 Hz physics step.** The original ticks on the render frame, which
-   makes the n-body system's trajectories depend on framerate. Same arithmetic,
-   stable step.
+1. **Fixed 60 Hz physics step.** The original ticks on the render frame, so
+   your trajectory through the system depends on your framerate. Same
+   arithmetic, stable step.
 2. **Double-precision position and velocity.** Panda's default vectors are
    float32; at the demo system's ~5·10⁵ cm scale that loses about a centimetre
    per component and lets momentum visibly drift. Orientation stays float32.

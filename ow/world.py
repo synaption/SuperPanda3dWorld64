@@ -19,7 +19,7 @@ from .movement import InputState, SpaceMovementComponent
 
 
 class World:
-    def __init__(self, bodies=None, variables=None, planets_attract_each_other=True):
+    def __init__(self, bodies=None, variables=None, planets_attract_each_other=False):
         self.gravity = GravityWorld(planets_attract_each_other)
         self.definitions = bodies if bodies is not None else demo_system()
 

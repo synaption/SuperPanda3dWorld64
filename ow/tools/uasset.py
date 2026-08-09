@@ -8,6 +8,10 @@ import sys
 
 TAG = 0x9E2A83C1
 
+# EPropertyTagFlags, UE 5.4. Only the two we depend on are named.
+FLAG_HAS_PROPERTY_GUID = 1 << 1
+FLAG_BOOL_TRUE = 1 << 4
+
 
 class R:
     def __init__(self, d, p=0):
@@ -181,7 +185,7 @@ def props54(pkg, start, end, limit=4000):
             flags = r.u8()
         except Exception:
             break
-        if flags & 2:
+        if flags & FLAG_HAS_PROPERTY_GUID:
             r.p += 16
         if size < 0 or r.p + size > end:
             break
@@ -196,7 +200,9 @@ def props54(pkg, start, end, limit=4000):
             elif base in ("IntProperty", "Int32Property"):
                 val = struct.unpack_from("<i", d, body)[0]
             elif base == "BoolProperty":
-                val = bool(d[body]) if size else None
+                # A bool has no value payload (size 0); UE 5.4 stores it in
+                # the tag's flags byte as EPropertyTagFlags::BoolTrue.
+                val = bool(flags & FLAG_BOOL_TRUE)
             elif base == "NameProperty":
                 val = pkg.name(struct.unpack_from("<I", d, body)[0])
             elif base == "StrProperty":

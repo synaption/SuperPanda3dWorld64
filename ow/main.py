@@ -2,10 +2,21 @@
 
     python -m ow.main              run the demo system
     python -m ow.main --selftest   headless physics checks, no window
+
+Running the file directly -- `python ow/main.py` -- works too; the block below
+puts the project root on the path so the package-relative imports resolve.
 """
 
 import argparse
+import os
 import sys
+
+if __name__ == "__main__" and __package__ in (None, ""):
+    # Executed as a plain script, so there is no parent package for `from .x`
+    # to resolve against. Adopt one.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    __package__ = "ow"
+    import ow  # noqa: F401  (binds the name the relative imports need)
 
 
 def selftest():
@@ -133,6 +144,26 @@ def selftest():
     check("braking cannot reverse the velocity",
           sim.player.speed.getX() > -1e-6 and sim.player.speed.length() < 1e-6,
           "speed {}".format(sim.player.speed))
+
+    print("planets attract each other (bPlanetsAttractEachOther = False)")
+    sim = World()
+    check("the level default leaves planets inert",
+          not sim.gravity.planets_attract_each_other)
+    for _ in range(60 * 60):  # 60 s
+        sim.step(FIXED_TIMESTEP)
+    drift = max((b.position - vec3d(d.position)).length()
+                for b, d in zip(sim.planets, sim.definitions))
+    check("planets do not move, even with the player nearby",
+          drift == 0.0, "max drift {} cm".format(drift))
+
+    # ...and the toggle really does turn full n-body back on.
+    sim = World(planets_attract_each_other=True)
+    for _ in range(600):
+        sim.step(FIXED_TIMESTEP)
+    moved = max((b.position - vec3d(d.position)).length()
+                for b, d in zip(sim.planets, sim.definitions))
+    check("the toggle restores mutual attraction", moved > 0.0,
+          "max drift {} cm".format(moved))
 
     print("demo system")
     sim = World()
