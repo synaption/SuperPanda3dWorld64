@@ -18,8 +18,8 @@
     "start_frame": 0
   },
   "anim_03": {
-    "frames": 64,
-    "loop_end": 64,
+    "frames": 63,
+    "loop_end": 63,
     "loop_start": 0,
     "start_frame": 0
   },
@@ -162,8 +162,8 @@
     "start_frame": 0
   },
   "anim_1B": {
-    "frames": 64,
-    "loop_end": 64,
+    "frames": 63,
+    "loop_end": 63,
     "loop_start": 0,
     "start_frame": 0
   },
@@ -762,14 +762,14 @@
     "start_frame": 0
   },
   "anim_7F": {
-    "frames": 64,
-    "loop_end": 64,
+    "frames": 63,
+    "loop_end": 63,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_80": {
-    "frames": 64,
-    "loop_end": 64,
+    "frames": 63,
+    "loop_end": 63,
     "loop_start": 0,
     "start_frame": 0
   },
@@ -792,8 +792,8 @@
     "start_frame": 0
   },
   "anim_84": {
-    "frames": 64,
-    "loop_end": 64,
+    "frames": 63,
+    "loop_end": 63,
     "loop_start": 0,
     "start_frame": 0
   },
@@ -936,8 +936,8 @@
     "start_frame": 0
   },
   "anim_9C": {
-    "frames": 64,
-    "loop_end": 64,
+    "frames": 63,
+    "loop_end": 63,
     "loop_start": 0,
     "start_frame": 0
   },
@@ -1250,6 +1250,30 @@
   "anim_D0": {
     "frames": 14,
     "loop_end": 14,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_skate_glide": {
+    "frames": 30,
+    "loop_end": 30,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_skate_stride": {
+    "frames": 45,
+    "loop_end": 45,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_zombie_idle": {
+    "frames": 40,
+    "loop_end": 40,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "anim_zombie_walk": {
+    "frames": 40,
+    "loop_end": 40,
     "loop_start": 0,
     "start_frame": 0
   }

@@ -6,6 +6,10 @@ each clip `anim_XX` after its hex id, so the id is all that needs storing here.
 A few actions pick their clip from state rather than a fixed choice -- walking
 switches between tiptoe, walk and run by speed, and the rising and falling
 halves of a double jump are different clips -- so entries may be a callable.
+
+Clips that did not come out of the decomp have no number to be named after, so
+their id is the name itself and they end up as `anim_zombie_walk` and the like.
+Everything downstream keys on the id without caring which kind it is.
 """
 
 import json
@@ -63,9 +67,21 @@ ANIM_FLUTTERKICK = 0xAC
 ANIM_WATER_ACTION_END = 0xAD
 ANIM_WATER_IDLE = 0xB2
 
+# Retargeted onto Mario's skeleton from the mesh2motion animation library by
+# tools/retarget_anim.py, which is also where the clip names come from.
+ANIM_ZOMBIE_WALK = "zombie_walk"
+ANIM_ZOMBIE_IDLE = "zombie_idle"
+
+# Authored rather than borrowed, by tools/author_skate.py -- nothing in the
+# mesh2motion library skates.
+ANIM_SKATE_STRIDE = "skate_stride"
+ANIM_SKATE_GLIDE = "skate_glide"
+
 
 def anim_name(anim_id):
     """Clip name in the exported glTF."""
+    if isinstance(anim_id, str):
+        return f"anim_{anim_id}"
     return f"anim_{anim_id:02X}"
 
 
@@ -95,6 +111,11 @@ def _ground_pound(m):
     return ANIM_START_GROUND_POUND if m.action_state == 0 else ANIM_GROUND_POUND
 
 
+def _skating(m):
+    """Pushing or coasting, which is what the action already tracks."""
+    return ANIM_SKATE_STRIDE if m.action_state else ANIM_SKATE_GLIDE
+
+
 ACTION_ANIMATIONS = {
     # stationary
     C.ACT_IDLE: ANIM_IDLE_HEAD_CENTER,
@@ -113,6 +134,7 @@ ACTION_ANIMATIONS = {
     C.ACT_TURNING_AROUND: ANIM_TURNING_PART1,
     C.ACT_FINISH_TURNING_AROUND: ANIM_TURNING_PART2,
     C.ACT_CRAWLING: ANIM_CRAWLING,
+    C.ACT_SKATING: _skating,
     C.ACT_BUTT_SLIDE: ANIM_SLIDE,
     C.ACT_STOMACH_SLIDE: ANIM_DIVE,
     C.ACT_DIVE_SLIDE: ANIM_DIVE,
@@ -168,6 +190,28 @@ ACTION_ANIMATIONS = {
     C.ACT_WATER_JUMP: ANIM_FALL_FROM_WATER,
 }
 
+# What holding the zombie key replaces, and nothing else.
+#
+# Only the actions that keep Mario upright on the ground are covered. Jumping,
+# diving and swimming are left alone deliberately: there is no zombie clip for
+# any of them, and the alternative to leaving them be is a shamble that drops
+# out the moment he leaves the floor and comes back when he lands.
+#
+# Turning around is in here because it is what walking passes through to
+# reverse. Without it the shamble flickers back to Mario's own turn clip for
+# the few frames that takes.
+ZOMBIE_ANIMATIONS = {
+    C.ACT_IDLE: ANIM_ZOMBIE_IDLE,
+    C.ACT_BRAKING_STOP: ANIM_ZOMBIE_IDLE,
+
+    C.ACT_WALKING: ANIM_ZOMBIE_WALK,
+    C.ACT_DECELERATING: ANIM_ZOMBIE_WALK,
+    C.ACT_BRAKING: ANIM_ZOMBIE_WALK,
+    C.ACT_TURNING_AROUND: ANIM_ZOMBIE_WALK,
+    C.ACT_FINISH_TURNING_AROUND: ANIM_ZOMBIE_WALK,
+}
+
+
 # Clips that should hold on their last frame rather than repeat.
 NON_LOOPING = {
     ANIM_SINGLE_JUMP, ANIM_DOUBLE_JUMP_RISE, ANIM_DOUBLE_JUMP_FALL,
@@ -211,6 +255,18 @@ SPEED_SCALED = {
     ANIM_TIPTOE: 1.0,
     ANIM_WALKING: 4.0,
     ANIM_RUNNING: 4.0,
+    # Chosen so one shamble cycle takes as long as one walk cycle at the same
+    # speed: 4 * 77/40, the walk's divisor scaled by the ratio of clip
+    # lengths. Any other number makes the feet slide worse than Mario's own
+    # walk does, and matching his walk is the most that is available -- the
+    # retargeted clip is a fixed stride and the walk it stands in for is not.
+    ANIM_ZOMBIE_WALK: 7.7,
+    # Picked by eye rather than by stride length, and the reason is the point
+    # of the thing: a blade slides. Matching the clip's foot travel to the
+    # ground he covers -- which is what keeps a walk cycle honest -- would
+    # have the stride blurring past at skating speed. This is roughly a cycle
+    # every three quarters of a second at a cruise.
+    ANIM_SKATE_STRIDE: 12.0,
 }
 
 # Slowest an animation is allowed to crawl along at.
@@ -294,7 +350,24 @@ STEP_FRAMES = {
     ANIM_TIPTOE: (14, 72),
     ANIM_START_TIPTOE: (7, 22),
     ANIM_CRAWLING: (26, 79),
+    # Not the decomp's numbers, since the clip is not the decomp's. These are
+    # the frames tools/retarget_anim.py measured each ankle reaching furthest
+    # forward, which is where the foot comes down.
+    ANIM_ZOMBIE_WALK: (0, 19),
 }
+
+
+def action_anim(m):
+    """The clip the current action calls for.
+
+    Every read of the table goes through here, so the zombie substitution
+    cannot end up applied to what is drawn but not to the footfall timing or
+    the clip length actions measure themselves against.
+    """
+    if m.controller.zombie and m.action in ZOMBIE_ANIMATIONS:
+        return ZOMBIE_ANIMATIONS[m.action]
+    entry = ACTION_ANIMATIONS.get(m.action, ANIM_A_POSE)
+    return entry(m) if callable(entry) else entry
 
 
 def advance_frame(m):
@@ -304,16 +377,15 @@ def advance_frame(m):
     renderer, so footfalls stay in step with the clip whether or not anything
     is being drawn.
     """
-    entry = ACTION_ANIMATIONS.get(m.action, ANIM_A_POSE)
-    anim_id = entry(m) if callable(entry) else entry
+    anim = action_anim(m)
 
-    steps = STEP_FRAMES.get(anim_id)
-    length = frame_count(anim_name(anim_id))
+    steps = STEP_FRAMES.get(anim)
+    length = frame_count(anim_name(anim))
     if steps is None or length <= 0:
         m.anim_frame = 0.0
         return False
 
-    rate = play_rate(m, anim_id)
+    rate = play_rate(m, anim)
     previous = m.anim_frame
     current = previous + rate
     m.anim_frame = current % length
@@ -336,9 +408,7 @@ def action_frame_count(m):
     Returns 0 when no metadata has been loaded, which makes such an action end
     immediately rather than hang.
     """
-    entry = ACTION_ANIMATIONS.get(m.action, ANIM_A_POSE)
-    anim_id = entry(m) if callable(entry) else entry
-    return frame_count(anim_name(anim_id))
+    return frame_count(anim_name(action_anim(m)))
 
 
 def resolve(m):
@@ -350,8 +420,5 @@ def resolve(m):
     if m.action == C.ACT_FLUTTER_KICK and m.forward_vel >= FLUTTER_KICK_ANIM_SPEED:
         return None
 
-    entry = ACTION_ANIMATIONS.get(m.action, ANIM_A_POSE)
-    anim_id = entry(m) if callable(entry) else entry
-    return (anim_name(anim_id),
-            anim_id not in NON_LOOPING,
-            play_rate(m, anim_id))
+    anim = action_anim(m)
+    return (anim_name(anim), anim not in NON_LOOPING, play_rate(m, anim))

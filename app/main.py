@@ -9,6 +9,8 @@ Controls:
     Space                     A -- jump
     Left Shift                B -- punch / dive
     Left Ctrl                 Z -- crouch / ground pound / long jump
+    Z (held)                  shamble like a zombie
+    C                         put the skates on, and take them off again
     Q / E or mouse drag       swing the camera
     R                         re-centre the camera behind Mario
     F3                        toggle the collision overlay
@@ -331,6 +333,9 @@ class Game(ShowBase):
             ("arrow_up", "up"), ("arrow_down", "down"),
             ("arrow_left", "left"), ("arrow_right", "right"),
             ("space", "a"), ("lshift", "b"), ("lcontrol", "z"),
+            # The N64 Z trigger is on left control, so the Z key itself is
+            # free -- and it is the obvious one to put the zombie on.
+            ("z", "zombie"),
             ("q", "cam_left"), ("e", "cam_right"),
             ("r", "cam_center"),
         ]
@@ -338,6 +343,12 @@ class Game(ShowBase):
             self.keys.setdefault(name, False)
             self.accept(key, self._set_key, [name, True])
             self.accept(f"{key}-up", self._set_key, [name, False])
+
+        # The skates are the one control that latches. Holding a key to stay
+        # on ice would mean never letting go, since the whole level is the
+        # rink.
+        self._skating = False
+        self.accept("c", self._toggle_skating)
 
         self.accept("escape", sys.exit)
         self.accept("f1", self._toggle_debug)
@@ -357,6 +368,9 @@ class Game(ShowBase):
 
     def _set_dragging(self, value):
         self._dragging = value
+
+    def _toggle_skating(self):
+        self._skating = not self._skating
 
     def _toggle_debug(self):
         self._show_debug = not self._show_debug
@@ -437,6 +451,12 @@ class Game(ShowBase):
         if self.keys["z"]:
             buttons |= C.Z_TRIG
         self.controller.set_buttons(buttons)
+
+        # Purely a costume: the action code never reads it, so Mario walks and
+        # jumps exactly as he always did while it is held.
+        self.controller.zombie = self.keys["zombie"]
+        # The skates are not a costume -- this one drives an action.
+        self.controller.skating = self._skating
 
     # -- loop ----------------------------------------------------------------
 
@@ -559,7 +579,8 @@ class Game(ShowBase):
             f"   hits {self.interactions.hits_taken}\n"
             f"fps      {self.clock.get_average_frame_rate():5.1f}\n"
             f"\nWASD move   Space jump   Shift dive   Ctrl crouch\n"
-            f"Q/E camera  R recentre    F3 collision  F1 hud"
+            f"Z zombie    C skates{' ON ' if self._skating else '    '}"
+            f"  Q/E camera  R recentre  F3 collision  F1 hud"
         )
 
 

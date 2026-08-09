@@ -70,6 +70,13 @@ python3 tools/parse_f3d.py reference/Render96ex/levels/castle_grounds 1 \
 python3 tools/export_actor_gltf.py --actor mario --anims all \
     -o assets/mario/mario.glb
 
+# Clips that are not the decomp's. These append to the .glb the line above
+# writes, so they have to run after it, and they have to run *again* whenever
+# that line does -- a fresh export has no idea they ever existed.
+python3 tools/retarget_anim.py --clip Zombie_Walk:zombie_walk \
+    --clip Zombie_Idle:zombie_idle
+python3 tools/author_skate.py
+
 python3 tools/import_sounds.py
 ```
 
@@ -81,6 +88,8 @@ python3 tools/import_sounds.py
 | `Space` | A — jump |
 | `Left Shift` | B — punch, dive |
 | `Left Ctrl` | Z — crouch, ground pound, long jump |
+| `Z` (held) | shamble like a zombie |
+| `C` | put the skates on, and take them off again |
 | `Q` `E` / mouse drag | swing the camera |
 | `R` | re-centre the camera behind Mario |
 | `F3` | toggle the collision overlay |
@@ -112,6 +121,9 @@ tools/
   sm64_anim.py           animation tables -> per-frame joint rotations
   glb.py                 minimal glTF 2.0 / GLB writer
   export_actor_gltf.py   actor -> rigged, animated .glb
+  rig.py                 posing Mario's skeleton from outside the decomp data
+  retarget_anim.py       another rig's animation -> a clip on Mario's skeleton
+  author_skate.py        the ice-skating cycle, written rather than borrowed
   import_sounds.py       extracted AIFF samples -> assets/sounds/*.wav
   workbench.py           look at / measure one asset, interactively or headless
   check_anim_grounding.py  grounded actions keep their feet on the floor
@@ -299,6 +311,111 @@ animates nothing.
 The app maps 48 actions onto 33 clips (`sm64py/mario/animations.py`), including
 the speed-dependent tiptoe/walk/run split and the rise/fall halves of a double
 jump.
+
+## Borrowing animations from another rig
+
+`tools/retarget_anim.py` puts a clip authored on somebody else's skeleton onto
+Mario's. It is what the zombie shamble on the `Z` key is: `Zombie_Walk` and
+`Zombie_Idle` out of `reference/mesh2motion-app`, which ships a CC0 humanoid
+library on a rig with proper T-pose bind.
+
+The usual way to do this — take each bone's world-space rotation relative to
+its rig's rest pose, and apply that delta to the other rig — is unavailable
+here, for the reason two sections up: **Mario's rest pose is meaningless**. The
+bind pose is not a pose. Every joint is written with an identity rotation and
+its offset along local +X, so unposed Mario is a stack of parts all pointing
+the same way, and a delta measured against that means nothing.
+
+What makes it work is that Mario has an A-pose *clip* — `MARIO_ANIM_A_POSE`,
+`0x0E` — a real, untwisted, upright pose. Reading each joint's world rotation
+there recovers the one fact the bind pose withholds: how that joint's local
+axes sit relative to the body. Every SM64 joint puts its bone on local +X, but
+the roll about that axis is per-joint and mirrored between the left and right
+limbs, and only the A-pose measures it. Both rigs are then reduced to the same
+body-relative terms — bone direction, plus a forward reference projected
+perpendicular to it — and the transfer is absolute rather than relative, so the
+two skeletons' rest postures never have to agree.
+
+Some notes on what that does and does not buy:
+
+**Proportions do not transfer, and cannot.** Bone *directions* are copied;
+lengths stay Mario's. His legs are shorter and his thigh/shin ratio is inverted
+against the source's, so a bent-knee pose that reaches the floor on the human
+does not reach it on Mario. The clip is dropped to sit at the same average
+clearance as `MARIO_ANIM_WALKING` rather than pinned so nothing ever
+penetrates: the decomp's own walk swings between seven units through the floor
+and six above it, so pinning the worst frame is what would look wrong.
+
+**The head reads louder than it does on a human.** The source droops its head
+54° forward. On the mannequin that is a slouch; on Mario, whose head is a third
+of his height, it is the whole silhouette. This is faithful, not broken —
+rendering the source rig beside it is how to tell the difference, and worth
+doing before adjusting anything.
+
+**Clips that are not the decomp's have no number.** Their id is their name, so
+`anim_zombie_walk` sits in the same tables as `anim_48` and `anim_C5`, and
+`animations.anim_name` handles either. The tool appends to `mario.glb` and
+updates the `_clips.json` sidecar, replacing a clip of the same name, so it is
+safe to re-run. It is not safe to *skip*: re-exporting Mario from the decomp
+rewrites the `.glb` and drops every borrowed clip.
+
+## Ice skating
+
+`C` puts the skates on and takes them off again. It latches rather than being
+held, because the whole level is the rink.
+
+**The physics is SM64's, with one piece added.** `update_sliding` already *is*
+the game's ice — momentum that keeps going, a friction that barely bites, and
+steering that rotates the velocity vector rather than the body, so a turn costs
+distance instead of speed. All of it reads the floor *class* rather than the
+surface type, so `MarioState.get_floor_class` reporting very-slippery while
+`ACT_SKATING` is running is the whole of what makes the ground icy: the 10.0
+sliding acceleration, the 0.98 retained per frame, the 5.3 slope acceleration
+and the tightened slope thresholds all follow from that one override. The
+decomp plays the same trick in the other direction for crawling, a few lines
+below.
+
+What SM64 has no equivalent of is the **push**. Nothing in the game makes a
+sliding Mario go faster on the flat, because a slide is something that happens
+to him — he is always either falling down a hill or bleeding off speed he
+already had. A skater is the one supplying the speed, so that is the piece that
+had to be written: `SKATE_PUSH` per tick at full stick, up to `SKATE_TOP_SPEED`
+of 44, against a running top speed of 32. Skates that were slower than his own
+legs would be a downgrade.
+
+Panda3D was the other option offered and is the wrong one. What it has is
+`panda3d.bullet`, a rigid-body engine — using it here would mean replacing the
+30 Hz action state machine that every constant in this port is written against,
+to get a worse-feeling version of code the port already contains.
+
+Things that follow from reusing the sliding path, rather than being decided:
+a wall bounces him back at half speed instead of stopping him dead; a jump
+leaves `ACT_SKATING` and lands back in it; and he cannot climb a steep hill,
+because very-slippery slope deceleration takes 45 units of speed off him in
+five frames on the 68° bank behind the castle, and then he slides back down it.
+
+**The animation is authored, not borrowed.** The mesh2motion library has no
+skating clip — the nearest are a slide and a sprint — so `tools/author_skate.py`
+writes one, using the same A-pose joint constants `rig.py` gives the retargeter.
+The stride is stated as blade positions rather than joint angles: the blade goes
+down under the hip, travels out to the side and back as the body glides over it,
+lifts, and swings in and forward to land again. Two-bone IK solves the knee, so
+the blade lands where it was asked to and the leg bends however Mario's leg has
+to bend to reach.
+
+The arms are aimed directly instead, because IK was the wrong tool for them.
+His arms are 31 units against 39 for his legs, so hand positions that look right
+for a skater are mostly places he cannot reach, and the solver clamps to a pose
+nobody chose. Two bones aimed by angle have no unreachable case.
+
+Two clips come out: `skate_stride` for pushing and `skate_glide` for coasting,
+picked by whether there is anything on the stick. The stride's play rate is
+picked by eye rather than by stride length, which is the one place these clips
+differ from the walk cycles — matching foot travel to ground covered is what
+keeps a walk honest, and a blade is the one foot that is *supposed* to slide.
+
+There is no skating sound. The port's sound bank is keyed to decomp sound ids
+and there is no blade sample to point one at.
 
 ## Verified behaviour
 

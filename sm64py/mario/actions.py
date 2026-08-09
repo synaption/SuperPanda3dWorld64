@@ -114,6 +114,11 @@ def _set_action_moving(m, act, action_arg):
         if floor_class != C.SURFACE_CLASS_VERY_SLIPPERY:
             if 0.0 <= m.forward_vel < mag:
                 m.forward_vel = mag
+    elif act == C.ACT_SKATING:
+        # Whatever he was already doing becomes the glide he starts from, so
+        # the skates go on without a jolt at either end.
+        m.set_forward_vel(m.forward_vel)
+        m.slide_yaw = m.face_angle[1]
     elif act == C.ACT_BEGIN_SLIDING:
         act = C.ACT_BUTT_SLIDE if m.facing_downhill(False) else C.ACT_STOMACH_SLIDE
 
@@ -693,6 +698,14 @@ def act_crawling(m):
     return False
 
 
+def bounce_off_wall(m):
+    """Reflect Mario's facing in a wall and send him back at half speed."""
+    if m.wall is not None:
+        wall_angle = m.wall.yaw
+        m.face_angle[1] = s16(wall_angle - s16(m.face_angle[1] - wall_angle))
+    m.set_forward_vel(-m.forward_vel * 0.5)
+
+
 def _common_slide_action(m, stop_action, air_action):
     if m.input & C.INPUT_OFF_FLOOR:
         return set_mario_action(m, air_action, 0)
@@ -705,11 +718,7 @@ def _common_slide_action(m, stop_action, air_action):
     if result == C.GROUND_STEP_LEFT_GROUND:
         return set_mario_action(m, air_action, 0)
     if result == C.GROUND_STEP_HIT_WALL:
-        # Bounce off the wall and keep sliding.
-        if m.wall is not None:
-            wall_angle = m.wall.yaw
-            m.face_angle[1] = s16(wall_angle - s16(m.face_angle[1] - wall_angle))
-        m.set_forward_vel(-m.forward_vel * 0.5)
+        bounce_off_wall(m)
 
     if stopped and not (m.input & C.INPUT_NONZERO_ANALOG):
         return set_mario_action(m, stop_action, 0)
@@ -729,6 +738,85 @@ def act_stomach_slide(m):
 @action(C.ACT_DIVE_SLIDE, "dive_slide")
 def act_dive_slide(m):
     return _common_slide_action(m, C.ACT_IDLE, C.ACT_FREEFALL)
+
+
+# -- skating ----------------------------------------------------------------
+#
+# Not a decomp action, but it is built out of decomp parts. `update_sliding`
+# *is* SM64's ice: momentum that keeps going, a friction that barely bites,
+# and steering that rotates the velocity vector rather than the body, so
+# turning costs distance instead of speed. Overriding the floor class to
+# very-slippery (see MarioState.get_floor_class) is what hands it the numbers
+# ice would have had -- 10.0 acceleration, 0.98 retained per frame.
+#
+# What SM64 has no equivalent of is the push. Nothing in the game makes a
+# sliding Mario go faster on the flat, because a slide is something that
+# happens to him: he is always either falling down a hill or bleeding off
+# speed he already had. A skater is the one supplying the speed, so that is
+# the piece that had to be written rather than reused.
+
+# Speed added per tick at full stick, and the speed that eventually buys.
+# Deliberately above his running top speed of 32: skates that are slower than
+# his own legs would be a downgrade.
+SKATE_PUSH = 1.15
+SKATE_TOP_SPEED = 44.0
+
+# Below this, with nothing on the stick, he has come to rest. Applied only
+# while coasting -- a push starts below it by definition, and checking it
+# regardless is a Mario who can never get going.
+SKATE_STOP_SPEED = 2.0
+
+
+@action(C.ACT_SKATING, "skating")
+def act_skating(m):
+    if m.input & C.INPUT_OFF_FLOOR:
+        return set_mario_action(m, C.ACT_FREEFALL, 0)
+    if m.input & C.INPUT_A_PRESSED:
+        return set_jumping_action(m, C.ACT_JUMP, 0)
+    if not m.controller.skating:
+        # Skates off. Hand back whatever speed he had rather than dropping it,
+        # so stepping off the ice at pace carries into a run.
+        return set_mario_action(
+            m, C.ACT_WALKING if m.forward_vel > 0.0 else C.ACT_IDLE, 0)
+
+    # Pushing or coasting. The two skating clips differ by nothing else, and
+    # neither does the physics.
+    m.action_state = 1 if m.intended_mag > 0.0 else 0
+
+    if m.action_state and m.forward_vel < SKATE_TOP_SPEED:
+        push = SKATE_PUSH * (m.intended_mag / 32.0)
+        m.slide_vel_x += push * sins(m.intended_yaw)
+        m.slide_vel_z += push * coss(m.intended_yaw)
+
+    update_sliding(m, 0.0 if m.action_state else SKATE_STOP_SPEED)
+    result = perform_ground_step(m)
+
+    if result == C.GROUND_STEP_LEFT_GROUND:
+        return set_mario_action(m, C.ACT_FREEFALL, 0)
+    if result == C.GROUND_STEP_HIT_WALL:
+        # Off the boards and back down the rink, the way a slide bounces --
+        # stopping dead on a wall is the one thing that would not read as ice.
+        bounce_off_wall(m)
+    return False
+
+
+def check_skating(m):
+    """Take over whatever ground action he is in, once the skates are on.
+
+    Not a decomp transition. The skate key is a mode rather than a button, so
+    there is no action that presses its way in the way Z presses into a butt
+    slide. Airborne actions are left alone so a jump finishes as a jump, and
+    attacks and slides are left to resolve on their own -- a dive that turned
+    into a glide halfway through would just eat the input.
+    """
+    if not m.controller.skating or m.action == C.ACT_SKATING:
+        return
+    if (m.action & C.ACT_GROUP_MASK) not in (C.ACT_GROUP_STATIONARY,
+                                             C.ACT_GROUP_MOVING):
+        return
+    if m.action & (C.ACT_FLAG_BUTT_OR_STOMACH_SLIDE | C.ACT_FLAG_ATTACKING):
+        return
+    set_mario_action(m, C.ACT_SKATING, 0)
 
 
 @action(C.ACT_MOVE_PUNCHING, "move_punching")
@@ -1218,6 +1306,10 @@ def execute_action(m):
     # rather than inside every land action, since it applies to all of them.
     from .water import check_common_water_cancels
     check_common_water_cancels(m)
+
+    # Same reasoning, one layer out: the skates are a mode, so nothing presses
+    # its way into them and the check has to happen somewhere every frame.
+    check_skating(m)
 
     # An action returning True changed action and wants the new one to run
     # immediately, so transitions resolve within a single frame.

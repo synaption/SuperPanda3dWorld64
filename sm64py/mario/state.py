@@ -18,7 +18,7 @@ class Controller:
     """
 
     __slots__ = ("stick_x", "stick_y", "stick_mag", "button_down",
-                 "button_pressed", "_prev_down")
+                 "button_pressed", "_prev_down", "zombie", "skating")
 
     def __init__(self):
         self.stick_x = 0.0
@@ -27,6 +27,16 @@ class Controller:
         self.button_down = 0
         self.button_pressed = 0
         self._prev_down = 0
+        # Not an N64 button. The controller had no room for one, and the
+        # zombie shamble changes nothing the action code can see -- it swaps
+        # which clip standing and walking draw and stops there -- so it rides
+        # here rather than being folded into the button mask, where every
+        # action test would have to learn to ignore it.
+        self.zombie = False
+
+        # Skates on. Unlike the zombie this one does reach the action code --
+        # it is what ACT_SKATING stays in, and what puts ice underfoot.
+        self.skating = False
 
     def set_stick(self, x, y):
         """Feed a normalised [-1, 1] stick position, with a deadzone."""
@@ -150,6 +160,15 @@ class MarioState:
     # -- floor classification ----------------------------------------------
 
     def get_floor_class(self):
+        # Skating puts ice under him wherever he happens to be, which is the
+        # whole of what the skates do -- everything below reads the floor class
+        # rather than the surface type, so overriding it here is what makes
+        # momentum, friction, steering and slope acceleration all become the
+        # very-slippery ones the game already has. The decomp plays the same
+        # trick in the other direction for crawling, a few lines down.
+        if self.action == C.ACT_SKATING:
+            return C.SURFACE_CLASS_VERY_SLIPPERY
+
         floor_class = C.SURFACE_CLASS_DEFAULT
         if self.floor is not None:
             ftype = self.floor.type

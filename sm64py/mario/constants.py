@@ -74,6 +74,11 @@ ACT_BUTT_SLIDE = 0x00840452
 ACT_STOMACH_SLIDE = 0x008C0453
 ACT_DIVE_SLIDE = 0x00880456
 ACT_MOVE_PUNCHING = 0x00800457
+# Not a decomp action. Its id is the last slot of the moving group, which the
+# decomp leaves free -- it stops at 0x07A -- so a later port of a real action
+# cannot collide with it.
+ACT_SKATING = 0x0400047F
+
 ACT_JUMP_LAND = 0x04000470
 ACT_FREEFALL_LAND = 0x04000471
 ACT_DOUBLE_JUMP_LAND = 0x04000472
