@@ -8,6 +8,7 @@ and orientations back out of here each frame.
 from panda3d.core import LVector3d
 
 from .constants import (
+    DEFAULT_GRAVITY_MODE,
     FIXED_TIMESTEP,
     MAX_STEPS_PER_FRAME,
     PLAYER_COLLISION_RADIUS,
@@ -20,7 +21,8 @@ from .movement import InputState, SpaceMovementComponent
 
 
 class World:
-    def __init__(self, bodies=None, variables=None, planets_attract_each_other=False):
+    def __init__(self, bodies=None, variables=None, planets_attract_each_other=False,
+                 gravity_mode=DEFAULT_GRAVITY_MODE):
         self.gravity = GravityWorld(planets_attract_each_other)
         self.definitions = bodies if bodies is not None else demo_system()
 
@@ -43,6 +45,7 @@ class World:
                 position=PLAYER_START,
                 radius=PLAYER_COLLISION_RADIUS,
                 is_planet=False,
+                gravity_mode=gravity_mode,
             )
         )
         self.movement = SpaceMovementComponent(
@@ -57,7 +60,8 @@ class World:
 
     def step(self, dt):
         """Advance one fixed step: input forces first, then integration."""
-        self.movement.update(self.input, dt)
+        ground_body, ground_normal = self.player.find_ground(self.gravity.bodies)
+        self.movement.update(self.input, dt, ground_body, ground_normal)
         # Mouse motion is a displacement already spent, not a held state, so
         # it must not be re-applied if several fixed steps run in one frame.
         self.input.look_impulse = (0.0, 0.0)
@@ -80,6 +84,16 @@ class World:
         if self._accumulator > FIXED_TIMESTEP * MAX_STEPS_PER_FRAME:
             self._accumulator = 0.0
         return steps
+
+    # -- gravity sourcing --------------------------------------------------
+
+    @property
+    def gravity_mode(self):
+        return self.player.gravity_mode
+
+    @gravity_mode.setter
+    def gravity_mode(self, mode):
+        self.player.gravity_mode = mode
 
     # -- queries for the HUD ----------------------------------------------
 

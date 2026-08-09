@@ -358,6 +358,30 @@ class MarioState:
         if self.squish_timer != 0 or self.quicksand_depth > 1.0:
             self.vel[1] *= 0.5
 
+    # -- how an enemy touch lands -------------------------------------------
+    #
+    # Reached from sm64py/objects.py, which resolves the player against every
+    # enemy and needs to put him into a reaction. It used to name Mario's
+    # actions directly; it cannot any more, because the Hero is playable and
+    # his machine has never heard of ACT_BACKWARD_AIR_KB. Naming the *reaction*
+    # rather than the action leaves each character to answer in its own
+    # vocabulary, and leaves Mario's answer exactly what it was.
+
+    def bounce_off_enemy(self, velocity):
+        from .actions import set_mario_action
+        # Action first, velocity second: entering an airborne action sets
+        # vel[1] itself, so assigning the bounce before the transition just
+        # gets overwritten.
+        set_mario_action(self, C.ACT_JUMP, 0)
+        self.vel[1] = velocity
+
+    def take_enemy_hit(self, away_yaw, speed, velocity):
+        from .actions import set_mario_action
+        self.face_angle[1] = away_yaw
+        self.set_forward_vel(-speed)
+        self.vel[1] = velocity
+        set_mario_action(self, C.ACT_BACKWARD_AIR_KB, 0)
+
     def sync_graphics(self):
         self.gfx_pos = list(self.pos)
         # On land only the yaw is drawn: Mario stays upright however steep the

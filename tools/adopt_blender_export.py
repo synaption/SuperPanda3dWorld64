@@ -1,8 +1,8 @@
-"""Make a Blender-exported mario.glb loadable by Panda3D, and resync the sidecar.
+"""Make a Blender-exported .glb loadable by Panda3D, and resync the sidecar.
 
 Blender's glTF exporter is not a faithful round trip of what
-tools/export_actor_gltf.py writes. Two differences break the game, and both
-are silent -- the file loads, and Mario is simply wrong on screen:
+tools/export_actor_gltf.py writes. Three differences break the game, and all
+of them are silent -- the file loads, and the actor is simply wrong on screen:
 
 **The mesh comes back as a sibling of the skeleton.** The exporter wraps
 everything in a new node and hangs the skinned mesh and the joint root off it
@@ -18,6 +18,14 @@ clip. The sidecar's `start_frame` values cannot be recovered from a .glb at all
 -- they come from the decomp's animation headers, and eighteen clips have a
 non-zero one -- so they are carried across from the previous sidecar rather
 than regenerated.
+
+**A material lit through an Emission node exports as emissive-only.** Blender
+writes the texture as `emissiveTexture` and leaves `baseColorFactor` black,
+which is faithful to the shader graph and useless to a game that lights its
+actors: the albedo is gone, and the model renders as a flat silhouette. The
+Hero's single "Atlas Hero" material is built this way. Where a material has an
+emissive texture and a black base colour, the texture is moved to
+`baseColorTexture` so it takes light like everything else in the level.
 
 Usage:
     python3 tools/adopt_blender_export.py /mnt/c/Users/.../mario_export.glb \\
@@ -35,6 +43,8 @@ sys.path.insert(0, HERE)
 import rig  # noqa: E402
 
 # The node the decomp exporter parents both the joints and the mesh to.
+# Other actors name theirs differently -- the Hero's is `rig`, straight out of
+# Rigify -- so this is only the default.
 SKELETON_ROOT = "armature"
 
 
@@ -42,11 +52,11 @@ def mesh_nodes(gltf):
     return [i for i, n in enumerate(gltf.json["nodes"]) if "mesh" in n]
 
 
-def reparent_mesh(gltf):
+def reparent_mesh(gltf, skeleton_root=SKELETON_ROOT):
     """Put the skinned mesh back under the skeleton root."""
-    if SKELETON_ROOT not in gltf.index:
-        raise KeyError(f"no {SKELETON_ROOT!r} node -- is this a mario export?")
-    skeleton = gltf.index[SKELETON_ROOT]
+    if skeleton_root not in gltf.index:
+        raise KeyError(f"no {skeleton_root!r} node -- wrong --skeleton-root?")
+    skeleton = gltf.index[skeleton_root]
 
     moved = []
     for mesh in mesh_nodes(gltf):
@@ -64,6 +74,42 @@ def reparent_mesh(gltf):
     return moved
 
 
+def unemit_materials(gltf):
+    """Move an emissive-only texture back to base colour.
+
+    Confined to the case that is unambiguously a shader-graph artefact: a
+    material carrying an emissive texture whose base colour is black and which
+    has no base colour texture of its own. A material that is emissive *and*
+    textured is left alone -- there the emission was meant.
+    """
+    fixed = []
+    for material in gltf.json.get("materials", []):
+        emissive = material.get("emissiveTexture")
+        if emissive is None:
+            continue
+        pbr = material.setdefault("pbrMetallicRoughness", {})
+        if pbr.get("baseColorTexture") is not None:
+            continue
+        factor = pbr.get("baseColorFactor")
+        if factor is not None and any(c > 0.0 for c in factor[:3]):
+            continue
+
+        pbr["baseColorTexture"] = emissive
+        pbr["baseColorFactor"] = [1.0, 1.0, 1.0, factor[3] if factor else 1.0]
+        del material["emissiveTexture"]
+        material["emissiveFactor"] = [0.0, 0.0, 0.0]
+
+        # An emissive-only material carries no metallic/roughness, and glTF
+        # defaults both to 1.0 -- a fully metallic surface. Panda3D's
+        # fixed-function pipeline renders that as a white silhouette with the
+        # texture washed out of it, which is exactly what the Hero looked like
+        # before these were written down.
+        pbr.setdefault("metallicFactor", 0.0)
+        pbr.setdefault("roughnessFactor", 1.0)
+        fixed.append(material.get("name"))
+    return fixed
+
+
 def clip_lengths(gltf):
     """Frame count per clip, read back off the animation samplers."""
     out = {}
@@ -76,9 +122,18 @@ def clip_lengths(gltf):
 
 
 def resync_sidecar(path, lengths):
-    """Update frame counts, keeping everything a .glb cannot tell us."""
-    with open(path, "r", encoding="utf-8") as fh:
-        clips = json.load(fh)
+    """Update frame counts, keeping everything a .glb cannot tell us.
+
+    An actor being adopted for the first time has no sidecar to keep anything
+    from, and every clip is then described by the .glb alone. That is right for
+    an actor whose clips were authored in Blender rather than lifted from the
+    decomp's animation headers -- there are no lead-in frames to preserve.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            clips = json.load(fh)
+    except FileNotFoundError:
+        clips = {}
 
     changed = []
     for name, frames in sorted(lengths.items()):
@@ -103,21 +158,26 @@ def main(argv):
         os.path.dirname(HERE), "assets", "mario", "mario.glb"))
     parser.add_argument("--sidecar", default=None,
                         help="defaults to <out>_clips.json")
+    parser.add_argument("--skeleton-root", default=SKELETON_ROOT,
+                        help=f"node the mesh belongs under (default {SKELETON_ROOT})")
     args = parser.parse_args(argv[1:])
 
     sidecar = args.sidecar or os.path.splitext(args.out)[0] + "_clips.json"
 
     gltf = rig.Gltf(args.export)
-    moved = reparent_mesh(gltf)
+    moved = reparent_mesh(gltf, args.skeleton_root)
+    unemitted = unemit_materials(gltf)
     lengths = clip_lengths(gltf)
     gltf.write(args.out)
 
     changed, clips = resync_sidecar(sidecar, lengths)
 
     for name, was in moved:
-        print(f"reparented {name!r} from {was} under {SKELETON_ROOT!r}")
+        print(f"reparented {name!r} from {was} under {args.skeleton_root!r}")
     if not moved:
         print("mesh was already under the skeleton root")
+    for name in unemitted:
+        print(f"moved emissive texture to base colour on {name!r}")
     print(f"{len(lengths)} clips, {len(clips)} sidecar entries")
     for name, old, new in changed:
         print(f"  {name}: {old} -> {new} frames")

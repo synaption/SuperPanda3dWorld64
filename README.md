@@ -12,6 +12,19 @@ are swimmable, actions raise the original sound events and play real samples,
 and the level's trees stand alongside a few goombas and scuttlebugs that can be
 stomped, punched, and run away from.
 
+The character you play is now **the Hero**, a rigged model with twenty
+hand-authored clips of his own. He is not Mario in a different costume: rather
+than retarget Mario's 209 animations onto him, he has his own action machine
+(`sm64py/hero/`) built around the moves he actually has — walk, run, jump, a
+two-hit sword chain, a spin kick out of a run. What he shares with Mario is
+everything below the neck: the same level, the same collision, the same
+quarter-step movement, and the same 30 Hz tick.
+
+Mario is still here, and still runs the full decomp port. He wanders the field
+as an NPC, and **F2** hands control back to him at wherever the Hero is
+standing — which is the point of keeping him, since it makes the two movement
+systems directly comparable over the same ground.
+
 ## Running
 
 ```bash
@@ -36,9 +49,13 @@ assets/
     mesh_materials.json          45 material groups, 44 of them textured
     textures/                    the 21 PNGs those groups reference (2.9 MB)
   mario/          mario.glb + mario_clips.json   (209 animations)
+  hero/           hero.glb + hero_clips.json     (20 animations, 53 joints)
   actors/         goomba, scuttlebug, tree, each with a clips sidecar
   sounds/         57 WAVs, plus .source recording where they came from
 ```
+
+`hero.glb` is built out of Blender rather than out of the decomp, so it goes
+through a different pipeline — see "Exporting the Hero" below.
 
 The textures are copied in by `parse_f3d.py` rather than referenced in place.
 They used to point back into `reference/RENDER96-HD-TEXTURE-PACK/`, which is 12
@@ -82,18 +99,34 @@ python3 tools/import_sounds.py
 
 ### Controls
 
+As the Hero:
+
 | | |
 |---|---|
 | `W` `A` `S` `D` / arrows | analog stick (camera-relative) |
+| `Space` | jump — held longer, jumps higher |
+| `Left Shift` | attack; again mid-swing to chain the second, or while running for the spin kick |
+| `Left Ctrl` | draw or sheathe the sword |
+
+As Mario, which is the original's set, unchanged:
+
+| | |
+|---|---|
 | `Space` | A — jump |
 | `Left Shift` | B — punch, dive |
 | `Left Ctrl` | Z — crouch, ground pound, long jump |
 | `Z` (held) | shamble like a zombie |
 | `C` | put the skates on, and take them off again |
+
+Either way:
+
+| | |
+|---|---|
 | `Q` `E` / mouse drag | swing the camera |
-| `R` | re-centre the camera behind Mario |
-| `F3` | toggle the collision overlay |
+| `R` | re-centre the camera |
 | `F1` | toggle the debug readout |
+| `F2` | swap between the Hero and Mario |
+| `F3` | toggle the collision overlay |
 | `Esc` | quit |
 
 ## Layout
@@ -114,6 +147,11 @@ sm64py/
     actions.py     the action state machine
     animations.py  which animation clip each action plays
     water.py       the submerged action group
+  hero/
+    constants.py   his actions, and the numbers his movement is tuned with
+    state.py       extends MarioState, so the same steps.py moves him
+    actions.py     his action state machine -- walk, jump, sword chain, spin kick
+    animations.py  which of his twenty clips each action plays
 tools/
   parse_collision.py     collision.inc.c -> npz
   parse_f3d.py           F3D display lists -> textured mesh + its textures
@@ -121,6 +159,9 @@ tools/
   sm64_anim.py           animation tables -> per-frame joint rotations
   glb.py                 minimal glTF 2.0 / GLB writer
   export_actor_gltf.py   actor -> rigged, animated .glb
+  export_hero_gltf.py    the Hero -> .glb, run inside Blender
+  adopt_blender_export.py  make a Blender .glb loadable by Panda3D
+  lock_root_motion.py    take the authored travel out of a clip
   rig.py                 posing Mario's skeleton from outside the decomp data
   retarget_anim.py       another rig's animation -> a clip on Mario's skeleton
   author_skate.py        the ice-skating cycle, written rather than borrowed
@@ -129,11 +170,12 @@ tools/
   check_anim_grounding.py  grounded actions keep their feet on the floor
   check_billboards.py      billboarded parts track the camera and hold width
   check_movement.py        the movement figures quoted under "Verified behaviour"
+  check_hero.py            the Hero's action machine, start to finish
   check_sound.py           why the game is silent, layer by layer
 app/main.py        the runnable game
 ```
 
-The four `check_*` scripts all run headless and print what they measured.
+The five `check_*` scripts all run headless and print what they measured.
 
 ## Notes on the port
 
@@ -311,6 +353,62 @@ animates nothing.
 The app maps 48 actions onto 33 clips (`sm64py/mario/animations.py`), including
 the speed-dependent tiptoe/walk/run split and the rise/fall halves of a double
 jump.
+
+## Exporting the Hero
+
+The Hero has no decomp behind him, so `export_actor_gltf.py` has nothing to
+work from and a three-step pipeline stands in its place. Run inside Blender,
+with the character's .blend open:
+
+```python
+exec(open("//wsl.localhost/Ubuntu/home/bob/mario/tools/export_hero_gltf.py").read())
+```
+
+then, back on this side:
+
+```bash
+python3 tools/adopt_blender_export.py assets/hero/hero_raw.glb \
+    --out assets/hero/hero.glb --sidecar assets/hero/hero_clips.json \
+    --skeleton-root rig
+python3 tools/lock_root_motion.py assets/hero/hero.glb
+```
+
+Four things about the source file make each step necessary, and every one of
+them fails *silently* — the export succeeds, the game loads it, and the
+character is quietly wrong:
+
+**The rig ships in rest position.** `pose_position` is `REST`, which makes the
+armature ignore pose evaluation altogether. The keyframes are all still there
+and visible in the dope sheet; every exported clip is the bind pose held still.
+`export_hero_gltf.py` forces it to `POSE`.
+
+**Rigify carries 240 bones, 53 of which deform.** `export_def_bones` drops the
+controls and mechanisms, which is also what gets the exported skeleton down to
+something comparable with Mario's 30 joints.
+
+**The material is lit through an Emission node.** Blender writes the texture as
+`emissiveTexture` and leaves the base colour black, and since an emissive-only
+material carries no metallic/roughness, glTF's defaults of 1.0 apply — a fully
+metallic surface, which Panda3D's fixed-function pipeline draws as a flat white
+silhouette with the texture washed out of it. `adopt_blender_export.py` moves
+the texture to `baseColorTexture` and pins metallic to 0.
+
+**The clips were authored on a stage, not on the spot.** Measured at the spine,
+`Idle` sits at the origin, the run cycles start 0.68 units forward of it, and
+`Attack 2` starts 0.83 forward and lunges another 0.85 mid-swing — a couple of
+hundred game units. Played one after another they slide the character across
+the ground and snap him back on every transition, while the physics position
+that walls are tested against never moves. `lock_root_motion.py` shifts every
+frame so the spine sits at the horizontal origin, which removes the authored
+offset and the in-clip travel together. Height is left alone: the feet already
+sit on the origin plane, and the vertical differences between clips are real
+crouches and leaps. The attack's lunge is handed back as forward velocity in
+`sm64py/hero/actions.py`, where a wall can stop it.
+
+He is scaled on the Panda3D side (`HERO_SCALE` in `app/main.py`) rather than in
+the export, so it is one number to change instead of a re-export. 81 puts him
+at ~154 units, which is the height Mario is exported at — that is what lets the
+two share a collision radius and a jump height.
 
 ## Borrowing animations from another rig
 

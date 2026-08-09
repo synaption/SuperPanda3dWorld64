@@ -363,11 +363,17 @@ class ObjectRenderer:
     """
 
     def __init__(self, model_dir, loader, parent, coordinate_transform=to_panda,
-                 tuning=None):
+                 tuning=None, model_paths=None):
         self.model_dir = model_dir
         self.loader = loader
         self.parent = parent
         self.transform = coordinate_transform
+        # Models that do not live in model_dir, by name. The player characters
+        # are the case this exists for: Mario is an NPC now, and his .glb is
+        # 13 MB of 209 clips sitting in assets/mario/ where the game already
+        # loads it from. Copying it into assets/actors/ to satisfy a naming
+        # rule would put the same 13 MB in the repo twice.
+        self.model_paths = dict(model_paths or {})
         self._sources = {}
         self.nodes = []
         self.actors = []
@@ -376,13 +382,18 @@ class ObjectRenderer:
         # aim without editing source. See sm64py/billboard.py.
         self.tuning = tuning if tuning is not None else billboard.Tuning.load()
 
+    def _model_path(self, model):
+        """Where a model's .glb is, honouring any override given for it."""
+        return self.model_paths.get(model,
+                                    os.path.join(self.model_dir, model + ".glb"))
+
     def _static_source(self, model):
         """Load a model once, keeping it off-screen as a template to instance."""
         if model in self._sources:
             return self._sources[model]
 
         from panda3d.core import Filename
-        path = os.path.join(self.model_dir, model + ".glb")
+        path = self._model_path(model)
         node = None
         if os.path.exists(path):
             node = self.loader.load_model(
@@ -406,8 +417,8 @@ class ObjectRenderer:
         from panda3d.core import Filename
         from direct.actor.Actor import Actor
 
-        path = os.path.join(self.model_dir, obj.model + ".glb")
-        if not os.path.exists(path):
+        path = self._model_path(obj.model)
+        if path is None or not os.path.exists(path):
             return None
 
         holder = self.parent.attach_new_node(f"{obj.model}_{index}")
@@ -418,9 +429,13 @@ class ObjectRenderer:
             use_linear_textures(actor)
             use_mipmaps(actor)
             actor.reparent_to(holder)
-            actor.loop(clips[0])
-            actor.set_play_rate(getattr(obj, "anim_rate", 1.0), clips[0])
-            self.actors.append((obj, actor, clips[0]))
+            # An object that names a clip gets it; one that does not gets
+            # whatever came first, which is all a single-clip enemy needs.
+            wanted = getattr(obj, "anim", None)
+            clip = wanted if wanted in clips else clips[0]
+            actor.loop(clip)
+            actor.set_play_rate(getattr(obj, "anim_rate", 1.0), clip)
+            self.actors.append([obj, actor, clip])
             if self._claim_billboards(obj, actor):
                 # Billboard quads are single-sided, so once one is turned to
                 # face the camera it is invisible from half of every orbit --
@@ -475,8 +490,15 @@ class ObjectRenderer:
             node.set_pos(*self.transform(*obj.draw_pos))
             node.set_h(s16_to_degrees(obj.draw_yaw))
 
-        # Walk cycles keep pace with how fast the object is actually moving.
-        for obj, actor, clip in self.actors:
+        # Walk cycles keep pace with how fast the object is actually moving,
+        # and an object that changes which clip it wants gets switched over.
+        for entry in self.actors:
+            obj, actor, clip = entry
+            wanted = getattr(obj, "anim", None)
+            if wanted is not None and wanted != clip \
+                    and actor.get_anim_control(wanted) is not None:
+                actor.loop(wanted)
+                entry[2] = clip = wanted
             actor.set_play_rate(getattr(obj, "anim_rate", 1.0), clip)
 
         self._aim_billboards(camera_pos)

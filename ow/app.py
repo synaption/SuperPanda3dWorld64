@@ -17,7 +17,7 @@ from panda3d.core import (
     loadPrcFileData,
 )
 
-from .constants import CharacterVariables
+from .constants import GRAVITY_ALL, GRAVITY_NEAREST, CharacterVariables
 from .geometry import make_sphere, make_starfield
 from .world import World
 
@@ -150,6 +150,7 @@ class OuterWildsApp(ShowBase):
         self.accept("f1", self._toggle_hud)
         self.accept("f2", self._toggle_zero_g)
         self.accept("f3", self._toggle_planet_attraction)
+        self.accept("f4", self._toggle_gravity_mode)
         self.accept("r", self._recentre_camera)
         self.accept("mouse1", self._capture_mouse, [True])
 
@@ -173,6 +174,11 @@ class OuterWildsApp(ShowBase):
     def _toggle_planet_attraction(self):
         self.world.gravity.planets_attract_each_other = (
             not self.world.gravity.planets_attract_each_other
+        )
+
+    def _toggle_gravity_mode(self):
+        self.world.gravity_mode = (
+            GRAVITY_ALL if self.world.gravity_mode == GRAVITY_NEAREST else GRAVITY_NEAREST
         )
 
     def _recentre_camera(self):
@@ -278,19 +284,32 @@ class OuterWildsApp(ShowBase):
         # Gravity only -- acceleration would fold in jetpack thrust.
         pull = world.player.gravity_force.length() / (world.player.mass_self or 1.0) / 100.0
 
+        grounded = movement.grounded
         lines = [
+            "mode       {}".format(
+                "ON FOOT -- {}".format(movement.ground_body.name)
+                if grounded else "flying"),
             "speed      {:8.1f} m/s".format(speed_ms),
             "nearest    {:>8}  {:.0f} m".format(nearest.name if nearest else "-", gap_m),
-            "gravity    {:8.2f} m/s^2".format(pull),
-            "roll       {}".format("ON" if movement.is_rolling else "off"),
+            "gravity    {:8.2f} m/s^2  ({})".format(
+                pull, "nearest body" if world.gravity_mode == GRAVITY_NEAREST
+                else "all bodies, as shipped"),
             "zero-g     {}".format("on" if world.player.is_zero_g else "OFF"),
             "n-body     {}".format(
                 "planets attract" if world.gravity.planets_attract_each_other
                 else "planets static (as shipped)"
             ),
             "",
-            "WASD thrust   space/ctrl up-down   shift brake",
-            "mouse look    Q+mouse roll         R recentre view",
-            "F1 hud  F2 zero-g  F3 n-body  Esc release mouse",
         ]
+        if grounded:
+            lines += [
+                "WASD walk     space jump            mouse look",
+                "F1 hud  F2 zero-g  F3 n-body  F4 gravity  Esc release mouse",
+            ]
+        else:
+            lines += [
+                "WASD thrust   space/ctrl up-down   shift brake",
+                "mouse look    Q+mouse roll         R recentre view",
+                "F1 hud  F2 zero-g  F3 n-body  F4 gravity  Esc release mouse",
+            ]
         self.hud.setText("\n".join(lines))

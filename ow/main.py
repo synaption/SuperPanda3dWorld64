@@ -31,9 +31,15 @@ def selftest():
 
     from panda3d.core import LVector3d
 
-    from .constants import FIXED_TIMESTEP, GRAVITY_CONSTANT
+    from .constants import (
+        FIXED_TIMESTEP,
+        GRAVITY_ALL,
+        GRAVITY_CONSTANT,
+        GROUND_TOLERANCE,
+        WALK_SPEED,
+    )
     from .gravity import GravityComponent, GravityWorld, vec3d
-    from .movement import InputState
+    from .movement import InputState, vec3f
     from .world import World
 
     failures = []
@@ -195,6 +201,87 @@ def selftest():
           (sim.player.position - target.position).length() >= contact - 1e-6,
           "ended {:.1f} cm from centre".format(
               (sim.player.position - target.position).length()))
+
+    print("nearest-body gravity")
+    sim = World()
+    target = sim.planets[5]
+    up = LVector3d(0.0, 0.0, 1.0)
+    sim.player.position = target.position + up * (target.radius + sim.player.radius)
+    sim.player.accumulate_gravity(sim.gravity.bodies, False)
+    field = sim.player.gravity_force / sim.player.mass_self
+    off_axis = (field - up * field.dot(up)).length()
+    check("gravity points straight down at the surface you are on",
+          off_axis < 1e-6, "{:.3f} cm/s^2 sideways".format(off_axis))
+    # The original summed every body; that is what made surfaces unwalkable.
+    sim2 = World(gravity_mode=GRAVITY_ALL)
+    sim2.player.position = LVector3d(sim.player.position)
+    sim2.player.accumulate_gravity(sim2.gravity.bodies, False)
+    field2 = sim2.player.gravity_force / sim2.player.mass_self
+    check("summing every body does not, which is why walking needed a change",
+          (field2 - up * field2.dot(up)).length() > 100.0,
+          "{:.1f} cm/s^2 sideways".format((field2 - up * field2.dot(up)).length()))
+
+    print("walking")
+    sim = World()
+    target = sim.planets[5]
+    contact = target.radius + sim.player.radius
+    up = (sim.player.position - target.position)
+    up /= up.length()
+    sim.player.position = target.position + up * (contact + 2000.0)
+    sim.player.speed = LVector3d(0, 0, 0)
+    for _ in range(int(6.0 / FIXED_TIMESTEP)):
+        sim.step(FIXED_TIMESTEP)
+    check("you land and end up standing", sim.movement.grounded)
+    check("and come to rest rather than sliding",
+          sim.player.speed.length() < 30.0,
+          "{:.1f} cm/s".format(sim.player.speed.length()))
+
+    sim.input.clear()
+    sim.input.move = (0.0, 1.0)
+    altitudes, airborne = [], 0
+    for _ in range(int(25.0 / FIXED_TIMESTEP)):
+        sim.step(FIXED_TIMESTEP)
+        altitudes.append(
+            (sim.player.position - target.position).length() - contact)
+        if not sim.movement.grounded:
+            airborne += 1
+    check("walking holds the surface -- facing is re-flattened as it curves",
+          max(altitudes) < GROUND_TOLERANCE and airborne == 0,
+          "peak {:.2f} cm, airborne on {} steps".format(max(altitudes), airborne))
+    check("and reaches walking speed",
+          abs(sim.player.speed.length() - WALK_SPEED) < WALK_SPEED * 0.05,
+          "{:.1f} vs {:.1f} cm/s".format(sim.player.speed.length(), WALK_SPEED))
+    # Feet on the ground means two things: you face along the surface, and
+    # your head tilts only by however far you are looking up or down. (Not
+    # "up == normal" -- looking down 37 degrees tilts your up by 37 degrees.)
+    normal = vec3f((sim.player.position - target.position).normalized())
+    check("facing stays in the surface's tangent plane",
+          abs(sim.movement.walk_forward.dot(normal)) < 1e-2,
+          "{:.2e} out of plane".format(sim.movement.walk_forward.dot(normal)))
+    check("head tilts only by the view pitch",
+          abs(sim.movement.arrow_quat.getUp().dot(normal)
+              - math.cos(math.radians(sim.movement.ground_pitch))) < 0.02,
+          "up.n {:.4f} vs cos(pitch) {:.4f}".format(
+              sim.movement.arrow_quat.getUp().dot(normal),
+              math.cos(math.radians(sim.movement.ground_pitch))))
+
+    sim.input.clear()
+    for _ in range(int(2.0 / FIXED_TIMESTEP)):
+        sim.step(FIXED_TIMESTEP)
+    check("letting go stops you", sim.player.speed.length() < 30.0,
+          "{:.1f} cm/s".format(sim.player.speed.length()))
+
+    sim.input.clear()
+    sim.input.up_down = 1.0
+    sim.step(FIXED_TIMESTEP)
+    sim.input.clear()
+    peak, landed = 0.0, False
+    for _ in range(int(5.0 / FIXED_TIMESTEP)):
+        sim.step(FIXED_TIMESTEP)
+        peak = max(peak, (sim.player.position - target.position).length() - contact)
+        landed = landed or sim.movement.grounded
+    check("jumping leaves the ground and comes back down",
+          peak > 50.0 and landed, "peak {:.0f} cm".format(peak))
 
     print("demo system")
     sim = World()

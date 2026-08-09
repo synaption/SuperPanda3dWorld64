@@ -20,7 +20,13 @@ import math
 
 from panda3d.core import LVector3d
 
-from .constants import COLLISION_SKIN, GRAVITY_CONSTANT
+from .constants import (
+    COLLISION_SKIN,
+    DEFAULT_GRAVITY_MODE,
+    GRAVITY_CONSTANT,
+    GRAVITY_NEAREST,
+    GROUND_TOLERANCE,
+)
 
 
 def sweep_sphere(origin, delta, centre, radius):
@@ -75,6 +81,7 @@ class GravityComponent:
         is_planet=False,
         collides=True,
         gravity_constant=GRAVITY_CONSTANT,
+        gravity_mode=DEFAULT_GRAVITY_MODE,
     ):
         self.name = name
         self.mass_self = float(mass)
@@ -88,6 +95,8 @@ class GravityComponent:
         self.collides = collides
         self.previous_position = vec3d(position)
         self.gravity_constant = gravity_constant
+        #: GRAVITY_NEAREST or GRAVITY_ALL; see gravity_sources().
+        self.gravity_mode = gravity_mode
 
         #: ListForces: everything pushing on this body this tick. Jetpack
         #: thrust lands here too, via add_force().
@@ -134,13 +143,47 @@ class GravityComponent:
         if self.is_planet and not planets_attract_each_other:
             self.gravity_force = total
             return
-        for other in bodies:
-            if other is self:
-                continue
+        for other in self.gravity_sources(bodies):
             force = self.gravitational_force_toward(other)
             self.list_forces.append(force)
             total += force
         self.gravity_force = total
+
+    def gravity_sources(self, bodies):
+        """Which bodies pull on this one.
+
+        In GRAVITY_ALL -- what the Unreal component does -- that is everything.
+        In GRAVITY_NEAREST only the closest surface pulls, so gravity always
+        points straight down at whatever you are standing on. That is the one
+        change that makes surfaces walkable; summing every body leaves the
+        field tens of degrees off vertical and slides you off.
+        """
+        others = [b for b in bodies if b is not self]
+        if self.gravity_mode != GRAVITY_NEAREST or not others:
+            return others
+        return [min(others, key=lambda b: (b.position - self.position).length() - b.radius)]
+
+    # -- standing on something ---------------------------------------------
+
+    def find_ground(self, bodies, tolerance=GROUND_TOLERANCE):
+        """The body this one is resting on, if any, with its surface normal.
+
+        A proximity test rather than a reading of the last sweep: resting
+        contact is re-established every step by gravity, and testing distance
+        keeps `grounded` from flickering off on the steps in between.
+        """
+        if not self.collides:
+            return None, None
+        for other in bodies:
+            if other is self or not other.collides or other.radius <= 0.0:
+                continue
+            offset = self.position - other.position
+            distance = offset.length()
+            if distance <= 0.0:
+                continue
+            if distance - (self.radius + other.radius) <= tolerance:
+                return other, offset / distance
+        return None, None
 
     # -- Tick --------------------------------------------------------------
 

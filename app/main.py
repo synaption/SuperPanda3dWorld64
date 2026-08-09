@@ -1,20 +1,35 @@
-"""Run Mario's movement system on the castle grounds in Panda3D.
+"""Run the Hero on the castle grounds in Panda3D, with Mario's level and physics.
+
+The Hero is the character being played; Mario is an NPC wandering the field,
+and can be switched to at any time to compare the two. They share the level,
+the collision and the 30 Hz tick, and nothing above that: the Hero runs his own
+action machine (sm64py/hero/) built around the twenty clips he actually has,
+while Mario still runs the decomp port (sm64py/mario/) and its 209.
 
 The game logic runs at a fixed 30 Hz, as the original does -- every physics
 constant in the action code is per-frame at that rate, so rendering is
 decoupled and the simulation is stepped in whole ticks.
 
-Controls:
+Controls, as the Hero:
     W / A / S / D or arrows   analog stick (camera-relative)
+    Space                     jump (held longer, jumps higher)
+    Left Shift                attack -- again mid-swing to chain the second,
+                              or while running for the spin kick
+    Left Ctrl                 draw or sheathe the sword
+
+Controls, as Mario -- the original's, unchanged:
     Space                     A -- jump
     Left Shift                B -- punch / dive
     Left Ctrl                 Z -- crouch / ground pound / long jump
     Z (held)                  shamble like a zombie
     C                         put the skates on, and take them off again
+
+Both:
     Q / E or mouse drag       swing the camera
-    R                         re-centre the camera behind Mario
-    F3                        toggle the collision overlay
+    R                         re-centre the camera
     F1                        toggle the debug readout
+    F2                        swap between the Hero and Mario
+    F3                        toggle the collision overlay
     Escape                    quit
 """
 
@@ -42,6 +57,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from sm64py import audio, objects, surfaces  # noqa: E402
 from sm64py.camera import FollowCamera  # noqa: E402
+from sm64py.hero import HeroState  # noqa: E402
+from sm64py.hero import actions as hero_actions  # noqa: E402
+from sm64py.hero import animations as hero_animations  # noqa: E402
+from sm64py.hero import constants as HC  # noqa: E402
 from sm64py.level import (  # noqa: E402
     ObjectRenderer,
     animate_water,
@@ -63,6 +82,8 @@ ASSETS = os.path.abspath(
 CASTLE_GROUNDS = os.path.join(ASSETS, "castle_grounds")
 MARIO_MODEL = os.path.join(ASSETS, "mario", "mario.glb")
 MARIO_CLIPS = os.path.join(ASSETS, "mario", "mario_clips.json")
+HERO_MODEL = os.path.join(ASSETS, "hero", "hero.glb")
+HERO_CLIPS = os.path.join(ASSETS, "hero", "hero_clips.json")
 SOUNDS = os.path.join(ASSETS, "sounds")
 ACTORS = os.path.join(ASSETS, "actors")
 LEVEL_OBJECTS = os.path.join(CASTLE_GROUNDS, "collision_objects.json")
@@ -100,6 +121,24 @@ def panda_path(path):
 # on purpose rather than something to rediscover.
 MODEL_YAW_OFFSET = 0.0
 
+# The Hero comes out of Blender at his own scale -- 1.9 units standing -- since
+# nothing in the export pipeline knows about game units. Scaled here rather
+# than baked into the .glb so it is one number to change instead of a
+# re-export. 81 puts him at ~154 units, the height Mario is exported at, which
+# is what keeps a shared collision radius and a shared jump height honest.
+HERO_SCALE = 81.0
+
+# Which way the Hero's model faces once loaded -- the same way Mario does, so
+# the same (absent) correction. Measured rather than assumed: in the exported
+# .glb his toe joints sit forward of his ankles along +Z, and +Z is the way
+# game yaw 0 points. An earlier guess of 180 here had him running backwards.
+HERO_YAW_OFFSET = 0.0
+
+# Where Mario stands about now that he is not the one being played. Out in the
+# field in front of the castle, clear of the spawn so the Hero does not start
+# inside him.
+MARIO_NPC_SPAWN = (-1750.0, 300.0, 3600.0)
+
 # The game ticks at 30 Hz; all movement constants assume it.
 TICK_RATE = 30.0
 TICK_DT = 1.0 / TICK_RATE
@@ -129,6 +168,41 @@ loadPrcFileData("", "multisamples 4")
 loadPrcFileData("", f"sync-video {os.environ.get('MARIO_VSYNC', '0')}")
 
 
+class Player:
+    """One playable character: what simulates it, and what draws it.
+
+    Two characters now run in the same level and they have nothing in common
+    below the neck -- different skeletons, different clip names, different
+    action machines, different ideas about what pressing B means. What they do
+    share is the shape of the frame: step the state, resolve a clip, draw a
+    node. That shape is all this holds, so the update loop can stay written
+    once instead of forking on which character is active.
+    """
+
+    def __init__(self, name, state, execute, anims, action_names,
+                 node, actor, yaw_offset):
+        self.name = name
+        self.state = state
+        self.execute = execute              # one tick of the action machine
+        self.anims = anims                  # module with resolve/start_frame
+        self.action_names = action_names
+        self.node = node
+        self.actor = actor
+        self.yaw_offset = yaw_offset
+        # Which clip is playing, so a change can be told from a repeat.
+        self.current_anim = None
+
+    @property
+    def action_name(self):
+        return self.action_names.get(self.state.action, hex(self.state.action))
+
+    def show(self):
+        self.node.show()
+
+    def hide(self):
+        self.node.hide()
+
+
 class Game(ShowBase):
     def __init__(self):
         ShowBase.__init__(self)
@@ -151,7 +225,12 @@ class Game(ShowBase):
         self.objects = objects.ObjectSet(self.surfaces)
         self._spawn_objects()
         self.interactions = objects.Interactions(self.objects)
-        self.object_renderer = ObjectRenderer(ACTORS, self.loader, self.render)
+        self.object_renderer = ObjectRenderer(
+            ACTORS, self.loader, self.render,
+            # Mario is an NPC now, and his model is the one the game already
+            # ships rather than a second copy under assets/actors/.
+            model_paths={"mario": MARIO_MODEL},
+        )
         drawn = self.object_renderer.build(self.objects)
         print(f"Objects: {len(self.objects.objects)} spawned, {drawn} drawn")
 
@@ -163,13 +242,8 @@ class Game(ShowBase):
         self.collision_view.hide()
 
         self.controller = Controller()
-        self.mario = MarioState(self.surfaces, self.controller)
-        self.mario.spawn(*SPAWN, SPAWN_YAW)
-
-        self._current_anim = None
-        animations.load_clip_metadata(MARIO_CLIPS)
-        self.mario_node, self.mario_actor = self._build_mario()
-        self.follow_camera = FollowCamera(self.surfaces, self.mario)
+        self._build_players()
+        self.follow_camera = FollowCamera(self.surfaces, self.state)
 
         self.camLens.set_fov(45)
         self.camLens.set_near_far(10, 30000)
@@ -199,6 +273,71 @@ class Game(ShowBase):
                 self.objects.load_special_objects(json.load(fh))
         for cls, x, y, z in ENEMY_SPAWNS:
             self.objects.spawn(cls, x, y, z)
+        self.mario_npc = self.objects.spawn(objects.Mario, *MARIO_NPC_SPAWN)
+
+    # -- players -------------------------------------------------------------
+
+    def _build_players(self):
+        """Both characters, sharing one controller and one spawn point.
+
+        Both are simulated from the same Controller instance, but only the
+        active one is stepped, so the other simply holds its last state until
+        it is switched back to.
+        """
+        hero = HeroState(self.surfaces, self.controller)
+        hero.spawn(*SPAWN, SPAWN_YAW)
+        hero_animations.load_clip_metadata(HERO_CLIPS)
+        hero_node, hero_actor = self._build_actor(
+            HERO_MODEL, HERO_YAW_OFFSET, "hero", scale=HERO_SCALE,
+            build_hint="python3 tools/export_hero_gltf.py (inside Blender)")
+
+        mario = MarioState(self.surfaces, self.controller)
+        mario.spawn(*SPAWN, SPAWN_YAW)
+        animations.load_clip_metadata(MARIO_CLIPS)
+        mario_node, mario_actor = self._build_actor(
+            MARIO_MODEL, MODEL_YAW_OFFSET, "mario",
+            build_hint="python3 tools/export_actor_gltf.py --actor mario "
+                       "--anims all -o assets/mario/mario.glb")
+
+        self.players = [
+            Player("hero", hero, hero_actions.execute_action, hero_animations,
+                   HC.ACTION_NAMES, hero_node, hero_actor, HERO_YAW_OFFSET),
+            Player("mario", mario, execute_action, animations,
+                   ACTION_NAMES, mario_node, mario_actor, MODEL_YAW_OFFSET),
+        ]
+        # The Hero is who the game is about now; Mario is switched to.
+        self.player = self.players[0]
+        self.players[1].hide()
+
+    @property
+    def state(self):
+        """The active character's simulation state."""
+        return self.player.state
+
+    def _switch_player(self):
+        """Hand control to the other character, where the current one stands.
+
+        Moving him rather than letting him keep his own position is the whole
+        point: switching is for comparing how the two move over the same
+        ground, and that is no use if they are in different parts of the level.
+        """
+        self.player.hide()
+        previous = self.player.state
+
+        self.player = self.players[1 - self.players.index(self.player)]
+        self.player.show()
+
+        state = self.player.state
+        state.spawn(previous.pos[0], previous.pos[1], previous.pos[2],
+                    s16_to_degrees(previous.face_angle[1]))
+        self.player.current_anim = None
+
+        # Mario is only an NPC while somebody else is being played; two of him
+        # standing in the same field reads as a bug rather than a cameo.
+        self.mario_npc.active = self.player.name != "mario"
+
+        self._reset_interpolation()
+        print(f"Playing as {self.player.name}")
 
     # -- scene ---------------------------------------------------------------
 
@@ -254,75 +393,79 @@ class Game(ShowBase):
         level = self.surfaces.find_water_level(x, z)
         self._apply_camera_medium(level is not None and y < level)
 
-    def _build_mario(self):
-        """Load the converted actor, or fall back to a marker if it is missing.
+    def _build_actor(self, model, yaw_offset, name, scale=1.0, build_hint=""):
+        """Load a converted actor, or fall back to a marker if it is missing.
 
-        The .glb comes out of tools/export_actor_gltf.py already at game
-        units, so no scaling is needed here.
+        Mario's .glb comes out of tools/export_actor_gltf.py already at game
+        units and so wants no scaling; the Hero's comes out of Blender at
+        Blender's scale and does. Hence the argument rather than an assumption.
         """
-        if not os.path.exists(MARIO_MODEL):
-            print(f"Mario model not found at {MARIO_MODEL}; using a marker.")
-            print("Build it with:")
-            print("  python3 tools/export_actor_gltf.py --actor mario "
-                  "--anims all -o assets/mario/mario.glb")
+        if not os.path.exists(model):
+            print(f"{name} model not found at {model}; using a marker.")
+            if build_hint:
+                print(f"Build it with:\n  {build_hint}")
             marker = self.loader.load_model("models/box")
             marker.set_scale(50, 50, 150)
             marker.set_pos(-25, -25, 0)
             marker.set_texture_off(1)
             marker.set_color(0.85, 0.20, 0.20, 1)
-            root = self.render.attach_new_node("mario")
+            root = self.render.attach_new_node(name)
             marker.reparent_to(root)
             return root, None
 
-        actor = Actor(panda_path(MARIO_MODEL))
+        actor = Actor(panda_path(model))
         use_linear_textures(actor)
         use_mipmaps(actor)
         actor.reparent_to(self.render)
         # The model faces +Y in Panda3D once loaded, while yaw 0 in the game
         # means facing +Z, which maps to -Y. Hence the half turn.
-        actor.set_h(MODEL_YAW_OFFSET)
+        actor.set_h(yaw_offset)
+        if scale != 1.0:
+            actor.set_scale(scale)
 
-        holder = self.render.attach_new_node("mario")
+        holder = self.render.attach_new_node(name)
         actor.reparent_to(holder)
         actor.set_pos(0, 0, 0)
         return holder, actor
 
     def _update_animation(self):
-        """Play whatever clip the current action calls for."""
-        if self.mario_actor is None:
+        """Play whatever clip the active character's action calls for."""
+        player = self.player
+        if player.actor is None:
             return
+        state = player.state
 
-        resolved = animations.resolve(self.mario)
+        resolved = player.anims.resolve(state)
         if resolved is None:
             # The action asked to keep whatever is already playing.
-            self.mario.anim_reset = False
+            state.anim_reset = False
             return
         name, loop, rate = resolved
 
-        if self.mario_actor.get_anim_control(name) is None:
+        if player.actor.get_anim_control(name) is None:
             # Not every action has a clip exported; keep the previous pose.
-            self.mario.anim_reset = False
+            state.anim_reset = False
             return
 
         # An action can ask for its clip to restart without the clip itself
         # changing, which is how a held swim stroke reads as one continuous
         # cycle instead of visibly retriggering.
-        restart = self.mario.anim_reset
-        self.mario.anim_reset = False
+        restart = state.anim_reset
+        state.anim_reset = False
 
-        if name != self._current_anim or restart:
-            self._current_anim = name
+        if name != player.current_anim or restart:
+            player.current_anim = name
             # Several clips carry lead-in frames the game never shows, so
             # playback starts where the animation header says it does.
-            start = animations.start_frame(name)
+            start = player.anims.start_frame(name)
             if loop:
-                self.mario_actor.loop(name, fromFrame=start)
+                player.actor.loop(name, fromFrame=start)
             else:
-                self.mario_actor.play(name, fromFrame=start)
+                player.actor.play(name, fromFrame=start)
 
         # Reapplied every frame, not just on a change: the walk and run cycles
-        # follow Mario's current speed rather than a fixed cadence.
-        self.mario_actor.set_play_rate(rate, name)
+        # follow the character's current speed rather than a fixed cadence.
+        player.actor.set_play_rate(rate, name)
 
     # -- input ---------------------------------------------------------------
 
@@ -352,6 +495,7 @@ class Game(ShowBase):
 
         self.accept("escape", sys.exit)
         self.accept("f1", self._toggle_debug)
+        self.accept("f2", self._switch_player)
         self.accept("f3", self._toggle_collision)
 
         self._dragging = False
@@ -469,27 +613,28 @@ class Game(ShowBase):
         self._accumulator += dt
         steps = 0
         while self._accumulator >= TICK_DT and steps < 8:
-            # Remember where Mario was so the render can interpolate out of it.
-            self._prev_pos = list(self.mario.gfx_pos)
-            self._prev_angle = list(self.mario.gfx_angle)
+            state = self.state
+            # Remember where he was so the render can interpolate out of it.
+            self._prev_pos = list(state.gfx_pos)
+            self._prev_angle = list(state.gfx_angle)
 
             self._poll_controller()
-            self.mario.camera_yaw = self.follow_camera.mario_yaw
-            execute_action(self.mario)
-            self.objects.update(self.mario)
+            state.camera_yaw = self.follow_camera.mario_yaw
+            self.player.execute(state)
+            self.objects.update(state)
             # After both have moved, so a stomp is judged on where they
             # actually ended up rather than where they started.
-            self.interactions.resolve(self.mario)
+            self.interactions.resolve(state)
             # Drained inside the tick loop, not after it: a frame that runs
             # two ticks would otherwise drop the first tick's sounds.
-            self.sounds.play_events(self.mario)
+            self.sounds.play_events(state)
             self._accumulator -= TICK_DT
             steps += 1
 
-            # Standing in for the death warp: if Mario loses the floor
-            # entirely he would otherwise fall forever.
-            if self.mario.floor is None or self.mario.pos[1] < DEATH_PLANE:
-                self.mario.spawn(*SPAWN, SPAWN_YAW)
+            # Standing in for the death warp: losing the floor entirely would
+            # otherwise mean falling forever.
+            if state.floor is None or state.pos[1] < DEATH_PLANE:
+                state.spawn(*SPAWN, SPAWN_YAW)
                 self._reset_interpolation()
 
         # The simulation only moves in 33 ms steps, so drawing its raw output
@@ -506,11 +651,11 @@ class Game(ShowBase):
         self.object_renderer.sync(self.follow_camera.pos)
         self._update_camera_medium()
 
-        self.mario_node.set_pos(*to_panda(*pos))
+        self.player.node.set_pos(*to_panda(*pos))
         # Panda3D takes heading, pitch, roll; the port stores pitch, yaw, roll.
-        self.mario_node.set_hpr(s16_to_degrees(angle[1]),
-                                s16_to_degrees(angle[0]),
-                                s16_to_degrees(angle[2]))
+        self.player.node.set_hpr(s16_to_degrees(angle[1]),
+                                 s16_to_degrees(angle[0]),
+                                 s16_to_degrees(angle[2]))
         self._update_animation()
 
         self._hud_timer -= dt
@@ -521,7 +666,8 @@ class Game(ShowBase):
         return task.cont
 
     def _interpolated_transform(self, alpha):
-        current = self.mario.gfx_pos
+        state = self.state
+        current = state.gfx_pos
         pos = [
             self._prev_pos[i] + (current[i] - self._prev_pos[i]) * alpha
             for i in range(3)
@@ -531,15 +677,15 @@ class Game(ShowBase):
         # crossing the angle wrap does not spin.
         angle = [
             self._prev_angle[i]
-            + s16(self.mario.gfx_angle[i] - self._prev_angle[i]) * alpha
+            + s16(state.gfx_angle[i] - self._prev_angle[i]) * alpha
             for i in range(3)
         ]
         return pos, angle
 
     def _reset_interpolation(self):
-        """Drop the blend after a teleport, so Mario does not streak across."""
-        self._prev_pos = list(self.mario.gfx_pos)
-        self._prev_angle = list(self.mario.gfx_angle)
+        """Drop the blend after a teleport, so he does not streak across."""
+        self._prev_pos = list(self.state.gfx_pos)
+        self._prev_angle = list(self.state.gfx_angle)
         self._accumulator = 0.0
 
     def _update_camera_input(self, dt):
@@ -563,25 +709,49 @@ class Game(ShowBase):
             self._mouse_anchor = None
 
     def _update_hud(self):
-        m = self.mario
-        action = ACTION_NAMES.get(m.action, hex(m.action))
+        m = self.state
+        action = self.player.action_name
         floor_type = f"0x{m.floor.type:04X}" if m.floor else "none"
 
         # DirectGUI classes keep camelCase, unlike the C++ bindings.
         self.hud.setText(
+            f"playing  {self.player.name}  (F2 to swap)\n"
             f"action   {action}  ({m.anim_name})\n"
             f"pos      {m.pos[0]:8.1f} {m.pos[1]:8.1f} {m.pos[2]:8.1f}\n"
             f"vel      fwd {m.forward_vel:6.2f}   y {m.vel[1]:7.2f}\n"
             f"yaw      {s16_to_degrees(m.face_angle[1]):7.1f} deg\n"
             f"floor    {floor_type}  height {m.floor_height:8.1f}\n"
-            f"enemies  {sum(1 for o in self.objects.objects if o.active and o.model != 'tree')} left"
+            f"enemies  {self._enemies_left()} left"
             f"   defeated {self.interactions.defeated}"
             f"   hits {self.interactions.hits_taken}\n"
             f"fps      {self.clock.get_average_frame_rate():5.1f}\n"
-            f"\nWASD move   Space jump   Shift dive   Ctrl crouch\n"
-            f"Z zombie    C skates{' ON ' if self._skating else '    '}"
-            f"  Q/E camera  R recentre  F3 collision  F1 hud"
+            f"\n{self._control_legend()}\n"
+            f"Q/E camera  R recentre  F2 swap  F3 collision  F1 hud"
         )
+
+    def _enemies_left(self):
+        """Things that can actually be fought.
+
+        Counted by type rather than by "everything that is not a tree": Mario
+        stands in the same field now, and he is scenery with opinions, not an
+        enemy.
+        """
+        return sum(1 for o in self.objects.objects
+                   if o.active and isinstance(o, (objects.Goomba,
+                                                  objects.Scuttlebug)))
+
+    def _control_legend(self):
+        """The moves the character being played actually has.
+
+        Listing Mario's while the Hero is out is worse than listing nothing:
+        the Hero has no dive, no crouch and no skates, and a legend offering
+        them reads as four broken keys.
+        """
+        if self.player.name == "hero":
+            return ("WASD move   Space jump   Shift attack (again to chain, "
+                    "running to spin)   Ctrl sword")
+        return (f"WASD move   Space jump   Shift dive   Ctrl crouch   "
+                f"Z zombie   C skates{' ON' if self._skating else ''}")
 
 
 def main():

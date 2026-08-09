@@ -14,14 +14,18 @@ python3 -m ow.main --selftest   # headless physics checks, no window needed
 
 | | |
 |---|---|
-| `W` `A` `S` `D` / arrows | jetpack thrust, along the direction arrow |
-| `Space` / `Left Ctrl` | thrust up / down |
-| `Left Shift` | brake — thrust against your current velocity |
-| mouse | look |
-| `Q` + mouse | roll instead of yaw |
-| `R` | snap the camera to where you are actually pointing |
-| `F1` / `F2` / `F3` | toggle HUD / zero-g / mutual planet gravity (see below) |
-| `Esc` | release the mouse, then quit |
+| | flying | on foot |
+|---|---|---|
+| `W` `A` `S` `D` / arrows | jetpack thrust along the direction arrow | walk across the surface |
+| `Space` | thrust up | jump |
+| `Left Ctrl` | thrust down | — |
+| `Left Shift` | brake — thrust against your velocity | — |
+| mouse | look | look (turn about the surface normal) |
+| `Q` + mouse | roll | — (the axis is needed for turning) |
+| `R` | snap camera to where you are pointing | — |
+
+`F1` HUD · `F2` zero-g · `F3` mutual planet gravity · `F4` gravity sourcing ·
+`Esc` release the mouse, then quit.
 
 The original binds only a gamepad for movement (`Gamepad_Left2D`); `Space`,
 `Left Ctrl`, `Left Shift` and the mouse are its keyboard bindings verbatim.
@@ -77,14 +81,41 @@ m/s² — the constants were tuned around that substitution, and "fixing" the
 exponent breaks the level. `--selftest` asserts the linear law so nobody
 tidies it away later.
 
-It has one consequence worth knowing before you go landing on things. **Every
-body pulls the player at once**, and with a linear falloff the distant ones
-stay significant: standing on Hearth, Hearth itself contributes 13.8 m/s² while
-four other planets and the sun add another 6 or so — leaving the net field
-**38° off the local vertical**, with a 5.9 m/s² sideways component. So planet
-surfaces are not level. You can land, but you will slide, and given long enough
-the slide throws you off. That is the model working as designed, not a bug in
-the port.
+### Walking, and why gravity had to change
+
+The original has no ground mode: you are a sphere with a jetpack, and landing
+just means resting against a collider. This port adds walking, which needed one
+change to gravity underneath it.
+
+`AC_GravityComponent` sums the pull of **every** body at once. With a linear
+falloff the distant ones stay significant, so standing on Hearth you get 13.8
+m/s² from Hearth and another ~6 from four other planets and the sun — leaving
+the net field **38° off the local vertical**, with a 5.9 m/s² sideways
+component. Surfaces are not level, so you slide, and eventually the slide
+throws you off. Walking on that is not really possible.
+
+So the default here is **nearest-body gravity**: only the closest surface pulls
+you, which puts gravity exactly along the local normal wherever you stand. `F4`
+switches back to summing every body, the way the Unreal component does — the
+HUD says which is active, and the self-test covers both.
+
+On the ground:
+
+* your feet swing round to the surface over about a third of a second, so
+  landing rights you rather than snapping;
+* mouse X turns you about the surface normal, mouse Y tilts the view only
+  (clamped to ±85°, no roll), and the direction you walk stays in the tangent
+  plane regardless of where you are looking;
+* one acceleration serves as both drive and friction, so releasing the keys
+  skids you to a stop;
+* the camera follows tightly on foot (`GROUND_CAMERA_LAG`) — `CameraLag`'s
+  0.44 s is right for drifting in space and unusable for mouse-look walking.
+
+Walking a sphere in straight tangent steps lifts you off it very slightly
+between contacts, and your facing has to be re-flattened onto the tangent plane
+every step as the ground curves away — skip that and a steady walk gently
+launches you off the planet. A full lap of Hearth holds within half a
+centimetre of the surface.
 
 ### Collision
 
@@ -146,27 +177,34 @@ Panda is right-handed, so level positions have Y negated on import.
 
 ## Deliberate differences from the original
 
-Six, all noted in the code at the point they matter:
+The first two are features you asked for and are the biggest departures; the
+rest are small corrections. All are noted in the code at the point they matter.
 
-1. **Fixed 60 Hz physics step.** The original ticks on the render frame, so
+1. **Nearest-body gravity, not the sum of every body** (`F4` restores the
+   original). Without it surfaces are 38° off level and cannot be walked on.
+2. **A walk mode**, which the original does not have at all.
+
+Then:
+
+3. **Fixed 60 Hz physics step.** The original ticks on the render frame, so
    your trajectory through the system depends on your framerate. Same
    arithmetic, stable step.
-2. **Double-precision position and velocity.** Panda's default vectors are
+4. **Double-precision position and velocity.** Panda's default vectors are
    float32; at the demo system's ~5·10⁵ cm scale that loses about a centimetre
    per component and lets momentum visibly drift. Orientation stays float32.
-3. **Braking cannot reverse your velocity.** The original applies the braking
+5. **Braking cannot reverse your velocity.** The original applies the braking
    force unclamped, so a hard stop overshoots into a slow drift backwards. The
    final frame is clamped to land exactly on zero.
-4. **Mouse look is not scaled by delta-time.** A mouse reports a displacement,
+6. **Mouse look is not scaled by delta-time.** A mouse reports a displacement,
    not a deflection, so scaling it by `dt` — as the original's shared look path
    does — turns you further at low framerates. Stick input still takes the
    dt-scaled path.
-5. **Contact cancels the inbound velocity.** Unreal leaves velocity alone on a
+7. **Contact cancels the inbound velocity.** Unreal leaves velocity alone on a
    blocking hit, so resting on a planet keeps accumulating speed into it — a
    few seconds of that and you launch when you finally thrust away. Here the
    normal component is removed on contact and the tangential part kept, so you
    settle and can still slide.
-6. **Planets are drawn at their collision radius**, not the authored 32.5. The
+8. **Planets are drawn at their collision radius**, not the authored 32.5. The
    mesh scale of 0.65 was reaching for the collider's 32 and overshot by 1.6%;
    at planet scale that is metres of mesh standing proud of the surface you
    stop on, which buries the camera inside the sphere on landing.
@@ -175,6 +213,4 @@ Six, all noted in the code at the point they matter:
 
 The demo level's static geometry and the gym level (`L_GymLevel`, with its
 accelerating/braking/spinning mannequin test rigs) are Unreal assets rather
-than logic, so the port ships the solar system only. There is no walk mode in
-the original — landing leaves you a sphere resting on a sphere, with the
-jetpack still your only means of moving.
+than logic, so the port ships the solar system only.

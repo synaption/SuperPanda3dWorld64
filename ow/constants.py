@@ -69,6 +69,40 @@ class CharacterVariables:
     roll_speed: float = 130.0
 
 
+# -- gravity sourcing ---------------------------------------------------------
+# The original sums the pull of every body at once. With the linear falloff
+# that leaves the net field tens of degrees off the local vertical on a
+# surface, so you slide. GRAVITY_NEAREST takes only the closest body, which
+# points gravity straight down wherever you stand and makes walking possible.
+GRAVITY_NEAREST = "nearest"
+GRAVITY_ALL = "all"          # what AC_GravityComponent actually does
+DEFAULT_GRAVITY_MODE = GRAVITY_NEAREST
+
+
+# -- walking ------------------------------------------------------------------
+#: Top speed on foot, cm/s.
+WALK_SPEED = 600.0
+#: How hard you accelerate toward that -- and, with no input, decelerate to a
+#: stop. One constant does both, so it doubles as ground friction.
+GROUND_ACCELERATION = 3000.0
+#: Upward kick when jumping, cm/s. About 1.5 m of hop at Hearth's gravity.
+JUMP_SPEED = 700.0
+#: Counted as standing on a surface within this gap, cm. Walking a sphere in
+#: straight tangent steps lifts you very slightly off it between contacts, so
+#: this has to clear that hop or `grounded` flickers and control drops out.
+GROUND_TOLERANCE = 15.0
+#: Ignore the ground for this long after jumping, s, so a jump can clear it.
+JUMP_LOCKOUT = 0.15
+#: How fast your feet swing round to the surface on landing, per second.
+GROUND_ALIGN_RATE = 8.0
+#: Look limit on foot, degrees from the horizon.
+MAX_GROUND_PITCH = 85.0
+#: Camera follow rate while walking, per second. CameraLag's 2.25 is a ~0.44 s
+#: time constant -- lovely for drifting in space, unusably sluggish for
+#: mouse-look on foot. The *arrow* still eases round to the surface at
+#: GROUND_ALIGN_RATE, so landing keeps its roll-upright.
+GROUND_CAMERA_LAG = 20.0
+
 #: Physics runs on a fixed step. The original ticks on the render frame, which
 #: makes orbits drift with framerate; a fixed step keeps the demo system stable
 #: without changing any of the arithmetic.

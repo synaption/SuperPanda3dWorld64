@@ -215,6 +215,82 @@ class Goomba(Object):
         self.anim_rate = max(0.4, abs(self.forward_vel) * 0.4)
 
 
+class Mario(Object):
+    """Mario, now that the Hero is the one being played.
+
+    He keeps his own animation set -- the clips are still in
+    assets/mario/mario.glb, addressed by the same `anim_XX` names his action
+    code uses -- but none of that action code runs here. An NPC needs a
+    fraction of it, and driving the real state machine from a fake controller
+    would mean pretending to press buttons to get him to walk in a circle.
+
+    So this is the same shape as the goomba: wander a while, stand a while, and
+    turn to watch whoever is playing when they come near. What it borrows from
+    the decomp is the part that reads on screen -- the clips, and the walk
+    cycle keeping pace with his actual speed.
+    """
+
+    model = "mario"
+    radius = 37.0
+    height = 160.0
+
+    # MARIO_ANIM_IDLE_HEAD_CENTER and MARIO_ANIM_WALKING, the two his own
+    # action code uses for standing about and for walking.
+    ANIM_IDLE = "anim_C5"
+    ANIM_WALK = "anim_48"
+
+    # Close enough that he notices and turns to watch.
+    NOTICE_RANGE = 700.0
+    WALK_SPEED = 8.0
+    TURN_RATE = 0x400
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.target_yaw = self.yaw
+        # Staggered so several Marios do not step off together.
+        self.walk_timer = random.randint(30, 150)
+        self.resting = True
+        self.anim = self.ANIM_IDLE
+        self.anim_rate = 1.0
+
+    def update(self, player):
+        self.timer += 1
+        self.observe(player)
+
+        if self.dist_to_mario < self.NOTICE_RANGE:
+            # Stop and face the player rather than wandering off mid-greeting.
+            self.resting = True
+            self.walk_timer = random.randint(30, 90)
+            self.target_yaw = self.angle_to_mario
+        elif self.walk_timer > 0:
+            self.walk_timer -= 1
+        else:
+            self.resting = not self.resting
+            if self.resting:
+                self.walk_timer = random.randint(60, 180)
+            else:
+                self.walk_timer = random.randint(90, 240)
+                self.target_yaw = s16(self.yaw + random.randint(-0x4000, 0x4000))
+
+        self.turn_toward(self.target_yaw, self.TURN_RATE)
+
+        target_speed = 0.0 if self.resting else self.WALK_SPEED
+        self.forward_vel += max(-0.5, min(0.5, target_speed - self.forward_vel))
+
+        if self.move() and not self.resting:
+            self.target_yaw = s16(self.yaw + 0x8000
+                                  + random.randint(-0x2000, 0x2000))
+
+        # Below a crawl the walk cycle reads as a stumble, so he stands instead.
+        if abs(self.forward_vel) < 1.0:
+            self.anim = self.ANIM_IDLE
+            self.anim_rate = 1.0
+        else:
+            self.anim = self.ANIM_WALK
+            # The divisor his own animation code uses for the walk cycle.
+            self.anim_rate = max(0.4, abs(self.forward_vel) / 4.0)
+
+
 class Scuttlebug(Object):
     """Crawls toward Mario and lunges when it lines him up.
 
@@ -323,7 +399,6 @@ class Interactions:
 
     def resolve(self, mario):
         from .mario import constants as C
-        from .mario.actions import set_mario_action
 
         # Being knocked back leaves Mario inside the enemy that hit him, so
         # without a cooldown the same touch re-triggers every tick and he is
@@ -363,25 +438,19 @@ class Interactions:
                 mario.sound_events.append(C.SOUND_MARIO_YAHOO if attacking
                                           else C.SOUND_ACTION_TERRAIN_LANDING)
                 if stomping:
-                    # Action first, velocity second: entering an airborne
-                    # action sets vel[1] itself, so assigning the bounce
-                    # before the transition just gets overwritten.
-                    set_mario_action(mario, C.ACT_JUMP, 0)
-                    mario.vel[1] = BOUNCE_VELOCITY
+                    mario.bounce_off_enemy(BOUNCE_VELOCITY)
             else:
                 # Thrown away from the enemy, facing it, the way a hit reads.
                 away = s16(atan2s(dz, dx) + 0x8000)
-                mario.face_angle[1] = away
-                mario.set_forward_vel(-KNOCKBACK_SPEED)
-                mario.vel[1] = KNOCKBACK_VELOCITY
                 mario.sound_events.append(C.SOUND_MARIO_OOOF)
-                set_mario_action(mario, C.ACT_BACKWARD_AIR_KB, 0)
+                mario.take_enemy_hit(away, KNOCKBACK_SPEED, KNOCKBACK_VELOCITY)
                 mario.invinc_timer = INVINCIBLE_FRAMES
                 self.hits_taken += 1
                 return
 
 
-MODELS = {"tree": Tree, "goomba": Goomba, "scuttlebug": Scuttlebug}
+MODELS = {"tree": Tree, "goomba": Goomba, "scuttlebug": Scuttlebug,
+          "mario": Mario}
 
 # What the level's special-object presets correspond to here.
 PRESET_MODELS = {"special_bubble_tree": Tree}
