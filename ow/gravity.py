@@ -16,9 +16,35 @@ makes the demo system's surface gravity land near 1 g while still being
 noticeable between planets -- do not "fix" it.
 """
 
+import math
+
 from panda3d.core import LVector3d
 
-from .constants import GRAVITY_CONSTANT
+from .constants import COLLISION_SKIN, GRAVITY_CONSTANT
+
+
+def sweep_sphere(origin, delta, centre, radius):
+    """First t in [0,1] where a point travelling origin->origin+delta touches
+    the sphere (centre, radius). None if it never does.
+
+    The moving body's own radius is folded into `radius` by the caller, which
+    is the standard reduction of sphere-vs-sphere to point-vs-sphere.
+    """
+    m = origin - centre
+    a = delta.dot(delta)
+    if a <= 0.0:
+        return None
+    c = m.dot(m) - radius * radius
+    if c <= 0.0:
+        return 0.0  # already interpenetrating
+    b = 2.0 * m.dot(delta)
+    if b >= 0.0:
+        return None  # moving away
+    discriminant = b * b - 4.0 * a * c
+    if discriminant < 0.0:
+        return None
+    t = (-b - math.sqrt(discriminant)) / (2.0 * a)
+    return t if 0.0 <= t <= 1.0 else None
 
 
 def vec3d(value):
@@ -47,6 +73,7 @@ class GravityComponent:
         initial_speed=(0.0, 0.0, 0.0),
         radius=0.0,
         is_planet=False,
+        collides=True,
         gravity_constant=GRAVITY_CONSTANT,
     ):
         self.name = name
@@ -57,6 +84,9 @@ class GravityComponent:
         self.initial_speed = vec3d(initial_speed)
         self.radius = float(radius)
         self.is_planet = is_planet
+        #: BlockAll on both the planets' CollisionBox and the player's root.
+        self.collides = collides
+        self.previous_position = vec3d(position)
         self.gravity_constant = gravity_constant
 
         #: ListForces: everything pushing on this body this tick. Jetpack
@@ -125,6 +155,7 @@ class GravityComponent:
             net += force
         self.net_force = net
 
+        self.previous_position = LVector3d(self.position)
         if self.mass_self != 0.0 and self.is_zero_g:
             self.acceleration = net / self.mass_self
             self.speed += self.acceleration * dt
@@ -133,6 +164,58 @@ class GravityComponent:
             self.acceleration = LVector3d(0, 0, 0)
 
         self.list_forces.clear()
+
+    # -- the sweep on K2_AddActorWorldOffset -------------------------------
+
+    def resolve_collision(self, bodies, max_contacts=3):
+        """Stop at the first surface hit on the way to the new position.
+
+        The original moves with `K2_AddActorWorldOffset(bSweep=true)` against
+        `BlockAll` sphere colliders, so movement is swept and blocked. Unreal
+        leaves the velocity untouched on a blocking hit, which means resting on
+        a planet keeps accumulating speed into it -- seconds of that and you
+        launch when you finally thrust away. Here the inbound (normal)
+        component is removed on contact and the tangential part kept, so you
+        settle onto a surface and can still slide along it.
+        """
+        if not self.collides:
+            return
+        remaining = self.position - self.previous_position
+        position = LVector3d(self.previous_position)
+
+        for _ in range(max_contacts):
+            if remaining.lengthSquared() <= 0.0:
+                break
+            nearest_t, hit = None, None
+            for other in bodies:
+                if other is self or not other.collides or other.radius <= 0.0:
+                    continue
+                t = sweep_sphere(
+                    position, remaining, other.position, self.radius + other.radius
+                )
+                if t is not None and (nearest_t is None or t < nearest_t):
+                    nearest_t, hit = t, other
+            if hit is None:
+                position += remaining
+                break
+
+            position += remaining * nearest_t
+            normal = position - hit.position
+            length = normal.length()
+            if length <= 0.0:
+                break
+            normal /= length
+            # Sit exactly on the surface, plus a skin to avoid re-contact.
+            position = hit.position + normal * (self.radius + hit.radius + COLLISION_SKIN)
+            into = self.speed.dot(normal)
+            if into < 0.0:
+                self.speed -= normal * into
+            leftover = remaining * (1.0 - nearest_t)
+            remaining = leftover - normal * leftover.dot(normal)
+        else:
+            position += remaining
+
+        self.position = position
 
 
 class GravityWorld:
@@ -157,6 +240,10 @@ class GravityWorld:
             body.accumulate_gravity(self.bodies, self.planets_attract_each_other)
         for body in self.bodies:
             body.integrate(dt)
+        # Sweeping runs after every body has moved, so a contact is resolved
+        # against this step's positions rather than a half-updated world.
+        for body in self.bodies:
+            body.resolve_collision(self.bodies)
 
     # -- BFL_ZeroGFunctions."Enable/Disable Zero-G" ------------------------
 

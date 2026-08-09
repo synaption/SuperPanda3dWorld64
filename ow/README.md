@@ -72,10 +72,36 @@ The Unreal graph carries this comment on the force node:
 > vs. on-planet.
 
 So the falloff is **linear**. Combined with `GravityConstant = 1e7` and the
-demo level's radii, surface gravity across the system lands between 6 and 11
+demo level's radii, surface gravity across the system lands between 9.5 and 17
 m/s² — the constants were tuned around that substitution, and "fixing" the
 exponent breaks the level. `--selftest` asserts the linear law so nobody
 tidies it away later.
+
+It has one consequence worth knowing before you go landing on things. **Every
+body pulls the player at once**, and with a linear falloff the distant ones
+stay significant: standing on Hearth, Hearth itself contributes 13.8 m/s² while
+four other planets and the sun add another 6 or so — leaving the net field
+**38° off the local vertical**, with a 5.9 m/s² sideways component. So planet
+surfaces are not level. You can land, but you will slide, and given long enough
+the slide throws you off. That is the model working as designed, not a bug in
+the port.
+
+### Collision
+
+The planets do block you. `AC_GravityComponent` moves its owner with
+`K2_AddActorWorldOffset` and the `bSweep` pin set to `true` (its sibling
+`K2_SetWorldRotation` leaves the equivalent pin `false`, which is the control
+case), against `BlockAll` sphere colliders. Radii, per unit of
+`BP_Planet.Scale`:
+
+| | |
+|---|---|
+| planet collider | 32 — `USphereComponent`'s default `SphereRadius` |
+| planet mesh | 32.5 — `/Engine/BasicShapes/Sphere` (radius 50) at `RelativeScale3D` 0.65 |
+| player collider | 32, unscaled |
+
+Movement is swept rather than point-sampled, so nothing tunnels through a
+planet regardless of speed.
 
 ## Layout
 
@@ -120,7 +146,7 @@ Panda is right-handed, so level positions have Y negated on import.
 
 ## Deliberate differences from the original
 
-Four, all noted in the code at the point they matter:
+Six, all noted in the code at the point they matter:
 
 1. **Fixed 60 Hz physics step.** The original ticks on the render frame, so
    your trajectory through the system depends on your framerate. Same
@@ -135,11 +161,20 @@ Four, all noted in the code at the point they matter:
    not a deflection, so scaling it by `dt` — as the original's shared look path
    does — turns you further at low framerates. Stick input still takes the
    dt-scaled path.
+5. **Contact cancels the inbound velocity.** Unreal leaves velocity alone on a
+   blocking hit, so resting on a planet keeps accumulating speed into it — a
+   few seconds of that and you launch when you finally thrust away. Here the
+   normal component is removed on contact and the tangential part kept, so you
+   settle and can still slide.
+6. **Planets are drawn at their collision radius**, not the authored 32.5. The
+   mesh scale of 0.65 was reaching for the collider's 32 and overshot by 1.6%;
+   at planet scale that is metres of mesh standing proud of the surface you
+   stop on, which buries the camera inside the sphere on landing.
 
 ## Not ported
 
 The demo level's static geometry and the gym level (`L_GymLevel`, with its
 accelerating/braking/spinning mannequin test rigs) are Unreal assets rather
-than logic, so the port ships the solar system only. There is no landing,
-collision or walk mode in the original either — you pass through planets, and
-so do you here.
+than logic, so the port ships the solar system only. There is no walk mode in
+the original — landing leaves you a sphere resting on a sphere, with the
+jetpack still your only means of moving.

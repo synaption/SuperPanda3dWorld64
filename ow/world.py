@@ -10,6 +10,7 @@ from panda3d.core import LVector3d
 from .constants import (
     FIXED_TIMESTEP,
     MAX_STEPS_PER_FRAME,
+    PLAYER_COLLISION_RADIUS,
     PLAYER_MASS,
     CharacterVariables,
 )
@@ -40,7 +41,7 @@ class World:
                 "Player",
                 PLAYER_MASS,
                 position=PLAYER_START,
-                radius=0.0,
+                radius=PLAYER_COLLISION_RADIUS,
                 is_planet=False,
             )
         )

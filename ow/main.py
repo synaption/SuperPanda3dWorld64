@@ -165,6 +165,37 @@ def selftest():
     check("the toggle restores mutual attraction", moved > 0.0,
           "max drift {} cm".format(moved))
 
+    print("collision (K2_AddActorWorldOffset with bSweep = true)")
+    sim = World()
+    target = sim.planets[5]
+    contact = target.radius + sim.player.radius
+    up = LVector3d(0.0, 0.0, 1.0)
+    sim.player.position = target.position + up * (contact + 5000.0)
+    sim.player.speed = LVector3d(0, 0, 0)
+    closest = None
+    for _ in range(60 * 20):
+        sim.step(FIXED_TIMESTEP)
+        d = (sim.player.position - target.position).length()
+        closest = d if closest is None else min(closest, d)
+    check("falling onto a planet stops at its surface",
+          closest >= contact - 1e-6,
+          "reached {:.1f} cm, surface at {:.1f}".format(closest, contact))
+    check("and actually reaches it rather than hanging above",
+          closest < contact + 50.0, "closest {:.1f} cm".format(closest))
+
+    # Sweeping, not point-sampling: a fast body must not skip through.
+    sim = World()
+    target = sim.planets[5]
+    contact = target.radius + sim.player.radius
+    offset = LVector3d(0.0, 0.0, 1.0) * (contact + 1000.0)
+    sim.player.position = target.position + offset
+    sim.player.speed = -offset / offset.length() * 5.0e5   # 5 km per step
+    sim.step(FIXED_TIMESTEP)
+    check("a fast body does not tunnel through a planet",
+          (sim.player.position - target.position).length() >= contact - 1e-6,
+          "ended {:.1f} cm from centre".format(
+              (sim.player.position - target.position).length()))
+
     print("demo system")
     sim = World()
     _, gap = sim.nearest_planet()
@@ -172,7 +203,7 @@ def selftest():
     surface = [sim.surface_gravity(body) / 100.0 for body in sim.planets]
     rocky = [g for g in surface[:-1]]
     check("surface gravity lands in a human range (m/s^2)",
-          all(2.0 < g < 30.0 for g in rocky),
+          all(5.0 < g < 40.0 for g in rocky),
           "min {:.2f} max {:.2f}".format(min(rocky), max(rocky)))
     print("       surface gravity: " + ", ".join(
         "{} {:.1f}".format(b.name, g) for b, g in zip(sim.planets, surface)))

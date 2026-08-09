@@ -24,11 +24,14 @@ from .world import World
 #: Degrees of look per pixel of mouse movement.
 MOUSE_SENSITIVITY = 0.12
 
-#: The scene spans ~1e6 cm. Keeping the near plane well off zero is what makes
-#: the depth buffer usable across that range.
-NEAR_PLANE = 60.0
-FAR_PLANE = 3.0e6
-STARFIELD_RADIUS = 1.2e6
+# The scene spans ~1e6 cm, so the near plane wants to be as far out as it can
+# be -- but no further than the player's own collision radius (32 cm), or the
+# ground clips away the moment you land on something and stand on it.
+NEAR_PLANE = 10.0
+FAR_PLANE = 1.6e6
+#: Stars draw depth-test-off in the background bin, so this only has to be
+#: inside the far plane; it is not a real distance.
+STARFIELD_RADIUS = 8.0e5
 
 
 def configure():
@@ -75,7 +78,7 @@ class OuterWildsApp(ShowBase):
     def _build_scene(self):
         self.planet_nodes = []
         for definition, body in zip(self.world.definitions, self.world.planets):
-            node = NodePath(make_sphere(body.radius, 48, 24, definition.color))
+            node = NodePath(make_sphere(definition.visual_radius, 48, 24, definition.color))
             node.reparentTo(self.render)
             node.setPos(*body.position)
             if definition.emissive:

@@ -24,8 +24,30 @@ PLAYER_MASS = 1.0
 # Actors that gravity applies to are tagged this way in the Unreal level.
 PHYSICS_OBJECT_TAG = "PhysicsObject"
 
-# BP_Planet draws a UE sphere (radius 50 at scale 1) and scales it uniformly.
-UE_SPHERE_UNIT_RADIUS = 50.0
+# BP_Planet's root is a USphereComponent ("CollisionBox", profile BlockAll) at
+# its default radius of 32, with the visible mesh parented under it:
+# /Engine/BasicShapes/Sphere is radius 50 and carries RelativeScale3D 0.65, so
+# it draws at 32.5 -- deliberately sized to sit on the collision sphere. Both
+# then scale by BP_Planet.Scale.
+#: Collision radius per unit of BP_Planet.Scale.
+PLANET_COLLISION_UNIT_RADIUS = 32.0
+# The authored mesh scale of 0.65 draws at 32.5, aiming at the collider's 32
+# but overshooting by 1.6% -- 0.64 would have matched exactly. At planet scale
+# that gap is metres: on Hearth the mesh stands 226 cm proud of the surface you
+# actually stop on, so landing buries the camera inside the sphere and you see
+# nothing but back-faces. We draw at the collision radius instead, which is
+# plainly what the 0.65 was reaching for.
+#: Drawn radius per unit of BP_Planet.Scale.
+PLANET_MESH_UNIT_RADIUS = PLANET_COLLISION_UNIT_RADIUS
+#: What the Unreal asset actually specifies, kept for reference.
+PLANET_AUTHORED_MESH_UNIT_RADIUS = 50.0 * 0.65
+
+#: BP_Player's root sphere, at the same engine default and unscaled.
+PLAYER_COLLISION_RADIUS = 32.0
+
+#: Pushed this far past a contact, so resting on a surface does not re-trigger
+#: the same hit on the following step.
+COLLISION_SKIN = 0.5
 
 
 @dataclass

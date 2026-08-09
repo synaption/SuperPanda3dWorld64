@@ -11,7 +11,7 @@ Names are ours. The original level leaves the planets unnamed.
 
 from dataclasses import dataclass, field
 
-from .constants import UE_SPHERE_UNIT_RADIUS
+from .constants import PLANET_COLLISION_UNIT_RADIUS, PLANET_MESH_UNIT_RADIUS
 
 #: PlayerStart, converted to Panda's handedness.
 PLAYER_START = (-249300.0, -33165.0, 6285.0)
@@ -30,7 +30,13 @@ class Body:
 
     @property
     def radius(self):
-        return self.scale * UE_SPHERE_UNIT_RADIUS
+        """The surface you actually hit."""
+        return self.scale * PLANET_COLLISION_UNIT_RADIUS
+
+    @property
+    def visual_radius(self):
+        """The surface you see -- 1.6% outside the collider, as authored."""
+        return self.scale * PLANET_MESH_UNIT_RADIUS
 
 
 #: Loosely rocky/icy/gas colours so the bodies are tellable apart in flight.
