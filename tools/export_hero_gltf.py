@@ -32,8 +32,17 @@ Usage, from the MCP connection or Blender's text editor:
 then, on the WSL side:
 
     python3 tools/adopt_blender_export.py assets/hero/hero_raw.glb \\
-        --out assets/hero/hero.glb --sidecar assets/hero/hero_clips.json
+        --out assets/hero/hero.glb --sidecar assets/hero/hero_clips.json \\
+        --skeleton-root rig
+
+Or let tools/build_hero.py do both halves headless, which is the same thing
+without the Windows round trip:
+
+    python3 tools/build_hero.py
 """
+
+import argparse
+import sys
 
 import bpy
 
@@ -112,4 +121,10 @@ def export(path=OUT):
 
 
 if __name__ == "__main__":
-    print(export())
+    # Under `blender --background ... --python this_file -- --out X` the
+    # arguments arrive after a bare `--`. Pasted into Blender's text editor
+    # there are none, and OUT (the Windows-side UNC path) still stands.
+    argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
+    ap = argparse.ArgumentParser(prog="export_hero_gltf")
+    ap.add_argument("--out", default=OUT)
+    print(export(ap.parse_args(argv).out))
