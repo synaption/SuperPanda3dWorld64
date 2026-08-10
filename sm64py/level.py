@@ -503,6 +503,16 @@ class ObjectRenderer:
 
         self._aim_billboards(camera_pos)
 
+    def freeze(self):
+        """Stop every object's clip where it stands.
+
+        Nothing undoes this: `sync` sets each play rate from the object it
+        belongs to, so the first frame the game runs again starts them all
+        back up on its own.
+        """
+        for obj, actor, clip in self.actors:
+            actor.set_play_rate(0.0, clip)
+
     def _aim_billboards(self, camera_pos):
         """Turn every billboard joint to face the camera."""
         if camera_pos is None or not self.billboards:

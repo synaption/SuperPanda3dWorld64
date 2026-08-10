@@ -124,10 +124,70 @@ Either way:
 |---|---|
 | `Q` `E` / mouse drag | swing the camera |
 | `R` | re-centre the camera |
+| `` ` `` (backquote / tilde) | open the debug console, pausing the game |
 | `F1` | toggle the debug readout |
 | `F2` | swap between the Hero and Mario |
 | `F3` | toggle the collision overlay |
-| `Esc` | quit |
+| `Esc` | close the console, or quit |
+
+## The debug console
+
+`` ` `` drops down a console over the game, and **pauses it** for as long as it
+is open. It carries the readout `F1` draws, everything the game has printed
+since it started, and a command line:
+
+```
+> run_speed
+run_speed = 30.00  -- slider added, top speed, units per 30 Hz frame
+> run_speed 12
+run_speed = 12.00  (was 30.00)
+```
+
+Typing the name of a variable puts a **slider** for it on screen, bottom right.
+The slider stays there when the console is dismissed, which is the point of it:
+a movement constant is not worth tuning from a menu, it is worth tuning while
+you are running around, and the game reads these values on the frame it uses
+them, so a drag lands on the next 30 Hz tick.
+
+| | |
+|---|---|
+| `<name>` | put a slider for that variable on screen |
+| `<name> <value>` | set it outright |
+| `vars` | every variable, with its value, range and what it does |
+| `close <name>` / `close all` | take a slider away |
+| `reset <name>` / `reset all` | back to the value it started at |
+| `clear` | empty the log |
+| `help` | the same list, in the console |
+
+`Tab` completes a name, the arrow keys recall previous commands, the **scroll
+wheel** goes back through the log — a marker on the divider says how far back
+you are, and new output does not slide the lines you are reading — and the
+keyboard belongs to the console while it is open, so typing `run_speed` does
+not walk the Hero across the field.
+
+The pause is the simulation simply not being stepped: no ticks, no accumulated
+time to replay on the way out, and the clips are held on their current frame
+rather than left walking on the spot. Nothing restarts them by hand —
+`ObjectRenderer.sync` and `_update_animation` set every play rate from scratch
+on each frame the game actually runs.
+
+The variables themselves are declared in `Game._register_tunables`
+(`app/main.py`), which is a dozen lines to extend: give a name, the module or
+object holding the value, the attribute or attributes to write, and a range.
+Most of them are the Hero's movement constants — `run_speed`, `walk_accel`,
+`turn_rate`, `jump_velocity`, the sword and spin kick speeds — plus the two the
+camera keeps for itself.
+
+One number to know about `run_speed`: it tops out at 32 because the stick does.
+`intended_mag` is the stick's magnitude squared into 0..64 and halved, and the
+speed the Hero accelerates toward is the smaller of that and the cap, so a cap
+above 32 can never be reached. It writes both `MAX_WALK_SPEED` and
+`MAX_RUN_SPEED`, since a ceiling below the target is a Hero accelerating into a
+wall he can never cross.
+
+Standard output is captured by wrapping `sys.stdout` and `sys.stderr`, so the
+terminal still gets everything as well. Panda3D's own notify output is written
+from C++, never passes through Python, and so appears only in the terminal.
 
 ## Layout
 
@@ -137,6 +197,7 @@ sm64py/
   surfaces.py      collision triangles, spatial partition, floor/ceil/wall queries
   level.py         converted mesh -> Panda3D geometry
   camera.py        following camera
+  console.py       the debug console: captured output, commands, live sliders
   objects.py       trees and enemies: spawning, behaviour, stepping
   billboard.py     aiming billboarded actor parts at the camera, and its settings
   audio.py         sound events -> Panda3D, plus placeholder sample synthesis

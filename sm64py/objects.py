@@ -238,11 +238,20 @@ class Mario(Object):
     # action code uses for standing about and for walking.
     ANIM_IDLE = "anim_C5"
     ANIM_WALK = "anim_48"
+    ANIM_JUMP = "anim_4D"
+    ANIM_SWIM = "anim_AA"
+    ANIM_SWIM_GLIDE = "anim_AB"
 
     # Close enough that he notices and turns to watch.
     NOTICE_RANGE = 700.0
     WALK_SPEED = 8.0
+    SWIM_SPEED = 10.0
     TURN_RATE = 0x400
+    JUMP_VELOCITY = 42.0
+    JUMP_MIN_TICKS = 90
+    JUMP_MAX_TICKS = 240
+    SWIM_DEPTH = 80.0
+    SWIM_STROKE_TICKS = 14
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -250,12 +259,26 @@ class Mario(Object):
         # Staggered so several Marios do not step off together.
         self.walk_timer = random.randint(30, 150)
         self.resting = True
+        self.swimming = False
+        self.jump_timer = random.randint(self.JUMP_MIN_TICKS,
+                                         self.JUMP_MAX_TICKS)
+        self.swim_timer = 0
         self.anim = self.ANIM_IDLE
         self.anim_rate = 1.0
 
     def update(self, player):
         self.timer += 1
         self.observe(player)
+
+        water_level = self.surfaces.find_water_level(self.pos[0], self.pos[2])
+        if water_level is not None and self.pos[1] < water_level - 20.0:
+            self.swimming = True
+        elif water_level is None:
+            self.swimming = False
+
+        if self.swimming:
+            self._swim(water_level)
+            return
 
         if self.dist_to_mario < self.NOTICE_RANGE:
             # Stop and face the player rather than wandering off mid-greeting.
@@ -277,18 +300,53 @@ class Mario(Object):
         target_speed = 0.0 if self.resting else self.WALK_SPEED
         self.forward_vel += max(-0.5, min(0.5, target_speed - self.forward_vel))
 
+        # An occasional jump keeps his wandering from reading as a looped
+        # walk animation. Only launch from solid ground, never in greeting.
+        self.jump_timer -= 1
+        if self.jump_timer <= 0 and self.on_ground and not self.resting:
+            self.vel_y = self.JUMP_VELOCITY
+            self.on_ground = False
+            self.jump_timer = random.randint(self.JUMP_MIN_TICKS,
+                                             self.JUMP_MAX_TICKS)
+
         if self.move() and not self.resting:
             self.target_yaw = s16(self.yaw + 0x8000
                                   + random.randint(-0x2000, 0x2000))
 
+        if not self.on_ground:
+            self.anim = self.ANIM_JUMP
+            self.anim_rate = 1.0
         # Below a crawl the walk cycle reads as a stumble, so he stands instead.
-        if abs(self.forward_vel) < 1.0:
+        elif abs(self.forward_vel) < 1.0:
             self.anim = self.ANIM_IDLE
             self.anim_rate = 1.0
         else:
             self.anim = self.ANIM_WALK
             # The divisor his own animation code uses for the walk cycle.
             self.anim_rate = max(0.4, abs(self.forward_vel) / 4.0)
+
+    def _swim(self, water_level):
+        """Paddle through a water box near its surface."""
+        self.resting = False
+        self.swim_timer = (self.swim_timer + 1) % self.SWIM_STROKE_TICKS
+
+        # Pick a fresh course every few strokes, with the same broad wandering
+        # turns he uses on land.
+        if self.swim_timer == 0 and random.randrange(3) == 0:
+            self.target_yaw = s16(self.yaw + random.randint(-0x3000, 0x3000))
+        self.turn_toward(self.target_yaw, self.TURN_RATE)
+        self.forward_vel += max(-0.4, min(
+            0.4, self.SWIM_SPEED - self.forward_vel))
+
+        target_y = water_level - self.SWIM_DEPTH
+        self.vel_y = max(-3.0, min(3.0, target_y - self.pos[1]))
+        if self.move():
+            self.target_yaw = s16(self.yaw + 0x8000
+                                  + random.randint(-0x2000, 0x2000))
+
+        self.anim = (self.ANIM_SWIM if self.swim_timer < 10
+                     else self.ANIM_SWIM_GLIDE)
+        self.anim_rate = 1.0
 
 
 class Scuttlebug(Object):

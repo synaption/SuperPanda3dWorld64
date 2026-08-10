@@ -57,10 +57,52 @@ def resolve(sound_id, terrain):
 
 
 def sound_key(sound_id):
-    """Stable short name for an id, used to find its sample file."""
+    """Readable, stable filename stem for a resolved sound id."""
     bank = (sound_id >> 28) & 0xF
     ident = (sound_id >> 16) & 0xFF
-    return f"bank{bank}_{ident:02x}"
+
+    terrain_names = (
+        "default", "grass", "water", "stone",
+        "spooky", "snow", "ice", "sand",
+    )
+    terrain_families = (
+        (0x00, "jump"),
+        (0x08, "landing"),
+        (0x10, "step"),
+        (0x18, "body_hit_ground"),
+        (0x20, "tiptoe_step"),
+        (0x60, "heavy_landing"),
+    )
+    if bank == C.SOUND_BANK_ACTION:
+        for base, action_name in terrain_families:
+            terrain = ident - base
+            if 0 <= terrain < len(terrain_names):
+                return f"{action_name}_{terrain_names[terrain]}"
+
+        action_names = {
+            0x30: "water_plunge",
+            0x31: "surface_splash",
+            0x33: "swim_stroke",
+            0x47: "fast_swim_stroke",
+        }
+        if ident in action_names:
+            return action_names[ident]
+
+    if bank == C.SOUND_BANK_VOICE:
+        voice_names = {
+            0x00: "mario_yah_wah_hoo",
+            0x03: "mario_hoohoo",
+            0x04: "mario_yahoo",
+            0x05: "mario_ooof",
+            0x0F: "mario_attacked",
+            0x11: "mario_haha",
+            0x18: "mario_panting",
+        }
+        if ident in voice_names:
+            return voice_names[ident]
+
+    # Keep unknown IDs usable without pretending to know what they contain.
+    return f"unknown_bank_{bank}_sound_{ident:02x}"
 
 
 # -- placeholder synthesis --------------------------------------------------

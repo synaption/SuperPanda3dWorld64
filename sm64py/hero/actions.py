@@ -37,7 +37,9 @@ def action(action_id, anim=None):
 # Mario actions use: the simulation never plays anything itself, so it runs
 # identically with or without an audio device.
 _ENTRY_SOUNDS = {
-    H.ACT_HERO_JUMP: (C.SOUND_ACTION_TERRAIN_JUMP, C.SOUND_MARIO_YAH_WAH_HOO),
+    # The Hero has no voice sample of his own.  Reusing Mario's call here made
+    # him sound like Mario whenever he jumped, so his jump is deliberately
+    # silent; Mario's separate action table still raises both of his sounds.
     H.ACT_HERO_LAND: (C.SOUND_ACTION_TERRAIN_LANDING,),
     H.ACT_HERO_ATTACK: (C.SOUND_MARIO_YAH_WAH_HOO,),
     H.ACT_HERO_SPIN_KICK: (C.SOUND_MARIO_YAHOO,),

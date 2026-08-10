@@ -27,10 +27,18 @@ Controls, as Mario -- the original's, unchanged:
 Both:
     Q / E or mouse drag       swing the camera
     R                         re-centre the camera
+    `  (backquote / tilde)    open the debug console, pausing the game
     F1                        toggle the debug readout
     F2                        swap between the Hero and Mario
     F3                        toggle the collision overlay
-    Escape                    quit
+    Escape                    close the console, or quit
+
+The console shows the readout, everything the game has printed -- scroll back
+through it with the wheel -- and a command line; typing the name of one of the
+tunables registered in `_register_tunables` puts a slider for it on screen,
+which stays up once the console is dismissed so it can be dragged while
+playing. The game is paused for as long as the console is open. `help` inside
+it lists the rest.
 """
 
 import json
@@ -55,7 +63,7 @@ from panda3d.core import (
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from sm64py import audio, objects, surfaces  # noqa: E402
+from sm64py import audio, console, objects, surfaces  # noqa: E402
 from sm64py.camera import FollowCamera  # noqa: E402
 from sm64py.hero import HeroState  # noqa: E402
 from sm64py.hero import actions as hero_actions  # noqa: E402
@@ -249,13 +257,16 @@ class Game(ShowBase):
         self.camLens.set_near_far(10, 30000)
 
         self._setup_lighting()
-        self._setup_input()
         self._setup_hud()
+        # Before the input, which asks the console whether it has the keyboard.
+        self._setup_console()
+        self._setup_input()
 
         self._accumulator = 0.0
         self._show_debug = True
         self._mouse_anchor = None
         self._hud_timer = 0.0
+        self._water_time = 0.0
         self._reset_interpolation()
 
         # Everything is in the scene graph by now, so get it onto the GPU
@@ -337,6 +348,10 @@ class Game(ShowBase):
         self.mario_npc.active = self.player.name != "mario"
 
         self._reset_interpolation()
+        # Swapping is allowed from inside the console, and the character that
+        # just came on stage has not been stopped yet.
+        if self.console.visible:
+            self._freeze_animation()
         print(f"Playing as {self.player.name}")
 
     # -- scene ---------------------------------------------------------------
@@ -493,7 +508,7 @@ class Game(ShowBase):
         self._skating = False
         self.accept("c", self._toggle_skating)
 
-        self.accept("escape", sys.exit)
+        self.accept("escape", self._escape)
         self.accept("f1", self._toggle_debug)
         self.accept("f2", self._switch_player)
         self.accept("f3", self._toggle_collision)
@@ -508,16 +523,33 @@ class Game(ShowBase):
         self.win.request_properties(props)
 
     def _set_key(self, name, value):
+        # Releases always land, so a key held as the console opened does not
+        # stay stuck down; presses do not, so typing is only typing.
+        if value and self.console.visible:
+            return
         self.keys[name] = value
 
     def _set_dragging(self, value):
         self._dragging = value
 
     def _toggle_skating(self):
+        if self.console.visible:
+            return
         self._skating = not self._skating
+
+    def _escape(self):
+        """Back out of the console if it is open; otherwise quit."""
+        if self.console.visible:
+            self.console.hide()
+            return
+        sys.exit()
 
     def _toggle_debug(self):
         self._show_debug = not self._show_debug
+        # The console draws the readout itself while it is open, so leave it
+        # hidden and let the toggle take effect when the console goes away.
+        if self.console.visible:
+            return
         (self.hud.show if self._show_debug else self.hud.hide)()
 
     def _toggle_collision(self):
@@ -575,7 +607,107 @@ class Game(ShowBase):
             mayChange=True,
         )
 
+    # -- console -------------------------------------------------------------
+
+    def _setup_console(self):
+        self.console = console.Console(
+            self, self._register_tunables(),
+            log=console.capture_output(),
+            readout=self._hud_text,
+            on_toggle=self._console_toggled,
+        )
+
+    def _register_tunables(self):
+        """The numbers the console is allowed to put on a slider.
+
+        Every one of these is looked up where it is used, on the frame it is
+        used -- the action code says `H.MAX_RUN_SPEED` rather than copying it
+        into the state -- so writing to the module is all it takes for a drag
+        to land on the next 30 Hz tick. Anything cached at startup would need
+        a setter that re-applies it, which is why the camera's two are
+        registered against the camera object rather than against its module.
+        """
+        t = console.Tunables()
+
+        # Both caps, together: the walking cap is what he accelerates toward
+        # and the running cap is the ceiling nothing may exceed, and a Hero
+        # whose ceiling sat below his target would accelerate into a wall he
+        # could never cross. 32 is not a matter of taste -- the stick's
+        # magnitude is squared into 0..64 and halved, so `intended_mag` tops
+        # out there, and a cap above it can never be reached.
+        t.add("run_speed", HC, ("MAX_WALK_SPEED", "MAX_RUN_SPEED"), 0.0, 32.0,
+              "top speed, units per 30 Hz frame (the stick caps out at 32)")
+        t.add("walk_accel", HC, "WALK_ACCEL", 0.0, 8.0,
+              "acceleration per frame, before the taper")
+        t.add("accel_taper", HC, "ACCEL_TAPER", 5.0, 200.0,
+              "acceleration falls away as speed approaches this")
+        t.add("decel", HC, "DECELERATION", 0.0, 10.0,
+              "slowing per frame with no stick")
+        t.add("brake_decel", HC, "BRAKE_DECELERATION", 0.0, 10.0,
+              "slowing per frame when stopping hard")
+        t.add("turn_rate", HC, "TURN_RATE", 0x0100, 0x4000,
+              "s16 angle units per frame", integer=True)
+        t.add("run_anim_speed", HC, "RUN_SPEED", 0.0, 32.0,
+              "speed the run cycle takes over from the walk")
+
+        t.add("jump_velocity", HC, "JUMP_VELOCITY", 0.0, 120.0,
+              "take-off speed; 42 is the ~250 unit jump the level was built for")
+        t.add("jump_speed_bonus", HC, "JUMP_SPEED_BONUS", 0.0, 1.0,
+              "how much a running start lends to the jump")
+
+        t.add("attack_lunge", HC, "ATTACK_LUNGE_SPEED", 0.0, 40.0,
+              "the forward travel handed back to the sword swings")
+        t.add("spin_kick_speed", HC, "SPIN_KICK_SPEED", 0.0, 60.0,
+              "how fast the spin kick carries him")
+        t.add("spin_kick_min", HC, "SPIN_KICK_MIN_SPEED", 0.0, 32.0,
+              "speed needed to spin kick rather than swing")
+        t.add("wade_scale", HC, "WADE_SPEED_SCALE", 0.05, 1.0,
+              "what deep water leaves of his speed")
+
+        t.add("cam_distance", self.follow_camera, "distance", 250.0, 5000.0,
+              "how far the camera sits behind him")
+        t.add("cam_height", self.follow_camera, "height", -500.0, 1500.0,
+              "how far above him it looks from")
+        return t
+
+    def _console_toggled(self, visible):
+        """The console has the keyboard while it is open, and the readout.
+
+        Held keys are dropped rather than left set, since the key-up for a key
+        pressed before the console opened arrives while it is open and would
+        otherwise be the only thing that ever cleared it.
+        """
+        if visible:
+            self.hud.hide()
+            for name in self.keys:
+                self.keys[name] = False
+            self._freeze_animation()
+        elif self._show_debug:
+            self.hud.show()
+
+    def _freeze_animation(self):
+        """Hold every clip on its current frame while the game is paused.
+
+        The simulation stops by simply not being stepped, but the clips are
+        played by Panda3D off the render clock and would carry on walking on
+        the spot. Nothing here has to be undone: `ObjectRenderer.sync` and
+        `_update_animation` set every play rate from scratch each frame, and
+        neither runs again until the game does.
+        """
+        self.object_renderer.freeze()
+        player = self.player
+        if player.actor is not None and player.current_anim is not None:
+            player.actor.set_play_rate(0.0, player.current_anim)
+
     def _poll_controller(self):
+        # Typing `run_speed` should not walk him across the field.
+        if self.console.visible:
+            self.controller.set_stick(0.0, 0.0)
+            self.controller.set_buttons(0)
+            self.controller.zombie = False
+            self.controller.skating = self._skating
+            return
+
         right = 1.0 if self.keys["right"] else 0.0
         left = 1.0 if self.keys["left"] else 0.0
         up = 1.0 if self.keys["up"] else 0.0
@@ -606,6 +738,14 @@ class Game(ShowBase):
 
     def _update(self, task):
         dt = min(self.clock.get_dt(), 0.25)
+
+        # The console pauses the game. Nothing accumulates while it is open
+        # either, so coming back steps a single tick rather than replaying
+        # however long was spent typing -- and since the task still runs every
+        # frame, the clock's dt is one frame's worth, not the whole pause.
+        if self.console.visible:
+            self.console.update(dt)
+            return task.cont
 
         self._update_camera_input(dt)
 
@@ -647,7 +787,10 @@ class Game(ShowBase):
                                   recenter=self.keys["cam_center"])
         self.follow_camera.apply_to(self.camera)
 
-        animate_water(self.water, self.clock.get_frame_time())
+        # Its own clock rather than the frame time, so a spell in the console
+        # does not leave the sheet somewhere else when the game comes back.
+        self._water_time += dt
+        animate_water(self.water, self._water_time)
         self.object_renderer.sync(self.follow_camera.pos)
         self._update_camera_medium()
 
@@ -658,10 +801,12 @@ class Game(ShowBase):
                                  s16_to_degrees(angle[2]))
         self._update_animation()
 
+        self.console.update(dt)
+
         self._hud_timer -= dt
-        if self._show_debug and self._hud_timer <= 0.0:
+        if self._show_debug and not self.console.visible and self._hud_timer <= 0.0:
             self._hud_timer = HUD_INTERVAL
-            self._update_hud()
+            self.hud.setText(self._hud_text())
 
         return task.cont
 
@@ -695,8 +840,11 @@ class Game(ShowBase):
         if self.keys["cam_right"]:
             self.follow_camera.rotate(speed * dt)
 
-        # Dragging with a mouse button held swings the camera too.
-        if self._dragging and self.mouseWatcherNode.has_mouse():
+        # Dragging with a mouse button held swings the camera too -- unless
+        # the pointer is on the console or one of its sliders, where a drag
+        # means the slider and nothing else.
+        if (self._dragging and not self.console.wants_mouse()
+                and self.mouseWatcherNode.has_mouse()):
             pos = self.mouseWatcherNode.get_mouse()
             current = (pos.get_x(), pos.get_y())
             if self._mouse_anchor is not None:
@@ -708,14 +856,20 @@ class Game(ShowBase):
         else:
             self._mouse_anchor = None
 
-    def _update_hud(self):
+    def _hud_text(self):
+        """The readout, as text.
+
+        Built rather than drawn, because it has two places to go now: the
+        OnscreenText F1 toggles, and the top of the console panel, which draws
+        the same thing in the console's own monospace font.
+        """
         m = self.state
         action = self.player.action_name
         floor_type = f"0x{m.floor.type:04X}" if m.floor else "none"
 
-        # DirectGUI classes keep camelCase, unlike the C++ bindings.
-        self.hud.setText(
-            f"playing  {self.player.name}  (F2 to swap)\n"
+        return (
+            f"playing  {self.player.name}  (F2 to swap)"
+            f"{'   -- PAUSED, close the console to run' if self.console.visible else ''}\n"
             f"action   {action}  ({m.anim_name})\n"
             f"pos      {m.pos[0]:8.1f} {m.pos[1]:8.1f} {m.pos[2]:8.1f}\n"
             f"vel      fwd {m.forward_vel:6.2f}   y {m.vel[1]:7.2f}\n"
@@ -726,7 +880,7 @@ class Game(ShowBase):
             f"   hits {self.interactions.hits_taken}\n"
             f"fps      {self.clock.get_average_frame_rate():5.1f}\n"
             f"\n{self._control_legend()}\n"
-            f"Q/E camera  R recentre  F2 swap  F3 collision  F1 hud"
+            f"Q/E camera  R recentre  F2 swap  F3 collision  F1 hud  ` console"
         )
 
     def _enemies_left(self):
@@ -755,6 +909,10 @@ class Game(ShowBase):
 
 
 def main():
+    # Before anything is built, so the console opens with the startup output
+    # -- what spawned, what the audio device turned out to be -- already in it.
+    console.capture_output()
+
     missing = [
         p for p in (
             os.path.join(CASTLE_GROUNDS, "collision.npz"),
