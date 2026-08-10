@@ -40,11 +40,12 @@ CAMERA_DEADZONE = 0.12
 # as both on some. Half pressed is pressed.
 TRIGGER_THRESHOLD = 0.5
 
-# The dead travel at the top of the aim trigger, and where it counts as fully
-# pressed. Triggers rest a little off zero and stop a little short of one, and
-# a player holding the sights would otherwise find them at 96%.
-AIM_TRIGGER_FLOOR = 0.08
-AIM_TRIGGER_CEILING = 0.85
+# The left trigger is the jetpack, and it is read as held rather than as an
+# amount: the boosters have one thrust and the action code takes a button.
+# Lower than the threshold above because this one is a control you fly with --
+# a finger resting on the trigger should not be a finger flying, but touching
+# it should be immediate.
+THRUST_THRESHOLD = 0.3
 
 
 def _apply_deadzone(x, y, deadzone):
@@ -76,10 +77,8 @@ class Gamepad(DirectObject):
         self.buttons = 0
         self.zombie = False
         self.recenter = False
-        # How far down the sights the left trigger is asking to be, 0 to 1. An
-        # amount rather than a flag because a trigger can give one: half
-        # pressed brings the camera half of the way in.
-        self.aim = 0.0
+        # The jetpack, off the left trigger.
+        self.thrust = False
         # Edges, cleared by the next poll: see `pressed` and `released`.
         self._pressed = set()
         self._released = set()
@@ -140,7 +139,7 @@ class Gamepad(DirectObject):
         self.buttons = 0
         self.zombie = False
         self.recenter = False
-        self.aim = 0.0
+        self.thrust = False
         self._pressed.clear()
         self._released.clear()
         self._held.clear()
@@ -207,7 +206,7 @@ class Gamepad(DirectObject):
 
         self.zombie = self._button(GamepadButton.lshoulder())
         self.recenter = self._button(GamepadButton.rshoulder())
-        self.aim = self._aim_amount()
+        self.thrust = self._thrust_down()
 
         held = set()
         if self._button(GamepadButton.face_y()):
@@ -216,6 +215,10 @@ class Gamepad(DirectObject):
             held.add("swap")
         if self._button(GamepadButton.face_x()):
             held.add("squad")
+        # Clicking the right stick is the zoom, and it latches: a stick you
+        # have to hold in is a stick you cannot aim with.
+        if self._button(GamepadButton.rstick()):
+            held.add("zoom")
         self._pressed = held - self._held
         self._released = self._held - held
         self._held = held
@@ -228,24 +231,17 @@ class Gamepad(DirectObject):
         the other.
 
         The right one only. Z used to come off either, and the left one is the
-        aim now -- which is where a shooter puts it, and which cannot also
-        crouch.
+        jetpack now -- which cannot also crouch.
         """
         if self._button(GamepadButton.rtrigger()):
             return True
         return self._axis(InputDevice.Axis.right_trigger) > TRIGGER_THRESHOLD
 
-    def _aim_amount(self):
-        """How far the left trigger is pressed, rescaled into a clean 0 to 1.
-
-        A driver that reports the trigger as a button rather than an axis gets
-        all or nothing, which is the most it can say.
-        """
-        value = self._axis(InputDevice.Axis.left_trigger)
-        if value <= AIM_TRIGGER_FLOOR:
-            return 1.0 if self._button(GamepadButton.ltrigger()) else 0.0
-        span = max(AIM_TRIGGER_CEILING - AIM_TRIGGER_FLOOR, 1e-3)
-        return min((value - AIM_TRIGGER_FLOOR) / span, 1.0)
+    def _thrust_down(self):
+        """The left trigger, from whichever way the driver reports it."""
+        if self._button(GamepadButton.ltrigger()):
+            return True
+        return self._axis(InputDevice.Axis.left_trigger) > THRUST_THRESHOLD
 
     def pressed(self, name):
         """True on the frame `name` went down, for the controls that latch."""

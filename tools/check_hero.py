@@ -52,10 +52,11 @@ class Run:
         self.hero.spawn(*pos, yaw)
         self.camera = FollowCamera(self.surfaces, self.hero)
 
-    def tick(self, forward=0.0, buttons=0):
+    def tick(self, forward=0.0, buttons=0, thrust=False):
         # Negative stick_y is forward; app/main.py feeds both axes mirrored.
         self.controller.set_stick(0.0, -forward)
         self.controller.set_buttons(buttons)
+        self.controller.set_thrust(thrust)
         self.hero.camera_yaw = self.camera.mario_yaw
         execute_action(self.hero)
         self.camera.update(TICK_DT)
@@ -136,6 +137,42 @@ def check_jump_height_is_variable():
 
     held, tapped = peak(H.JETPACK_DELAY - 1), peak(0)
     return held > tapped + 20.0, f"held {held:.0f} vs tapped {tapped:.0f} units"
+
+
+def check_the_trigger_flies_him():
+    """The jetpack's own control lifts him straight off the ground.
+
+    Not through a jump and not after a delay, which is the whole difference
+    between it and holding A: A has to be told apart from a tap before it can
+    commit to anything, and a control that means only the boosters does not.
+    """
+    run = Run()
+    for _ in range(4):
+        run.tick()                       # settle on the floor
+    started = run.hero.action_name
+
+    heights, actions = [], []
+    for frame in range(90):
+        run.tick(thrust=frame < 60)
+        heights.append(run.height)
+        name = run.hero.action_name
+        if not actions or actions[-1] != name:
+            actions.append(name)
+
+    lit = actions[0] if actions else "nothing"
+    problems = []
+    if lit != "jetpack":
+        problems.append(f"{started} went to {lit}, not straight to the jetpack")
+    if "jump" in actions:
+        problems.append("it jumped on the way up")
+    if max(heights) < 400.0:
+        problems.append(f"only climbed {max(heights):.0f} units")
+    if heights[-1] > max(heights) - 100.0:
+        problems.append("letting go did not bring him down")
+
+    return not problems, ("; ".join(problems) if problems
+                          else f"{started} -> {' -> '.join(actions)}, "
+                               f"peak {max(heights):.0f} units")
 
 
 def check_jetpack():
@@ -278,6 +315,7 @@ CHECKS = [
     ("jump leaves and regains the floor", check_jump),
     ("jump height follows the button", check_jump_height_is_variable),
     ("the jetpack flies, and only when held", check_jetpack),
+    ("the trigger flies him", check_the_trigger_flies_him),
     ("attack chains into the second swing", check_attack_chain),
     ("spin kick out of a run", check_spin_kick),
     ("every action has a clip", check_every_action_has_a_clip),

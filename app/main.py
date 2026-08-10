@@ -12,8 +12,9 @@ decoupled and the simulation is stepped in whole ticks.
 
 The camera is a third-person shooter's -- a spring arm off his shoulder, aimed
 with the mouse, which the window takes hold of at startup. Escape gives the
-pointer back and clicking the window takes it again. See sm64py/camera.py for
-what it does and why.
+pointer back and clicking the window takes it again. Nothing but the player
+ever points it: it does not drift back behind him, and R is the only thing that
+moves it on its own. See sm64py/camera.py for what it does and why.
 
 Controls, as the Hero:
     W / A / S / D or arrows   analog stick (camera-relative)
@@ -51,8 +52,11 @@ On a gamepad, if one is plugged in -- the same set, added to the keyboard
 rather than replacing it (see app/gamepad.py):
     left stick / d-pad        analog stick
     right stick               look
-    left trigger              aim, by however far it is pressed
-    A                         jump, and the jetpack
+    right stick (clicked)     aim -- a latch, since the thumb aiming with it
+                              cannot also hold it in
+    left trigger              the jetpack: held, he thrusts, straight off the
+                              ground and with no jump under it
+    A                         jump, and the jetpack the slow way -- held
     B                         attack -- Mario's B
     X                         the squad, held or tapped as above
     right trigger             Z
@@ -270,10 +274,15 @@ CROSSHAIR_DOT = 0.0045
 # the time this is a mark saying where the middle is, not an instrument.
 CROSSHAIR_HIP_ALPHA = 0.55
 
-# Pointer movement, in pixels, past which a frame's delta is thrown away
-# rather than looked through. Alt-tabbing, dragging the window and the frame
-# the capture is taken all produce one the width of the screen.
-MOUSE_JUMP = 400
+# Keeping the pointer off the edges of the window, where it would stop
+# reporting movement, on the platforms without a relative mouse mode. It is
+# shoved back to the middle once it leaves this share of the way out from the
+# centre; a warp is then in flight for up to this many frames, and readings are
+# dropped until one lands within this many pixels of where it was sent. See
+# `Game._read_mouse` for why any of that is necessary.
+MOUSE_MARGIN = 0.5
+MOUSE_WARP_FRAMES = 4
+MOUSE_SETTLED = 8.0
 
 # Degrees of view per unit of a loose-pointer drag, whose coordinates run -1 to
 # 1 across the window rather than in pixels.
@@ -772,8 +781,12 @@ class Game(ShowBase):
         # all. Escape and the console move between the two.
         self._mouse_captured = False
         self._was_captured = True
+        # The pad's zoom latch. Not a key, so it survives the console taking
+        # the keyboard, and it is dropped by hand where that matters.
+        self._aim_toggle = False
         self._mouse_anchor = None
         self._pointer_origin = None
+        self._warp_frames = 0
         self._dragging = False
         self.accept("mouse1", self._mouse_button, [1, True])
         self.accept("mouse1-up", self._mouse_button, [1, False])
@@ -815,6 +828,7 @@ class Game(ShowBase):
 
         # Whatever the pointer was doing before belongs to the other mode.
         self._pointer_origin = None
+        self._warp_frames = 0
         self._mouse_anchor = None
         self._dragging = False
 
@@ -839,43 +853,78 @@ class Game(ShowBase):
             (self._squad_press if down else self._squad_release)()
 
     def _read_mouse(self):
-        """Turn the pointer's movement into a look, and put it back if needed.
+        """Turn the pointer's movement into a look, and keep it off the edges.
 
-        The delta is clamped: a window drag, a mode change or the first frame
-        after the capture can all produce one the size of the screen, and a
-        camera that answers those spins the view through half a turn for no
-        reason the player can see.
+        The delta is always against the last reading, never against the middle
+        of the window, and that is the whole design. Where relative mouse mode
+        is available the pointer free-runs and there is nothing else to do.
+        Where it is not -- WSL over X11 is the case at hand, and it says so in
+        the log -- the pointer has to be shoved back to the middle before it
+        reaches an edge and stops reporting, and *that* is the part worth being
+        careful about:
+
+        `move_pointer` does not land synchronously. Reading the pointer back
+        immediately after warping it still returns the old position; the warp
+        arrives at some point before the next frame's read, or it does not. So
+        a delta taken as `pointer - centre`, which assumes last frame's warp
+        landed, is wrong exactly when it did not, and wrong by the width of the
+        window -- which is how a single frame ends up turning the view ninety
+        degrees and pinning the pitch at its limit. It cost an afternoon.
+
+        Taking the delta against the last *observed* position removes the
+        assumption. The one frame that cannot be read that way is the one the
+        warp lands on, since it is not motion; that frame is dropped, which
+        loses a sixtieth of a second of hand movement every couple of hundred
+        pixels of travel and is not detectable. The warp is only asked for near
+        an edge, so it is rare to begin with.
         """
-        if not self._mouse_captured or not self.win.get_properties().get_foreground():
+        if not self._mouse_captured:
             return
+        props = self.win.get_properties()
+        if not props.get_foreground():
+            # Whatever the pointer does while another window has it is not a
+            # look, and where it comes back is not a delta.
+            self._pointer_origin = None
+            return
+
         pointer = self.win.get_pointer(0)
         current = (pointer.get_x(), pointer.get_y())
+        origin, self._pointer_origin = self._pointer_origin, current
 
-        relative = (self.win.get_properties().get_mouse_mode()
-                    == WindowProperties.M_relative)
-        if relative:
-            # The pointer is free-running and reports where it has got to, so
-            # the delta is against the last reading rather than the middle.
-            origin = self._pointer_origin
-            self._pointer_origin = current
-        else:
-            centre = (self.win.get_x_size() // 2, self.win.get_y_size() // 2)
-            origin = self._pointer_origin
-            self._pointer_origin = centre
-            if not self.win.move_pointer(0, *centre):
-                # No pointer to move -- the window has lost it. Nothing to
-                # read this frame, and nothing to compare against next one.
+        if self._warp_frames > 0:
+            # A warp is in flight. Drop readings until one arrives near where
+            # it was sent -- that one is a good position to measure the next
+            # frame against, so it is kept as the origin above.
+            self._warp_frames -= 1
+            if math.dist(current, self._window_centre()) < MOUSE_SETTLED:
+                self._warp_frames = 0
+            elif self._warp_frames == 0:
+                # Given up on: a warp that never landed leaves the pointer
+                # somewhere unrelated to where it was sent, and the difference
+                # between the two is not hand movement. Take no delta at all
+                # next frame rather than that one.
                 self._pointer_origin = None
-                return
+            return
 
-        if origin is None:
+        if origin is not None:
+            # Panda3D's pointer counts down the screen and the camera counts up.
+            self.follow_camera.look_mouse(current[0] - origin[0],
+                                          -(current[1] - origin[1]))
+
+        if props.get_mouse_mode() == WindowProperties.M_relative:
+            # Free-running: it has no edge to reach.
             return
-        dx = current[0] - origin[0]
-        dy = current[1] - origin[1]
-        if abs(dx) > MOUSE_JUMP or abs(dy) > MOUSE_JUMP:
-            return
-        # Panda3D's pointer counts down the screen and the camera counts up.
-        self.follow_camera.look_mouse(dx, -dy)
+
+        # Keep it inside the middle of the window, where it has room to move in
+        # every direction before the screen stops it.
+        centre = self._window_centre()
+        if (abs(current[0] - centre[0]) > centre[0] * MOUSE_MARGIN
+                or abs(current[1] - centre[1]) > centre[1] * MOUSE_MARGIN):
+            if self.win.move_pointer(0, *centre):
+                self._warp_frames = MOUSE_WARP_FRAMES
+
+    def _window_centre(self):
+        return (self.win.get_x_size() // 2, self.win.get_y_size() // 2)
 
     def _toggle_skating(self):
         if self.console.visible:
@@ -1330,8 +1379,6 @@ class Game(ShowBase):
               "and what the sights pull it in to")
         t.add("cam_follow", cam, "follow_smooth", 0.0, 0.5,
               "seconds the camera takes to close on him -- 0 nails it to him")
-        t.add("cam_align", cam, "auto_align", 0.0, 2.0,
-              "how hard the view drifts back behind him; 0 turns it off")
         t.add("cam_shake", cam, "shake_scale", 0.0, 3.0,
               "how much a landing kicks the camera")
 
@@ -1365,6 +1412,7 @@ class Game(ShowBase):
             self._set_mouse_captured(False)
             for name in self.keys:
                 self.keys[name] = False
+            self._aim_toggle = False
             self.follow_camera.set_aim(0.0)
             self._freeze_animation()
         else:
@@ -1393,6 +1441,7 @@ class Game(ShowBase):
         if self.console.visible:
             self.controller.set_stick(0.0, 0.0)
             self.controller.set_buttons(0)
+            self.controller.set_thrust(False)
             self.controller.zombie = False
             self.controller.skating = self._skating
             return
@@ -1425,6 +1474,11 @@ class Game(ShowBase):
             buttons |= C.Z_TRIG
         self.controller.set_buttons(buttons)
 
+        # The jetpack's own control. Set through a method rather than as a
+        # field because the falling edge matters as much as the state does:
+        # `act_fall` lights the boosters again on a fresh press.
+        self.controller.set_thrust(self.gamepad.thrust)
+
         # Purely a costume: the action code never reads it, so Mario walks and
         # jumps exactly as he always did while it is held.
         self.controller.zombie = self.keys["zombie"] or self.gamepad.zombie
@@ -1447,6 +1501,8 @@ class Game(ShowBase):
             self._toggle_skating()
         if self.gamepad.pressed("swap"):
             self._switch_player()
+        if self.gamepad.pressed("zoom"):
+            self._toggle_zoom()
         if self.gamepad.pressed("squad"):
             self._squad_press()
         if self.gamepad.released("squad"):
@@ -1620,14 +1676,18 @@ class Game(ShowBase):
             self._mouse_anchor = None
 
     def _update_aim_mode(self):
-        """How far down the sights to be, from whichever control is asking.
+        """Whether to be down the sights, from whichever control is asking.
 
-        The trigger wins when it is doing more than the buttons, which is what
-        lets a pad half press into a partial aim while a keyboard and mouse
-        get all or nothing from theirs.
+        The pad latches and the other two are held, and that is not an
+        inconsistency: clicking the right stick is a thing you do with the
+        thumb that is aiming, so it cannot be held down while you aim with it.
+        A mouse button and a key can both be held, so they are.
         """
-        amount = 1.0 if self.keys["aim"] else 0.0
-        self.follow_camera.set_aim(max(amount, self.gamepad.aim))
+        held = self.keys["aim"] or self._aim_toggle
+        self.follow_camera.set_aim(1.0 if held else 0.0)
+
+    def _toggle_zoom(self):
+        self._aim_toggle = not self._aim_toggle
 
     def _turn_to_aim(self, dt):
         """Face him down the sights while he is standing in them.

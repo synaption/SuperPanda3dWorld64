@@ -106,10 +106,30 @@ def in_deep_water(m):
     return m.pos[1] < m.water_level - H.WADE_FLOAT_DEPTH
 
 
+def thrusting(m):
+    """Is the jetpack being asked to keep burning?
+
+    Two controls answer to it, and they are not interchangeable. The trigger is
+    the jetpack's own and means nothing else, so holding it is the whole
+    question. A is the jump button first and the boosters second, and it only
+    becomes the boosters once something else -- `check_jetpack_hold`, or the
+    fresh press `act_fall` reads -- has decided that is what it meant. So this
+    is only ever asked once he is already flying, and both answer to it there.
+    """
+    return m.controller.thrust or bool(m.input & C.INPUT_A_DOWN)
+
+
 def check_common_exits(m):
     """Transitions every grounded action shares."""
     if m.input & C.INPUT_A_PRESSED:
         return set_hero_action(m, H.ACT_HERO_JUMP, 0)
+    # The trigger alone, not `thrusting`: A held on the ground is a jump being
+    # held, and lifting off on it would mean he never jumped at all. Straight
+    # into the boosters with no jump under it and no delay in front of it,
+    # which is what a control dedicated to the jetpack buys -- A has to tell a
+    # tap from a hold before it can commit, and this does not.
+    if m.controller.thrust:
+        return set_hero_action(m, H.ACT_HERO_JETPACK, 0)
     if m.input & C.INPUT_OFF_FLOOR:
         return set_hero_action(m, H.ACT_HERO_FALL, 0)
     if in_deep_water(m):
@@ -353,7 +373,12 @@ def check_jetpack_hold(m):
     that bit is still set when this is first asked and every jump would become
     a flight before it had left the ground. Waiting `JETPACK_DELAY` frames and
     reading the button's *state* is what separates a tap from a hold.
+
+    The trigger is not subject to any of that. It has nothing to be told apart
+    from, so it lights the boosters on the frame it goes down, delay or no.
     """
+    if m.controller.thrust:
+        return set_hero_action(m, H.ACT_HERO_JETPACK, 0)
     if m.action_timer < H.JETPACK_DELAY:
         return False
     if not (m.input & C.INPUT_A_DOWN):
@@ -391,10 +416,11 @@ def act_jump(m):
 
 @action(H.ACT_HERO_FALL, "fall")
 def act_fall(m):
-    # Only a fresh press, not a held button: falling with A still down is what
-    # happens for the frame after the boosters cut out, and reading the hold
-    # here would light them again before he had dropped an inch.
-    if m.input & C.INPUT_A_PRESSED:
+    # Only a fresh press of either, not a held one: falling with the control
+    # still down is what happens for the frame after the boosters cut out, and
+    # reading the hold here would light them again before he had dropped an
+    # inch.
+    if m.input & C.INPUT_A_PRESSED or m.controller.thrust_pressed:
         return set_hero_action(m, H.ACT_HERO_JETPACK, 0)
 
     update_air_movement(m)
@@ -412,7 +438,7 @@ def act_fall(m):
 
 @action(H.ACT_HERO_JETPACK, "jetpack")
 def act_jetpack(m):
-    """Thrust up for as long as A is held, flown with the running controls.
+    """Thrust up for as long as it is asked for, flown with the running controls.
 
     The thrust is written as an approach toward a rise speed, run before the
     air step rather than after it, which is what makes the number behave: the
@@ -426,7 +452,7 @@ def act_jetpack(m):
         # frame he lets go rather than simply letting him fall.
         m.flags &= ~C.MARIO_JUMPING
 
-    if not (m.input & C.INPUT_A_DOWN):
+    if not thrusting(m):
         return set_hero_action(m, H.ACT_HERO_FALL, 0)
 
     m.vel[1] = approach_f32(m.vel[1], H.JETPACK_RISE_SPEED,

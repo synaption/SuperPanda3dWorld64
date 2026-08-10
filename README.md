@@ -147,6 +147,20 @@ sliders and takes it automatically — and clicking the window takes it again.
 While it is loose, dragging with a button held still swings the view, so the
 game is playable without the capture at all.
 
+Where the platform has a relative mouse mode the pointer free-runs and there is
+nothing more to say. Where it does not — WSL over X11 is the case at hand, and
+Panda3D says so in the log — the pointer has to be shoved back to the middle of
+the window before it reaches an edge and stops reporting. The delta is taken
+against the last *observed* position rather than against the centre, and the
+reason is worth recording: `move_pointer` does not land synchronously, reading
+the pointer straight back after a warp still returns the old position, and a
+delta measured as `pointer - centre` is therefore wrong by the width of the
+window on any frame the previous warp had not arrived. That is a single frame
+turning the view ninety degrees and pinning the pitch at its limit, at random,
+a few times a minute. Measured against the last reading instead, warp timing
+cannot enter into it; the one frame a warp lands on is dropped, since it is not
+motion, and one frame in a few hundred is not detectable.
+
 A crosshair marks the centre of the view, which is the same thing as the line
 the aim is taken along. It is drawn twice, a thick dark pass under a thin light
 one, because a single-colour reticle vanishes against the castle grounds —
@@ -167,8 +181,9 @@ and the stick pushed the opposite way simply cancel out.
 | left stick | analog stick, with a walk at the bottom of its travel |
 | d-pad | the same, at full deflection, when the stick is centred |
 | right stick | look, with a response curve and a turn ramp — see the camera below |
-| left trigger | aim, by however far it is pressed |
-| `A` | jump, and the jetpack |
+| right stick, clicked | aim. A latch, not a hold: the thumb aiming with the stick cannot also hold it in |
+| left trigger | the jetpack — held, he thrusts, straight off the ground with no jump under it |
+| `A` | jump, and the jetpack the slow way: held past the delay |
 | `B` | attack — Mario's B |
 | `X` | the squad, held or tapped as above |
 | right trigger | Z — crouch, ground pound, long jump |
@@ -236,29 +251,39 @@ recovery has nothing to rebound from. The air gets a wider band and a slower
 spring — a jump you can see the top of reads better than one the camera rides —
 and a hard leash at 520 units, because nothing above outruns a jetpack.
 
-**The boom pulls in hard and pushes out soft.** The segment from the pivot to
-where the camera wants to be is marched against the collision, and anything in
-the way shortens it. Coming in is instantaneous: a camera that eases into a
-wall spends those milliseconds inside it. Going back out takes a third of a
-second, because a camera that snaps out the moment a pillar clears is a jolt.
-That asymmetry is the whole of the occlusion behaviour.
+**The boom pulls in hard and pushes out soft.** The line back from his shoulder
+to where the camera wants to be is marched against the collision, and anything
+in the way — walls, ceilings and the ground alike — shortens it. Coming in is
+instantaneous: a camera that eases into a wall spends those milliseconds inside
+it. Going back out takes a third of a second, because a camera that snaps out
+the moment a pillar clears is a jolt. That asymmetry is the whole of the
+occlusion behaviour.
 
-Ground is the exception, and is not treated as an obstruction at all. A
-hillside behind him would otherwise crowd the camera onto his shoulder every
-time he ran downhill; the answer to ground in the way is to go over it, so the
-camera rides up on a short smoothed lift instead. Only what it cannot go over
-shortens the boom.
+Shortening is the only answer it has, and that is deliberate, because it is the
+only answer that is free. **The camera sits on its own aim ray**, so sliding in
+and out along that ray leaves the ray — and so the point under the crosshair —
+exactly where it was. Lifting the camera over a hillside instead would keep the
+distance and drag the aim across the world with the terrain: a hundred units of
+lift with the view angled eight degrees down moves the point under the
+crosshair seven hundred units further out, and at five degrees, eleven hundred.
+A camera that crowds your shoulder on a slope is doing its job. One that walks
+your aim off target every time you cross a hill is not. The march therefore
+runs backwards along the view direction, not outwards from the pivot, so that
+the length can change by any amount at all and cost the aim nothing.
 
 **The shoulder offset** puts him to one side so he is not standing on top of
-what you are aiming at. It is applied along the camera's own axes and folded
-into the collision march, so backing into a corner gives up the offset along
-with the length.
+what you are aiming at. It is the one part of the rig that sits *off* the ray,
+so it is left alone unless it has to give: only when the offset itself is
+buried in a wall — him flat against it, shoulder side in — does it fold away,
+smoothly and in both directions, since that move is one the aim can feel.
 
 **The sights** blend the whole rig — boom length, shoulder, field of view, look
 sensitivity, pitch limits — toward a tight over-the-shoulder framing over about
-a tenth of a second in and twice that out. `set_aim` takes an amount rather than
-a flag, so a trigger held half way gets half the move, which is a thing a
-trigger can do and a button cannot.
+a tenth of a second in and twice that out. `set_aim` takes an amount rather
+than a flag, so a partial aim is expressible — an analog control could hold the
+camera half way in. Nothing is bound to one at the moment: the pad aims on a
+right-stick click, which latches, because the thumb aiming with that stick
+cannot also hold it in.
 
 **Sticks get a curve and a ramp.** The magnitude is squared and the direction
 kept, so the middle of the stick's travel is fine control and the rim is the
@@ -268,12 +293,9 @@ slowly. The mouse gets neither — it needs neither — beyond 20 ms of smoothin
 to take the stair-step off a 125 Hz mouse read at 200 fps, which is a slider
 (`mouse_smooth`) and can be set to zero for a raw 1:1 pointer.
 
-**The view drifts back behind him** while he runs, but only after the look
-control has been left alone for a second and only in proportion to his speed.
-It is what keeps a keyboard player — who can only turn the view with `Q` and
-`E` — from having to steer the camera as a second job. It is off entirely while
-aiming, where the view *is* the aim and a camera that quietly re-points it is a
-camera arguing with the player. `cam_align` turns it down, and to zero.
+**Nothing re-points the view but the player.** No drift back behind him while
+he runs, no framing assist, no correction of any kind. `R` is the only thing in
+here that turns the view on its own, and `R` is a button.
 
 The rest is small: a landing kicks the camera in proportion to the fall, a
 sprint widens the view by four degrees and lengthens the boom, and the whole
@@ -295,6 +317,21 @@ as long as it is held; let go and he falls. Pressing it again in mid-air — off
 a ledge, or halfway down from a jump he let go of — lights it from wherever he
 is, arresting the fall over a few frames and then climbing. A tap is still an
 ordinary jump, which is what the six-frame delay is for.
+
+**On a pad the boosters have a control of their own**: the left trigger, which
+means nothing else. That changes what it can do, and the delay is the reason.
+`Space` is the jump button first, so it has to wait six frames to find out
+whether it was a tap before it can commit to anything; a trigger that means
+only the jetpack has nothing to be told apart from, so it lifts him straight
+off the ground with no jump under it and no delay in front of it. Holding it is
+the thrust and letting go drops him, exactly as the key does — `thrusting()` in
+`sm64py/hero/actions.py` is the pair of them, and only the trigger appears in
+`check_common_exits`, since A held while standing is a jump being held and
+lifting off on it would mean he never jumped at all.
+
+It rides on the `Controller` as its own field rather than as a button bit, the
+way the skates do: the button mask is the N64's, every bit in it already means
+something, and Mario shares the same controller.
 
 He steers under thrust with the running controls rather than a jump's weak air
 control: the stick turns him at the same `TURN_RATE` and accelerates him to the

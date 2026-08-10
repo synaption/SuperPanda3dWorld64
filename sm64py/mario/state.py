@@ -18,7 +18,8 @@ class Controller:
     """
 
     __slots__ = ("stick_x", "stick_y", "stick_mag", "button_down",
-                 "button_pressed", "_prev_down", "zombie", "skating")
+                 "button_pressed", "_prev_down", "zombie", "skating",
+                 "thrust", "thrust_pressed")
 
     def __init__(self):
         self.stick_x = 0.0
@@ -37,6 +38,22 @@ class Controller:
         # Skates on. Unlike the zombie this one does reach the action code --
         # it is what ACT_SKATING stays in, and what puts ice underfoot.
         self.skating = False
+
+        # The jetpack's own control, on the Hero's left trigger. Also not an
+        # N64 button, and it rides here for the same reason the skates do:
+        # folding it into the button mask would mean picking a bit the original
+        # already means something by, and Mario shares this controller.
+        #
+        # The press is kept beside the hold because both are asked for -- the
+        # hold is the thrust, and the press is what lights the boosters again
+        # after they have been let go of in mid-air.
+        self.thrust = False
+        self.thrust_pressed = False
+
+    def set_thrust(self, down):
+        """Feed the jetpack control. Once a tick, as `set_buttons` is."""
+        self.thrust_pressed = bool(down) and not self.thrust
+        self.thrust = bool(down)
 
     def set_stick(self, x, y):
         """Feed a normalised [-1, 1] stick position, with a deadzone."""

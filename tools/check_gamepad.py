@@ -226,17 +226,78 @@ def check_the_squad_button_reports_both_edges():
     return ok, f"down {down}, held {holding}, up {up}"
 
 
+def check_the_left_trigger_is_the_jetpack():
+    """It thrusts, and it does not also crouch.
+
+    The two triggers used to be one control between them, both giving Z. The
+    left one is the jetpack now, and a player holding it to fly must not be
+    ground-pounding at the same time.
+    """
+    problems = []
+
+    pad, device = fresh()
+    device.axes[InputDevice.Axis.left_trigger] = 0.9
+    pad.poll()
+    if not pad.thrust:
+        problems.append("a held left trigger did not give thrust")
+    if pad.buttons & C.Z_TRIG:
+        problems.append("the left trigger still gives Z")
+
+    # And the other way: Z's own trigger is not the jetpack.
+    pad, device = fresh()
+    device.axes[InputDevice.Axis.right_trigger] = 0.9
+    pad.poll()
+    if pad.thrust:
+        problems.append("the right trigger gave thrust")
+
+    # The button form, for drivers that report it that way.
+    pad, device = fresh()
+    device.press(GamepadButton.ltrigger())
+    pad.poll()
+    if not pad.thrust:
+        problems.append("a left trigger held as a button did not give thrust")
+
+    return not problems, ("; ".join(problems) if problems
+                          else "the left trigger thrusts and the right one is Z")
+
+
+def check_the_right_stick_click_latches():
+    """The zoom is a press, not a hold.
+
+    Clicking the right stick is done with the thumb that aims, so it cannot be
+    held down while aiming with it -- which is the whole reason it latches
+    rather than being read as a held button.
+    """
+    pad, device = fresh()
+    device.press(GamepadButton.rstick())
+    pad.poll()
+    first = pad.pressed("zoom")
+    pad.poll()
+    held = pad.pressed("zoom")
+    device.press()
+    pad.poll()
+    device.press(GamepadButton.rstick())
+    pad.poll()
+    again = pad.pressed("zoom")
+
+    ok = first and not held and again
+    return ok, f"click {first}, still held {held}, clicked again {again}"
+
+
 def check_console_holds_it_neutral():
     """Everything centred while the console has the input, and no stuck press."""
     pad, device = fresh()
     device.stick(1.0, 1.0)
     device.press(GamepadButton.face_a())
     pad.poll()
-    live = pad.stick != (0.0, 0.0) and pad.buttons != 0
+    device.axes[InputDevice.Axis.left_trigger] = 0.9
+    pad.poll()
+    live = pad.stick != (0.0, 0.0) and pad.buttons != 0 and pad.thrust
 
     pad.poll(active=False)
-    ok = live and pad.stick == (0.0, 0.0) and pad.buttons == 0
-    return ok, f"live {live}, then {pad.stick} and 0x{pad.buttons:X}"
+    ok = (live and pad.stick == (0.0, 0.0) and pad.buttons == 0
+          and not pad.thrust)
+    return ok, f"live {live}, then {pad.stick}, 0x{pad.buttons:X}, thrust {pad.thrust}"
 
 
 def check_no_pad_is_no_input():
@@ -245,7 +306,7 @@ def check_no_pad_is_no_input():
     pad.poll()
     ok = (not pad.connected and pad.stick == (0.0, 0.0)
           and pad.camera == (0.0, 0.0) and pad.buttons == 0
-          and not pad.zombie and not pad.recenter
+          and not pad.zombie and not pad.recenter and not pad.thrust
           and not pad.pressed("skates"))
     return ok, f"unplugged reads neutral, name {pad.name!r}"
 
@@ -258,6 +319,8 @@ CHECKS = [
     ("latching controls press once", check_latching_controls_press_once),
     ("the squad button reports both edges",
      check_the_squad_button_reports_both_edges),
+    ("the left trigger is the jetpack", check_the_left_trigger_is_the_jetpack),
+    ("the right stick click latches", check_the_right_stick_click_latches),
     ("the console holds the pad neutral", check_console_holds_it_neutral),
     ("no pad is no input", check_no_pad_is_no_input),
 ]

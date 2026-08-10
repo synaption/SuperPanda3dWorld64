@@ -183,7 +183,8 @@ def check_the_stick_ramps():
     early = turned_over(0.0, 0.2)
     late = turned_over(0.2, 0.4)      # by now the ramp is up
     ok = late > early * 1.15
-    return ok, f"{early:.1f} deg in the first fifth of a second, {late:.1f} in the third"
+    return ok, (f"{early:.1f} deg in the first fifth of a second, "
+                f"{late:.1f} in the third")
 
 
 def check_the_curve_leaves_a_slow_turn():
@@ -355,10 +356,12 @@ def check_the_sights_pull_in_and_let_go():
                 f"boom {far:.0f} -> {close:.0f} -> {out:.0f}")
 
 
-def check_half_a_trigger_is_half_the_aim():
-    """A trigger held half way gets a framing half way in.
+def check_half_an_amount_is_half_the_aim():
+    """Asked for half the sights, the rig goes half way in.
 
-    What `set_aim` taking an amount rather than a flag is for.
+    What `set_aim` taking an amount rather than a flag is for. Nothing is bound
+    to an analog control at the moment, so this is the only thing holding the
+    blend to being a blend rather than a switch with a ramp on it.
     """
     camera, hero = a_camera()
     settled(camera)
@@ -370,7 +373,7 @@ def check_half_a_trigger_is_half_the_aim():
     full = camera.fov
     share = (cam.HIP_FOV - half) / max(cam.HIP_FOV - full, 1e-6)
     ok = 0.35 < share < 0.65
-    return ok, f"half the trigger moved the view {share * 100:.0f}% of the way in"
+    return ok, f"half the amount moved the view {share * 100:.0f}% of the way in"
 
 
 def check_aiming_slows_the_hand():
@@ -438,35 +441,70 @@ def check_the_stick_is_measured_against_the_view():
                 f"{after - before:+.0f} units further off")
 
 
-# -- drifting back -----------------------------------------------------------
+# -- nothing points the view but the player -----------------------------------
 
 
-def check_the_view_drifts_back_behind_him():
-    """Run for a while without touching the look and the camera comes round."""
+def check_nothing_re_points_the_view():
+    """Left alone, the view stays exactly where it was put.
+
+    Not approximately, and not for a while: no drift back behind him, no
+    framing assist, no correction. He runs a hundred units a second under a
+    camera that does not answer for it.
+    """
     camera, hero = a_camera(yaw=0, speed=38.0)
     settled(camera)
-    camera.look(80.0, 0.0)
-    off = abs(s16_to_degrees(cam._wrap_angle(
-        camera.yaw - s16(hero.face_angle[1] + 0x8000))))
-    run(camera, 4.0)
-    left = abs(s16_to_degrees(cam._wrap_angle(
-        camera.yaw - s16(hero.face_angle[1] + 0x8000))))
-    ok = left < off * 0.5
-    return ok, f"{off:.0f} deg off his back, {left:.0f} four seconds later"
+    camera.look(80.0, -20.0)
+    yaw, pitch = camera.yaw, camera.pitch
+    run(camera, 6.0, before=lambda t: hero.pos.__setitem__(2, t * 1000.0))
+    moved = abs(s16_to_degrees(cam._wrap_angle(yaw - camera.yaw)))
+    tilted = abs(pitch - camera.pitch)
+    ok = moved < 1e-6 and tilted < 1e-9
+    return ok, (f"six seconds and a thousand units a second later: "
+                f"{moved:.1e} deg of yaw, {tilted:.1e} rad of pitch")
 
 
-def check_it_does_not_drift_while_aiming():
-    """Down the sights the view is the aim, and nothing else may point it."""
-    camera, hero = a_camera(yaw=0, speed=38.0)
+def check_the_boom_length_does_not_move_the_aim():
+    """Whatever the boom does, the crosshair keeps pointing at the same spot.
+
+    This is the invariant the occlusion behaviour is built on and the reason
+    ground is treated as something to shorten the boom for rather than
+    something to lift the camera over: a camera anywhere along its own view ray
+    sees the same point at the middle of the screen, so pulling in for a wall
+    or a hillside costs the aim nothing, while lifting over one walks the aim
+    across the world as the terrain changes.
+
+    The boom is driven here by moving the tunable rather than by finding a wall
+    for every length, but it is the same code doing the placing. An earlier
+    version measured the boom from the pivot rather than from the shoulder,
+    which tilted the line the camera came in along by the shoulder offset and
+    moved the aim point by about eleven units over this range -- small, and
+    the sort of small that is felt rather than seen, since it happens exactly
+    when a wall slides in behind you.
+    """
+    camera, hero = a_camera()
     settled(camera)
-    camera.set_aim(1.0)
+    camera.look(0.0, -8.0)          # a shallow angle: it magnifies any error
     run(camera, 0.5)
-    camera.look(80.0, 0.0)
-    before = camera.yaw
-    run(camera, 4.0)
-    moved = abs(s16_to_degrees(cam._wrap_angle(before - camera.yaw)))
-    ok = moved < 0.5
-    return ok, f"the view held to within {moved:.2f} deg over four seconds"
+
+    hits = []
+    for distance in (cam.HIP_DISTANCE, 620.0, 350.0, cam.MIN_DISTANCE):
+        camera.distance = distance
+        run(camera, 0.8)
+        hits.append(_ground_hit(*camera.aim_ray()))
+
+    worst = max(math.dist(hits[0], hit) for hit in hits)
+    spread = abs(camera._boom - cam.HIP_DISTANCE)
+    ok = worst < 1.0 and spread > 400.0
+    return ok, (f"the boom moved {spread:.0f} units; the aim point moved "
+                f"{worst:.4f}")
+
+
+def _ground_hit(origin, direction):
+    """Where a ray meets the y = 0 plane. The plane every check stands on."""
+    if direction[1] >= -1e-6:
+        return (origin[0], 0.0, origin[2])
+    t = -origin[1] / direction[1]
+    return (origin[0] + direction[0] * t, 0.0, origin[2] + direction[2] * t)
 
 
 def check_recentring_arrives():
@@ -499,13 +537,14 @@ CHECKS = [
     ("the boom goes out slowly", check_the_boom_goes_out_slowly),
     ("the camera stays above ground", check_the_camera_stays_above_the_ground),
     ("the sights pull in and let go", check_the_sights_pull_in_and_let_go),
-    ("half a trigger is half the aim", check_half_a_trigger_is_half_the_aim),
+    ("half an amount is half the aim", check_half_an_amount_is_half_the_aim),
     ("aiming slows the hand", check_aiming_slows_the_hand),
     ("the ray is the view", check_the_ray_is_the_view),
     ("the stick is measured against the view",
      check_the_stick_is_measured_against_the_view),
-    ("the view drifts back behind him", check_the_view_drifts_back_behind_him),
-    ("it does not drift while aiming", check_it_does_not_drift_while_aiming),
+    ("nothing re-points the view", check_nothing_re_points_the_view),
+    ("the boom does not move the aim",
+     check_the_boom_length_does_not_move_the_aim),
     ("recentring arrives", check_recentring_arrives),
 ]
 

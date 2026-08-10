@@ -47,14 +47,24 @@ The pieces:
 
   * **Sights.**  `set_aim` blends the whole rig -- boom length, shoulder,
     field of view, look sensitivity, pitch limits -- toward a tight
-    over-the-shoulder framing.  It takes an amount rather than a flag so an
-    analog trigger can be half pressed and get half the move.
+    over-the-shoulder framing.  It takes an amount rather than a flag, so an
+    analog control could hold it half way in; the front end currently hands it
+    a nought or a one.
 
   * **A ray, and only one.**  The camera looks exactly along its own yaw and
     pitch: no separate focus point above his head, no look-at that quietly
     disagrees with where the boom is pointing.  That is what makes the
     crosshair mean something -- `aim_ray()` is the line out of the middle of
     the screen, and it is the same line the view was built from.
+
+And the corollary, which is what decides several of the arguments below: the
+camera may slide *along* that ray as freely as it likes, because a ray is the
+same ray whichever point on it you start from, and it may not move off it
+without the player having asked.  Occlusion shortens the boom -- it never lifts
+the camera over things.  Nothing re-points the view but the player: there is no
+drift back behind him while he runs, no framing assist, no correction.  The
+only thing here that turns the view on its own is the recentre, which is a
+button.
 
 Everything with a number in it is an attribute rather than a constant read at
 use, so the console's sliders can move it while the game runs.
@@ -155,9 +165,6 @@ AIRBORNE_HEIGHT = 60.0
 CAMERA_RADIUS = 90.0
 FLOOR_CLEARANCE = 90.0
 CEILING_CLEARANCE = 60.0
-# Seconds the camera takes to climb over ground it has run into.  See
-# `_ride_the_ground`; this is the one keep-out that is smoothed, and why.
-LIFT_SMOOTH = 0.08
 
 # Nearest the camera may ever sit to the pivot.  At this range it is nearly a
 # first-person view, which is the right answer when he is jammed into a corner
@@ -168,6 +175,11 @@ MIN_DISTANCE = 190.0
 # other direction has no constant because it has no delay: see the module
 # docstring.
 BOOM_RETURN = 0.32
+
+# Seconds the shoulder offset takes to fold away against a wall and to come
+# back out.  Both directions, because unlike the boom this one moves the camera
+# sideways, and sideways is the direction the aim can feel.
+FOLD_SMOOTH = 0.18
 
 # How finely the pivot-to-camera segment is sampled for occlusion.  A step of
 # about 110 units against a camera radius of 90 means nothing thinner than the
@@ -210,16 +222,7 @@ AIM_SENSITIVITY = 0.55
 AIM_IN_SMOOTH = 0.11
 AIM_OUT_SMOOTH = 0.18
 
-# -- auto-align --------------------------------------------------------------
-
-# The camera drifts back behind him while he runs, but only after he has left
-# the look control alone this long, and only in proportion to how fast he is
-# going.  It is what keeps a keyboard player -- who can only turn the view with
-# Q and E -- from having to steer the camera as a second job, and it has to be
-# gentle enough that it is never felt as the camera disagreeing.
-AUTO_ALIGN_DELAY = 1.1
-AUTO_ALIGN_RATE = 2.2
-AUTO_ALIGN_MIN_SPEED = 8.0
+# -- recentring ---------------------------------------------------------------
 
 # Recentring (R, or the right shoulder) is not a snap.  It is a quarter-second
 # spring onto his back, which arrives fast enough to be a command and slow
@@ -336,7 +339,6 @@ class FollowCamera:
         self.stick_speed = STICK_YAW_SPEED
         self.stick_pitch_speed = STICK_PITCH_SPEED
         self.follow_smooth = FOLLOW_SMOOTH
-        self.auto_align = 1.0
         self.shake_scale = 1.0
         self.invert_pitch = False
 
@@ -361,8 +363,8 @@ class FollowCamera:
 
         self._boom = self.distance
         self._boom_vel = 0.0
-        self._lift = 0.0
-        self._lift_vel = 0.0
+        self._shoulder_fold = 1.0
+        self._fold_vel = 0.0
 
         self._aim = 0.0             # where the sights actually are, eased
         self._aim_raw = 0.0         # the same, before the ease
@@ -372,7 +374,6 @@ class FollowCamera:
         self._speed_vel = 0.0
 
         self._ramp = 0.0            # the stick's turn ramp, 0..1
-        self._look_idle = 0.0       # seconds since the player last looked
         self._pending_mouse = [0.0, 0.0]
 
         self._recentring = False
@@ -412,7 +413,9 @@ class FollowCamera:
         self.pitch = self._clamp_pitch(
             self.pitch - math.radians(up_degrees * scale))
         if right_degrees or up_degrees:
-            self._look_idle = 0.0
+            # Looking cancels a recentre in flight: the player has taken the
+            # view back, and finishing the spring would be the camera taking
+            # it away again.
             self._recentring = False
 
     def look_mouse(self, dx_pixels, dy_pixels):
@@ -477,9 +480,10 @@ class FollowCamera:
     def set_aim(self, amount):
         """How far down the sights to be, 0 to 1.
 
-        Takes an amount rather than a flag so an analog trigger half pressed
-        gets half the move, which is a thing a trigger can do and a button
-        cannot.
+        An amount rather than a flag, so an analog control can hold the camera
+        part of the way in.  Nothing is bound to one at the moment -- the pad
+        aims on a right-stick click, which latches -- but the blend is built to
+        be driven that way and the transitions read correctly at any value.
         """
         self._aim_target = _clamp(float(amount), 0.0, 1.0)
 
@@ -510,8 +514,6 @@ class FollowCamera:
         self._flush_mouse(dt)
         self._update_aim_blend(dt)
         self._update_recenter(dt, recenter)
-        self._update_auto_align(dt)
-        self._look_idle += dt
 
         self._follow(dt, pos)
         self._place(dt)
@@ -571,25 +573,6 @@ class FollowCamera:
         if abs(_wrap_angle(target - self.yaw)) < 0x0040 and not held:
             self._recentring = False
 
-    def _update_auto_align(self, dt):
-        """Drift back behind him while he runs and nobody is looking around.
-
-        Off entirely while aiming: down the sights the view *is* the aim, and
-        a camera that quietly re-points it is a camera fighting the player.
-        """
-        if (self._recentring or self.auto_align <= 0.0 or self._aim > 0.01
-                or self._look_idle < AUTO_ALIGN_DELAY):
-            return
-        speed = abs(getattr(self.target, "forward_vel", 0.0))
-        if speed < AUTO_ALIGN_MIN_SPEED:
-            return
-
-        strength = min(speed / SPEED_REFERENCE, 1.0) * self.auto_align
-        target = float(s16(self.target.face_angle[1] + 0x8000))
-        delta = _wrap_angle(target - self.yaw)
-        self.yaw = _wrap_angle(
-            self.yaw + delta * (1.0 - math.exp(-AUTO_ALIGN_RATE * strength * dt)))
-
     def _follow(self, dt, pos):
         """Move the pivot toward chest height on him."""
         target_y = pos[1] + self.height
@@ -648,31 +631,22 @@ class FollowCamera:
         # The boom root: the pivot, shifted along the camera's own axes.  Up is
         # world up rather than the camera's, so looking down does not slide the
         # framing sideways up the screen.
+        #
+        # The offset is folded away if it has put the root inside something,
+        # which happens when he is flat against a wall on the shoulder side.
+        # That is a *lateral* move and so it does shift the aim, which is why
+        # it is done here, separately and rarely, rather than by folding the
+        # shoulder into the boom: everything after this point runs along the
+        # view ray, where sliding in and out costs the aim nothing at all.
+        self._fold_shoulder(dt, right, side, lift)
+        fold = self._shoulder_fold
         root = [
-            self._pivot[0] + right[0] * side,
-            self._pivot[1] + lift,
-            self._pivot[2] + right[2] * side,
+            self._pivot[0] + right[0] * side * fold,
+            self._pivot[1] + lift * fold,
+            self._pivot[2] + right[2] * side * fold,
         ]
-        desired = [root[i] - forward[i] * length for i in range(3)]
 
-        # Everything from here is measured along the segment from the pivot,
-        # which is inside him and therefore known to be somewhere the camera
-        # could legally be.  Folding the shoulder offset into that segment is
-        # what makes backing into a corner give the offset up along with the
-        # length instead of grinding it into the wall.
-        dx = desired[0] - self._pivot[0]
-        dy = desired[1] - self._pivot[1]
-        dz = desired[2] - self._pivot[2]
-        full = math.sqrt(dx * dx + dy * dy + dz * dz)
-        if full < 1e-4:
-            self.pos = list(self._pivot)
-            self.focus = [self._pivot[i] + forward[i] * 100.0 for i in range(3)]
-            self._update_fov(hip)
-            return
-
-        direction = (dx / full, dy / full, dz / full)
-        clear = self._clear_distance(direction, full)
-
+        clear = self._clear_distance(root, forward, length)
         if clear < self._boom:
             # In, on the frame it is needed.  A spring here is a camera that
             # spends the first hundred milliseconds of every corner inside it.
@@ -682,41 +656,82 @@ class FollowCamera:
             self._boom, self._boom_vel = smooth_damp(
                 self._boom, clear, self._boom_vel, BOOM_RETURN, dt)
 
-        self.pos = [self._pivot[i] + direction[i] * self._boom for i in range(3)]
-        self.pos = self._safety_net(self._ride_the_ground(self.pos, dt))
+        self.pos = self._safety_net(
+            [root[i] - forward[i] * self._boom for i in range(3)])
         # The point on the view ray level with him: what the old camera called
         # its focus, and still what anything measuring the aim starts from.
         self.focus = [self.pos[i] + forward[i] * self._boom for i in range(3)]
         self._update_fov(hip)
+
+    def _fold_shoulder(self, dt, right, side, lift):
+        """How much of the shoulder offset there is room for, 0 to 1.
+
+        Only ever asked because of the one case the boom cannot answer: he is
+        pressed against a wall on the side the camera is offset toward, so the
+        offset alone -- before the boom has gone anywhere -- is already inside
+        it.  Backing the camera up would not help, since the whole line it
+        would back along is in the wall.
+
+        Smoothed in both directions, unlike the boom.  The boom is allowed to
+        snap in because moving along the view ray is invisible; this is not,
+        and a hard fold reads as the world sliding sideways.
+        """
+        wanted = 1.0
+        if side or lift:
+            for fraction in (1.0, 0.6, 0.3, 0.0):
+                point = (self._pivot[0] + right[0] * side * fraction,
+                         self._pivot[1] + lift * fraction,
+                         self._pivot[2] + right[2] * side * fraction)
+                if not self._occupied(*point):
+                    wanted = fraction
+                    break
+            else:
+                wanted = 0.0
+        self._shoulder_fold, self._fold_vel = smooth_damp(
+            self._shoulder_fold, wanted, self._fold_vel, FOLD_SMOOTH, dt)
 
     def _update_fov(self, hip):
         self.fov = (self.base_fov
                     + (self.aim_fov - self.base_fov) * self._aim
                     + SPEED_FOV_KICK * self._speed_blend * hip)
 
-    def _clear_distance(self, direction, full):
-        """How far along `direction` the camera can go before it hits something.
+    def _clear_distance(self, root, forward, full):
+        """How far back from `root` the camera can go before it hits something.
+
+        Backwards along the view direction, which is the whole point: the
+        camera is then somewhere on the line it is looking along, and the
+        crosshair means the same thing at every distance the march might come
+        back with.
 
         Marched rather than solved: the collision here is a soup of triangles
-        in a lateral grid with no ray query on it, and the two tests it does
-        have -- push a sphere out of the walls, find the floor under a point --
-        are exactly the two a camera cares about.  Sampling them along the
-        segment costs about a dozen queries a frame, which is a fifth of what
-        the squad reticle spends while it is up.
+        in a lateral grid with no ray query on it, and the three tests it does
+        have -- push a sphere out of the walls, find the floor under a point,
+        find the ceiling over it -- are exactly the three a camera cares about.
+        Sampling them along the segment costs about a dozen queries a frame,
+        which is a fifth of what the squad reticle spends while it is up.
 
-        Note what is *not* in `_occupied`: standing on the ground.  A hillside
-        rising behind him would otherwise shorten the boom every time he ran
-        downhill, and the answer to ground in the way is to go over it, not to
-        crowd his shoulder -- which is what `_ride_the_ground` does.  Only
-        something the camera cannot go over shortens the boom.
+        Shortening the boom is the *only* answer to anything in the way, and
+        that includes the ground.  It looks like an over-reaction -- a hillside
+        rising behind him is something the camera could plainly see over from a
+        few feet up, and lifting it would keep the distance -- but the lift is
+        the one move a camera in an aimed game may not make.  Everything the
+        crosshair means comes from the camera sitting *on* the aim ray: sliding
+        in and out along that ray leaves the ray, and so the aim, exactly where
+        it was, while lifting off it drags the aim point across the world with
+        the terrain, and not slightly.  A hundred units of lift with the view
+        angled eight degrees down moves the point under the crosshair seven
+        hundred units further away; at five degrees it is eleven hundred.  A
+        camera that crowds his shoulder on a slope is a camera doing its job.
+        A camera that walks your aim off target every time you cross a hill is
+        not.
         """
         samples = int(min(max(full / OCCLUSION_STEP, 3.0), OCCLUSION_MAX_SAMPLES))
         step = full / samples
         for i in range(1, samples + 1):
             distance = step * i
-            point = (self._pivot[0] + direction[0] * distance,
-                     self._pivot[1] + direction[1] * distance,
-                     self._pivot[2] + direction[2] * distance)
+            point = (root[0] - forward[0] * distance,
+                     root[1] - forward[1] * distance,
+                     root[2] - forward[2] * distance)
             if self._occupied(*point):
                 # Stop short of the sample that was inside something, by the
                 # camera's own radius: the sample before it is the last one
@@ -725,54 +740,39 @@ class FollowCamera:
         return full
 
     def _occupied(self, x, y, z):
-        """Is a camera-sized sphere here inside a wall or through a ceiling?"""
+        """Is a camera-sized sphere here inside the level?"""
         data = WallCollisionData(x, y, z, 0.0, CAMERA_RADIUS)
         if self.surfaces.find_wall_collisions(data, for_camera=True):
+            return True
+
+        height, floor = self.surfaces.find_floor(
+            x, y + CAMERA_RADIUS, z, for_camera=True)
+        if floor is not None and y < height + FLOOR_CLEARANCE:
             return True
 
         height, ceil = self.surfaces.find_ceil(
             x, y - CAMERA_RADIUS, z, for_camera=True)
         return ceil is not None and y > height - CEILING_CLEARANCE
 
-    def _ride_the_ground(self, pos, dt):
-        """Lift the camera over whatever ground it has ended up inside.
-
-        A slope behind him is not an obstruction, it is a thing to stand on.
-        Shortening the boom for it would mean the camera crowded his shoulder
-        every time he walked down a hill -- and it is a hill, so he can see over
-        it perfectly well from six feet up.
-
-        The lift is smoothed, and it is the one keep-out in here that is: what
-        it tracks is the ground under a point that is moving, so it changes with
-        every bump the camera passes over, and a hard clamp would transmit each
-        of them to the view.  Eighty milliseconds is short enough that the few
-        frames it spends catching up with a step in the terrain are frames the
-        camera is a little low rather than frames it is underground.
-        """
-        height, floor = self.surfaces.find_floor(
-            pos[0], pos[1] + CAMERA_RADIUS, pos[2], for_camera=True)
-        wanted = 0.0
-        if floor is not None:
-            wanted = max(height + FLOOR_CLEARANCE - pos[1], 0.0)
-        self._lift, self._lift_vel = smooth_damp(
-            self._lift, wanted, self._lift_vel, LIFT_SMOOTH, dt)
-        pos[1] += self._lift
-        return pos
-
     def _safety_net(self, pos):
         """Last resort: keep the camera out of what it has ended up inside.
 
-        The march and the lift are what actually keep the camera clear, and in
-        open ground neither of these fires.  This is for what they cannot cover
-        -- a surface that appears between the pivot and the camera without ever
+        The march is what actually keeps the camera clear, and over open ground
+        this never fires.  It is here for what the march cannot cover -- a
+        surface that appears between the pivot and the camera without ever
         crossing the segment, which the level's moving platforms can do -- and
         it is deliberately a hard clamp, because a smoothed correction to being
         underground is a smooth trip underground.
+
+        It is also the one place the camera moves off the aim ray, so the
+        clearances are as small as they can be: better a frame of grazing the
+        ground than a visible push, since a push here is the aim moving without
+        the player having asked.
         """
         x, y, z = pos
         height, ceil = self.surfaces.find_ceil(x, y, z, for_camera=True)
-        if ceil is not None and y > height - 50.0:
-            y = height - 50.0
+        if ceil is not None and y > height - 30.0:
+            y = height - 30.0
         height, floor = self.surfaces.find_floor(x, y, z, for_camera=True)
         if floor is not None and y < height + 20.0:
             y = height + 20.0
