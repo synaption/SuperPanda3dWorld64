@@ -51,13 +51,28 @@ ACTION_NAMES = {
 #
 # Kept in the decomp's units -- per 30 Hz frame, and tuned against the same
 # quarter-step collision -- because that is what the level was built for.
-# The Hero is quicker off the mark than Mario and tops out a little lower,
-# which is the one place his movement is deliberately not Mario's.
+# The Hero is quicker off the mark than Mario and now outruns him too: 38
+# against Mario's 32, which is the one place his movement is deliberately not
+# Mario's.
 
 WALK_ACCEL = 1.4                # per frame, before the taper below
 ACCEL_TAPER = 43.0              # acceleration falls away as speed approaches this
-MAX_WALK_SPEED = 30.0
-MAX_RUN_SPEED = 30.0
+MAX_WALK_SPEED = 38.0
+MAX_RUN_SPEED = 38.0
+
+# The speed ACCEL_TAPER was tuned at, which is not the same thing as whatever
+# the caps above happen to say today: the taper is scaled by the ratio between
+# them so the ramp keeps its shape when the top speed moves. Left at the value
+# the number was authored against rather than following the caps, so raising
+# the top speed does not quietly re-tune the acceleration curve as well.
+TAPER_REFERENCE_SPEED = 30.0
+
+# What a fully pressed stick reports. The magnitude is squared into 0..64 and
+# halved (see MarioState.update_inputs), so this is the ceiling, and the speed
+# caps above are read as a fraction of it rather than clipped against it --
+# otherwise no cap above 32 could ever be reached, and the debug console's
+# run_speed slider would go dead halfway along.
+MAX_STICK_MAG = 32.0
 DECELERATION = 1.8              # per frame with no stick
 BRAKE_DECELERATION = 3.0        # per frame when reversing hard
 

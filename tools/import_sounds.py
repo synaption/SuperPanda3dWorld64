@@ -27,7 +27,7 @@ from sm64py.mario import constants as C  # noqa: E402
 
 DEFAULT_SOURCE = os.path.join(
     HERE, "..", "reference", "sm64pcbuilder2", "assets", "US", "sound", "samples")
-DEFAULT_OUTPUT = os.path.join(HERE, "..", "assets", "sounds")
+DEFAULT_OUTPUT = os.path.join(HERE, "..", "assets", "sounds", "mario64")
 
 # Terrain code -> sample. Mapped by name rather than by index on purpose: the
 # sample bank is not ordered by terrain code. Its file 02 is stone, while

@@ -1,0 +1,1 @@
+hero character model does not interact with lighting.  

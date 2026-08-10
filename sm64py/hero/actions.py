@@ -72,12 +72,22 @@ def update_ground_speed(m):
     it, speed ramps linearly and the difference between a nudge and a shove
     disappears within a few frames.
     """
-    target = min(m.intended_mag, H.MAX_WALK_SPEED)
+    # How far the stick is pressed as a fraction of its own ceiling, times the
+    # cap. Clipping the stick's magnitude against the cap instead -- which is
+    # what the decomp does, and what this used to do -- makes every cap above
+    # 32 the same cap, since the stick never reports more than that. At the
+    # default 30 the two agree at a full press and differ by 6% at a half one.
+    target = min(m.intended_mag / H.MAX_STICK_MAG, 1.0) * H.MAX_WALK_SPEED
 
     if m.forward_vel <= 0.0:
         m.forward_vel += H.WALK_ACCEL
     elif m.forward_vel <= target:
-        m.forward_vel += H.WALK_ACCEL - m.forward_vel / H.ACCEL_TAPER
+        # The taper was written against a 30-unit top speed; above it the
+        # acceleration would taper to nothing before the target was reached,
+        # so it scales with the cap and keeps its shape.
+        taper = H.ACCEL_TAPER * max(
+            1.0, H.MAX_WALK_SPEED / H.TAPER_REFERENCE_SPEED)
+        m.forward_vel += H.WALK_ACCEL - m.forward_vel / taper
     else:
         m.forward_vel -= H.DECELERATION
 

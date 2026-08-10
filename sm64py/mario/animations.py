@@ -88,14 +88,51 @@ def anim_name(anim_id):
 # -- state-dependent choices ------------------------------------------------
 
 
+# The thresholds the original switches on, and the slack either side of them.
+#
+# Speed sawtooths by about a unit a frame -- the walk code adds acceleration
+# below its target and subtracts a flat unit above it, and check_movement
+# measures the result settling between 31.01 and 32.35 -- so a bare threshold
+# is crossed back and forth on consecutive frames wherever Mario happens to
+# settle near one. Every crossing restarts the clip from frame zero, which
+# reads as the animation stuttering rather than as him changing gait.
+TIPTOE_SPEED = 5.0
+RUN_ANIM_SPEED = 22.0
+GAIT_HYSTERESIS = 2.0
+
+
 def _walking(m):
-    """Tiptoe, walk or run, chosen by speed the way the original does."""
-    speed = max(abs(m.forward_vel), m.intended_mag)
-    if speed < 5.0:
-        return ANIM_TIPTOE
-    if speed > 22.0:
-        return ANIM_RUNNING
-    return ANIM_WALKING
+    """Tiptoe, walk or run, chosen by how fast Mario is actually going.
+
+    The original chooses on whichever is larger, his speed or how far the
+    stick is pushed -- `val04` in `anim_and_audio_for_walk`. That works on a
+    stick that reports a range. It does not work on a keyboard, where a
+    pressed key is always a full deflection and `intended_mag` is therefore
+    pinned at its ceiling of 32: the comparison picks 32 every frame, so the
+    run clip comes out on the first frame of movement and plays at its top
+    cadence while Mario is still crawling forward at a quarter of that speed.
+    That is the "screwed up" walk -- his legs sprinting while he creeps.
+
+    Choosing on speed alone gives back what the original shows on a stick:
+    tiptoe, then walk, then run, as he gets up to it.
+    """
+    speed = abs(m.forward_vel)
+    current = m.gait_anim
+
+    # Widen whichever band he is already in, so the sawtooth cannot flicker:
+    # the gait he is already showing keeps its threshold on the far side.
+    slack = GAIT_HYSTERESIS
+    tiptoe_at = TIPTOE_SPEED + slack if current == ANIM_TIPTOE else TIPTOE_SPEED
+    run_at = RUN_ANIM_SPEED - slack if current == ANIM_RUNNING else RUN_ANIM_SPEED
+
+    if speed < tiptoe_at:
+        chosen = ANIM_TIPTOE
+    elif speed > run_at:
+        chosen = ANIM_RUNNING
+    else:
+        chosen = ANIM_WALKING
+    m.gait_anim = chosen
+    return chosen
 
 
 def _double_jump(m):
@@ -274,17 +311,26 @@ MIN_PLAY_RATE = 1.0 / 16.0
 
 
 def play_rate(m, anim_id):
-    """Playback multiplier for a clip, given Mario's current speed."""
+    """Playback multiplier for a clip, given Mario's current speed.
+
+    The original drives this from whichever is larger, his speed or how hard
+    the stick is pushed. On a keyboard the second of those is a constant --
+    see `_walking` -- and taking the larger of the two pins every cycle at the
+    cadence of a full sprint however slowly he is moving, which is what made
+    the walk look broken. His actual speed is the half of that comparison
+    which still means something here.
+    """
     if anim_id == ANIM_CRAWLING:
-        return max(m.intended_mag * 2.0, MIN_PLAY_RATE)
+        # The original scales the crawl by the stick alone, which on a
+        # keyboard is 32 and would whirr; his crawl tops out near 10, and a
+        # matching cadence is what the doubling is there to give.
+        return max(abs(m.forward_vel) * 2.0, MIN_PLAY_RATE)
 
     divisor = SPEED_SCALED.get(anim_id)
     if divisor is None:
         return 1.0
 
-    # The original drives this from whichever is larger: how fast Mario is
-    # actually going, or how hard the stick is pushed.
-    speed = max(abs(m.forward_vel), m.intended_mag, 4.0)
+    speed = max(abs(m.forward_vel), 4.0)
     return max(speed / divisor, MIN_PLAY_RATE)
 
 

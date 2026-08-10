@@ -51,7 +51,7 @@ assets/
   mario/          mario.glb + mario_clips.json   (209 animations)
   hero/           hero.glb + hero_clips.json     (20 animations, 53 joints)
   actors/         goomba, scuttlebug, tree, each with a clips sidecar
-  sounds/         57 WAVs, plus .source recording where they came from
+  sounds/mario64/ full source library plus 57 runtime WAVs and .source marker
 ```
 
 `hero.glb` is built out of Blender rather than out of the decomp, so it goes
@@ -138,9 +138,9 @@ since it started, and a command line:
 
 ```
 > run_speed
-run_speed = 30.00  -- slider added, top speed, units per 30 Hz frame
+run_speed = 38.00  -- slider added, top speed, units per 30 Hz frame
 > run_speed 12
-run_speed = 12.00  (was 30.00)
+run_speed = 12.00  (was 38.00)
 ```
 
 Typing the name of a variable puts a **slider** for it on screen, bottom right.
@@ -178,12 +178,28 @@ Most of them are the Hero's movement constants — `run_speed`, `walk_accel`,
 `turn_rate`, `jump_velocity`, the sword and spin kick speeds — plus the two the
 camera keeps for itself.
 
-One number to know about `run_speed`: it tops out at 32 because the stick does.
-`intended_mag` is the stick's magnitude squared into 0..64 and halved, and the
-speed the Hero accelerates toward is the smaller of that and the cap, so a cap
-above 32 can never be reached. It writes both `MAX_WALK_SPEED` and
-`MAX_RUN_SPEED`, since a ceiling below the target is a Hero accelerating into a
-wall he can never cross.
+`run_speed` defaults to 38 — the Hero outruns Mario, whose own top speed is 32 —
+and the slider runs to 120 and means it the whole way. Two things had to change for that to
+be true, both in `update_ground_speed`:
+
+- The stick's magnitude tops out at 32 — `intended_mag` is that magnitude
+  squared into 0..64 and halved — and the speed he accelerated toward was the
+  *smaller* of that and the cap, so every cap above 32 was the same cap. The
+  target is now the stick as a fraction of its own ceiling, times the cap. At
+  the default 30 the two agree at a full press and differ by 6% at a half one.
+- The acceleration taper (`WALK_ACCEL - forward_vel / ACCEL_TAPER`) falls to
+  nothing at 60, so nothing above that could be reached however long you held
+  the stick. It now scales with the cap, keeping its shape. The ramp takes
+  proportionally longer — a second to reach 30, four to reach 120 — so raise
+  `walk_accel` alongside it if you want the top end to arrive sooner.
+
+120 is where the movement stops being trustworthy rather than an arbitrary
+stop: the ground step splits a frame into four, and at 120 units a frame each
+quarter is 30 units, still inside the 50-unit wall check, so he is stopped by
+walls instead of passing through them.
+
+`run_speed` writes both `MAX_WALK_SPEED` and `MAX_RUN_SPEED`, since a ceiling
+below the target is a Hero accelerating into a wall he can never cross.
 
 Standard output is captured by wrapping `sys.stdout` and `sys.stderr`, so the
 terminal still gets everything as well. Panda3D's own notify output is written
@@ -226,7 +242,7 @@ tools/
   rig.py                 posing Mario's skeleton from outside the decomp data
   retarget_anim.py       another rig's animation -> a clip on Mario's skeleton
   author_skate.py        the ice-skating cycle, written rather than borrowed
-  import_sounds.py       extracted AIFF samples -> assets/sounds/*.wav
+  import_sounds.py       extracted AIFF samples -> assets/sounds/mario64/*.wav
   workbench.py           look at / measure one asset, interactively or headless
   check_anim_grounding.py  grounded actions keep their feet on the floor
   check_billboards.py      billboarded parts track the camera and hold width
@@ -266,6 +282,25 @@ surface cucking, where a lower triangle shadows a higher one. Wall pushback
 likewise tests every wall against the entry position while accumulating the
 output, so overlapping walls each push by their full amount. These are not bugs
 to fix; changing any of them changes how the game plays.
+
+**Gait is chosen on speed, not on the stick.** This is a deliberate departure,
+and the one place a keyboard forced one. `anim_and_audio_for_walk` picks between
+tiptoe, walk and run — and scales the cycle — on `val04`, whichever is larger of
+Mario's speed and how far the stick is pushed. That reads a range on a stick.
+A key has no range: a press is always a full deflection, so `intended_mag` is
+pinned at its ceiling of 32 and the comparison picks 32 on every frame. The run
+clip therefore came out on the first frame of movement and played at a full
+sprint's cadence — eight times its authored speed, 240 clip frames a second —
+while Mario was still creeping forward at a quarter of that speed. The walk clip
+never appeared at all. Choosing on his actual speed gives back what the original
+shows on a stick: tiptoe, then walk, then run, as he gets up to it.
+
+The thresholds and the divisors are still the decomp's. What is not the
+decomp's is a two-unit hysteresis on the gait thresholds, and it earns its keep:
+speed sawtooths by about a unit a frame, so where Mario settles near 5 or 22 a
+bare threshold flips on alternate frames, and every flip restarts the clip from
+frame zero. That reads as the animation stuttering rather than as him changing
+gait.
 
 **Coordinates.** SM64 is Y-up with +Z toward the camera; Panda3D is Z-up with +Y
 away from it. `(x, y, z) -> (x, -z, y)` maps one to the other and preserves
@@ -678,8 +713,8 @@ python3 tools/import_sounds.py
 
 pulls the 15 samples the port actually plays out of
 `reference/sm64pcbuilder2/assets/US/sound/samples/` and converts them to WAV in
-`assets/sounds/` -- 57 files once the terrain variants are expanded, which is
-exactly what the action code can raise, with nothing spare. Those are committed
+`assets/sounds/mario64/` -- 57 runtime files once the terrain variants are
+expanded. Those are committed
 (see "Assets"), so this step is only needed to regenerate them. Without any
 samples at all the game synthesises crude stand-ins and says so at startup, so
 the two are never confused:

@@ -92,7 +92,7 @@ MARIO_MODEL = os.path.join(ASSETS, "mario", "mario.glb")
 MARIO_CLIPS = os.path.join(ASSETS, "mario", "mario_clips.json")
 HERO_MODEL = os.path.join(ASSETS, "hero", "hero.glb")
 HERO_CLIPS = os.path.join(ASSETS, "hero", "hero_clips.json")
-SOUNDS = os.path.join(ASSETS, "sounds")
+SOUNDS = os.path.join(ASSETS, "sounds", "mario64")
 ACTORS = os.path.join(ASSETS, "actors")
 LEVEL_OBJECTS = os.path.join(CASTLE_GROUNDS, "collision_objects.json")
 
@@ -632,11 +632,15 @@ class Game(ShowBase):
         # Both caps, together: the walking cap is what he accelerates toward
         # and the running cap is the ceiling nothing may exceed, and a Hero
         # whose ceiling sat below his target would accelerate into a wall he
-        # could never cross. 32 is not a matter of taste -- the stick's
-        # magnitude is squared into 0..64 and halved, so `intended_mag` tops
-        # out there, and a cap above it can never be reached.
-        t.add("run_speed", HC, ("MAX_WALK_SPEED", "MAX_RUN_SPEED"), 0.0, 32.0,
-              "top speed, units per 30 Hz frame (the stick caps out at 32)")
+        # could never cross.
+        #
+        # 120 rather than something rounder because that is where the movement
+        # stops being trustworthy: the ground step splits a frame into four,
+        # and at 120 units a frame each quarter is 30 units -- still inside the
+        # 50-unit wall check, so he is stopped by walls rather than passing
+        # through them. Mario's own top speed is 32, for scale.
+        t.add("run_speed", HC, ("MAX_WALK_SPEED", "MAX_RUN_SPEED"), 0.0, 120.0,
+              "top speed, units per 30 Hz frame (Mario's own is 32)")
         t.add("walk_accel", HC, "WALK_ACCEL", 0.0, 8.0,
               "acceleration per frame, before the taper")
         t.add("accel_taper", HC, "ACCEL_TAPER", 5.0, 200.0,

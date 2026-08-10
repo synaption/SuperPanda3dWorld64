@@ -119,8 +119,8 @@ MIN_PLAY_RATE = 1.0 / 16.0
 #
 # The reason a cap is needed at all is that the two things a locomotion clip
 # should do cannot both be had here. Planting the feet means one cycle per
-# stride covered, and at his top speed of 30 units a frame that is better than
-# three cycles a second, because his stride is a human 267 units and Mario's
+# stride covered, and at his top speed of 38 units a frame that is better than
+# four cycles a second, because his stride is a human 267 units and Mario's
 # speed was never meant for a character this size. So the cadence wins and the
 # foot contact gives: he slides at speed. The divisors above still govern while
 # he is moving slowly enough for the cap not to bind.

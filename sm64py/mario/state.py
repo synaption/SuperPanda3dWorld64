@@ -135,6 +135,11 @@ class MarioState:
         self.anim_name = "idle"
         self.anim_frame = 0
 
+        # Which of tiptoe / walk / run the walking action last drew, so the
+        # choice can hold its ground when his speed sawtooths across the
+        # threshold between two of them. See animations._walking.
+        self.gait_anim = None
+
     # -- spawning -----------------------------------------------------------
 
     def spawn(self, x, y, z, yaw_degrees=0.0):
