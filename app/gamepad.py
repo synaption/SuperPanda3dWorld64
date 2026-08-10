@@ -79,6 +79,11 @@ class Gamepad(DirectObject):
         self.recenter = False
         # The jetpack, off the left trigger.
         self.thrust = False
+        # Clicking the left stick and holding it, which hands the right stick
+        # to the camera boom for as long as it is down. Held rather than
+        # latched, unlike the zoom on the other stick: the thumb setting the
+        # distance is not the one holding this in.
+        self.boom = False
         # Edges, cleared by the next poll: see `pressed` and `released`.
         self._pressed = set()
         self._released = set()
@@ -140,6 +145,7 @@ class Gamepad(DirectObject):
         self.zombie = False
         self.recenter = False
         self.thrust = False
+        self.boom = False
         self._pressed.clear()
         self._released.clear()
         self._held.clear()
@@ -207,6 +213,7 @@ class Gamepad(DirectObject):
         self.zombie = self._button(GamepadButton.lshoulder())
         self.recenter = self._button(GamepadButton.rshoulder())
         self.thrust = self._thrust_down()
+        self.boom = self._button(GamepadButton.lstick())
 
         held = set()
         if self._button(GamepadButton.face_y()):

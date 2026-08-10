@@ -35,8 +35,12 @@ ACT_HERO_SPIN_KICK = HERO | ACT_FLAG_MOVING | ACT_FLAG_ATTACKING | 0x07
 ACT_HERO_SWORD = HERO | ACT_FLAG_STATIONARY | 0x08
 ACT_HERO_WADING = HERO | ACT_FLAG_MOVING | 0x09
 # No CONTROL_JUMP_HEIGHT: that flag is what lets releasing A cut a rise short,
-# and here releasing A ends the flight outright.
+# and the flight is not held up by A at all -- the trigger is what burns.
 ACT_HERO_JETPACK = HERO | ACT_FLAG_AIR | 0x0A
+# The boosters at ground level. A moving action rather than a stationary one:
+# it carries momentum, and the animation and camera code both read that flag to
+# mean "he is going somewhere".
+ACT_HERO_SKATING = HERO | ACT_FLAG_MOVING | 0x0B
 
 ACTION_NAMES = {
     ACT_HERO_IDLE: "idle",
@@ -49,6 +53,7 @@ ACTION_NAMES = {
     ACT_HERO_SWORD: "sword",
     ACT_HERO_WADING: "wading",
     ACT_HERO_JETPACK: "jetpack",
+    ACT_HERO_SKATING: "skating",
 }
 
 # -- ground movement --------------------------------------------------------
@@ -103,25 +108,72 @@ HEAVY_LANDING_SPEED = 52.0
 
 # -- the jetpack ------------------------------------------------------------
 #
-# Hold A in the air and he keeps going up. The thrust is applied as an approach
-# toward a rise speed rather than as an acceleration, so the boosters have a
-# top speed of their own and holding the button does not build up something
-# that takes a hundred units of altitude to shed.
+# The trigger is the whole of the jetpack, and A is the whole of the jump. That
+# separation is what the two controls are for: A used to double as the boosters
+# once it had been held long enough to be told apart from a tap, and a jump that
+# turns into a flight if you are slow off the button is a jump you cannot trust.
+#
+# On the ground the trigger skates (below); in the air it flies. The thrust is
+# applied as an approach toward a rise speed rather than as an acceleration, so
+# the boosters have a top speed of their own and holding the trigger does not
+# build up something that takes a hundred units of altitude to shed.
 #
 # The thrust has to beat gravity to be thrust at all: `apply_gravity` takes 4
 # units a frame back after every air step, and the approach below runs before
 # the step, so anything at or under 4 hovers instead of climbing. 8 climbs
-# briskly and still lets the descent take over the moment the button is let go.
+# briskly and still lets the descent take over the moment the trigger is let go.
 JETPACK_THRUST = 8.0
 JETPACK_RISE_SPEED = 20.0
 
-# Frames of ordinary jump before the boosters light, so a tap is still a jump
-# and a hold turns into flight. Short enough not to feel like a delay -- a
-# fifth of a second -- and long enough that the take-off reads as a jump.
-JETPACK_DELAY = 6
+# The kick that takes him off the ground when A launches him out of the skate.
+# Above the rise speed on purpose, so the boosters read as lighting rather than
+# as him drifting upward, and the approach brings it back down within two
+# frames. It also buys the clearance the flight needs: at 20 units a frame
+# against 38 forward he can climb away from anything up to about 28 degrees,
+# and a slope steeper than that catches the air step and puts him back on his
+# skates rather than into a landing.
+JETPACK_LAUNCH_SPEED = 30.0
+
 # Frames the landing pose holds before idle or walking takes over. The clip is
 # 24 frames; this is short enough that it never blocks the next input.
 LAND_FRAMES = 8
+
+# -- the skates -------------------------------------------------------------
+#
+# Holding the trigger on the ground puts him on the boosters without lifting
+# him off, and the physics is the ice the game already has: `update_sliding`
+# with the floor class forced to very-slippery is momentum that keeps going, a
+# friction that barely bites, and steering that rotates the velocity vector
+# rather than the body. That is what a character riding thrust across the
+# ground should feel like, and it was already written -- see the skating
+# section of sm64py/mario/actions.py, where the same trick makes Mario's
+# skates.
+#
+# What ice has no answer for is where the speed comes from, since nothing in
+# SM64 makes a sliding character go faster on the flat. Here the jets do.
+
+# Speed added per tick at full stick, and the ceiling it buys. Above his own
+# running top speed of 38 by half again: boosters that were slower than his legs
+# would be a downgrade, and the skate is the fastest way he has of crossing the
+# grounds.
+SKATE_PUSH = 1.35
+SKATE_TOP_SPEED = 56.0
+
+# Below this, with nothing on the stick, he has come to rest. Applied only while
+# coasting -- a push starts below it by definition, and checking it regardless
+# is a Hero who can never get going.
+SKATE_STOP_SPEED = 2.0
+
+# How much of the slope pull the jets cancel, in the units `update_sliding`
+# applies it in: 10.0 a frame at full steepness on very-slippery ground, and
+# nothing in a slide answers it. That is right for ice and wrong here. A skater
+# is at the mercy of a hill; a character being pushed by an engine is not, and
+# on grounds with a hill up to the castle door, holding the trigger and being
+# dragged backwards down it is not what the control should feel like. Leaving
+# 1.5 rather than cancelling outright is what keeps a steep face costing him
+# speed -- and what leaves the jets something to be pointed at, later, when
+# they answer to where he is aiming rather than to where the stick is.
+SKATE_GRIP = 8.5
 
 # -- combat -----------------------------------------------------------------
 

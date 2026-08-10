@@ -44,9 +44,28 @@ def flat_ground():
     return SurfaceSet(vertices, triangles, zeros, zeros, None)
 
 
+# A 25 degree hill, which is gentler than the one up to the castle door and
+# steep enough for what it is here to test: at a 38 unit run it lifts the floor
+# 16 units a frame, and the boosters climb 8 on the frame they light. Anything
+# that tries to take off by out-climbing the ground loses on a hill like this.
+HILL_RISE, HILL_RUN = 3000, 6400
+
+
+def ground_with_a_hill():
+    """Flat until z = 0, then a hill climbing away from it."""
+    vertices = np.array([
+        [-PLANE, 0, -PLANE], [PLANE, 0, -PLANE], [PLANE, 0, 0], [-PLANE, 0, 0],
+        [PLANE, HILL_RISE, HILL_RUN], [-PLANE, HILL_RISE, HILL_RUN],
+    ], dtype=np.int32)
+    triangles = np.array([[0, 2, 1], [0, 3, 2], [3, 4, 2], [3, 5, 4]],
+                         dtype=np.int32)
+    zeros = np.zeros(4, dtype=np.int32)
+    return SurfaceSet(vertices, triangles, zeros, zeros, None)
+
+
 class Run:
-    def __init__(self, pos=(0.0, 10.0, 0.0), yaw=0.0):
-        self.surfaces = flat_ground()
+    def __init__(self, pos=(0.0, 10.0, 0.0), yaw=0.0, surfaces=None):
+        self.surfaces = surfaces if surfaces is not None else flat_ground()
         self.controller = Controller()
         self.hero = HeroState(self.surfaces, self.controller)
         self.hero.spawn(*pos, yaw)
@@ -68,7 +87,9 @@ class Run:
 
     @property
     def grounded(self):
-        return self.hero.pos[1] <= 0.01
+        # Against the floor rather than against zero, so the same reading works
+        # on the hill as on the plane.
+        return self.hero.pos[1] - self.hero.floor_height <= 0.01
 
 
 def check_walking():
@@ -118,10 +139,10 @@ def check_jump():
 def check_jump_height_is_variable():
     """Releasing the button early must give a lower jump than holding it.
 
-    "Held" means held to the last frame before the jetpack would take over,
-    not held indefinitely: holding past `JETPACK_DELAY` is no longer a jump at
-    all, it is flight, and measuring that here would report a number in the
-    thousands and stop saying anything about the jump.
+    Held all the way now, rather than held to the last frame before the
+    boosters would have taken over: A is a jump and nothing else, so there is
+    no longer a length of hold that turns it into a flight and stops this from
+    measuring a jump at all.
     """
     def peak(frames_held):
         run = Run()
@@ -135,53 +156,99 @@ def check_jump_height_is_variable():
             best = max(best, run.height)
         return best
 
-    held, tapped = peak(H.JETPACK_DELAY - 1), peak(0)
+    held, tapped = peak(150), peak(0)
     return held > tapped + 20.0, f"held {held:.0f} vs tapped {tapped:.0f} units"
 
 
-def check_the_trigger_flies_him():
-    """The jetpack's own control lifts him straight off the ground.
+def check_the_trigger_skates_him():
+    """On the ground the boosters skate rather than lift.
 
-    Not through a jump and not after a delay, which is the whole difference
-    between it and holding A: A has to be told apart from a tap before it can
-    commit to anything, and a control that means only the boosters does not.
+    Both halves matter. He must not leave the floor -- a trigger that took off
+    on its own is the behaviour this replaced -- and he must end up faster than
+    his own legs, because a skate that is slower than running is a downgrade
+    nobody would press the button for.
     """
     run = Run()
     for _ in range(4):
         run.tick()                       # settle on the floor
     started = run.hero.action_name
 
-    heights, actions = [], []
-    for frame in range(90):
-        run.tick(thrust=frame < 60)
-        heights.append(run.height)
+    actions, lift = [], 0.0
+    for _ in range(120):
+        run.tick(forward=1.0, thrust=True)
+        lift = max(lift, run.height)
         name = run.hero.action_name
         if not actions or actions[-1] != name:
             actions.append(name)
 
-    lit = actions[0] if actions else "nothing"
     problems = []
-    if lit != "jetpack":
-        problems.append(f"{started} went to {lit}, not straight to the jetpack")
-    if "jump" in actions:
-        problems.append("it jumped on the way up")
-    if max(heights) < 400.0:
-        problems.append(f"only climbed {max(heights):.0f} units")
-    if heights[-1] > max(heights) - 100.0:
-        problems.append("letting go did not bring him down")
+    if actions[:1] != ["skating"]:
+        problems.append(f"{started} went to {actions[:1]}, not to the skates")
+    if set(actions) != {"skating"}:
+        problems.append(f"it did not stay on them: {actions}")
+    if lift > 1.0:
+        problems.append(f"it lifted him {lift:.0f} units off the floor")
+    if run.hero.forward_vel <= H.MAX_RUN_SPEED:
+        problems.append(f"only reached {run.hero.forward_vel:.0f} u/frame, "
+                        f"no better than his {H.MAX_RUN_SPEED} run")
 
     return not problems, ("; ".join(problems) if problems
-                          else f"{started} -> {' -> '.join(actions)}, "
-                               f"peak {max(heights):.0f} units")
+                          else f"{started} -> skating at "
+                               f"{run.hero.forward_vel:.0f} u/frame, "
+                               f"{lift:.1f} units of lift")
+
+
+def check_a_takes_off_from_the_skates():
+    """A out of a skate is the take-off, and there is no jump in front of it.
+
+    The clip is checked as well as the action, because "no jump animation at
+    the beginning" is not something the action ids can say on their own: the
+    skate and the flight draw the same held pose, and the take-off is only
+    seamless if the transition leaves it alone rather than restarting it.
+    """
+    run = Run()
+    run.tick(thrust=True)
+    pose = A.action_anim(run.hero)
+
+    actions, resets = [], 0
+    run.hero.anim_reset = False
+    for frame in range(120):
+        run.tick(thrust=True, buttons=C.A_BUTTON if frame == 4 else 0)
+        # Read and cleared the way `Game._update_animation` reads and clears
+        # it, so what is counted is restarts asked for rather than one flag
+        # left standing since the first transition.
+        resets += run.hero.anim_reset
+        run.hero.anim_reset = False
+        name = run.hero.action_name
+        if not actions or actions[-1] != name:
+            actions.append(name)
+
+    problems = []
+    if "jump" in actions:
+        problems.append(f"it jumped on the way up: {actions}")
+    if "jetpack" not in actions:
+        problems.append(f"A never took him off the skates: {actions}")
+    if A.action_anim(run.hero) != pose:
+        problems.append(f"the pose changed: {pose!r} -> "
+                        f"{A.action_anim(run.hero)!r}")
+    if resets:
+        problems.append(f"the clip restarted {resets} times")
+    if run.height < 800.0:
+        problems.append(f"only climbed {run.height:.0f} units")
+
+    return not problems, ("; ".join(problems) if problems else
+                          f"skating -> jetpack holding {pose!r} throughout, "
+                          f"{run.height:.0f} units up")
 
 
 def check_jetpack():
-    """Holding the button flies, letting go falls, and a tap does neither."""
-    def fly(hold_for):
+    """The trigger flies, letting go falls, and A alone is only ever a jump."""
+    def fly(hold_for, thrust=True):
         run = Run()
         airborne, best, actions = 0, 0.0, []
-        for _ in range(120):
-            run.tick(buttons=C.A_BUTTON if airborne <= hold_for else 0)
+        for frame in range(120):
+            run.tick(thrust=thrust and frame <= hold_for,
+                     buttons=C.A_BUTTON if frame == 1 else 0)
             if not run.grounded:
                 airborne += 1
             best = max(best, run.height)
@@ -191,8 +258,8 @@ def check_jetpack():
         return best, actions
 
     flying, actions = fly(120)
-    fell, _ = fly(H.JETPACK_DELAY + 10)
-    tapped, tap_actions = fly(0)
+    fell, _ = fly(20)
+    jumped, jump_actions = fly(0, thrust=False)
 
     problems = []
     if "jetpack" not in actions:
@@ -201,12 +268,48 @@ def check_jetpack():
         problems.append(f"holding only climbed {flying:.0f} units")
     if not fell < flying / 2.0:
         problems.append(f"letting go still climbed to {fell:.0f}")
-    if "jetpack" in tap_actions:
-        problems.append("a tap lit the boosters")
+    if "jetpack" in jump_actions:
+        problems.append(f"A alone lit the boosters: {jump_actions}")
 
     return not problems, ("; ".join(problems) if problems else
                           f"held climbs {flying:.0f} units, released stops at "
-                          f"{fell:.0f}, a tap peaks at {tapped:.0f}")
+                          f"{fell:.0f}, A alone jumps {jumped:.0f}")
+
+
+def check_a_hill_does_not_loop_the_landing():
+    """Thrusting up a slope must not bounce between the boosters and a landing.
+
+    The bug this stands against: the boosters used to lift him at 8 units a
+    frame, which is less than a hill lifts the floor under a 38 unit run, so
+    the air step landed him on the frame it started. That played the landing
+    pose, the trigger was still down, and the landing handed him straight back
+    to the boosters -- a landing animation on a loop and no flight at all.
+
+    The floor is not the enemy now: touching it under thrust is a skate.
+    """
+    run = Run(pos=(0.0, 10.0, -1500.0), surfaces=ground_with_a_hill())
+    for _ in range(40):
+        run.tick(forward=1.0)            # get up to speed, onto the hill
+
+    actions, landings = [], 0
+    started = run.height
+    for _ in range(120):
+        run.tick(forward=1.0, thrust=True)
+        name = run.hero.action_name
+        if not actions or actions[-1] != name:
+            actions.append(name)
+            landings += name == "land"
+
+    problems = []
+    if landings:
+        problems.append(f"the landing played {landings} times: {actions}")
+    if run.height - started < 500.0:
+        problems.append(f"he only got {run.height - started:.0f} units "
+                        "up the hill")
+
+    return not problems, ("; ".join(problems) if problems else
+                          f"{' -> '.join(actions)} up the hill, "
+                          f"{run.height - started:.0f} units gained")
 
 
 def check_attack_chain():
@@ -315,7 +418,9 @@ CHECKS = [
     ("jump leaves and regains the floor", check_jump),
     ("jump height follows the button", check_jump_height_is_variable),
     ("the jetpack flies, and only when held", check_jetpack),
-    ("the trigger flies him", check_the_trigger_flies_him),
+    ("the trigger skates him", check_the_trigger_skates_him),
+    ("A takes off from the skates", check_a_takes_off_from_the_skates),
+    ("a hill does not loop the landing", check_a_hill_does_not_loop_the_landing),
     ("attack chains into the second swing", check_attack_chain),
     ("spin kick out of a run", check_spin_kick),
     ("every action has a clip", check_every_action_has_a_clip),

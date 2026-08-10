@@ -24,6 +24,11 @@ class HeroState(MarioState):
 
     voice_profile = "hero"
 
+    # He skates on the jetpack rather than on a pair of skates, but the ice is
+    # the same ice: `MarioState.get_floor_class` reads this to know which
+    # action puts it underfoot.
+    skating_action = H.ACT_HERO_SKATING
+
     def __init__(self, surfaces, controller=None):
         super().__init__(surfaces, controller)
 

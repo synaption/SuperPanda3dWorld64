@@ -284,6 +284,42 @@ def check_the_right_stick_click_latches():
     return ok, f"click {first}, still held {held}, clicked again {again}"
 
 
+def check_the_left_stick_click_is_held():
+    """The boom is the one stick click that does not latch.
+
+    The opposite of the zoom on the other stick, and for the same reason read
+    the other way round: the thumb that clicks this one is not the thumb that
+    then sets the distance, so it can be held, and a control you hold is one
+    you cannot be left stuck in.
+    """
+    problems = []
+
+    pad, device = fresh()
+    device.press(GamepadButton.lstick())
+    pad.poll()
+    if not pad.boom:
+        problems.append("a held left stick click did not give the boom")
+    pad.poll()
+    if not pad.boom:
+        problems.append("it did not stay down while held")
+
+    device.press()
+    pad.poll()
+    if pad.boom:
+        problems.append("it stayed down after being let go")
+
+    # And it is not the zoom: the two clicks must not be one control.
+    pad, device = fresh()
+    device.press(GamepadButton.rstick())
+    pad.poll()
+    if pad.boom:
+        problems.append("the right stick click gave the boom too")
+
+    return not problems, ("; ".join(problems) if problems
+                          else "held while down, released when let go, and "
+                               "not the same click as the zoom")
+
+
 def check_console_holds_it_neutral():
     """Everything centred while the console has the input, and no stuck press."""
     pad, device = fresh()
@@ -321,6 +357,7 @@ CHECKS = [
      check_the_squad_button_reports_both_edges),
     ("the left trigger is the jetpack", check_the_left_trigger_is_the_jetpack),
     ("the right stick click latches", check_the_right_stick_click_latches),
+    ("the left stick click is held", check_the_left_stick_click_is_held),
     ("the console holds the pad neutral", check_console_holds_it_neutral),
     ("no pad is no input", check_no_pad_is_no_input),
 ]

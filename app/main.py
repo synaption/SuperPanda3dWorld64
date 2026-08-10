@@ -21,8 +21,10 @@ Controls, as the Hero:
     mouse                     look
     Right mouse or F (held)   aim: the camera comes in over his shoulder, the
                               view narrows and the crosshair closes up
-    Space                     jump; held, the jetpack takes over and he flies,
-                              and pressing it again in mid-air lights it too
+    Space                     jump, and only a jump -- unless he is skating,
+                              where it takes off on the jets instead
+    V (held)                  the jetpack. On the ground it puts him on his
+                              skates; in the air it flies him
     Left Shift                attack -- again mid-swing to chain the second,
                               or while running for the spin kick
     Left Ctrl                 draw or sheathe the sword
@@ -54,9 +56,11 @@ rather than replacing it (see app/gamepad.py):
     right stick               look
     right stick (clicked)     aim -- a latch, since the thumb aiming with it
                               cannot also hold it in
-    left trigger              the jetpack: held, he thrusts, straight off the
-                              ground and with no jump under it
-    A                         jump, and the jetpack the slow way -- held
+    left stick (held in)      the right stick sets how far out the camera
+                              sits, rather than where it looks
+    left trigger              the jetpack: on the ground he skates on it, in
+                              the air he flies on it
+    A                         jump -- or, off the skates, take off
     B                         attack -- Mario's B
     X                         the squad, held or tapped as above
     right trigger             Z
@@ -734,6 +738,11 @@ class Game(ShowBase):
             ("arrow_up", "up"), ("arrow_down", "down"),
             ("arrow_left", "left"), ("arrow_right", "right"),
             ("space", "a"), ("lshift", "b"), ("lcontrol", "z"),
+            # The jetpack's own control, which the pad has on a trigger and
+            # the keyboard has nowhere obvious: A used to double as it and no
+            # longer does, so without a key of its own the keyboard would have
+            # no boosters at all.
+            ("v", "thrust"),
             # The N64 Z trigger is on left control, so the Z key itself is
             # free -- and it is the obvious one to put the zombie on.
             ("z", "zombie"),
@@ -1326,8 +1335,13 @@ class Game(ShowBase):
               "how hard the boosters push, per frame")
         t.add("jetpack_rise", HC, "JETPACK_RISE_SPEED", 0.0, 80.0,
               "the climb it settles at, units per frame")
-        t.add("jetpack_delay", HC, "JETPACK_DELAY", 0, 60,
-              "frames of ordinary jump before the boosters light", integer=True)
+        t.add("jetpack_launch", HC, "JETPACK_LAUNCH_SPEED", 0.0, 80.0,
+              "the kick A gives when it takes him off his skates")
+
+        t.add("skate_push", HC, "SKATE_PUSH", 0.0, 6.0,
+              "speed the jets add per frame at full stick")
+        t.add("skate_top", HC, "SKATE_TOP_SPEED", 0.0, 120.0,
+              "how fast the skates will carry him")
 
         t.add("attack_lunge", HC, "ATTACK_LUNGE_SPEED", 0.0, 40.0,
               "the forward travel handed back to the sword swings")
@@ -1474,10 +1488,9 @@ class Game(ShowBase):
             buttons |= C.Z_TRIG
         self.controller.set_buttons(buttons)
 
-        # The jetpack's own control. Set through a method rather than as a
-        # field because the falling edge matters as much as the state does:
-        # `act_fall` lights the boosters again on a fresh press.
-        self.controller.set_thrust(self.gamepad.thrust)
+        # The jetpack's own control: on the ground it skates him, in the air it
+        # flies him, and it is the only thing that does either.
+        self.controller.set_thrust(self.gamepad.thrust or self.keys["thrust"])
 
         # Purely a costume: the action code never reads it, so Mario walks and
         # jumps exactly as he always did while it is held.
@@ -1652,6 +1665,15 @@ class Game(ShowBase):
         keys_x = (1.0 if self.keys["cam_right"] else 0.0) \
             - (1.0 if self.keys["cam_left"] else 0.0)
         pad_x, pad_y = self.gamepad.camera
+        if self.gamepad.boom:
+            # Left stick held in, and the right one stops being the view and
+            # becomes the boom: push it forward and the camera comes in over
+            # his shoulder, pull it back and it stands off. Both axes are taken
+            # away from the look rather than only the one being used, so the
+            # drift on a diagonal cannot quietly turn the view while the
+            # distance is being set.
+            self.follow_camera.dolly(-pad_y, dt)
+            pad_x = pad_y = 0.0
         self.follow_camera.look_stick(keys_x + pad_x, pad_y, dt)
 
         self._read_mouse()
@@ -1795,13 +1817,14 @@ class Game(ShowBase):
         """The moves the character being played actually has.
 
         Listing Mario's while the Hero is out is worse than listing nothing:
-        the Hero has no dive, no crouch and no skates, and a legend offering
-        them reads as four broken keys.
+        the Hero has no dive and no crouch, and a legend offering them reads as
+        broken keys. He does skate, but on the jets rather than on C.
         """
         squad_keys = "X/LMB hold to whistle, tap to send"
         if self.player.name == "hero":
-            return ("WASD move   Space jump   Shift attack (again to chain, "
-                    f"running to spin)   Ctrl sword   {squad_keys}")
+            return ("WASD move   Space jump   V jetpack (skates on the "
+                    "ground, Space to take off)   Shift attack (again to "
+                    f"chain, running to spin)   Ctrl sword   {squad_keys}")
         return (f"WASD move   Space jump   Shift dive   Ctrl crouch   "
                 f"Z zombie   C skates{' ON' if self._skating else ''}   "
                 f"{squad_keys}")

@@ -176,6 +176,16 @@ MIN_DISTANCE = 190.0
 # docstring.
 BOOM_RETURN = 0.32
 
+# How far in and out the player may set the boom by hand, and how fast the
+# stick moves it.  The bounds are the console sliders' own, so the two ways of
+# setting the same number cannot disagree about what is reachable.  The rate is
+# a little over a boom length a second: fast enough to go from over his shoulder
+# to a wide view in the time a thumb stays on the stick, slow enough to stop
+# where you meant to.
+BOOM_MIN, BOOM_MAX = 250.0, 4000.0
+AIM_BOOM_MIN, AIM_BOOM_MAX = 150.0, 2000.0
+DOLLY_SPEED = 900.0
+
 # Seconds the shoulder offset takes to fold away against a wall and to come
 # back out.  Both directions, because unlike the boom this one moves the camera
 # sideways, and sideways is the direction the aim can feel.
@@ -474,6 +484,26 @@ class FollowCamera:
     def tilt(self, delta):
         """Raise or lower the *camera*, in radians.  The legacy sign."""
         self.look(0.0, -math.degrees(delta))
+
+    def dolly(self, amount, dt):
+        """Push the boom in or pull it out.  Positive pulls out.
+
+        Which of the two lengths it moves follows which one is in effect: at the
+        hip it sets the hip distance, down the sights it sets the sights', so
+        the player frames the two independently instead of one dragging the
+        other about.  Nothing else has to be told -- the boom is re-measured
+        against this every frame, and shortening it only slides the camera along
+        the aim ray, so the point under the crosshair does not move while it
+        travels.
+        """
+        if not amount:
+            return
+        step = amount * DOLLY_SPEED * dt
+        if self._aim >= 0.5:
+            self.aim_distance = _clamp(self.aim_distance + step,
+                                       AIM_BOOM_MIN, AIM_BOOM_MAX)
+        else:
+            self.distance = _clamp(self.distance + step, BOOM_MIN, BOOM_MAX)
 
     # -- the sights -----------------------------------------------------------
 

@@ -19,7 +19,7 @@ class Controller:
 
     __slots__ = ("stick_x", "stick_y", "stick_mag", "button_down",
                  "button_pressed", "_prev_down", "zombie", "skating",
-                 "thrust", "thrust_pressed")
+                 "thrust")
 
     def __init__(self):
         self.stick_x = 0.0
@@ -44,15 +44,15 @@ class Controller:
         # folding it into the button mask would mean picking a bit the original
         # already means something by, and Mario shares this controller.
         #
-        # The press is kept beside the hold because both are asked for -- the
-        # hold is the thrust, and the press is what lights the boosters again
-        # after they have been let go of in mid-air.
+        # The hold is all of it, and there is no press beside it: the Hero's
+        # actions only ever ask whether the boosters are on, and each of them
+        # is a state the trigger can only have entered from the other way
+        # round. A press bit was kept here while A doubled as the jetpack and
+        # a held button had to be told apart from a fresh one.
         self.thrust = False
-        self.thrust_pressed = False
 
     def set_thrust(self, down):
         """Feed the jetpack control. Once a tick, as `set_buttons` is."""
-        self.thrust_pressed = bool(down) and not self.thrust
         self.thrust = bool(down)
 
     def set_stick(self, x, y):
@@ -77,6 +77,12 @@ class Controller:
 
 class MarioState:
     """Everything the action state machine reads and writes each frame."""
+
+    #: Which of this character's actions puts ice underfoot wherever he stands.
+    #: Named rather than written into `get_floor_class` directly because the
+    #: Hero skates too, on his own action id and off a different control, and
+    #: he inherits this class's floor handling whole.
+    skating_action = C.ACT_SKATING
 
     def __init__(self, surfaces, controller=None):
         self.surfaces = surfaces
@@ -188,7 +194,7 @@ class MarioState:
         # momentum, friction, steering and slope acceleration all become the
         # very-slippery ones the game already has. The decomp plays the same
         # trick in the other direction for crawling, a few lines down.
-        if self.action == C.ACT_SKATING:
+        if self.action == self.skating_action:
             return C.SURFACE_CLASS_VERY_SLIPPERY
 
         floor_class = C.SURFACE_CLASS_DEFAULT

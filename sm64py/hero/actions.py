@@ -17,6 +17,12 @@ exactly as they do for Mario.
 from .. import audio
 from ..math_util import approach_f32, approach_s32, coss, s16, sins
 from ..mario import constants as C
+# Two helpers rather than two actions: `update_sliding` is SM64's ice and
+# `bounce_off_wall` is what a slide does when it meets one, and both are
+# character-agnostic in the same way the step functions below are. They live in
+# the decomp's actions.c rather than in a physics file, which is the only reason
+# this import reaches into Mario's module at all.
+from ..mario.actions import bounce_off_wall, update_sliding
 from ..mario.steps import (
     perform_air_step,
     perform_ground_step,
@@ -106,30 +112,43 @@ def in_deep_water(m):
     return m.pos[1] < m.water_level - H.WADE_FLOAT_DEPTH
 
 
-def thrusting(m):
-    """Is the jetpack being asked to keep burning?
+def hold_pose(m):
+    """Complete a transition without restarting the clip. Returns True.
 
-    Two controls answer to it, and they are not interchangeable. The trigger is
-    the jetpack's own and means nothing else, so holding it is the whole
-    question. A is the jump button first and the boosters second, and it only
-    becomes the boosters once something else -- `check_jetpack_hold`, or the
-    fresh press `act_fall` reads -- has decided that is what it meant. So this
-    is only ever asked once he is already flying, and both answer to it there.
+    `set_hero_action` restarts the animation on every change, which is right
+    for nineteen of the twenty transitions in here and wrong for the ones
+    between the skate and the flight: both draw the same held pose, and letting
+    the clip reset would replay the take-off on the spot -- a jump animation in
+    front of a take-off that is explicitly not a jump.
     """
-    return m.controller.thrust or bool(m.input & C.INPUT_A_DOWN)
+    m.anim_reset = False
+    return True
+
+
+def launch_jetpack(m, lift=True):
+    """Out of the skate and into the air, with no jump under it.
+
+    `lift` is the difference between choosing to go up and simply running out
+    of ground. A launched by A gets the booster kick; skating off the edge of
+    something keeps whatever vertical velocity he had, so a ledge drops him the
+    way a ledge should and the jets only stop him falling further.
+    """
+    set_hero_action(m, H.ACT_HERO_JETPACK, 0)
+    if lift:
+        m.vel[1] = max(m.vel[1], H.JETPACK_LAUNCH_SPEED)
+    return hold_pose(m)
 
 
 def check_common_exits(m):
     """Transitions every grounded action shares."""
+    # The trigger before A, and the order is the control scheme: with the
+    # trigger down he is on his skates, and A out of the skate is a take-off
+    # rather than a jump. Reading A first would mean the two pressed together
+    # jumped, and a jump is exactly the thing the launch is not.
+    if m.controller.thrust:
+        return set_hero_action(m, H.ACT_HERO_SKATING, 0)
     if m.input & C.INPUT_A_PRESSED:
         return set_hero_action(m, H.ACT_HERO_JUMP, 0)
-    # The trigger alone, not `thrusting`: A held on the ground is a jump being
-    # held, and lifting off on it would mean he never jumped at all. Straight
-    # into the boosters with no jump under it and no delay in front of it,
-    # which is what a control dedicated to the jetpack buys -- A has to tell a
-    # tap from a hold before it can commit, and this does not.
-    if m.controller.thrust:
-        return set_hero_action(m, H.ACT_HERO_JETPACK, 0)
     if m.input & C.INPUT_OFF_FLOOR:
         return set_hero_action(m, H.ACT_HERO_FALL, 0)
     if in_deep_water(m):
@@ -201,6 +220,11 @@ def act_walking(m):
 
 @action(H.ACT_HERO_LAND, "land")
 def act_land(m):
+    # The landing swallows most input for its eight frames, but not the
+    # boosters: a trigger pressed as he touches down should put him on his
+    # skates, not wait for the pose to finish first.
+    if m.controller.thrust:
+        return set_hero_action(m, H.ACT_HERO_SKATING, 0)
     if m.input & C.INPUT_A_PRESSED:
         return set_hero_action(m, H.ACT_HERO_JUMP, 0)
     if check_attack_input(m):
@@ -232,6 +256,68 @@ def act_sword(m):
     if m.action_timer >= H.SWORD_DRAW_FRAMES:
         m.sword_drawn = not m.sword_drawn
         return set_hero_action(m, H.ACT_HERO_IDLE, 0)
+    return False
+
+
+# -- the skates -------------------------------------------------------------
+
+
+@action(H.ACT_HERO_SKATING, "skating")
+def act_skating(m):
+    """The boosters at ground level: he skims instead of lifting off.
+
+    Holding the trigger on the ground is its own thing rather than a slower
+    take-off, and that is what fixed the worst bug the jetpack had. Thrust used
+    to lift him the moment it was pressed, at 8 units a frame -- which loses to
+    any slope he can run up at 38 units a frame forward, so the air step landed
+    him on the frame it started, the landing pose played, the trigger was still
+    down, and he lit the boosters again. Running uphill on the trigger was a
+    landing animation on a loop and no flight at all.
+
+    Now there is no take-off to fail. Ground under a burning jetpack is a
+    skate, whether he started there or flew into it, and A is what leaves.
+    """
+    if not m.controller.thrust:
+        # Hand back whatever speed he had rather than dropping it, so stepping
+        # off the jets at pace carries into a run.
+        return set_hero_action(
+            m, H.ACT_HERO_WALKING if m.forward_vel > 0.0 else H.ACT_HERO_IDLE,
+            0)
+    if m.input & C.INPUT_A_PRESSED:
+        return launch_jetpack(m)
+    if in_deep_water(m):
+        return set_hero_action(m, H.ACT_HERO_WADING, 0)
+    if m.input & C.INPUT_OFF_FLOOR:
+        return launch_jetpack(m, lift=False)
+
+    # Pushing or coasting. Nothing else differs between the two, and the pose
+    # does not either -- he is riding thrust, not striding.
+    pushing = m.intended_mag > 0.0
+
+    if pushing and m.forward_vel < H.SKATE_TOP_SPEED:
+        push = H.SKATE_PUSH * (m.intended_mag / H.MAX_STICK_MAG)
+        m.slide_vel_x += push * sins(m.intended_yaw)
+        m.slide_vel_z += push * coss(m.intended_yaw)
+
+    # The jets holding the hill, applied against the pull `update_sliding` is
+    # about to add and in the same terms, so the two are one subtraction. See
+    # SKATE_GRIP for why a slide's answer to a slope is the wrong one here.
+    grip = H.SKATE_GRIP * m.get_slope_steepness()
+    m.slide_vel_x -= grip * sins(m.floor_angle)
+    m.slide_vel_z -= grip * coss(m.floor_angle)
+
+    update_sliding(m, 0.0 if pushing else H.SKATE_STOP_SPEED)
+    step = perform_ground_step(m)
+
+    if step == C.GROUND_STEP_LEFT_GROUND:
+        return launch_jetpack(m, lift=False)
+    if step == C.GROUND_STEP_HIT_WALL:
+        # Off the boards and back down the rink, the way a slide bounces.
+        # Stopping dead against a wall is the one thing that would not read as
+        # a character carrying this much momentum.
+        bounce_off_wall(m)
+
+    m.action_timer += 1
     return False
 
 
@@ -366,22 +452,16 @@ def land_from_air(m):
 
 
 def check_jetpack_hold(m):
-    """A still held this far into the jump lights the boosters.
+    """The trigger, in the air, lights the boosters.
 
-    The hold rather than the press, and the press is no use here: the jump is
-    entered on `INPUT_A_PRESSED` and runs its first frame on the same tick, so
-    that bit is still set when this is first asked and every jump would become
-    a flight before it had left the ground. Waiting `JETPACK_DELAY` frames and
-    reading the button's *state* is what separates a tap from a hold.
-
-    The trigger is not subject to any of that. It has nothing to be told apart
-    from, so it lights the boosters on the frame it goes down, delay or no.
+    The hold rather than the press, and it cannot arrive stale: the only way to
+    hold the trigger on the ground is to be skating, and the only way out of a
+    skate on A is the launch, so a jump with the trigger already down is not a
+    state this machine can be in. A is not asked about at all any more -- it
+    used to become the boosters once it had been held past a few frames, which
+    meant a jump you were slow off the button on turned into a flight.
     """
-    if m.controller.thrust:
-        return set_hero_action(m, H.ACT_HERO_JETPACK, 0)
-    if m.action_timer < H.JETPACK_DELAY:
-        return False
-    if not (m.input & C.INPUT_A_DOWN):
+    if not m.controller.thrust:
         return False
     return set_hero_action(m, H.ACT_HERO_JETPACK, 0)
 
@@ -416,12 +496,13 @@ def act_jump(m):
 
 @action(H.ACT_HERO_FALL, "fall")
 def act_fall(m):
-    # Only a fresh press of either, not a held one: falling with the control
-    # still down is what happens for the frame after the boosters cut out, and
-    # reading the hold here would light them again before he had dropped an
-    # inch.
-    if m.input & C.INPUT_A_PRESSED or m.controller.thrust_pressed:
-        return set_hero_action(m, H.ACT_HERO_JETPACK, 0)
+    # The hold is safe to read here now that the trigger is the only control
+    # that flies him: the flight only ever falls out of `act_jetpack` because
+    # the trigger came *up*, so a held one on this frame is a new one. When A
+    # answered here as well it had to be the press, since falling with A still
+    # down is the ordinary end of a jump.
+    if check_jetpack_hold(m):
+        return True
 
     update_air_movement(m)
     step = perform_air_step(m)
@@ -452,7 +533,7 @@ def act_jetpack(m):
         # frame he lets go rather than simply letting him fall.
         m.flags &= ~C.MARIO_JUMPING
 
-    if not thrusting(m):
+    if not m.controller.thrust:
         return set_hero_action(m, H.ACT_HERO_FALL, 0)
 
     m.vel[1] = approach_f32(m.vel[1], H.JETPACK_RISE_SPEED,
@@ -462,9 +543,14 @@ def act_jetpack(m):
     step = perform_air_step(m)
 
     if step == C.AIR_STEP_LANDED:
-        # Reachable: the ground rises under him on a slope, and hugging one on
-        # the way up should set him down rather than grind him along it.
-        return land_from_air(m)
+        # Ground under a burning jetpack is a skate, never a landing -- and the
+        # trigger is necessarily still down, since the check at the top of this
+        # action is the only way to reach here. Hugging a rising slope on the
+        # way up puts him on his skates and he carries on up the hill; before
+        # this it put him in the landing pose, from which the same trigger lit
+        # the boosters again, and that loop was the whole of the bug.
+        set_hero_action(m, H.ACT_HERO_SKATING, 0)
+        return hold_pose(m)
     if step == C.AIR_STEP_HIT_WALL:
         # Through the setter rather than the field alone, as the grounded
         # actions do it: it clears the horizontal velocity the wall stopped as

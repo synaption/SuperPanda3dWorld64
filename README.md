@@ -113,7 +113,8 @@ As the Hero:
 | `W` `A` `S` `D` / arrows | analog stick (camera-relative) |
 | mouse | look — the window takes the pointer at startup |
 | right mouse / `F` (held) | aim: the camera comes in over his shoulder, the view narrows, the crosshair closes up |
-| `Space` | jump; hold it and the jetpack takes over — see below |
+| `Space` | jump — and, off the skates, the take-off; see below |
+| `V` (held) | the jetpack. On the ground it puts him on his skates; in the air it flies him |
 | `Left Shift` | attack; again mid-swing to chain the second, or while running for the spin kick |
 | `Left Ctrl` | draw or sheathe the sword |
 
@@ -182,8 +183,9 @@ and the stick pushed the opposite way simply cancel out.
 | d-pad | the same, at full deflection, when the stick is centred |
 | right stick | look, with a response curve and a turn ramp — see the camera below |
 | right stick, clicked | aim. A latch, not a hold: the thumb aiming with the stick cannot also hold it in |
-| left trigger | the jetpack — held, he thrusts, straight off the ground with no jump under it |
-| `A` | jump, and the jetpack the slow way: held past the delay |
+| left stick, held in | the right stick sets how far out the camera sits, rather than where it looks |
+| left trigger | the jetpack — on the ground he skates on it, in the air he flies on it |
+| `A` | jump — or, off the skates, take off |
 | `B` | attack — Mario's B |
 | `X` | the squad, held or tapped as above |
 | right trigger | Z — crouch, ground pound, long jump |
@@ -293,6 +295,16 @@ slowly. The mouse gets neither — it needs neither — beyond 20 ms of smoothin
 to take the stair-step off a 125 Hz mouse read at 200 fps, which is a slider
 (`mouse_smooth`) and can be set to zero for a raw 1:1 pointer.
 
+**The boom length is the player's too.** Hold the left stick in and the right
+one stops being the view and becomes the boom: push it forward and the camera
+comes in over his shoulder, pull it back and it stands off, between 250 and
+4000 units. It costs the aim nothing to move, for the same reason occlusion
+does not — the camera is travelling along its own ray — so the distance can be
+changed mid-fight without the crosshair drifting off what it was on. The hip
+and the sights keep their own lengths and the stick sets whichever is in
+effect, since how far back you want to stand and how close you want to be down
+the sights are two different decisions.
+
 **Nothing re-points the view but the player.** No drift back behind him while
 he runs, no framing assist, no correction of any kind. `R` is the only thing in
 here that turns the view on its own, and `R` is a button.
@@ -307,31 +319,54 @@ attached, headless: that a look input lands on the frame it arrives and in
 full, that the same hand movement turns the same angle at 30 fps and at 240 for
 both the mouse and the stick, that everything which *is* smoothed settles
 rather than ringing, that the boom comes in on the frame it must and leaves
-slowly, and that the aim ray really is the middle of the screen.
+slowly, that the boom's stops hold and the two lengths stay independent, and
+that the aim ray really is the middle of the screen.
 
 ## The jetpack
 
-Hold `Space` and the Hero keeps going up. Six frames into a jump, with the key
-still down, `ACT_HERO_JETPACK` takes over from `ACT_HERO_JUMP` and thrusts for
-as long as it is held; let go and he falls. Pressing it again in mid-air — off
-a ledge, or halfway down from a jump he let go of — lights it from wherever he
-is, arresting the fall over a few frames and then climbing. A tap is still an
-ordinary jump, which is what the six-frame delay is for.
+**The left trigger is the jetpack, and `A` is the jump. Neither is the other.**
+That separation is the whole design, and it is not where this started: `A` used
+to become the boosters once it had been held six frames, on the grounds that
+six frames is long enough to tell a tap from a hold. It is, but a jump that
+turns into a flight when you are slow off the button is a jump you cannot
+trust, and it left the trigger and the button meaning overlapping things. Now
+`A` is a jump, every time, and the trigger is the boosters, everywhere.
 
-**On a pad the boosters have a control of their own**: the left trigger, which
-means nothing else. That changes what it can do, and the delay is the reason.
-`Space` is the jump button first, so it has to wait six frames to find out
-whether it was a tap before it can commit to anything; a trigger that means
-only the jetpack has nothing to be told apart from, so it lifts him straight
-off the ground with no jump under it and no delay in front of it. Holding it is
-the thrust and letting go drops him, exactly as the key does — `thrusting()` in
-`sm64py/hero/actions.py` is the pair of them, and only the trigger appears in
-`check_common_exits`, since A held while standing is a jump being held and
-lifting off on it would mean he never jumped at all.
+The keyboard has the trigger on `V`, since `A`'s key no longer doubles as it
+and a keyboard with no boosters would be a keyboard playing a different game.
 
-It rides on the `Controller` as its own field rather than as a button bit, the
-way the skates do: the button mask is the N64's, every bit in it already means
-something, and Mario shares the same controller.
+### On the ground it skates
+
+Holding the trigger while he is standing does not lift him. It puts him on
+`ACT_HERO_SKATING`, riding the jets at ground level, and the physics is the ice
+the game already had: `update_sliding` with the floor class forced to
+very-slippery is momentum that keeps going, a friction that barely bites, and
+steering that rotates the velocity vector rather than the body, so turning
+costs distance instead of speed. What ice has no answer for is where the speed
+comes from — nothing in SM64 makes a sliding character go faster on the flat —
+and here the jets supply it, `SKATE_PUSH` per tick at full stick up to
+`SKATE_TOP_SPEED` of 56, against a running top speed of 38. It is the fastest
+way he has of crossing the grounds, which is the point of pressing it.
+
+One thing is deliberately *not* the ice's answer. A slide is at the mercy of a
+hill: `update_sliding` pulls 10 units a frame downhill at full steepness and
+nothing in a slide answers it, which is why Mario on skates cannot climb. A
+character being pushed by an engine is not sliding, and being dragged backwards
+down the rise to the castle door is not what holding the trigger should feel
+like, so `SKATE_GRIP` cancels all but 1.5 of that pull before `update_sliding`
+adds it. A steep face still costs him speed; it does not reverse him.
+
+`A` out of a skate is the take-off, and it is not a jump: no jump action, no
+jump clip, and no clip restart either. The skate and the flight draw the same
+held pose, so `hold_pose()` suppresses the animation reset every other
+transition in the machine wants — otherwise the take-off would visibly replay
+on the spot, which is the jump animation the take-off is explicitly not.
+
+### In the air it flies
+
+Press the trigger in mid-air — off a ledge, or halfway down from a jump — and
+`ACT_HERO_JETPACK` lights from wherever he is, arresting the fall over a few
+frames and then climbing. Let go and he falls.
 
 He steers under thrust with the running controls rather than a jump's weak air
 control: the stick turns him at the same `TURN_RATE` and accelerates him to the
@@ -352,8 +387,33 @@ then hands 4 of it to gravity, so the approach re-covers that loss every frame
 and he settles at exactly `JETPACK_RISE_SPEED` rather than somewhere under it.
 Measured over a long hold, he gains 20 units a frame at the default 20.
 
-`jetpack_thrust`, `jetpack_rise` and `jetpack_delay` are all on the console, so
-the feel is a slider away.
+### Why the ground is a skate and not a slow take-off
+
+Because taking off from the ground did not work, and could not be made to.
+
+The boosters climb 8 units on the frame they light. A hill lifts the floor
+under him faster than that the moment he is running: 38 units a frame forward
+up a 25 degree slope raises the ground 16. So the air step landed him on the
+frame it started, the landing pose played, the trigger was still down, the
+landing handed him back to the boosters, and it went round again. Holding the
+trigger while running uphill was a landing animation on a loop and no flight at
+all — and the castle grounds are a hill.
+
+There is no take-off to fail now. Ground under a burning jetpack is a skate,
+whether he started there or flew into it, so `act_jetpack` answers
+`AIR_STEP_LANDED` with `ACT_HERO_SKATING` rather than with a landing, and
+hugging a rising slope on the way up puts him on his skates and he carries on
+up the hill. `A` is what leaves the ground, and it leaves it at
+`JETPACK_LAUNCH_SPEED` — 30 rather than 8, which clears anything up to about 28
+degrees, and steeper than that simply puts him back on his skates.
+`tools/check_hero.py` runs that hill and fails if the landing plays even once.
+
+It rides on the `Controller` as its own field rather than as a button bit, the
+way the skates do: the button mask is the N64's, every bit in it already means
+something, and Mario shares the same controller.
+
+`jetpack_thrust`, `jetpack_rise`, `jetpack_launch`, `skate_push` and
+`skate_top` are all on the console, so the feel is a slider away.
 
 ## The squad
 
@@ -856,15 +916,19 @@ rewrites the `.glb` and drops every borrowed clip.
 
 ## Ice skating
 
-`C` puts the skates on and takes them off again. It latches rather than being
-held, because the whole level is the rink.
+`C` puts Mario's skates on and takes them off again. It latches rather than
+being held, because the whole level is the rink. The Hero skates too, on the
+jets rather than on a pair of blades and off the trigger rather than off `C`,
+and everything in this section about the physics applies to both — see
+[The jetpack](#the-jetpack) for the two places his differ.
 
 **The physics is SM64's, with one piece added.** `update_sliding` already *is*
 the game's ice — momentum that keeps going, a friction that barely bites, and
 steering that rotates the velocity vector rather than the body, so a turn costs
 distance instead of speed. All of it reads the floor *class* rather than the
 surface type, so `MarioState.get_floor_class` reporting very-slippery while
-`ACT_SKATING` is running is the whole of what makes the ground icy: the 10.0
+the character's `skating_action` is running is the whole of what makes the
+ground icy: the 10.0
 sliding acceleration, the 0.98 retained per frame, the 5.3 slope acceleration
 and the tightened slope thresholds all follow from that one override. The
 decomp plays the same trick in the other direction for crawling, a few lines
@@ -1460,6 +1524,12 @@ python3 app/main.py    # with: clock-mode limited / clock-frame-rate 120
 - **Scuttlebug legs render as thin wire quads.** Fifteen of its animated parts
   carry flat `LAYER_ALPHA` display lists that the geo does not billboard, so
   unlike its body they have nothing to turn toward the camera.
+- **The Hero skates in a jump pose.** There is no skating clip among his twenty
+  and no equivalent of `author_skate.py` for his rig, so `ACT_HERO_SKATING`
+  holds `jump up` — a body with its legs gathered under it, which is what a
+  character riding thrust should look like and is not the same thing as an
+  animation for it. The camera does not see objects either: trees and warp
+  pipes are not in the collision set, so the boom will not pull in for them.
 - **Most cutscene and automatic actions** (poles, hanging, cannons), and the
   parts of swimming that need systems this port does not have: drowning and the
   breath meter (no health), metal-cap water walking, and carrying an object

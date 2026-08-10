@@ -499,6 +499,56 @@ def check_the_boom_length_does_not_move_the_aim():
                 f"{worst:.4f}")
 
 
+def check_the_stick_sets_the_boom():
+    """Holding the left stick in and pushing the right one dollies the camera.
+
+    Three things, and the third is the one worth having a check for. Pushing
+    forward brings it in and pulling back stands it off; the travel is bounded
+    at both ends, so a thumb left on the stick cannot put the camera inside his
+    head or a mile behind him; and the two lengths are set independently, since
+    the framing at the hip and the framing down the sights are different
+    decisions and one dragging the other about would mean setting either twice.
+    """
+    camera, hero = a_camera()
+    settled(camera)
+
+    started = camera.distance
+    for _ in range(30):
+        camera.dolly(-1.0, 1.0 / 60.0)      # forward on the stick: in
+    closer = camera.distance
+    for _ in range(600):
+        camera.dolly(1.0, 1.0 / 60.0)       # and back: out, to the stop
+    far = camera.distance
+    for _ in range(1200):
+        camera.dolly(-1.0, 1.0 / 60.0)
+    near = camera.distance
+
+    # Down the sights it is the other length that moves.
+    camera.distance = cam.HIP_DISTANCE
+    camera.set_aim(1.0)
+    run(camera, 1.0)
+    aim_started, hip_started = camera.aim_distance, camera.distance
+    for _ in range(30):
+        camera.dolly(1.0, 1.0 / 60.0)
+
+    problems = []
+    if not closer < started:
+        problems.append(f"forward did not come in: {started:.0f} -> {closer:.0f}")
+    if abs(far - cam.BOOM_MAX) > 0.5 or abs(near - cam.BOOM_MIN) > 0.5:
+        problems.append(f"the stops are at {near:.0f} and {far:.0f}, not "
+                        f"{cam.BOOM_MIN:.0f} and {cam.BOOM_MAX:.0f}")
+    if camera.aim_distance <= aim_started:
+        problems.append("the sights' length did not move down the sights")
+    if camera.distance != hip_started:
+        problems.append("the hip length moved down the sights as well")
+
+    return not problems, ("; ".join(problems) if problems else
+                          f"{started:.0f} -> {closer:.0f} in, out to the stop "
+                          f"at {far:.0f}, in to {near:.0f}; the sights move "
+                          f"on their own ({aim_started:.0f} -> "
+                          f"{camera.aim_distance:.0f})")
+
+
 def _ground_hit(origin, direction):
     """Where a ray meets the y = 0 plane. The plane every check stands on."""
     if direction[1] >= -1e-6:
@@ -545,6 +595,7 @@ CHECKS = [
     ("nothing re-points the view", check_nothing_re_points_the_view),
     ("the boom does not move the aim",
      check_the_boom_length_does_not_move_the_aim),
+    ("the stick sets the boom", check_the_stick_sets_the_boom),
     ("recentring arrives", check_recentring_arrives),
 ]
 
