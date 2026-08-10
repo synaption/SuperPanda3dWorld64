@@ -910,10 +910,32 @@ stands instead of resetting, so a kill resumes the clock rather than triggering
 a spawn. That is the difference between one along every thirty seconds and a
 replacement appearing the instant something dies.
 
-*A mob is spawned at the pipe's feet and thrown upward*, not placed on the rim.
-Objects fall at 4 a frame, so a launch at 44 peaks 242 units up — comfortably
-over the 205 the pipe is tall — and it starts hidden inside the barrel rather
-than appearing in mid-air above it. The pipes are drawn but not collided with:
+*A mob is spawned at the pipe's feet and thrown upward*, not placed on the rim,
+so it starts hidden inside the barrel rather than appearing in mid-air above
+it. Objects fall at 4 a frame, so a launch at v peaks v²/8 units up and stays
+airborne for v/2 frames: at 60 that is 480 units, clearing the 205-unit pipe by
+as much again, with a full second in the air to be carried 20 a frame outwards
+— about 620 units, four pipe-widths.
+
+*And the arc is flown by `Object.coast()`, not by the behaviour.* Every one of
+these behaviours writes its own speed each tick — a goomba bleeds 0.4 a frame
+off whatever it has back toward a walk, a scuttlebug overwrites it outright
+with its crawl — so a launch handed straight to the behaviour is gone within a
+tick or two and the mob lands back down the barrel it came out of. While
+`launched` is running the object set flies the object ballistically instead and
+hands it back the moment it lands, which is what makes the distance thrown mean
+anything. There is a 120-frame cap on that, in case an arc never finds a floor
+to end on.
+
+*The heading is chosen rather than simply random.* At 620 units out, which way
+matters: the west pipe stands a few hundred units from where the ground falls
+1700 into the moat, and measured over 200 throws a quarter of its goombas were
+coming down in the water. The pipe now samples the floor where the arc would
+put one down and rerolls, up to eight times, until it finds ground no more than
+400 below itself. That takes it to 3 in 200 — the arcs that clip terrain on the
+way and so do not land where the flat estimate said they would.
+
+The pipes are drawn but not collided with:
 the level's own collision is all the physics reads, and the actor's
 `collision.inc.c` is not loaded, so you can walk through one.
 

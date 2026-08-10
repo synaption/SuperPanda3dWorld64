@@ -28,6 +28,11 @@ TERMINAL_VELOCITY = -78.0
 # whoever is being played.
 DEATH_FRAMES = 12
 
+# How long a launched object is flown ballistically before its own behaviour
+# gets it back, in case the arc never finds a floor to land on. Comfortably
+# longer than the arc itself, which is about a second.
+LAUNCH_MAX_TICKS = 120
+
 
 class Object:
     """Base for anything that stands on the floor and can be drawn."""
@@ -65,6 +70,9 @@ class Object:
         self.world = None
         # Counts down after a defeat, so the hit is visible before it vanishes.
         self.dying = 0
+        # Frames left of a launch. While this is running the object flies the
+        # arc it was thrown on and its behaviour is suspended; see `coast`.
+        self.launched = 0
         # Killed, as opposed to merely switched off. A pipe counts its brood by
         # this rather than by `active`, so standing an object down -- which is
         # what happens to the Mario NPCs when Mario himself is being played --
@@ -132,6 +140,22 @@ class Object:
 
     def update(self, mario):
         self.timer += 1
+
+    def coast(self):
+        """Fly the arc a pipe threw it on, with its behaviour suspended.
+
+        Every one of these behaviours writes its own speed each tick -- a
+        goomba bleeds 0.4 a frame off whatever it has back toward a walk, and a
+        scuttlebug simply overwrites it with its crawl -- so a launch handed to
+        the behaviour is gone within a tick or two and the mob lands back on
+        the pipe it came out of. Flying the whole arc here is what makes the
+        distance thrown mean anything.
+        """
+        self.timer += 1
+        self.launched -= 1
+        self.move()
+        if self.on_ground:
+            self.launched = 0
 
     def defeat(self):
         """Take the killing blow: play the death frames, then leave."""
@@ -573,12 +597,21 @@ class WarpPipe(Object):
     radius = 150.0
     height = 205.0
 
-    # Hard enough to clear the rim. Gravity takes 4 a frame back, so a launch
-    # at v peaks v*v/8 units up: 44 reaches ~240, comfortably over the 205 it
-    # has to get out of.
-    LAUNCH_VELOCITY = 44.0
-    # A shove outwards as well, so five of them do not land in one stack.
-    LAUNCH_SPEED = 8.0
+    # Gravity takes 4 a frame back, so a launch at v peaks v*v/8 units up and
+    # is in the air for v/2 frames: 60 clears the 205-unit rim by as much
+    # again, and stays up for a full second on the way.
+    LAUNCH_VELOCITY = 60.0
+    # Carried outwards for the whole of that second, so it lands about 600
+    # units out -- four pipe-widths, and far enough that five of them come down
+    # spread around it rather than in a stack on top of it.
+    LAUNCH_SPEED = 20.0
+
+    # How far below the pipe a landing spot may be and still count as somewhere
+    # to throw something. Thrown this far, direction matters: the west pipe
+    # stands a few hundred units from where the ground drops 1700 into the
+    # moat, and a share of its goombas were coming down in the water.
+    LANDING_DROP = 400.0
+    LANDING_TRIES = 8
 
     def __init__(self, surfaces, x, y, z, yaw=0,
                  spawns=None, interval=30 * 30, limit=5):
@@ -609,16 +642,36 @@ class WarpPipe(Object):
         self.countdown = self.interval
         self.launch()
 
+    def _launch_heading(self):
+        """A direction with something to land on at the end of it."""
+        # Where the arc puts it down: airborne for twice the time it takes
+        # gravity to cancel the launch, carried outwards throughout.
+        reach = self.LAUNCH_SPEED * 2.0 * self.LAUNCH_VELOCITY / -OBJECT_GRAVITY
+        yaw = 0
+        for _ in range(self.LANDING_TRIES):
+            yaw = random.randint(0, 0xFFFF)
+            x = self.pos[0] + reach * sins(yaw)
+            z = self.pos[2] + reach * coss(yaw)
+            height, floor = self.surfaces.find_floor(x, self.pos[1] + 200.0, z)
+            if floor is not None and height > self.pos[1] - self.LANDING_DROP:
+                return yaw
+        # Ringed by drops, apparently. Throw it anyway rather than not at all.
+        return yaw
+
     def launch(self):
         """Throw one out of the mouth, in a direction of its own."""
         # Spawned at the pipe's feet rather than at its lip: the launch carries
         # it up through the barrel and out, which is what the pop is, and it
         # starts hidden inside instead of appearing in mid-air above.
         mob = self.world.spawn(self.spawns, self.pos[0], self.pos[1],
-                               self.pos[2], random.randint(0, 0xFFFF))
+                               self.pos[2], self._launch_heading())
         mob.vel_y = self.LAUNCH_VELOCITY
         mob.forward_vel = self.LAUNCH_SPEED
         mob.on_ground = False
+        mob.launched = LAUNCH_MAX_TICKS
+        # Mario has a clip for being in the air; the enemies have the one clip
+        # each and keep it.
+        mob.anim = getattr(mob, "ANIM_JUMP", mob.anim)
         self.brood.append(mob)
         return mob
 
@@ -768,6 +821,11 @@ class ObjectSet:
                 obj.dying -= 1
                 if obj.dying == 0:
                     obj.active = False
+                continue
+            if obj.launched:
+                # Thrown by a pipe and still in the air. Its behaviour gets it
+                # back the moment it lands.
+                obj.coast()
                 continue
             obj.update(mario)
 
