@@ -122,6 +122,12 @@ SOUNDS = os.path.join(ASSETS, "sounds", "mario64")
 ACTORS = os.path.join(ASSETS, "actors")
 LEVEL_OBJECTS = os.path.join(CASTLE_GROUNDS, "collision_objects.json")
 
+# What counts as an enemy: the things that can be fought, as against the trees
+# and the Marios, which are scenery and company respectively. Named once
+# because two places ask the question -- the readout counting what is left, and
+# the tuning that only wants the pipes producing these.
+ENEMY_TYPES = (objects.Goomba, objects.Scuttlebug)
+
 # Enemies the level does not place itself. Castle grounds has no goombas or
 # scuttlebugs in the original, so these are placed by hand -- out across the
 # field rather than on top of the spawn, so they are something to walk toward
@@ -202,9 +208,19 @@ TICK_RATE = 30.0
 TICK_DT = 1.0 / TICK_RATE
 
 # One out of each pipe every thirty seconds, up to five of them alive at once.
-# The pipe counts in ticks, as everything in the simulation does.
-PIPE_INTERVAL = int(30.0 * TICK_RATE)
+# The pipe counts in ticks, as everything in the simulation does; these are in
+# seconds, which is the unit the number is worth thinking about in, and the
+# unit the console slider drags in.
+PIPE_INTERVAL_SECONDS = 30.0
+PIPE_INTERVAL = int(PIPE_INTERVAL_SECONDS * TICK_RATE)
 PIPE_LIMIT = 5
+
+# What the enemy_rate and enemy_limit sliders are allowed to reach. Half a
+# second between spawns with a cap of thirty is a swarm, which is the
+# interesting end of both ranges; a limit of zero at the bottom of the other
+# turns the pipes off without needing a restart to get an empty field.
+ENEMY_RATE_RANGE = (0.5, 120.0)
+ENEMY_LIMIT_RANGE = (0, 30)
 
 # Mario spawns where the level script places him, facing the castle.
 SPAWN = (-1328.0, 260.0, 4664.0)
@@ -300,6 +316,49 @@ class Player:
         self.node.hide()
 
 
+class PipeTuning:
+    """The enemy pipes' rate and cap, as two numbers rather than two per pipe.
+
+    A tunable reads and writes one attribute of one object, and the numbers it
+    wants live on every enemy pipe -- so this stands in for the group: reading
+    the first, writing all of them. The Mario pipe is deliberately not in here;
+    it produces company rather than enemies, and a slider labelled "enemy"
+    dragging it too would be a surprise.
+
+    A rate cut also pulls in a countdown already running, since a pipe part way
+    through a thirty-second wait would otherwise ignore the new number until
+    the old one had finished elapsing -- which reads as a slider that does
+    nothing for half a minute.
+    """
+
+    def __init__(self, pipes):
+        self.pipes = list(pipes)
+
+    @property
+    def seconds(self):
+        if not self.pipes:
+            return PIPE_INTERVAL_SECONDS
+        return self.pipes[0].interval / TICK_RATE
+
+    @seconds.setter
+    def seconds(self, value):
+        # At least one tick: an interval of zero would fire the pipe on every
+        # frame the cap left room, which is not a rate but a fountain.
+        ticks = max(1, int(round(value * TICK_RATE)))
+        for pipe in self.pipes:
+            pipe.interval = ticks
+            pipe.countdown = min(pipe.countdown, ticks)
+
+    @property
+    def limit(self):
+        return self.pipes[0].limit if self.pipes else PIPE_LIMIT
+
+    @limit.setter
+    def limit(self, value):
+        for pipe in self.pipes:
+            pipe.limit = int(value)
+
+
 class Game(ShowBase):
     def __init__(self):
         ShowBase.__init__(self)
@@ -381,6 +440,10 @@ class Game(ShowBase):
                                interval=PIPE_INTERVAL, limit=PIPE_LIMIT)
             for cls, x, y, z in PIPE_SPAWNS
         ]
+        # The ones the enemy sliders speak for; see PipeTuning.
+        self.pipe_tuning = PipeTuning(
+            pipe for pipe in self.pipes if pipe.spawns in ENEMY_TYPES
+        )
 
     # -- players -------------------------------------------------------------
 
@@ -1032,6 +1095,14 @@ class Game(ShowBase):
         t.add("squad_follow", squad, "FOLLOW_DISTANCE", 100.0, 1200.0,
               "how far behind you the group gathers")
 
+        # The two numbers that decide how busy the field is. Both are written
+        # straight onto the pipes, which read them on the tick they use them,
+        # so a drag lands on the next spawn rather than the next run.
+        t.add("enemy_rate", self.pipe_tuning, "seconds", *ENEMY_RATE_RANGE,
+              doc="seconds between one enemy out of each pipe and the next")
+        t.add("enemy_limit", self.pipe_tuning, "limit", *ENEMY_LIMIT_RANGE,
+              doc="how many each enemy pipe keeps alive", integer=True)
+
         t.add("cam_distance", self.follow_camera, "distance", 250.0, 5000.0,
               "how far the camera sits behind him")
         t.add("cam_height", self.follow_camera, "height", -500.0, 1500.0,
@@ -1318,8 +1389,7 @@ class Game(ShowBase):
         enemy.
         """
         return sum(1 for o in self.objects.objects
-                   if o.active and isinstance(o, (objects.Goomba,
-                                                  objects.Scuttlebug)))
+                   if o.active and isinstance(o, ENEMY_TYPES))
 
     def _pipe_text(self):
         """What each pipe is holding, and how long until the next one out.
