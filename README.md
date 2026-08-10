@@ -137,6 +137,39 @@ Either way:
 | `F3` | toggle the collision overlay |
 | `Esc` | close the console, or quit |
 
+### A gamepad
+
+Plug one in — before starting or while playing, either works — and it drives
+the same set. Nothing has to be configured and the keyboard keeps working
+alongside it; the two are added together rather than switched between, so a key
+and the stick pushed the opposite way simply cancel out.
+
+| | |
+|---|---|
+| left stick | analog stick, with a walk at the bottom of its travel |
+| d-pad | the same, at full deflection, when the stick is centred |
+| right stick | swing and tilt the camera |
+| `A` | jump, and the jetpack |
+| `X` or `B` | attack — Mario's B |
+| either trigger | Z — crouch, ground pound, long jump |
+| right shoulder | re-centre the camera |
+| left shoulder (held) | shamble like a zombie |
+| `Y` | put the skates on, and take them off again |
+| `Start` | swap between the Hero and Mario |
+
+The button names are Panda3D's, which are an Xbox pad's; a DualShock reports
+its own layout through the same names, so `A` is cross and `X` is square. The
+console still needs the keyboard, and holds the pad neutral for as long as it
+is open.
+
+`app/gamepad.py` is the whole of it: it polls the first pad the system reports
+once a rendered frame and hands the game a snapshot, rather than throwing
+button events, because the rest of the input is polled too — the analog stick
+has no event to throw and the tick loop reads held state. `python3
+tools/check_gamepad.py` exercises the mapping against a stub device, so the
+directions, the deadzone and the latching buttons can be checked with no pad
+plugged in.
+
 ## The jetpack
 
 Hold `Space` and the Hero keeps going up. Six frames into a jump, with the key
@@ -287,10 +320,13 @@ tools/
   check_movement.py        the movement figures quoted under "Verified behaviour"
   check_hero.py            the Hero's action machine, start to finish
   check_sound.py           why the game is silent, layer by layer
-app/main.py        the runnable game
+  check_gamepad.py         the pad mapping, against a stub device
+app/
+  main.py          the runnable game
+  gamepad.py       the pad, polled a frame at a time
 ```
 
-The five `check_*` scripts all run headless and print what they measured.
+The six `check_*` scripts all run headless and print what they measured.
 
 ## Notes on the port
 

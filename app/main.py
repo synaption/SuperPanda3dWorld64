@@ -34,6 +34,18 @@ Both:
     F3                        toggle the collision overlay
     Escape                    close the console, or quit
 
+On a gamepad, if one is plugged in -- the same set, added to the keyboard
+rather than replacing it (see app/gamepad.py):
+    left stick / d-pad        analog stick
+    right stick               swing and tilt the camera
+    A                         jump, and the jetpack
+    X or B                    attack -- Mario's B
+    either trigger            Z
+    right shoulder            re-centre the camera
+    left shoulder (held)      shamble like a zombie
+    Y                         the skates
+    Start                     swap between the Hero and Mario
+
 The console shows the readout, everything the game has printed -- scroll back
 through it with the wheel -- and a command line; typing the name of one of the
 tunables registered in `_register_tunables` puts a slider for it on screen,
@@ -64,6 +76,12 @@ from panda3d.core import (
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+# Through the package rather than as a sibling module: `tools/check_hero.py`
+# imports this file as `app.main`, and in that reading the directory this file
+# sits in is not on the path -- only the root inserted above is.
+from app.gamepad import (  # noqa: E402
+    CAMERA_PITCH_SPEED, CAMERA_YAW_SPEED, Gamepad,
+)
 from sm64py import audio, console, objects, surfaces  # noqa: E402
 from sm64py.camera import FollowCamera  # noqa: E402
 from sm64py.hero import HeroState  # noqa: E402
@@ -552,6 +570,11 @@ class Game(ShowBase):
         self.accept("f2", self._switch_player)
         self.accept("f3", self._toggle_collision)
 
+        # A pad, if there is one, driving the same controls the keys above do
+        # rather than a set of its own. It is read by polling and not through
+        # the event bindings here, so nothing above has to know about it.
+        self.gamepad = Gamepad(self.devices)
+
         self._dragging = False
         for button in ("mouse1", "mouse3"):
             self.accept(button, self._set_dragging, [True])
@@ -765,13 +788,21 @@ class Game(ShowBase):
         up = 1.0 if self.keys["up"] else 0.0
         down = 1.0 if self.keys["down"] else 0.0
 
+        # The pad's stick, added rather than chosen between: a key held while
+        # the stick is pushed the other way cancels out, which is what either
+        # one alone does anyway, and there is no mode to be in. `set_stick`
+        # clamps the pair back inside the circular gate, so the sum of the two
+        # cannot walk him faster than either.
+        pad_x, pad_y = self.gamepad.stick
+
         # Both stick axes come out mirrored from screen space: the heading is
         # built as atan2s(-stick_y, stick_x) and then rotated by the camera
         # yaw, which flips Y and mirrors X. Hence left-minus-right, not the
-        # other way round.
-        self.controller.set_stick(left - right, down - up)
+        # other way round -- and hence the pad's axes, which point right and
+        # up, coming through negated.
+        self.controller.set_stick(left - right - pad_x, down - up - pad_y)
 
-        buttons = 0
+        buttons = self.gamepad.buttons
         if self.keys["a"]:
             buttons |= C.A_BUTTON
         if self.keys["b"]:
@@ -782,7 +813,7 @@ class Game(ShowBase):
 
         # Purely a costume: the action code never reads it, so Mario walks and
         # jumps exactly as he always did while it is held.
-        self.controller.zombie = self.keys["zombie"]
+        self.controller.zombie = self.keys["zombie"] or self.gamepad.zombie
         # The skates are not a costume -- this one drives an action.
         self.controller.skating = self._skating
 
@@ -790,6 +821,18 @@ class Game(ShowBase):
 
     def _update(self, task):
         dt = min(self.clock.get_dt(), 0.25)
+
+        # Once a frame, before anything reads it, and held neutral while the
+        # console has the input -- the pad has no key-up to arrive later, so a
+        # direction held as the console opened would otherwise stay held.
+        self.gamepad.poll(active=not self.console.visible)
+        # The two controls that latch rather than being held. Read here rather
+        # than in the tick loop because a frame can run two ticks or none, and
+        # a press is a press either way.
+        if self.gamepad.pressed("skates"):
+            self._toggle_skating()
+        if self.gamepad.pressed("swap"):
+            self._switch_player()
 
         # The console pauses the game. Nothing accumulates while it is open
         # either, so coming back steps a single tick rather than replaying
@@ -836,8 +879,9 @@ class Game(ShowBase):
         alpha = min(max(self._accumulator / TICK_DT, 0.0), 1.0)
         pos, angle = self._interpolated_transform(alpha)
 
-        self.follow_camera.update(dt, target_pos=pos,
-                                  recenter=self.keys["cam_center"])
+        self.follow_camera.update(
+            dt, target_pos=pos,
+            recenter=self.keys["cam_center"] or self.gamepad.recenter)
         self.follow_camera.apply_to(self.camera)
 
         # Its own clock rather than the frame time, so a spell in the console
@@ -894,6 +938,15 @@ class Game(ShowBase):
             self.follow_camera.rotate(-speed * dt)
         if self.keys["cam_right"]:
             self.follow_camera.rotate(speed * dt)
+
+        # The pad's right stick, per second rather than per drag: unlike the
+        # mouse it reports a position that is held, so the pan has to be scaled
+        # by dt or it would swing at whatever the frame rate happens to be. The
+        # tilt takes the same sign the drag does, so pushing up looks up.
+        cam_x, cam_y = self.gamepad.camera
+        if cam_x or cam_y:
+            self.follow_camera.rotate(cam_x * CAMERA_YAW_SPEED * dt)
+            self.follow_camera.tilt(-cam_y * CAMERA_PITCH_SPEED * dt)
 
         # Dragging with a mouse button held swings the camera too -- unless
         # the pointer is on the console or one of its sliders, where a drag
