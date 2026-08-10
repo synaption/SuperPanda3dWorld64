@@ -104,7 +104,7 @@ As the Hero:
 | | |
 |---|---|
 | `W` `A` `S` `D` / arrows | analog stick (camera-relative) |
-| `Space` | jump — held longer, jumps higher |
+| `Space` | jump; hold it and the jetpack takes over — see below |
 | `Left Shift` | attack; again mid-swing to chain the second, or while running for the spin kick |
 | `Left Ctrl` | draw or sheathe the sword |
 
@@ -129,6 +129,31 @@ Either way:
 | `F2` | swap between the Hero and Mario |
 | `F3` | toggle the collision overlay |
 | `Esc` | close the console, or quit |
+
+## The jetpack
+
+Hold `Space` and the Hero keeps going up. Six frames into a jump, with the key
+still down, `ACT_HERO_JETPACK` takes over from `ACT_HERO_JUMP` and thrusts for
+as long as it is held; let go and he falls. Pressing it again in mid-air — off
+a ledge, or halfway down from a jump he let go of — lights it from wherever he
+is, arresting the fall over a few frames and then climbing. A tap is still an
+ordinary jump, which is what the six-frame delay is for.
+
+There is no flying clip among his twenty, so he keeps the pose he is already
+in: `jump up` while he is rising, `jump down` while he is still coming down.
+
+The one number worth knowing is that **the thrust has to beat gravity to be
+thrust at all**. `apply_gravity` takes 4 units a frame back after every air
+step, and the thrust is applied as an approach *before* the step, so anything
+at or under 4 hovers rather than climbs — which is why `jetpack_thrust` has a
+floor of 4 on its slider. Running the approach before the step is also what
+makes the climb honest: the step moves him by the velocity it is given and only
+then hands 4 of it to gravity, so the approach re-covers that loss every frame
+and he settles at exactly `JETPACK_RISE_SPEED` rather than somewhere under it.
+Measured over a long hold, he gains 20 units a frame at the default 20.
+
+`jetpack_thrust`, `jetpack_rise` and `jetpack_delay` are all on the console, so
+the feel is a slider away.
 
 ## The debug console
 

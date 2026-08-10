@@ -58,6 +58,18 @@ def _walking(m):
     return RUN if speed > H.RUN_SPEED else WALK
 
 
+def _jetpack(m):
+    """The jump he is already in, held for as long as the boosters burn.
+
+    There is no flying clip in the set and inventing one out of the twenty
+    there are would look worse than this does: `jump up` holds its last pose,
+    which is a body already off the ground with its legs gathered, and that is
+    what a character under thrust should look like. Coming back down is the
+    falling pose, the same as any other descent.
+    """
+    return JUMP_RISE if m.vel[1] >= 0.0 else JUMP_FALL
+
+
 def _landing(m):
     return LAND_HEAVY if m.action_arg else LAND
 
@@ -71,6 +83,7 @@ ACTION_ANIMATIONS = {
     H.ACT_HERO_WALKING: _walking,
     H.ACT_HERO_JUMP: JUMP_RISE,
     H.ACT_HERO_FALL: JUMP_FALL,
+    H.ACT_HERO_JETPACK: _jetpack,
     H.ACT_HERO_LAND: _landing,
     H.ACT_HERO_ATTACK: _attack,
     H.ACT_HERO_SPIN_KICK: SPIN_KICK,

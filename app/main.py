@@ -12,7 +12,8 @@ decoupled and the simulation is stepped in whole ticks.
 
 Controls, as the Hero:
     W / A / S / D or arrows   analog stick (camera-relative)
-    Space                     jump (held longer, jumps higher)
+    Space                     jump; held, the jetpack takes over and he flies,
+                              and pressing it again in mid-air lights it too
     Left Shift                attack -- again mid-swing to chain the second,
                               or while running for the spin kick
     Left Ctrl                 draw or sheathe the sword
@@ -658,6 +659,15 @@ class Game(ShowBase):
               "take-off speed; 42 is the ~250 unit jump the level was built for")
         t.add("jump_speed_bonus", HC, "JUMP_SPEED_BONUS", 0.0, 1.0,
               "how much a running start lends to the jump")
+
+        # Gravity takes 4 a frame back after every air step, so a thrust at or
+        # under that hovers rather than climbs -- hence the floor of 4.
+        t.add("jetpack_thrust", HC, "JETPACK_THRUST", 4.0, 40.0,
+              "how hard the boosters push, per frame")
+        t.add("jetpack_rise", HC, "JETPACK_RISE_SPEED", 0.0, 80.0,
+              "the climb it settles at, units per frame")
+        t.add("jetpack_delay", HC, "JETPACK_DELAY", 0, 60,
+              "frames of ordinary jump before the boosters light", integer=True)
 
         t.add("attack_lunge", HC, "ATTACK_LUNGE_SPEED", 0.0, 40.0,
               "the forward travel handed back to the sword swings")

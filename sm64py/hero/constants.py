@@ -34,6 +34,9 @@ ACT_HERO_ATTACK = HERO | ACT_FLAG_STATIONARY | ACT_FLAG_ATTACKING | 0x06
 ACT_HERO_SPIN_KICK = HERO | ACT_FLAG_MOVING | ACT_FLAG_ATTACKING | 0x07
 ACT_HERO_SWORD = HERO | ACT_FLAG_STATIONARY | 0x08
 ACT_HERO_WADING = HERO | ACT_FLAG_MOVING | 0x09
+# No CONTROL_JUMP_HEIGHT: that flag is what lets releasing A cut a rise short,
+# and here releasing A ends the flight outright.
+ACT_HERO_JETPACK = HERO | ACT_FLAG_AIR | 0x0A
 
 ACTION_NAMES = {
     ACT_HERO_IDLE: "idle",
@@ -45,6 +48,7 @@ ACTION_NAMES = {
     ACT_HERO_SPIN_KICK: "spin kick",
     ACT_HERO_SWORD: "sword",
     ACT_HERO_WADING: "wading",
+    ACT_HERO_JETPACK: "jetpack",
 }
 
 # -- ground movement --------------------------------------------------------
@@ -87,7 +91,8 @@ TURN_RATE = 0x0C00
 # -- jumping ----------------------------------------------------------------
 
 # Mario's own take-off velocity, and for a reason rather than by imitation: it
-# puts a held jump at ~250 units (tools/check_movement.py, tools/check_hero.py),
+# puts a jump held to the last frame before the boosters at ~250 units
+# (tools/check_movement.py, tools/check_hero.py),
 # which is the height the castle grounds were built around. A Hero who jumped
 # higher would reach ledges the level does not expect anyone to stand on.
 JUMP_VELOCITY = 42.0
@@ -95,6 +100,25 @@ JUMP_VELOCITY = 42.0
 JUMP_SPEED_BONUS = 0.15
 # Landing harder than this plays the heavy landing instead of the light one.
 HEAVY_LANDING_SPEED = 52.0
+
+# -- the jetpack ------------------------------------------------------------
+#
+# Hold A in the air and he keeps going up. The thrust is applied as an approach
+# toward a rise speed rather than as an acceleration, so the boosters have a
+# top speed of their own and holding the button does not build up something
+# that takes a hundred units of altitude to shed.
+#
+# The thrust has to beat gravity to be thrust at all: `apply_gravity` takes 4
+# units a frame back after every air step, and the approach below runs before
+# the step, so anything at or under 4 hovers instead of climbing. 8 climbs
+# briskly and still lets the descent take over the moment the button is let go.
+JETPACK_THRUST = 8.0
+JETPACK_RISE_SPEED = 20.0
+
+# Frames of ordinary jump before the boosters light, so a tap is still a jump
+# and a hold turns into flight. Short enough not to feel like a delay -- a
+# fifth of a second -- and long enough that the take-off reads as a jump.
+JETPACK_DELAY = 6
 # Frames the landing pose holds before idle or walking takes over. The clip is
 # 24 frames; this is short enough that it never blocks the next input.
 LAND_FRAMES = 8

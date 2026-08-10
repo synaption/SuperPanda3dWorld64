@@ -115,24 +115,61 @@ def check_jump():
 
 
 def check_jump_height_is_variable():
-    """Releasing the button early must give a lower jump than holding it."""
-    def peak(hold):
+    """Releasing the button early must give a lower jump than holding it.
+
+    "Held" means held to the last frame before the jetpack would take over,
+    not held indefinitely: holding past `JETPACK_DELAY` is no longer a jump at
+    all, it is flight, and measuring that here would report a number in the
+    thousands and stop saying anything about the jump.
+    """
+    def peak(frames_held):
         run = Run()
-        launched = False
+        airborne = 0
         best = 0.0
         for _ in range(150):
-            if not launched:
-                buttons = C.A_BUTTON
-            else:
-                buttons = C.A_BUTTON if hold else 0
+            buttons = C.A_BUTTON if airborne <= frames_held else 0
             run.tick(buttons=buttons)
             if not run.grounded:
-                launched = True
+                airborne += 1
             best = max(best, run.height)
         return best
 
-    held, tapped = peak(True), peak(False)
+    held, tapped = peak(H.JETPACK_DELAY - 1), peak(0)
     return held > tapped + 20.0, f"held {held:.0f} vs tapped {tapped:.0f} units"
+
+
+def check_jetpack():
+    """Holding the button flies, letting go falls, and a tap does neither."""
+    def fly(hold_for):
+        run = Run()
+        airborne, best, actions = 0, 0.0, []
+        for _ in range(120):
+            run.tick(buttons=C.A_BUTTON if airborne <= hold_for else 0)
+            if not run.grounded:
+                airborne += 1
+            best = max(best, run.height)
+            name = run.hero.action_name
+            if not actions or actions[-1] != name:
+                actions.append(name)
+        return best, actions
+
+    flying, actions = fly(120)
+    fell, _ = fly(H.JETPACK_DELAY + 10)
+    tapped, tap_actions = fly(0)
+
+    problems = []
+    if "jetpack" not in actions:
+        problems.append(f"holding never reached the jetpack: {actions}")
+    if flying < 800.0:
+        problems.append(f"holding only climbed {flying:.0f} units")
+    if not fell < flying / 2.0:
+        problems.append(f"letting go still climbed to {fell:.0f}")
+    if "jetpack" in tap_actions:
+        problems.append("a tap lit the boosters")
+
+    return not problems, ("; ".join(problems) if problems else
+                          f"held climbs {flying:.0f} units, released stops at "
+                          f"{fell:.0f}, a tap peaks at {tapped:.0f}")
 
 
 def check_attack_chain():
@@ -240,6 +277,7 @@ CHECKS = [
     ("stopping returns to idle", check_stop),
     ("jump leaves and regains the floor", check_jump),
     ("jump height follows the button", check_jump_height_is_variable),
+    ("the jetpack flies, and only when held", check_jetpack),
     ("attack chains into the second swing", check_attack_chain),
     ("spin kick out of a run", check_spin_kick),
     ("every action has a clip", check_every_action_has_a_clip),

@@ -325,6 +325,22 @@ def land_from_air(m):
     return set_hero_action(m, H.ACT_HERO_LAND, 1 if heavy else 0)
 
 
+def check_jetpack_hold(m):
+    """A still held this far into the jump lights the boosters.
+
+    The hold rather than the press, and the press is no use here: the jump is
+    entered on `INPUT_A_PRESSED` and runs its first frame on the same tick, so
+    that bit is still set when this is first asked and every jump would become
+    a flight before it had left the ground. Waiting `JETPACK_DELAY` frames and
+    reading the button's *state* is what separates a tap from a hold.
+    """
+    if m.action_timer < H.JETPACK_DELAY:
+        return False
+    if not (m.input & C.INPUT_A_DOWN):
+        return False
+    return set_hero_action(m, H.ACT_HERO_JETPACK, 0)
+
+
 @action(H.ACT_HERO_JUMP, "jump")
 def act_jump(m):
     if m.action_timer == 0:
@@ -332,6 +348,9 @@ def act_jump(m):
         # Read by the gravity rule in steps.py: without it, releasing the
         # button on the way up does not shorten the jump.
         m.flags |= C.MARIO_JUMPING
+
+    if check_jetpack_hold(m):
+        return True
 
     update_air_movement(m)
     step = perform_air_step(m)
@@ -352,11 +371,53 @@ def act_jump(m):
 
 @action(H.ACT_HERO_FALL, "fall")
 def act_fall(m):
+    # Only a fresh press, not a held button: falling with A still down is what
+    # happens for the frame after the boosters cut out, and reading the hold
+    # here would light them again before he had dropped an inch.
+    if m.input & C.INPUT_A_PRESSED:
+        return set_hero_action(m, H.ACT_HERO_JETPACK, 0)
+
     update_air_movement(m)
     step = perform_air_step(m)
 
     if step == C.AIR_STEP_LANDED:
         m.flags &= ~C.MARIO_JUMPING
+        return land_from_air(m)
+    if step == C.AIR_STEP_HIT_WALL:
+        m.forward_vel = 0.0
+
+    m.action_timer += 1
+    return False
+
+
+@action(H.ACT_HERO_JETPACK, "jetpack")
+def act_jetpack(m):
+    """Thrust up for as long as A is held, steering with the stick.
+
+    The thrust is written as an approach toward a rise speed, run before the
+    air step rather than after it, which is what makes the number behave: the
+    step moves him by the velocity it is given and only then hands 4 units of
+    it back to gravity, so the approach re-covers that loss every frame and he
+    settles at exactly `JETPACK_RISE_SPEED` instead of somewhere under it.
+    """
+    if m.action_timer == 0:
+        # He is no longer in a jump whose height the button governs, and
+        # leaving the flag set would have steps.py quarter his velocity the
+        # frame he lets go rather than simply letting him fall.
+        m.flags &= ~C.MARIO_JUMPING
+
+    if not (m.input & C.INPUT_A_DOWN):
+        return set_hero_action(m, H.ACT_HERO_FALL, 0)
+
+    m.vel[1] = approach_f32(m.vel[1], H.JETPACK_RISE_SPEED,
+                            H.JETPACK_THRUST, H.JETPACK_THRUST)
+
+    update_air_movement(m)
+    step = perform_air_step(m)
+
+    if step == C.AIR_STEP_LANDED:
+        # Reachable: the ground rises under him on a slope, and hugging one on
+        # the way up should set him down rather than grind him along it.
         return land_from_air(m)
     if step == C.AIR_STEP_HIT_WALL:
         m.forward_vel = 0.0
