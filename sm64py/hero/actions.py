@@ -14,6 +14,7 @@ this frame" so a transition costs no visible frame. Movement is handed to
 exactly as they do for Mario.
 """
 
+from .. import audio
 from ..math_util import approach_f32, approach_s32, coss, s16, sins
 from ..mario import constants as C
 from ..mario.steps import (
@@ -37,12 +38,10 @@ def action(action_id, anim=None):
 # Mario actions use: the simulation never plays anything itself, so it runs
 # identically with or without an audio device.
 _ENTRY_SOUNDS = {
-    # The Hero has no voice sample of his own.  Reusing Mario's call here made
-    # him sound like Mario whenever he jumped, so his jump is deliberately
-    # silent; Mario's separate action table still raises both of his sounds.
+    H.ACT_HERO_JUMP: (audio.SOUND_HERO_JUMP,),
     H.ACT_HERO_LAND: (C.SOUND_ACTION_TERRAIN_LANDING,),
-    H.ACT_HERO_ATTACK: (C.SOUND_MARIO_YAH_WAH_HOO,),
-    H.ACT_HERO_SPIN_KICK: (C.SOUND_MARIO_YAHOO,),
+    H.ACT_HERO_ATTACK: (audio.SOUND_HERO_ATTACK_1,),
+    H.ACT_HERO_SPIN_KICK: (audio.SOUND_HERO_SPIN_KICK,),
 }
 
 
@@ -253,6 +252,7 @@ def act_attack(m):
             and H.COMBO_WINDOW_START <= m.action_timer <= H.COMBO_WINDOW_END
             and m.input & C.INPUT_B_PRESSED):
         m.combo_index = 1
+        m.sound_events.append(audio.SOUND_HERO_ATTACK_2)
         return set_hero_action(m, H.ACT_HERO_ATTACK, 0)
 
     m.action_timer += 1

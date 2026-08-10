@@ -456,7 +456,10 @@ class Interactions:
         self.hits_taken = 0
 
     def resolve(self, mario):
+        from . import audio
         from .mario import constants as C
+
+        hero_voice = getattr(mario, "voice_profile", None) == "hero"
 
         # Being knocked back leaves Mario inside the enemy that hit him, so
         # without a cooldown the same touch re-triggers every tick and he is
@@ -493,14 +496,19 @@ class Interactions:
             if stomping or attacking:
                 obj.dying = DEATH_FRAMES
                 self.defeated += 1
-                mario.sound_events.append(C.SOUND_MARIO_YAHOO if attacking
-                                          else C.SOUND_ACTION_TERRAIN_LANDING)
+                if attacking:
+                    mario.sound_events.append(
+                        audio.SOUND_HERO_VICTORY_HIT if hero_voice
+                        else C.SOUND_MARIO_YAHOO)
+                else:
+                    mario.sound_events.append(C.SOUND_ACTION_TERRAIN_LANDING)
                 if stomping:
                     mario.bounce_off_enemy(BOUNCE_VELOCITY)
             else:
                 # Thrown away from the enemy, facing it, the way a hit reads.
                 away = s16(atan2s(dz, dx) + 0x8000)
-                mario.sound_events.append(C.SOUND_MARIO_OOOF)
+                mario.sound_events.append(
+                    audio.SOUND_HERO_HIT if hero_voice else C.SOUND_MARIO_OOOF)
                 mario.take_enemy_hit(away, KNOCKBACK_SPEED, KNOCKBACK_VELOCITY)
                 mario.invinc_timer = INVINCIBLE_FRAMES
                 self.hits_taken += 1

@@ -22,6 +22,8 @@ from . import constants as H
 class HeroState(MarioState):
     """The Hero, standing on the same floors Mario does."""
 
+    voice_profile = "hero"
+
     def __init__(self, surfaces, controller=None):
         super().__init__(surfaces, controller)
 

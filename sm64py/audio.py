@@ -16,10 +16,23 @@ because it often is absent under WSL.
 
 import math
 import os
+import random
 import struct
 import wave
 
 from .mario import constants as C
+
+# Hero voice events are paths relative to assets/sounds. Keeping them distinct
+# from Mario's packed IDs lets both characters share one event queue without
+# ever substituting one character's voice for the other's.
+SOUND_HERO_JUMP = "vc_zelda/vc_zelda_jump01.wav"
+SOUND_HERO_ATTACK_1 = "vc_zelda/vc_zelda_attack01.wav"
+SOUND_HERO_ATTACK_2 = "vc_zelda/vc_zelda_attack02.wav"
+SOUND_HERO_SPIN_KICK = "vc_zelda/vc_zelda_attackair_f01.wav"
+SOUND_HERO_HIT = "vc_zelda/vc_zelda_damage02.wav"
+SOUND_HERO_VICTORY_HIT = "vc_zelda/vc_zelda_attack07.wav"
+HERO_PITCH_MIN = 0.95
+HERO_PITCH_MAX = 1.05
 
 # Terrain-dependent IDs have their terrain written into the low bits of the
 # sound id byte, so one constant covers grass, sand, snow, stone and water.
@@ -241,7 +254,12 @@ class SoundBank:
         if resolved_id in self._missing:
             return None
 
-        path = os.path.join(self.directory, sound_key(resolved_id) + ".wav")
+        if isinstance(resolved_id, str):
+            # Mario's runtime WAVs live in assets/sounds/mario64 while the
+            # Hero voice pack is its sibling, assets/sounds/vc_zelda.
+            path = os.path.join(os.path.dirname(self.directory), resolved_id)
+        else:
+            path = os.path.join(self.directory, sound_key(resolved_id) + ".wav")
         sound = None
         if os.path.exists(path):
             # Converted, not passed raw. Panda3D loaders take its own path
@@ -274,6 +292,11 @@ class SoundBank:
             return
         terrain = terrain_for(mario)
         for sound_id in mario.sound_events:
-            sound = self._sound_for(resolve(sound_id, terrain))
+            hero_voice = isinstance(sound_id, str)
+            resolved = sound_id if hero_voice else resolve(sound_id, terrain)
+            sound = self._sound_for(resolved)
             if sound is not None:
+                if hero_voice:
+                    sound.set_play_rate(random.uniform(HERO_PITCH_MIN,
+                                                       HERO_PITCH_MAX))
                 sound.play()
