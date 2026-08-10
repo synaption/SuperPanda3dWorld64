@@ -160,7 +160,9 @@ def check_buttons():
     problems = []
     for handles, want, name in (
         ((GamepadButton.face_a(),), C.A_BUTTON, "A"),
-        ((GamepadButton.face_x(),), C.B_BUTTON, "B"),
+        ((GamepadButton.face_b(),), C.B_BUTTON, "B"),
+        # X is the squad button now, and must not also swing the sword.
+        ((GamepadButton.face_x(),), 0, "X, which is no longer B"),
         ((GamepadButton.rtrigger(),), C.Z_TRIG, "Z from the trigger button"),
     ):
         pad, device = fresh()
@@ -203,6 +205,27 @@ def check_latching_controls_press_once():
     return ok, (f"press {first}, still held {held}, pressed again {again}")
 
 
+def check_the_squad_button_reports_both_edges():
+    """X gives a press and, one poll later, a release.
+
+    The squad reads the hold rather than the button: the press starts the aim
+    and the release is the command, so a falling edge that never arrived would
+    leave the whistle growing forever.
+    """
+    pad, device = fresh()
+    device.press(GamepadButton.face_x())
+    pad.poll()
+    down = pad.pressed("squad") and not pad.released("squad")
+    pad.poll()
+    holding = not pad.pressed("squad") and not pad.released("squad")
+    device.press()
+    pad.poll()
+    up = pad.released("squad") and not pad.pressed("squad")
+
+    ok = down and holding and up
+    return ok, f"down {down}, held {holding}, up {up}"
+
+
 def check_console_holds_it_neutral():
     """Everything centred while the console has the input, and no stuck press."""
     pad, device = fresh()
@@ -233,6 +256,8 @@ CHECKS = [
     ("the deadzone leaves a walk", check_deadzone_keeps_a_walk),
     ("A, B and Z map to the pad", check_buttons),
     ("latching controls press once", check_latching_controls_press_once),
+    ("the squad button reports both edges",
+     check_the_squad_button_reports_both_edges),
     ("the console holds the pad neutral", check_console_holds_it_neutral),
     ("no pad is no input", check_no_pad_is_no_input),
 ]

@@ -26,6 +26,10 @@ Controls, as Mario -- the original's, unchanged:
     C                         put the skates on, and take them off again
 
 Both:
+    X (held)                  aim: a circle grows on the ground where the view
+                              points, with the arc of a throw to it; let go and
+                              every ally inside it follows you
+    X (tapped)                send the squad to the spot being aimed at
     Q / E or mouse drag       swing the camera
     R                         re-centre the camera
     `  (backquote / tilde)    open the debug console, pausing the game
@@ -39,7 +43,8 @@ rather than replacing it (see app/gamepad.py):
     left stick / d-pad        analog stick
     right stick               swing and tilt the camera
     A                         jump, and the jetpack
-    X or B                    attack -- Mario's B
+    B                         attack -- Mario's B
+    X                         the squad, held or tapped as above
     either trigger            Z
     right shoulder            re-centre the camera
     left shoulder (held)      shamble like a zombie
@@ -84,7 +89,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from app.gamepad import (  # noqa: E402
     CAMERA_PITCH_SPEED, CAMERA_YAW_SPEED, Gamepad,
 )
-from sm64py import audio, console, objects, surfaces  # noqa: E402
+from sm64py import audio, console, objects, squad, surfaces  # noqa: E402
 from sm64py.camera import FollowCamera  # noqa: E402
 from sm64py.hero import HeroState  # noqa: E402
 from sm64py.hero import actions as hero_actions  # noqa: E402
@@ -145,6 +150,16 @@ PIPE_SPAWNS = [
 
 SKY_COLOUR = (0.32, 0.60, 0.86)
 UNDERWATER_COLOUR = (0.06, 0.28, 0.36)
+
+
+def _across(start, end, half_width):
+    """A horizontal offset at right angles to the line between two points."""
+    dx = end[0] - start[0]
+    dz = end[2] - start[2]
+    length = math.hypot(dx, dz)
+    if length < 1e-3:
+        return (half_width, 0.0)
+    return (-dz / length * half_width, dx / length * half_width)
 
 
 def panda_path(path):
@@ -212,6 +227,33 @@ HUD_INTERVAL = 0.1
 # there.
 CROSSHAIR_GAP = 0.012
 CROSSHAIR_ARM = 0.028
+
+# The squad reticle, drawn in the world rather than on the screen: the arc from
+# his hands to the spot being aimed at, a ring on that spot, and the whistle
+# circle around it while the button is held.
+#
+# The rings are traced along the ground they sit on rather than drawn flat, so
+# a circle over the slope up to the castle follows the slope; the lift keeps
+# them off the surface they are tracing, which they would otherwise z-fight
+# with. The point counts are what they are because every one of them on the
+# whistle circle costs a collision query, and those only run while aiming.
+AIM_CHEST = 110.0
+ARC_RUNG_EVERY = 4
+ARC_RUNG_HALF_WIDTH = 26.0
+SELECT_RING_POINTS = 28
+TARGET_RING_POINTS = 18
+TARGET_RING_RADIUS = 130.0
+RETICLE_LIFT = 6.0
+# Heavy enough to hold up against the level under it. These are world-space
+# lines seen at a distance and drawn over grass, sand and a white castle wall,
+# so a hairline reads as an artefact rather than as something the game is
+# telling you.
+RETICLE_THICKNESS = 5.0
+
+# How long the reticle lingers, fading, once the button comes up. Without it
+# the whole thing vanishes on the frame the order is given and there is nothing
+# to see where it went.
+RETICLE_FLASH = 0.4
 
 loadPrcFileData("", "window-title SM64 movement in Panda3D")
 loadPrcFileData("", "framebuffer-multisample 1")
@@ -306,6 +348,7 @@ class Game(ShowBase):
         self._setup_lighting()
         self._setup_hud()
         self._setup_crosshair()
+        self._setup_squad()
         # Before the input, which asks the console whether it has the keyboard.
         self._setup_console()
         self._setup_input()
@@ -397,6 +440,11 @@ class Game(ShowBase):
         self.player.current_anim = None
 
         self._stand_down_mario_npcs()
+        # The squad is made of Marios, and half of it has just been switched
+        # off -- or, going the other way, has just stopped being an NPC at all.
+        # Either way it is not a squad any more.
+        self.squad.disband()
+        self._cancel_aim()
 
         self._reset_interpolation()
         # Swapping is allowed from inside the console, and the character that
@@ -575,6 +623,13 @@ class Game(ShowBase):
         self._skating = False
         self.accept("c", self._toggle_skating)
 
+        # The squad button, where the press and the release are two different
+        # commands. The release is accepted unconditionally, as the key-ups
+        # above are: one that arrives while the console is open belongs to a
+        # press the console already threw away, and `_squad_release` checks.
+        self.accept("x", self._squad_press)
+        self.accept("x-up", self._squad_release)
+
         self.accept("escape", self._escape)
         self.accept("f1", self._toggle_debug)
         self.accept("f2", self._switch_player)
@@ -707,6 +762,194 @@ class Game(ShowBase):
             self.crosshair.attach_new_node(segs.create())
         self.crosshair.set_transparency(TransparencyAttrib.M_alpha)
 
+    # -- the squad -----------------------------------------------------------
+
+    def _setup_squad(self):
+        """The allies, and the node the aiming reticle is rebuilt into.
+
+        The Marios are the squad: they are the only things in the field that
+        are on your side, and they already fight, so an ally who has been told
+        where to stand is an ally who fights there instead of wherever he
+        happened to wander.
+        """
+        self.squad = squad.Squad(self.objects, objects.Mario)
+
+        self.aim_node = self.render.attach_new_node("squad-aim")
+        self.aim_node.set_transparency(TransparencyAttrib.M_alpha)
+        # Depth tested but not written: a circle behind the hill is hidden by
+        # it, which is what makes it read as lying on the ground, while the arc
+        # crossing itself does not carve a hole out of its own far half.
+        self.aim_node.set_depth_write(False)
+        self.aim_node.set_light_off()
+        self.aim_node.hide()
+
+        # Seconds the squad button has been down, or None if it is not. The
+        # aim point it last resolved to, so the release commands the same spot
+        # that was being drawn rather than one a frame further on.
+        self._aim_hold = None
+        self._aim_point = None
+        self._reticle_fade = 0.0
+
+    def _squad_press(self):
+        if self.console.visible:
+            return
+        self._aim_hold = 0.0
+        # Nothing has been aimed for this press yet. Cleared rather than left,
+        # so a press and release inside one frame cannot command the spot the
+        # last one was drawn at.
+        self._aim_point = None
+
+    def _squad_release(self):
+        """A tap sends the squad; a hold whistles up a new one.
+
+        Both take the aim point the last frame drew rather than resolving a
+        fresh one: it is the spot the player was looking at when they let go,
+        and it is the one they were shown.
+        """
+        if self._aim_hold is None:
+            return
+        held, self._aim_hold = self._aim_hold, None
+        target = self._aim_point
+        if target is None:
+            # Down and up inside a single frame -- a fast tap on a fast
+            # machine. Resolve the aim here rather than dropping the command,
+            # which is the one thing a button press must never do.
+            target = squad.aim_point(self.surfaces, self.follow_camera,
+                                     self.state.pos, self.state.face_angle[1])
+            self._aim_point = target
+
+        radius = None
+        if held < squad.TAP_SECONDS:
+            sent = self.squad.send(target)
+            if sent:
+                print(f"Squad: {sent} sent out")
+        else:
+            radius = squad.circle_radius(held - squad.TAP_SECONDS)
+            joined = self.squad.recruit(target, radius)
+            if joined:
+                print(f"Squad: {joined} joined, {len(self.squad.members)} following")
+
+        # Leave the reticle up for a moment, fading. Redrawn rather than left
+        # as it was, so what fades is the spot and the circle that were
+        # actually commanded -- which for a tap is a ring and no circle at all.
+        self._draw_reticle(self.state.pos, target, radius)
+        self.aim_node.set_color_scale(1.0, 1.0, 1.0, 1.0)
+        self.aim_node.show()
+        self._reticle_fade = RETICLE_FLASH
+
+    def _cancel_aim(self):
+        """Drop a half-made command -- what opening the console does to one."""
+        self._aim_hold = None
+        self._reticle_fade = 0.0
+        self.aim_node.hide()
+
+    def _selection_radius(self):
+        """The whistle circle's radius, or None while the press is still a tap.
+
+        Nothing is drawn for the first fifth of a second because nothing is
+        decided yet: a press that comes up inside it was an order to the squad
+        that already exists, and a circle flashing on every one of those would
+        say the opposite.
+        """
+        held = self._aim_hold
+        if held is None or held < squad.TAP_SECONDS:
+            return None
+        return squad.circle_radius(held - squad.TAP_SECONDS)
+
+    def _update_aim(self, dt, player_pos):
+        """Resolve and draw the reticle, or fade out the last one."""
+        if self._aim_hold is not None:
+            self._aim_hold += dt
+            self._aim_point = squad.aim_point(
+                self.surfaces, self.follow_camera, player_pos,
+                self.state.face_angle[1])
+            self._draw_reticle(player_pos, self._aim_point,
+                               self._selection_radius())
+            self.aim_node.set_color_scale(1.0, 1.0, 1.0, 1.0)
+            self.aim_node.show()
+            return
+
+        if self._reticle_fade > 0.0:
+            self._reticle_fade -= dt
+            if self._reticle_fade <= 0.0:
+                self.aim_node.hide()
+            else:
+                # Whatever the release drew, fading out where it was drawn.
+                self.aim_node.set_color_scale(
+                    1.0, 1.0, 1.0, self._reticle_fade / RETICLE_FLASH)
+
+    def _draw_reticle(self, player_pos, target, radius):
+        """Rebuild the arc, the target ring and the whistle circle.
+
+        Rebuilt from scratch every frame rather than transformed, because the
+        two things that change are the shape of the arc and how the rings
+        follow the ground under them, and neither is a transform.
+        """
+        self.aim_node.node().remove_all_children()
+
+        segs = LineSegs()
+        segs.set_thickness(RETICLE_THICKNESS)
+
+        start = (player_pos[0], player_pos[1] + AIM_CHEST, player_pos[2])
+        points = squad.throw_arc(start, target)
+
+        # Rungs across the arc, at right angles to the throw.
+        #
+        # The aim is always straight away from the camera, so the whole arc --
+        # and anything else in the vertical plane it flies through, including a
+        # shadow drawn under it -- projects to one vertical line on screen and
+        # reads as a pole rather than as something going over. A rung across it
+        # is the one part that is not in that plane: the rungs come out
+        # horizontal, and they crowd together toward the top, which is what the
+        # height of the lob looks like from behind it.
+        across = _across(player_pos, target, ARC_RUNG_HALF_WIDTH)
+        segs.set_color(1.0, 1.0, 1.0, 0.45)
+        for i in range(ARC_RUNG_EVERY, len(points) - 1, ARC_RUNG_EVERY):
+            x, y, z = points[i]
+            segs.move_to(*to_panda(x - across[0], y, z - across[1]))
+            segs.draw_to(*to_panda(x + across[0], y, z + across[1]))
+
+        # The arc itself, dashed: drawn as every other segment, which reads as
+        # travel rather than as a length of wire between him and the ground.
+        segs.set_color(1.0, 1.0, 1.0, 0.85)
+        for i in range(0, len(points) - 1, 2):
+            segs.move_to(*to_panda(*points[i]))
+            segs.draw_to(*to_panda(*points[i + 1]))
+
+        segs.set_color(1.0, 0.80, 0.25, 0.9)
+        self._ring(segs, target, TARGET_RING_RADIUS, TARGET_RING_POINTS,
+                   snap=False)
+
+        if radius is not None:
+            segs.set_color(0.35, 1.0, 0.45, 0.85)
+            self._ring(segs, target, radius, SELECT_RING_POINTS, snap=True)
+
+        self.aim_node.attach_new_node(segs.create())
+
+    def _ring(self, segs, centre, radius, points, snap):
+        """A circle on the ground about `centre`.
+
+        `snap` traces it over whatever it crosses, one collision query per
+        point. Worth it for the whistle circle, which is wide enough to span a
+        slope and would otherwise cut into it or float over it; not worth it
+        for the small target ring, which is flat enough at that size.
+        """
+        for i in range(points + 1):
+            angle = i / points * math.tau
+            x = centre[0] + radius * math.sin(angle)
+            z = centre[2] + radius * math.cos(angle)
+            y = centre[1]
+            if snap:
+                height, floor = self.surfaces.find_floor(
+                    x, centre[1] + 400.0, z)
+                if floor is not None:
+                    y = height
+            point = to_panda(x, y + RETICLE_LIFT, z)
+            if i == 0:
+                segs.move_to(*point)
+            else:
+                segs.draw_to(*point)
+
     # -- console -------------------------------------------------------------
 
     def _setup_console(self):
@@ -777,6 +1020,18 @@ class Game(ShowBase):
         t.add("wade_scale", HC, "WADE_SPEED_SCALE", 0.05, 1.0,
               "what deep water leaves of his speed")
 
+        # The squad's numbers are module-level in sm64py/squad.py and read on
+        # the frame they are used, the same way the movement constants are, so
+        # a drag lands on the next command rather than needing a restart.
+        t.add("squad_range", squad, "AIM_MAX_RANGE", 500.0, 6000.0,
+              "how far out the aim can put a spot")
+        t.add("squad_circle", squad, "CIRCLE_MAX_RADIUS", 300.0, 3000.0,
+              "how wide the whistle circle grows")
+        t.add("squad_grow", squad, "CIRCLE_GROW_SECONDS", 0.2, 4.0,
+              "seconds for the circle to reach that size")
+        t.add("squad_follow", squad, "FOLLOW_DISTANCE", 100.0, 1200.0,
+              "how far behind you the group gathers")
+
         t.add("cam_distance", self.follow_camera, "distance", 250.0, 5000.0,
               "how far the camera sits behind him")
         t.add("cam_height", self.follow_camera, "height", -500.0, 1500.0,
@@ -795,6 +1050,9 @@ class Game(ShowBase):
             # The console's panel is drawn in aspect2d too, and the crosshair
             # would sit on top of the text rather than behind it.
             self.crosshair.hide()
+            # A whistle half-grown when the console opened has no release
+            # coming: the key-up lands while the console has the keyboard.
+            self._cancel_aim()
             for name in self.keys:
                 self.keys[name] = False
             self._freeze_animation()
@@ -876,6 +1134,10 @@ class Game(ShowBase):
             self._toggle_skating()
         if self.gamepad.pressed("swap"):
             self._switch_player()
+        if self.gamepad.pressed("squad"):
+            self._squad_press()
+        if self.gamepad.released("squad"):
+            self._squad_release()
 
         # The console pauses the game. Nothing accumulates while it is open
         # either, so coming back steps a single tick rather than replaying
@@ -899,6 +1161,9 @@ class Game(ShowBase):
             self._poll_controller()
             state.camera_yaw = self.follow_camera.mario_yaw
             self.player.execute(state)
+            # Before the objects move, so an ally reads a goal set against
+            # where the leader is this tick rather than the last one.
+            self.squad.update(state)
             self.objects.update(state)
             self._stand_down_mario_npcs()
             # After both have moved, so a stomp is judged on where they
@@ -926,6 +1191,10 @@ class Game(ShowBase):
             dt, target_pos=pos,
             recenter=self.keys["cam_center"] or self.gamepad.recenter)
         self.follow_camera.apply_to(self.camera)
+
+        # After the camera has been placed: the aim is a ray out of it, and
+        # taking it beforehand would be aiming through last frame's view.
+        self._update_aim(dt, pos)
 
         # Its own clock rather than the frame time, so a spell in the console
         # does not leave the sheet somewhere else when the game comes back.
@@ -1035,6 +1304,7 @@ class Game(ShowBase):
             f"   defeated {self.interactions.defeated}"
             f"   hits {self.interactions.hits_taken}\n"
             f"pipes    {self._pipe_text()}\n"
+            f"squad    {self._squad_text()}\n"
             f"fps      {self.clock.get_average_frame_rate():5.1f}\n"
             f"\n{self._control_legend()}\n"
             f"Q/E camera  R recentre  F2 swap  F3 collision  F1 hud  ` console"
@@ -1064,6 +1334,25 @@ class Game(ShowBase):
             for pipe in self.pipes
         )
 
+    def _squad_text(self):
+        """Who is following, who is on the way, and what the button is doing.
+
+        The count inside the circle is the one number worth having while
+        aiming: the circle is drawn on the ground some way off, and how many
+        allies it has actually caught is not something you can see from behind
+        the player.
+        """
+        line = (f"{len(self.squad.members)} following"
+                f"   {self.squad.marching} on the way"
+                f"   {self.squad.holding} holding a spot")
+        radius = self._selection_radius()
+        if radius is not None and self._aim_point is not None:
+            caught = len(self.squad.in_circle(self._aim_point, radius))
+            line += f"   whistling {radius:4.0f} units, {caught} in the circle"
+        elif self._aim_hold is not None:
+            line += "   aiming"
+        return line
+
     def _control_legend(self):
         """The moves the character being played actually has.
 
@@ -1071,11 +1360,13 @@ class Game(ShowBase):
         the Hero has no dive, no crouch and no skates, and a legend offering
         them reads as four broken keys.
         """
+        squad_keys = "X hold to whistle, tap to send"
         if self.player.name == "hero":
             return ("WASD move   Space jump   Shift attack (again to chain, "
-                    "running to spin)   Ctrl sword")
+                    f"running to spin)   Ctrl sword   {squad_keys}")
         return (f"WASD move   Space jump   Shift dive   Ctrl crouch   "
-                f"Z zombie   C skates{' ON' if self._skating else ''}")
+                f"Z zombie   C skates{' ON' if self._skating else ''}   "
+                f"{squad_keys}")
 
 
 def main():

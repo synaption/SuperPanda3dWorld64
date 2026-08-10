@@ -122,22 +122,27 @@ SPEED_SCALED = {
 
 MIN_PLAY_RATE = 1.0 / 16.0
 
-# Nothing plays faster than this, however fast he is moving -- and this is the
-# knob to turn if the legs look wrong.
+# What the divisors ask for and what the legs can do part company well before
+# top speed. Planting the feet means one cycle per stride covered, and at 38
+# units a frame that is better than four cycles a second, because his stride is
+# a human 267 units and Mario's speed was never meant for a character this
+# size. Played honestly the run whirs; clamped flat at 1.0 -- which is what
+# this used to do -- it stops responding to speed at all, and since the run
+# only ever plays above 15 units a frame, where the ideal rate is already 2.3,
+# the clamp bound over the whole of its range. He ran at one fixed cadence from
+# the moment the clip came in to full sprint.
 #
-# 1.0 means "exactly as authored in Blender": his run cycle is 42 frames at
-# 30 fps, a slow, heavy 1.4 seconds, and at this cap that is what plays. It is
-# the floor of the scale rather than a tuned number -- there is no speeding up
-# left to remove.
-#
-# The reason a cap is needed at all is that the two things a locomotion clip
-# should do cannot both be had here. Planting the feet means one cycle per
-# stride covered, and at his top speed of 38 units a frame that is better than
-# four cycles a second, because his stride is a human 267 units and Mario's
-# speed was never meant for a character this size. So the cadence wins and the
-# foot contact gives: he slides at speed. The divisors above still govern while
-# he is moving slowly enough for the cap not to bind.
-MAX_PLAY_RATE = 1.0
+# So the excess over 1.0 is compressed rather than thrown away. Below that --
+# all of the slow walk -- the rate is untouched and the contact is still exact;
+# above it the rate keeps climbing, just far more slowly than the ground does.
+# The exponent is the knob: 0 is the old flat cap, 1 is honest foot-planting,
+# and 0.25 takes the run from 1.23 at the walk-run threshold to 1.55 at a
+# sprint. He accelerates visibly, and slides doing it.
+SLIDE_COMPRESSION = 0.25
+
+# A ceiling on the compressed rate, so a future speed increase cannot turn the
+# legs into a blur. At present speeds it does not bind.
+MAX_PLAY_RATE = 1.6
 
 
 def play_rate(m, clip):
@@ -149,7 +154,10 @@ def play_rate(m, clip):
         # speed as well would leave it crawling almost to a stop.
         return 0.6
     speed = max(abs(m.forward_vel), m.intended_mag, 4.0)
-    return min(max(speed / divisor, MIN_PLAY_RATE), MAX_PLAY_RATE)
+    ideal = speed / divisor
+    if ideal > 1.0:
+        ideal = ideal ** SLIDE_COMPRESSION
+    return min(max(ideal, MIN_PLAY_RATE), MAX_PLAY_RATE)
 
 
 # -- clip metadata ----------------------------------------------------------

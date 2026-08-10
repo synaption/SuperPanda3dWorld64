@@ -280,6 +280,12 @@ class Mario(Object):
     for, run down and punched. That takes priority over the wandering and over
     greeting the player, since a Mario who stops to wave while a goomba walks
     into him reads as broken rather than as friendly.
+
+    He is also who the squad is made of. `goal` is a spot the player's whistle
+    has put him on -- see sm64py/squad.py -- and while it is set it replaces
+    the wandering: he walks there and stands on it. It does not replace the
+    fighting, only shortens its reach, so an ally in formation still answers a
+    goomba that comes at the group but no longer crosses the field for one.
     """
 
     model = "mario"
@@ -325,6 +331,20 @@ class Mario(Object):
     PUNCH_TICKS = 10
     PUNCH_CONTACT = 3
 
+    # -- taking orders --
+    # How far he will stray from a squad goal to hit something. Far shorter
+    # than HUNT_RANGE: a squad that scatters across the field after the first
+    # goomba it sees is not a squad, and the whole point of ordering one
+    # somewhere is that it goes there.
+    SQUAD_HUNT_RANGE = 1000.0
+    # Beyond this he runs to catch up rather than jogging; the leader's own top
+    # speed is well over the chase he fights at, so without it the group is
+    # left behind the moment the player breaks into a run.
+    SQUAD_RUN_DISTANCE = 700.0
+    SQUAD_RUN_SPEED = 32.0
+    # Below this the walk cycle stands in for the run.
+    RUN_ANIM_SPEED = 12.0
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.target_yaw = self.yaw
@@ -339,6 +359,9 @@ class Mario(Object):
         self.anim_rate = 1.0
         self.target = None
         self.punch_timer = 0
+        # Where the squad wants him, as (x, z, arrive), or None if he is his
+        # own man. Written from outside once a tick; he only ever reads it.
+        self.goal = None
 
     def update(self, player):
         self.timer += 1
@@ -358,6 +381,11 @@ class Mario(Object):
         # half-finished swing: the jab has to play out before he moves again.
         if self.punch_timer > 0 or self._acquire_target():
             self._fight()
+            return
+
+        # Under orders, and nothing worth swinging at on the way.
+        if self.goal is not None:
+            self._march()
             return
 
         if self.dist_to_mario < self.NOTICE_RANGE:
@@ -405,19 +433,88 @@ class Mario(Object):
             # The divisor his own animation code uses for the walk cycle.
             self.anim_rate = max(0.4, abs(self.forward_vel) / 4.0)
 
+    def _march(self):
+        """Walk to the spot the squad has put him on, and hold it.
+
+        The same shape as the chase in `_fight`, with the target standing
+        still: turn toward it, approach at a pace that suits the distance, and
+        stop when he is on it. `arrive` comes with the goal rather than being a
+        constant here because the two goals want different tolerances -- a
+        formation slot is being dragged along behind a running player and wants
+        a loose one, a spot on the ground is not moving and wants a tight one.
+        """
+        goal_x, goal_z, arrive = self.goal
+        dx = goal_x - self.pos[0]
+        dz = goal_z - self.pos[2]
+        distance = math.hypot(dx, dz)
+
+        if distance <= arrive:
+            # On his mark, and staying on it -- a spot he was sent to is held
+            # until he is whistled up again. He turns to watch the player the
+            # same way a wandering Mario does, but only once the player is
+            # near: a line of allies posted across the field all staring back
+            # at you reads as a firing squad rather than as a garrison.
+            self.resting = True
+            target_speed = 0.0
+            if self.dist_to_mario < self.NOTICE_RANGE:
+                self.turn_toward(self.angle_to_mario, self.TURN_RATE)
+        else:
+            self.resting = False
+            self.target_yaw = atan2s(dz, dx)
+            self.turn_toward(self.target_yaw, self.TURN_RATE)
+            if distance > self.SQUAD_RUN_DISTANCE:
+                target_speed = self.SQUAD_RUN_SPEED
+            elif distance > arrive * 2.0:
+                target_speed = self.CHASE_SPEED
+            else:
+                target_speed = self.WALK_SPEED
+
+        self.forward_vel += max(-1.0, min(1.0, target_speed - self.forward_vel))
+        if self.move() and not self.resting:
+            # Something between him and his spot. Slide along it, the way he
+            # does when a wall comes between him and something he is chasing.
+            self.yaw = s16(self.yaw + 0x2000)
+
+        self._travel_anim()
+
+    def _travel_anim(self):
+        """Stand, walk or run, according to how fast he is actually going."""
+        self.anim_rate = 1.0
+        if not self.on_ground:
+            self.anim = self.ANIM_JUMP
+        elif abs(self.forward_vel) < 1.0:
+            self.anim = self.ANIM_IDLE
+        else:
+            self.anim = (self.ANIM_WALK
+                         if abs(self.forward_vel) < self.RUN_ANIM_SPEED
+                         else self.ANIM_RUN)
+            # The divisor his own animation code uses for the walk cycle.
+            self.anim_rate = max(0.4, abs(self.forward_vel) / 4.0)
+
     def _acquire_target(self):
-        """The nearest enemy worth crossing the field for, if there is one."""
+        """The nearest enemy worth crossing the field for, if there is one.
+
+        Under orders he keeps a much shorter leash, and it is measured from the
+        spot he was given rather than from wherever he currently is: a leash
+        held from his own feet lets him leapfrog across the level, each kill
+        putting the next enemy inside range of the last, until the order he was
+        given is a mile behind him.
+        """
         self.target = None
         if self.world is None:
             return None
-        nearest = self.HUNT_RANGE
+        if self.goal is not None:
+            nearest = self.SQUAD_HUNT_RANGE
+            anchor_x, anchor_z = self.goal[0], self.goal[1]
+        else:
+            nearest = self.HUNT_RANGE
+            anchor_x, anchor_z = self.pos[0], self.pos[2]
         for obj in self.world.objects:
             if not obj.active or obj.defeated:
                 continue
             if not isinstance(obj, (Goomba, Scuttlebug)):
                 continue
-            distance = math.hypot(obj.pos[0] - self.pos[0],
-                                  obj.pos[2] - self.pos[2])
+            distance = math.hypot(obj.pos[0] - anchor_x, obj.pos[2] - anchor_z)
             if distance < nearest:
                 self.target, nearest = obj, distance
         return self.target

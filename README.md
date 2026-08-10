@@ -129,6 +129,8 @@ Either way:
 
 | | |
 |---|---|
+| `X` (held) | aim: a circle grows where the view points, and the allies inside it when you let go follow you — see below |
+| `X` (tapped) | send the ones following to the spot being aimed at |
 | `Q` `E` / mouse drag | swing the camera |
 | `R` | re-centre the camera |
 | `` ` `` (backquote / tilde) | open the debug console, pausing the game |
@@ -155,7 +157,8 @@ and the stick pushed the opposite way simply cancel out.
 | d-pad | the same, at full deflection, when the stick is centred |
 | right stick | swing and tilt the camera |
 | `A` | jump, and the jetpack |
-| `X` or `B` | attack — Mario's B |
+| `B` | attack — Mario's B |
+| `X` | the squad, held or tapped as above |
 | either trigger | Z — crouch, ground pound, long jump |
 | right shoulder | re-centre the camera |
 | left shoulder (held) | shamble like a zombie |
@@ -166,6 +169,12 @@ The button names are Panda3D's, which are an Xbox pad's; a DualShock reports
 its own layout through the same names, so `A` is cross and `X` is square. The
 console still needs the keyboard, and holds the pad neutral for as long as it
 is open.
+
+`X` used to be a second attack button alongside `B`, and is the squad's now:
+one button cannot both swing a sword and hold a whistle open, and the squad is
+the one of the two that needs the hold. It is also the only control whose
+release is a command in its own right, so `Gamepad` publishes a falling edge
+(`released`) beside the rising one.
 
 `app/gamepad.py` is the whole of it: it polls the first pad the system reports
 once a rendered frame and hands the game a snapshot, rather than throwing
@@ -205,6 +214,73 @@ Measured over a long hold, he gains 20 units a frame at the default 20.
 
 `jetpack_thrust`, `jetpack_rise` and `jetpack_delay` are all on the console, so
 the feel is a slider away.
+
+## The squad
+
+Hold `X` and a circle opens on the ground where you are looking, growing to
+1100 units over about a second, with the arc of a throw drawn from your hands
+to the middle of it. Let go and every ally standing inside it falls in behind
+you. Tap `X` — the same button, under a fifth of a second — and the ones
+following are sent to the spot the same aim resolves to, where they spread out
+and hold it. Pikmin's shape, in other words, and `sm64py/squad.py` is all of
+it.
+
+**The allies are the Marios.** They are the only thing in the field that is on
+your side, and they already hunt goombas, so an ally posted somewhere is an
+ally fighting there. There are up to six about: the one the level places, and
+the five the castle-path pipe produces.
+
+**Aiming is the camera, not a cursor.** The camera looks at whoever is being
+played, so the crosshair sits on his back and the ray through it carries on
+past him. Tilting the view down brings the far end of that ray in; tilting it
+up throws it out to the cap. Left and right is the camera swing that was
+already there. That is the whole aim, and it is why the reticle never leaves
+the middle of the screen.
+
+What comes back is not the ray's own hit but a point in front of the player at
+the distance the ray chose: clamped into 250–2600 units, and walked back toward
+him 200 at a time until there is floor under it, which is what happens when the
+view is pointed out over the moat or off the edge of the map. A throw does not
+have to land exactly where it was pointed. It does have to land somewhere.
+
+**The circle is traced over the ground it covers**, one collision query per
+point, so a whistle across the slope up to the castle follows the slope instead
+of cutting into it. That is 28 queries a frame, and the ray march is another 32
+— coarse 150-unit steps and then six halvings, rather than fine steps
+throughout — but none of it runs unless the button is down.
+
+**The arc is a real arc**, in that its height comes from the same object
+gravity a goomba out of a pipe falls under: a lob rising `a` over its own chord
+is in the air `sqrt(8a / -g)` ticks, so the flight time follows from the shape
+rather than being picked. Nothing is actually thrown — the allies walk — but
+the preview is of a throw that would work.
+
+It is drawn with rungs across it, and that is not decoration. The aim is always
+straight away from the camera, so the arc, and anything else in the vertical
+plane it flies through — a shadow under it, a line along the ground — projects
+to a single vertical line on screen and reads as a pole planted in the dirt.
+The rungs are the one part that is not in that plane. They come out horizontal
+and crowd together toward the top, which is what the height of the lob looks
+like from behind it.
+
+**An order is held, not obeyed once.** An ally sent somewhere keeps the goal
+after he arrives and stands on it until he is whistled up again, because the
+alternative — handing him back to the wandering behaviour on arrival — has him
+a thousand units away inside ten seconds, and then sending a squad somewhere
+means nothing. He will still leave the spot to hit something, and walks back to
+it afterwards.
+
+**And his leash is held from the spot rather than from his own feet.** A loose
+Mario hunts anything inside 3500 units; one under orders is cut to 1000, which
+alone is not enough — measured from where he happens to be standing, each kill
+puts the next enemy inside range of the last and the squad leapfrogs across the
+level with the order a mile behind it. Measured from the goal, it stays put.
+
+`squad_range`, `squad_circle`, `squad_grow` and `squad_follow` are on the
+console. `python3 tools/check_squad.py` runs the whole of it against a flat
+plane with no window: that the aim lands in front of you and not behind, that
+tilting up throws it further, that the circle catches what it is drawn around,
+that a whistled ally arrives and a sent one stays.
 
 ## The debug console
 
@@ -291,6 +367,7 @@ sm64py/
   camera.py        following camera
   console.py       the debug console: captured output, commands, live sliders
   objects.py       trees, enemies and warp pipes: spawning, behaviour, stepping
+  squad.py         aiming at the ground, and the allies whistled up and sent out
   billboard.py     aiming billboarded actor parts at the camera, and its settings
   audio.py         sound events -> Panda3D, plus placeholder sample synthesis
   mario/
@@ -326,12 +403,13 @@ tools/
   check_hero.py            the Hero's action machine, start to finish
   check_sound.py           why the game is silent, layer by layer
   check_gamepad.py         the pad mapping, against a stub device
+  check_squad.py           aiming, whistling and sending, on a flat plane
 app/
   main.py          the runnable game
   gamepad.py       the pad, polled a frame at a time
 ```
 
-The six `check_*` scripts all run headless and print what they measured.
+The seven `check_*` scripts all run headless and print what they measured.
 
 ## Notes on the port
 
@@ -1227,7 +1305,13 @@ python3 app/main.py    # with: clock-mode limited / clock-frame-rate 120
   consumes.
 - **Nothing fights back at an NPC Mario.** He hunts goombas and scuttlebugs and
   they ignore him entirely, since both of them chase whoever is being played.
-  He cannot be hurt, and he never dies.
+  He cannot be hurt, and he never dies — which also means a squad cannot be
+  lost, only disbanded.
+- **The squad does not steer around anything.** An ally walks at his goal and
+  slides along whatever wall comes between the two, which gets him out of most
+  corners and not out of all of them; there is no path through the level, and
+  nothing keeps two of them from walking through each other on the way. The
+  formation slots are what keep them apart once they arrive.
 - **Scuttlebug legs render as thin wire quads.** Fifteen of its animated parts
   carry flat `LAYER_ALPHA` display lists that the geo does not billboard, so
   unlike its body they have nothing to turn toward the camera.

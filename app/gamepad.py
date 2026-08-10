@@ -73,8 +73,9 @@ class Gamepad(DirectObject):
         self.buttons = 0
         self.zombie = False
         self.recenter = False
-        # Edges, cleared by the next poll: see `pressed`.
+        # Edges, cleared by the next poll: see `pressed` and `released`.
         self._pressed = set()
+        self._released = set()
         self._held = set()
 
         self._devices = devices
@@ -133,6 +134,7 @@ class Gamepad(DirectObject):
         self.zombie = False
         self.recenter = False
         self._pressed.clear()
+        self._released.clear()
         self._held.clear()
 
     # -- reading it ---------------------------------------------------------
@@ -186,7 +188,10 @@ class Gamepad(DirectObject):
         buttons = 0
         if self._any_button(GamepadButton.face_a()):
             buttons |= C.A_BUTTON
-        if self._any_button(GamepadButton.face_x(), GamepadButton.face_b()):
+        # B alone. X used to double as attack, and now carries the squad
+        # commands instead -- one button cannot both swing a sword and hold a
+        # whistle open, and the squad is the one that needs the hold.
+        if self._any_button(GamepadButton.face_b()):
             buttons |= C.B_BUTTON
         if self._triggers_down():
             buttons |= C.Z_TRIG
@@ -200,7 +205,10 @@ class Gamepad(DirectObject):
             held.add("skates")
         if self._button(GamepadButton.start()):
             held.add("swap")
+        if self._button(GamepadButton.face_x()):
+            held.add("squad")
         self._pressed = held - self._held
+        self._released = self._held - held
         self._held = held
 
     def _triggers_down(self):
@@ -218,3 +226,14 @@ class Gamepad(DirectObject):
     def pressed(self, name):
         """True on the frame `name` went down, for the controls that latch."""
         return name in self._pressed
+
+    def released(self, name):
+        """True on the frame `name` came up.
+
+        The squad button is the one control where the release is a command in
+        its own right -- how long it was held is what tells a whistle from an
+        order -- so the falling edge is published alongside the rising one.
+        Going neutral does not produce one: a button held as the console opens
+        was not let go of, and the game cancels the aim itself.
+        """
+        return name in self._released
