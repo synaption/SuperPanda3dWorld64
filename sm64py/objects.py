@@ -1,4 +1,5 @@
-"""Level objects: the trees the level places, and a couple of enemies.
+"""Level objects: the trees the level places, a couple of enemies, and the
+warp pipes that produce more of them.
 
 Objects are simulated on the same fixed 30 Hz tick as Mario and use the same
 surface queries, so they stand on the same floors and are stopped by the same
@@ -20,6 +21,12 @@ from .surfaces import WallCollisionData
 # originals use rather than Mario's, which is stronger.
 OBJECT_GRAVITY = -4.0
 TERMINAL_VELOCITY = -78.0
+
+# Frames an object stays visible after being defeated, so the hit reads. Up
+# here rather than beside the interaction code because anything that can kill
+# something reaches for it, and by now that is the pipes' clientele as well as
+# whoever is being played.
+DEATH_FRAMES = 12
 
 
 class Object:
@@ -53,8 +60,16 @@ class Object:
         self.on_ground = False
         self.timer = 0
         self.active = True
+        # The set this belongs to, filled in by ObjectSet.spawn. Most objects
+        # never look at it; the ones that hunt or spawn need to see the rest.
+        self.world = None
         # Counts down after a defeat, so the hit is visible before it vanishes.
         self.dying = 0
+        # Killed, as opposed to merely switched off. A pipe counts its brood by
+        # this rather than by `active`, so standing an object down -- which is
+        # what happens to the Mario NPCs when Mario himself is being played --
+        # does not read as a vacancy the pipe should fill.
+        self.defeated = False
         # Distance and bearing to Mario, refreshed once a tick because the
         # behaviours below read them several times each.
         self.dist_to_mario = 0.0
@@ -117,6 +132,14 @@ class Object:
 
     def update(self, mario):
         self.timer += 1
+
+    def defeat(self):
+        """Take the killing blow: play the death frames, then leave."""
+        if self.defeated:
+            return False
+        self.defeated = True
+        self.dying = DEATH_FRAMES
+        return True
 
     # -- what the renderer asks for ----------------------------------------
 
@@ -228,6 +251,11 @@ class Mario(Object):
     turn to watch whoever is playing when they come near. What it borrows from
     the decomp is the part that reads on screen -- the clips, and the walk
     cycle keeping pace with his actual speed.
+
+    On top of that he fights: an enemy inside HUNT_RANGE is dropped everything
+    for, run down and punched. That takes priority over the wandering and over
+    greeting the player, since a Mario who stops to wave while a goomba walks
+    into him reads as broken rather than as friendly.
     """
 
     model = "mario"
@@ -238,9 +266,13 @@ class Mario(Object):
     # action code uses for standing about and for walking.
     ANIM_IDLE = "anim_C5"
     ANIM_WALK = "anim_48"
+    ANIM_RUN = "anim_72"
     ANIM_JUMP = "anim_4D"
     ANIM_SWIM = "anim_AA"
     ANIM_SWIM_GLIDE = "anim_AB"
+    # MARIO_ANIM_FIRST_PUNCH_FAST -- the short jab, rather than the wind-up
+    # version, because it is over in ten frames and so reads as one blow.
+    ANIM_PUNCH = "anim_69"
 
     # Close enough that he notices and turns to watch.
     NOTICE_RANGE = 700.0
@@ -252,6 +284,22 @@ class Mario(Object):
     JUMP_MAX_TICKS = 240
     SWIM_DEPTH = 80.0
     SWIM_STROKE_TICKS = 14
+
+    # -- fighting --
+    # How far off he will notice something worth hitting. Generous, so a mob
+    # coming out of a pipe halfway across the field is still answered.
+    HUNT_RANGE = 3500.0
+    CHASE_SPEED = 22.0
+    # His own hitbox radius plus the length of an arm; the enemy's own radius
+    # is added to it, so a wide scuttlebug is hit from further out than a
+    # goomba is, which is what stops him punching at thin air beside it.
+    STRIKE_RANGE = 90.0
+    # Only swings at something he is roughly facing, so the punch lands where
+    # the animation points rather than out of his shoulder.
+    STRIKE_ALIGNED = 0x2000
+    # Frames the jab holds him still, and how far into it the blow lands.
+    PUNCH_TICKS = 10
+    PUNCH_CONTACT = 3
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -265,6 +313,8 @@ class Mario(Object):
         self.swim_timer = 0
         self.anim = self.ANIM_IDLE
         self.anim_rate = 1.0
+        self.target = None
+        self.punch_timer = 0
 
     def update(self, player):
         self.timer += 1
@@ -278,6 +328,12 @@ class Mario(Object):
 
         if self.swimming:
             self._swim(water_level)
+            return
+
+        # Fighting outranks everything else he does on land, including a
+        # half-finished swing: the jab has to play out before he moves again.
+        if self.punch_timer > 0 or self._acquire_target():
+            self._fight()
             return
 
         if self.dist_to_mario < self.NOTICE_RANGE:
@@ -324,6 +380,82 @@ class Mario(Object):
             self.anim = self.ANIM_WALK
             # The divisor his own animation code uses for the walk cycle.
             self.anim_rate = max(0.4, abs(self.forward_vel) / 4.0)
+
+    def _acquire_target(self):
+        """The nearest enemy worth crossing the field for, if there is one."""
+        self.target = None
+        if self.world is None:
+            return None
+        nearest = self.HUNT_RANGE
+        for obj in self.world.objects:
+            if not obj.active or obj.defeated:
+                continue
+            if not isinstance(obj, (Goomba, Scuttlebug)):
+                continue
+            distance = math.hypot(obj.pos[0] - self.pos[0],
+                                  obj.pos[2] - self.pos[2])
+            if distance < nearest:
+                self.target, nearest = obj, distance
+        return self.target
+
+    def _fight(self):
+        """Run the current target down, then jab it."""
+        target = self.target
+
+        if self.punch_timer > 0:
+            self.punch_timer -= 1
+            # He plants his feet for the swing. The blow lands partway through
+            # rather than on the first frame, so the enemy falls to the punch
+            # instead of to having been stood next to.
+            self.forward_vel = 0.0
+            if (self.punch_timer == self.PUNCH_TICKS - self.PUNCH_CONTACT
+                    and target is not None and not target.defeated
+                    and self._in_reach(target)):
+                target.defeat()
+            self.move()
+            self.anim = self.ANIM_PUNCH
+            self.anim_rate = 1.0
+            return
+
+        self.resting = False
+        dx = target.pos[0] - self.pos[0]
+        dz = target.pos[2] - self.pos[2]
+        bearing = atan2s(dz, dx)
+        # Measured before the turn, so a target he is already facing can be
+        # hit on the same tick he closes on it.
+        aligned = abs(s16(bearing - self.yaw)) < self.STRIKE_ALIGNED
+        self.turn_toward(bearing, self.TURN_RATE)
+
+        if aligned and self.on_ground and self._in_reach(target):
+            self.punch_timer = self.PUNCH_TICKS
+            self.forward_vel = 0.0
+            self.move()
+            self.anim = self.ANIM_PUNCH
+            self.anim_rate = 1.0
+            return
+
+        self.forward_vel += max(-1.0, min(
+            1.0, self.CHASE_SPEED - self.forward_vel))
+        if self.move():
+            # A wall between him and it. Slide along rather than grind into it.
+            self.yaw = s16(self.yaw + 0x2000)
+
+        if not self.on_ground:
+            self.anim = self.ANIM_JUMP
+            self.anim_rate = 1.0
+        else:
+            self.anim = self.ANIM_RUN
+            self.anim_rate = max(0.4, abs(self.forward_vel) / 4.0)
+
+    def _in_reach(self, target):
+        """Close enough to hit, in the plane and vertically both."""
+        dx = target.pos[0] - self.pos[0]
+        dz = target.pos[2] - self.pos[2]
+        reach = self.STRIKE_RANGE + target.radius
+        if dx * dx + dz * dz > reach * reach:
+            return False
+        return (self.pos[1] <= target.pos[1] + target.height
+                and self.pos[1] + self.height >= target.pos[1])
 
     def _swim(self, water_level):
         """Paddle through a water box near its surface."""
@@ -408,13 +540,87 @@ class Scuttlebug(Object):
         self.turn_toward(self.angle_to_mario, self.TURN_RATE)
 
         if self.move():
-            # Recoils off walls instead of pressing into them.
+            # Recoils off walls instead of pressing into them -- but only with
+            # its feet down. The hop is re-applied on every frame of contact,
+            # so a scuttlebug held against a wall in mid-air is thrown up by it
+            # again before gravity has taken the last one back, and climbs the
+            # cliff by the corner of the map like a ladder.
             self.forward_vel = -10.0
-            self.vel_y = 30.0
+            if self.on_ground:
+                self.vel_y = 30.0
             self.lunging = False
 
         self.anim = "crawl"
         self.anim_rate = 1.0 if not self.lunging else 2.0
+
+
+class WarpPipe(Object):
+    """A pipe that things climb out of, up to a population it then holds.
+
+    The count is of its own brood rather than of the level: the field already
+    has enemies placed by hand, and a pipe that counted those would stop short
+    of its own quota or never fire at all. So each pipe is responsible for
+    exactly what it produced, and for replacing it when it dies.
+
+    The countdown only runs while there is room. At the cap it holds where it
+    stands, so a kill is what starts the clock again rather than restarting it
+    -- which is the difference between "one along every thirty seconds" and a
+    replacement appearing the instant something dies.
+    """
+
+    model = "warp_pipe"
+    # The collision the original gives it: a 306-unit square, 205 tall.
+    radius = 150.0
+    height = 205.0
+
+    # Hard enough to clear the rim. Gravity takes 4 a frame back, so a launch
+    # at v peaks v*v/8 units up: 44 reaches ~240, comfortably over the 205 it
+    # has to get out of.
+    LAUNCH_VELOCITY = 44.0
+    # A shove outwards as well, so five of them do not land in one stack.
+    LAUNCH_SPEED = 8.0
+
+    def __init__(self, surfaces, x, y, z, yaw=0,
+                 spawns=None, interval=30 * 30, limit=5):
+        super().__init__(surfaces, x, y, z, yaw)
+        self.spawns = spawns          # the class it produces
+        self.interval = interval      # ticks between one and the next
+        self.limit = limit            # how many of them it keeps alive
+        self.brood = []
+        self.countdown = interval
+
+    @property
+    def population(self):
+        return len(self.brood)
+
+    def update(self, mario):
+        self.timer += 1
+        if self.spawns is None or self.world is None:
+            return
+
+        self.brood = [mob for mob in self.brood if not mob.defeated]
+        if len(self.brood) >= self.limit:
+            return
+
+        self.countdown -= 1
+        if self.countdown > 0:
+            return
+
+        self.countdown = self.interval
+        self.launch()
+
+    def launch(self):
+        """Throw one out of the mouth, in a direction of its own."""
+        # Spawned at the pipe's feet rather than at its lip: the launch carries
+        # it up through the barrel and out, which is what the pop is, and it
+        # starts hidden inside instead of appearing in mid-air above.
+        mob = self.world.spawn(self.spawns, self.pos[0], self.pos[1],
+                               self.pos[2], random.randint(0, 0xFFFF))
+        mob.vel_y = self.LAUNCH_VELOCITY
+        mob.forward_vel = self.LAUNCH_SPEED
+        mob.on_ground = False
+        self.brood.append(mob)
+        return mob
 
 
 # -- interaction ------------------------------------------------------------
@@ -433,9 +639,6 @@ BOUNCE_VELOCITY = 42.0
 # How hard a hit throws Mario back.
 KNOCKBACK_SPEED = 24.0
 KNOCKBACK_VELOCITY = 20.0
-
-# Frames an enemy stays visible after being defeated, so the hit reads.
-DEATH_FRAMES = 12
 
 # How long Mario is immune after a hit. Roughly a second, which is long enough
 # for the knockback to carry him clear of whatever hit him.
@@ -471,10 +674,9 @@ class Interactions:
         for obj in self.objects.objects:
             if not obj.active or not isinstance(obj, (Goomba, Scuttlebug)):
                 continue
+            # Already dead and playing it out. The count is run by the object
+            # set, so it keeps running whether or not it is resolved here.
             if obj.dying:
-                obj.dying -= 1
-                if obj.dying == 0:
-                    obj.active = False
                 continue
 
             dx = mario.pos[0] - obj.pos[0]
@@ -494,7 +696,7 @@ class Interactions:
             attacking = bool(mario.action & C.ACT_FLAG_ATTACKING)
 
             if stomping or attacking:
-                obj.dying = DEATH_FRAMES
+                obj.defeat()
                 self.defeated += 1
                 if attacking:
                     mario.sound_events.append(
@@ -516,7 +718,7 @@ class Interactions:
 
 
 MODELS = {"tree": Tree, "goomba": Goomba, "scuttlebug": Scuttlebug,
-          "mario": Mario}
+          "mario": Mario, "warp_pipe": WarpPipe}
 
 # What the level's special-object presets correspond to here.
 PRESET_MODELS = {"special_bubble_tree": Tree}
@@ -529,8 +731,9 @@ class ObjectSet:
         self.surfaces = surfaces
         self.objects = []
 
-    def spawn(self, cls, x, y, z, yaw=0):
-        obj = cls(self.surfaces, x, y, z, yaw)
+    def spawn(self, cls, x, y, z, yaw=0, **kwargs):
+        obj = cls(self.surfaces, x, y, z, yaw, **kwargs)
+        obj.world = self
         self.objects.append(obj)
         return obj
 
@@ -551,9 +754,25 @@ class ObjectSet:
         return spawned
 
     def update(self, mario):
-        for obj in self.objects:
-            if obj.active:
-                obj.update(mario)
+        # Over a copy of the list, because a pipe firing appends to it: the
+        # new arrival is left to start on the following tick rather than being
+        # updated on the one it was created in.
+        for obj in list(self.objects):
+            if not obj.active:
+                continue
+            if obj.dying:
+                # Held still for its death frames, then gone. Counted here
+                # rather than in the interaction pass so that whatever landed
+                # the blow -- the player, or one Mario NPC on the warpath --
+                # it plays out the same way.
+                obj.dying -= 1
+                if obj.dying == 0:
+                    obj.active = False
+                continue
+            obj.update(mario)
 
     def of_model(self, model):
         return [o for o in self.objects if o.model == model]
+
+    def of_class(self, cls):
+        return [o for o in self.objects if isinstance(o, cls)]

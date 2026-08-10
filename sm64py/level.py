@@ -381,6 +381,10 @@ class ObjectRenderer:
         # Read from disk so the asset workbench can be used to adjust how these
         # aim without editing source. See sm64py/billboard.py.
         self.tuning = tuning if tuning is not None else billboard.Tuning.load()
+        # How much of the object set has a node. Objects are only ever
+        # appended, so everything past this is something a pipe has produced
+        # since the last look.
+        self._built = 0
 
     def _model_path(self, model):
         """Where a model's .glb is, honouring any override given for it."""
@@ -472,13 +476,30 @@ class ObjectRenderer:
         return len(rigs)
 
     def build(self, object_set):
-        """Create a node for every object. Call once, after they are spawned."""
-        for index, obj in enumerate(object_set.objects):
-            holder = self._build_one(obj, index)
-            if holder is not None:
-                self.nodes.append((obj, holder))
+        """Create a node for every object, and place them."""
+        self.refresh(object_set)
         self.sync()
         return len(self.nodes)
+
+    def refresh(self, object_set):
+        """Give a node to anything spawned since the last call.
+
+        Cheap enough to call every frame: the usual answer is that nothing has
+        appeared, and then this is a comparison of two integers. It is only
+        when a pipe fires that anything is loaded, and by then the model is
+        already in Panda3D's pool from the first one of its kind.
+        """
+        total = len(object_set.objects)
+        if total == self._built:
+            return 0
+        added = 0
+        for index in range(self._built, total):
+            holder = self._build_one(object_set.objects[index], index)
+            if holder is not None:
+                self.nodes.append((object_set.objects[index], holder))
+                added += 1
+        self._built = total
+        return added
 
     def sync(self, camera_pos=None):
         """Push every object's position, facing and visibility to its node."""

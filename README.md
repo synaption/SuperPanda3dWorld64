@@ -50,7 +50,8 @@ assets/
     textures/                    the 21 PNGs those groups reference (2.9 MB)
   mario/          mario.glb + mario_clips.json   (209 animations)
   hero/           hero.glb + hero_clips.json     (20 animations, 53 joints)
-  actors/         goomba, scuttlebug, tree, each with a clips sidecar
+  actors/         goomba, scuttlebug, tree, warp_pipe; a clips sidecar each
+                  where the actor animates
   sounds/mario64/ full source library plus 57 runtime WAVs and .source marker
 ```
 
@@ -86,6 +87,12 @@ python3 tools/parse_f3d.py reference/Render96ex/levels/castle_grounds 1 \
 
 python3 tools/export_actor_gltf.py --actor mario --anims all \
     -o assets/mario/mario.glb
+
+# The warp pipe. It needs both flags spelled out: its layout is `warp_pipe_geo`
+# rather than the `<actor>_geo_body` the exporter assumes, and like the tree it
+# carries no GEO_SCALE, so the default quarter would leave it knee-high.
+python3 tools/export_actor_gltf.py --actor warp_pipe \
+    --root-layout warp_pipe_geo --scale 1.0 -o assets/actors/warp_pipe.glb
 
 # Clips that are not the decomp's. These append to the .glb the line above
 # writes, so they have to run after it, and they have to run *again* whenever
@@ -239,7 +246,7 @@ sm64py/
   level.py         converted mesh -> Panda3D geometry
   camera.py        following camera
   console.py       the debug console: captured output, commands, live sliders
-  objects.py       trees and enemies: spawning, behaviour, stepping
+  objects.py       trees, enemies and warp pipes: spawning, behaviour, stepping
   billboard.py     aiming billboarded actor parts at the camera, and its settings
   audio.py         sound events -> Panda3D, plus placeholder sample synthesis
   mario/
@@ -884,6 +891,60 @@ one loaded model rather than loaded per tree.
 scuttlebugs in the original, so `ENEMY_SPAWNS` in `app/main.py` puts a few on
 open ground near the spawn.
 
+**Warp pipes produce more of them.** `PIPE_SPAWNS` puts three on the field: one
+by the spawn on the castle path that produces Marios, one in the western corner
+that produces goombas, and one in the eastern corner that produces
+scuttlebugs. Each throws one out every 30 seconds until five of its own are
+alive, and then holds.
+
+Three decisions in that are worth writing down.
+
+*A pipe counts its own brood, not the level.* Counting every goomba would have
+the goomba pipe stop two short of its quota, because `ENEMY_SPAWNS` already put
+three of them out there — and it would leave "until one of them is killed"
+meaning something the pipe had no hand in. Each pipe is responsible for exactly
+what it produced, and for replacing that.
+
+*The countdown runs only while there is room.* At the cap it stops where it
+stands instead of resetting, so a kill resumes the clock rather than triggering
+a spawn. That is the difference between one along every thirty seconds and a
+replacement appearing the instant something dies.
+
+*A mob is spawned at the pipe's feet and thrown upward*, not placed on the rim.
+Objects fall at 4 a frame, so a launch at 44 peaks 242 units up — comfortably
+over the 205 the pipe is tall — and it starts hidden inside the barrel rather
+than appearing in mid-air above it. The pipes are drawn but not collided with:
+the level's own collision is all the physics reads, and the actor's
+`collision.inc.c` is not loaded, so you can walk through one.
+
+**Mario fights, now that he is not the one being played.** An enemy within 3500
+units is dropped everything for: he runs it down at 22, and inside arm's reach
+— his own radius plus the enemy's, so a wide scuttlebug is hit from further out
+than a goomba — he throws `MARIO_ANIM_FIRST_PUNCH_FAST`. The blow lands three
+frames into the ten the jab holds him still for, so the enemy falls to the
+punch rather than to having been stood next to. Fighting outranks the wandering
+and outranks greeting the player, because a Mario who stops to wave while a
+goomba walks into him reads as broken rather than as friendly.
+
+Killing is `Object.defeat()` rather than writing the death timer directly, and
+the death frames are counted down by `ObjectSet.update`. They used to be
+counted inside the interaction pass, which returned early while Mario was
+invincible — with two things in the level that can kill, an enemy's death has
+to play out the same way whoever landed the blow.
+
+**Only one Mario is ever in the field.** His pipe makes four more of him, and
+the F2 swap has to stand all of them down rather than just the one the level
+placed — re-applied per tick, since the pipe can fire while Mario himself is
+being played. They are switched off, not killed, which is why a pipe counts
+`defeated` rather than `active`: standing an NPC down is not a vacancy.
+
+**A scuttlebug's wall recoil only fires with its feet down.** It hops backwards
+off a wall at 30, and that was re-applied on every frame of contact — so one
+held against a wall in mid-air was thrown up again before gravity had taken the
+last hop back, and climbed. Five of them out of a pipe in a corner of the map
+walked into the cliff beside it and levitated 1800 units up its face. Nothing
+in the open field had ever pressed against a wall long enough to show it.
+
 **Sizes come from hitboxes, not from eye.** Mario's hitbox is 160 tall, a
 regular goomba's is 50 scaled by 1.5, and a scuttlebug's is 70 -- so they
 should stand at about 0.47x and 0.44x his height. Measured in game: 0.46x.
@@ -1090,9 +1151,14 @@ python3 app/main.py    # with: clock-mode limited / clock-frame-rate 120
   machine with per-area modes and hand-authored triggers. Mario's control feel
   depends on the camera's yaw, which is wired up correctly, but the camera's own
   behaviour is an approximation.
-- **Objects are a thin slice.** Trees, goombas and scuttlebugs run; there are no
-  coins, no warps, and no other enemies. `collision_objects.json` carries more
-  presets than anything consumes.
+- **Objects are a thin slice.** Trees, goombas and scuttlebugs run, and warp
+  pipes produce more of them; there are no coins, no other enemies, and a pipe
+  is scenery that things come out of rather than something either character can
+  travel through. `collision_objects.json` carries more presets than anything
+  consumes.
+- **Nothing fights back at an NPC Mario.** He hunts goombas and scuttlebugs and
+  they ignore him entirely, since both of them chase whoever is being played.
+  He cannot be hurt, and he never dies.
 - **Scuttlebug legs render as thin wire quads.** Fifteen of its animated parts
   carry flat `LAYER_ALPHA` display lists that the geo does not billboard, so
   unlike its body they have nothing to turn toward the camera.

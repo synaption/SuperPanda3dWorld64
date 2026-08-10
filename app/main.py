@@ -109,6 +109,20 @@ ENEMY_SPAWNS = [
     (objects.Scuttlebug, 400.0, 300.0, 1900.0),
 ]
 
+# Warp pipes, and what comes out of each: where it stands, what it produces,
+# and how many of them it keeps going. One by the spawn on the castle path,
+# and one in each far corner of the map, so the two enemy pipes are somewhere
+# to go rather than something to trip over on the way out of the gate.
+#
+# The pipes are drawn but not collided with -- the level's own collision is
+# what the physics reads, and nothing here adds to it -- so a pipe is scenery
+# that you can walk through and that things come out of.
+PIPE_SPAWNS = [
+    (objects.Mario, -915.3, 260.0, 4629.5),
+    (objects.Goomba, -5509.3, 543.0, -3924.8),
+    (objects.Scuttlebug, 4681.0, 545.0, -6808.4),
+]
+
 SKY_COLOUR = (0.32, 0.60, 0.86)
 UNDERWATER_COLOUR = (0.06, 0.28, 0.36)
 
@@ -151,6 +165,11 @@ MARIO_NPC_SPAWN = (-1750.0, 300.0, 3600.0)
 # The game ticks at 30 Hz; all movement constants assume it.
 TICK_RATE = 30.0
 TICK_DT = 1.0 / TICK_RATE
+
+# One out of each pipe every thirty seconds, up to five of them alive at once.
+# The pipe counts in ticks, as everything in the simulation does.
+PIPE_INTERVAL = int(30.0 * TICK_RATE)
+PIPE_LIMIT = 5
 
 # Mario spawns where the level script places him, facing the castle.
 SPAWN = (-1328.0, 260.0, 4664.0)
@@ -286,6 +305,11 @@ class Game(ShowBase):
         for cls, x, y, z in ENEMY_SPAWNS:
             self.objects.spawn(cls, x, y, z)
         self.mario_npc = self.objects.spawn(objects.Mario, *MARIO_NPC_SPAWN)
+        self.pipes = [
+            self.objects.spawn(objects.WarpPipe, x, y, z, spawns=cls,
+                               interval=PIPE_INTERVAL, limit=PIPE_LIMIT)
+            for cls, x, y, z in PIPE_SPAWNS
+        ]
 
     # -- players -------------------------------------------------------------
 
@@ -344,9 +368,7 @@ class Game(ShowBase):
                     s16_to_degrees(previous.face_angle[1]))
         self.player.current_anim = None
 
-        # Mario is only an NPC while somebody else is being played; two of him
-        # standing in the same field reads as a bug rather than a cameo.
-        self.mario_npc.active = self.player.name != "mario"
+        self._stand_down_mario_npcs()
 
         self._reset_interpolation()
         # Swapping is allowed from inside the console, and the character that
@@ -354,6 +376,22 @@ class Game(ShowBase):
         if self.console.visible:
             self._freeze_animation()
         print(f"Playing as {self.player.name}")
+
+    def _stand_down_mario_npcs(self):
+        """Only one Mario in the field at a time.
+
+        Mario is only an NPC while somebody else is being played; two of him
+        standing in the same field reads as a bug rather than a cameo. Applied
+        to every copy of him rather than to the one the level placed, since
+        his pipe produces four more -- and re-applied each tick, because it
+        can produce one while Mario himself is the one being played.
+
+        They are switched off, not killed, so the pipe still counts them and
+        does not spend the swap making replacements.
+        """
+        wanted = self.player.name != "mario"
+        for npc in self.objects.of_class(objects.Mario):
+            npc.active = wanted
 
     # -- scene ---------------------------------------------------------------
 
@@ -776,6 +814,7 @@ class Game(ShowBase):
             state.camera_yaw = self.follow_camera.mario_yaw
             self.player.execute(state)
             self.objects.update(state)
+            self._stand_down_mario_npcs()
             # After both have moved, so a stomp is judged on where they
             # actually ended up rather than where they started.
             self.interactions.resolve(state)
@@ -805,6 +844,8 @@ class Game(ShowBase):
         # does not leave the sheet somewhere else when the game comes back.
         self._water_time += dt
         animate_water(self.water, self._water_time)
+        # Anything a pipe has produced needs a node before it can be drawn.
+        self.object_renderer.refresh(self.objects)
         self.object_renderer.sync(self.follow_camera.pos)
         self._update_camera_medium()
 
@@ -892,6 +933,7 @@ class Game(ShowBase):
             f"enemies  {self._enemies_left()} left"
             f"   defeated {self.interactions.defeated}"
             f"   hits {self.interactions.hits_taken}\n"
+            f"pipes    {self._pipe_text()}\n"
             f"fps      {self.clock.get_average_frame_rate():5.1f}\n"
             f"\n{self._control_legend()}\n"
             f"Q/E camera  R recentre  F2 swap  F3 collision  F1 hud  ` console"
@@ -907,6 +949,19 @@ class Game(ShowBase):
         return sum(1 for o in self.objects.objects
                    if o.active and isinstance(o, (objects.Goomba,
                                                   objects.Scuttlebug)))
+
+    def _pipe_text(self):
+        """What each pipe is holding, and how long until the next one out.
+
+        The seconds are the honest state of the countdown, so a pipe sitting
+        at its cap shows the time it froze at rather than ticking towards a
+        spawn that is not coming.
+        """
+        return "   ".join(
+            f"{pipe.spawns.__name__.lower()} {pipe.population}/{pipe.limit}"
+            f" {pipe.countdown / TICK_RATE:4.1f}s"
+            for pipe in self.pipes
+        )
 
     def _control_legend(self):
         """The moves the character being played actually has.
