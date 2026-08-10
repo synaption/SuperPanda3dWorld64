@@ -143,59 +143,86 @@ def _ray_ground(surfaces, origin, direction, start, end):
     return None
 
 
-def aim_point(surfaces, camera, player_pos, player_facing=0):
-    """Where on the ground the crosshair is pointing, as (x, y, z).
+def _view_ray(camera, player_pos):
+    """The crosshair's line, as (origin, direction, where the player is on it).
 
-    The camera looks at whoever is being played, so the crosshair sits on his
-    back and the ray through it carries on past him: tilting the view down
-    brings the far end of that ray in, tilting it up throws it out. That is the
-    whole of the aim -- left and right is the camera swing the player already
-    has, up and down is range -- and it is why the reticle never has to leave
-    the middle of the screen.
+    A shooter camera can hand this over directly -- it is built from the yaw
+    and pitch the view was placed with, so it is exact even on a frame the boom
+    is being shoved through a wall, and it accounts for the shoulder offset,
+    which a line drawn between two placed points does not.
 
-    The answer is a point in front of the player at a distance the ray chose,
-    not the ray's own hit: pulled back to AIM_MAX_RANGE when it is beyond
-    throwing, pushed out to AIM_MIN_RANGE when the view is pointed at his own
-    feet, and walked back toward him until there is floor under it when it is
-    out over the moat or off the edge of the world. A throw does not have to
-    land exactly where it was pointed; it does have to land somewhere.
+    The fallback subtracts the camera's focus from its position, which is what
+    this always used to do and is all a camera without an `aim_ray` can offer.
+    Returns None when there is no usable ray at all.
     """
-    origin = camera.pos
-    # The point the camera is looking at, which is what apply_to() aims it at.
-    focus = (camera.focus[0], camera.focus[1] + 60.0, camera.focus[2])
+    if hasattr(camera, "aim_ray"):
+        origin, direction = camera.aim_ray()
+        # Where along the ray the player is: the march starts there rather than
+        # at the camera, since the ground between the camera and his back is
+        # behind him and a target there points the arc the wrong way.
+        start = ((player_pos[0] - origin[0]) * direction[0]
+                 + (player_pos[1] - origin[1]) * direction[1]
+                 + (player_pos[2] - origin[2]) * direction[2])
+        return origin, direction, max(start, 1.0)
 
+    origin = camera.pos
+    focus = (camera.focus[0], camera.focus[1] + 60.0, camera.focus[2])
     dx = focus[0] - origin[0]
     dy = focus[1] - origin[1]
     dz = focus[2] - origin[2]
     length = math.sqrt(dx * dx + dy * dy + dz * dz)
     if length < 1.0:
-        # The camera is sitting on its own focus, which only happens on the
-        # frame before it has been placed. Aim along the player's own facing.
+        return None
+    return origin, (dx / length, dy / length, dz / length), length
+
+
+def aim_point(surfaces, camera, player_pos, player_facing=0):
+    """Where on the ground the crosshair is pointing, as (x, y, z).
+
+    The crosshair is the middle of the screen and the aim is the ray out of it,
+    picked up from the camera and marched until it meets ground. Left and right
+    is where the view is pointed; up and down is range, since a view tilted
+    down meets the ground nearer and one tilted up throws the meeting further
+    out. That is the whole of the aim, and it is why the reticle never has to
+    leave the middle of the screen.
+
+    The answer is a point in front of the player rather than the ray's own hit:
+    on the bearing from *him* to that hit, so the camera sitting off his
+    shoulder does not skew where the throw is aimed, at the distance the ray
+    chose -- pulled back to AIM_MAX_RANGE when it is beyond throwing, pushed
+    out to AIM_MIN_RANGE when the view is pointed at his own feet, and walked
+    back toward him until there is floor under it when it is out over the moat
+    or off the edge of the world. A throw does not have to land exactly where
+    it was pointed; it does have to land somewhere.
+    """
+    ray = _view_ray(camera, player_pos)
+    if ray is None:
+        # The camera has not been placed yet, which is only ever true on the
+        # first frame. Aim along the player's own facing.
         facing = (sins_f(player_facing), coss_f(player_facing))
         return _ground_ahead(surfaces, player_pos, facing, AIM_MIN_RANGE)
+    origin, direction, start = ray
 
-    direction = (dx / length, dy / length, dz / length)
-
-    # The horizontal part of the same ray. Taken from the ray rather than from
-    # the camera's yaw so the two cannot disagree: the ray passes through the
-    # player, so this is exactly the bearing from him to whatever it hits.
     flat = math.hypot(direction[0], direction[2])
     if flat < 1e-4:
         # Straight down. Nothing to aim along; put it at his feet.
         return (player_pos[0], player_pos[1], player_pos[2])
     heading = (direction[0] / flat, direction[2] / flat)
 
-    # From the player outward, never from the camera: the ground between the
-    # camera and his back is behind him, and a target there points the arc the
-    # wrong way.
     hit = _ray_ground(surfaces, origin, direction,
-                      length, length + AIM_MAX_RANGE * 1.5)
+                      start, start + AIM_MAX_RANGE * 1.5)
     if hit is None:
         distance = AIM_MAX_RANGE
     else:
         point = _along(origin, direction, hit)
-        distance = math.hypot(point[0] - player_pos[0],
-                              point[2] - player_pos[2])
+        dx = point[0] - player_pos[0]
+        dz = point[2] - player_pos[2]
+        distance = math.hypot(dx, dz)
+        # The bearing from him to what the crosshair found, which is the aim
+        # the player is actually taking. Only the ray's own heading is left
+        # when the two coincide, where a bearing would be noise.
+        if distance > 1.0:
+            heading = (dx / distance, dz / distance)
 
     return _ground_ahead(surfaces, player_pos, heading,
                          min(max(distance, AIM_MIN_RANGE), AIM_MAX_RANGE))

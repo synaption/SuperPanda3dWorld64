@@ -10,8 +10,16 @@ The game logic runs at a fixed 30 Hz, as the original does -- every physics
 constant in the action code is per-frame at that rate, so rendering is
 decoupled and the simulation is stepped in whole ticks.
 
+The camera is a third-person shooter's -- a spring arm off his shoulder, aimed
+with the mouse, which the window takes hold of at startup. Escape gives the
+pointer back and clicking the window takes it again. See sm64py/camera.py for
+what it does and why.
+
 Controls, as the Hero:
     W / A / S / D or arrows   analog stick (camera-relative)
+    mouse                     look
+    Right mouse or F (held)   aim: the camera comes in over his shoulder, the
+                              view narrows and the crosshair closes up
     Space                     jump; held, the jetpack takes over and he flies,
                               and pressing it again in mid-air lights it too
     Left Shift                attack -- again mid-swing to chain the second,
@@ -26,26 +34,28 @@ Controls, as Mario -- the original's, unchanged:
     C                         put the skates on, and take them off again
 
 Both:
-    X (held)                  aim: a circle grows on the ground where the view
+    X or left mouse (held)    a circle grows on the ground where the crosshair
                               points, with the arc of a throw to it; let go and
                               every ally inside it follows you
-    X (tapped)                send the squad to the spot being aimed at
-    Q / E or mouse drag       swing the camera
-    R                         re-centre the camera
+    X or left mouse (tapped)  send the squad to the spot being aimed at
+    Q / E                     swing the camera without the mouse
+    R                         re-centre the camera behind him
     `  (backquote / tilde)    open the debug console, pausing the game
     F1                        toggle the debug readout
     F2                        swap between the Hero and Mario
     F3                        toggle the collision overlay
-    Escape                    close the console, or quit
+    Escape                    close the console, then release the mouse, then
+                              quit
 
 On a gamepad, if one is plugged in -- the same set, added to the keyboard
 rather than replacing it (see app/gamepad.py):
     left stick / d-pad        analog stick
-    right stick               swing and tilt the camera
+    right stick               look
+    left trigger              aim, by however far it is pressed
     A                         jump, and the jetpack
     B                         attack -- Mario's B
     X                         the squad, held or tapped as above
-    either trigger            Z
+    right trigger             Z
     right shoulder            re-centre the camera
     left shoulder (held)      shamble like a zombie
     Y                         the skates
@@ -86,11 +96,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 # Through the package rather than as a sibling module: `tools/check_hero.py`
 # imports this file as `app.main`, and in that reading the directory this file
 # sits in is not on the path -- only the root inserted above is.
-from app.gamepad import (  # noqa: E402
-    CAMERA_PITCH_SPEED, CAMERA_YAW_SPEED, Gamepad,
-)
+from app.gamepad import Gamepad  # noqa: E402
 from sm64py import audio, console, objects, squad, surfaces  # noqa: E402
-from sm64py.camera import FollowCamera  # noqa: E402
+from sm64py.camera import FollowCamera, smooth_damp  # noqa: E402
 from sm64py.hero import HeroState  # noqa: E402
 from sm64py.hero import actions as hero_actions  # noqa: E402
 from sm64py.hero import animations as hero_animations  # noqa: E402
@@ -243,6 +251,46 @@ HUD_INTERVAL = 0.1
 # there.
 CROSSHAIR_GAP = 0.012
 CROSSHAIR_ARM = 0.028
+
+# It does not hold still. A crosshair that opens while he runs and closes when
+# he stops and aims is the cheapest honest thing a shooter's HUD can say, and
+# it is read without being looked at: the size is how settled the aim is.
+#
+# The spread is a multiplier on the whole reticle. 1.0 is standing at the hip;
+# a sprint pushes it out to SPREAD_RUNNING, being in the air adds SPREAD_AIR on
+# top, and the sights pull it down to SPREAD_AIM -- where the dot in the middle
+# also fades up, because at that size the four ticks are further from the point
+# being aimed at than the point is wide.
+CROSSHAIR_SPREAD_SMOOTH = 0.12
+CROSSHAIR_SPREAD_RUNNING = 1.9
+CROSSHAIR_SPREAD_AIR = 0.6
+CROSSHAIR_SPREAD_AIM = 0.55
+CROSSHAIR_DOT = 0.0045
+# What it fades to at the hip. Full brightness belongs to the aim; the rest of
+# the time this is a mark saying where the middle is, not an instrument.
+CROSSHAIR_HIP_ALPHA = 0.55
+
+# Pointer movement, in pixels, past which a frame's delta is thrown away
+# rather than looked through. Alt-tabbing, dragging the window and the frame
+# the capture is taken all produce one the width of the screen.
+MOUSE_JUMP = 400
+
+# Degrees of view per unit of a loose-pointer drag, whose coordinates run -1 to
+# 1 across the window rather than in pixels.
+DRAG_YAW = 180.0
+DRAG_PITCH = 55.0
+
+# Turning him to face the sights: how fast, and the speed above which he is
+# moving under his own steam and is left alone. See `Game._turn_to_aim`.
+AIM_TURN_RATE = 9.0
+AIM_TURN_MAX_SPEED = 2.0
+
+# A landing kicks the camera. Below the first speed nothing is felt and nothing
+# is drawn; at the second the kick is at full strength, which is a fall of
+# about a thousand units.
+LAND_SHAKE_MIN_SPEED = 45.0
+LAND_SHAKE_FULL_SPEED = 110.0
+LAND_SHAKE_AMOUNT = 0.55
 
 # The squad reticle, drawn in the world rather than on the screen: the arc from
 # his hands to the spot being aimed at, a ring on that spot, and the whistle
@@ -401,7 +449,10 @@ class Game(ShowBase):
         self._build_players()
         self.follow_camera = FollowCamera(self.surfaces, self.state)
 
-        self.camLens.set_fov(45)
+        # The camera owns the field of view from here -- it narrows for the
+        # sights and widens a little with his speed -- and sets it every frame
+        # it changes. This is only the value the first frame is drawn at.
+        self.camLens.set_fov(self.follow_camera.fov)
         self.camLens.set_near_far(10, 30000)
 
         self._setup_lighting()
@@ -501,6 +552,11 @@ class Game(ShowBase):
         state.spawn(previous.pos[0], previous.pos[1], previous.pos[2],
                     s16_to_degrees(previous.face_angle[1]))
         self.player.current_anim = None
+        # The camera reads his facing and his speed -- to recentre, and to
+        # drift back behind him while he runs -- so it has to be following the
+        # character that is actually being played rather than the one it was
+        # constructed with.
+        self.follow_camera.target = state
 
         self._stand_down_mario_npcs()
         # The squad is made of Marios, and half of it has just been switched
@@ -675,6 +731,11 @@ class Game(ShowBase):
             ("q", "cam_left"), ("e", "cam_right"),
             ("r", "cam_center"),
         ]
+        # The mouse is the aim now, so the keyboard keeps a key for the sights
+        # too -- for anyone playing without one, and because binding the
+        # sights to a mouse button alone makes them unavailable the moment the
+        # pointer is let go of.
+        bindings.append(("f", "aim"))
         for key, name in bindings:
             self.keys.setdefault(name, False)
             self.accept(key, self._set_key, [name, True])
@@ -703,14 +764,23 @@ class Game(ShowBase):
         # the event bindings here, so nothing above has to know about it.
         self.gamepad = Gamepad(self.devices)
 
+        # The mouse has two lives. Captured -- which is how it starts, and how
+        # it spends nearly all of its time -- it is the look control and its
+        # buttons are gameplay: right aims, left commands the squad. Released,
+        # it is a pointer for the console and its sliders, and a drag on it
+        # still swings the view so the game is playable without the capture at
+        # all. Escape and the console move between the two.
+        self._mouse_captured = False
+        self._was_captured = True
+        self._mouse_anchor = None
+        self._pointer_origin = None
         self._dragging = False
-        for button in ("mouse1", "mouse3"):
-            self.accept(button, self._set_dragging, [True])
-            self.accept(f"{button}-up", self._set_dragging, [False])
+        self.accept("mouse1", self._mouse_button, [1, True])
+        self.accept("mouse1-up", self._mouse_button, [1, False])
+        self.accept("mouse3", self._mouse_button, [3, True])
+        self.accept("mouse3-up", self._mouse_button, [3, False])
 
-        props = WindowProperties()
-        props.set_cursor_hidden(False)
-        self.win.request_properties(props)
+        self._set_mouse_captured(True)
 
     def _set_key(self, name, value):
         # Releases always land, so a key held as the console opened does not
@@ -719,8 +789,93 @@ class Game(ShowBase):
             return
         self.keys[name] = value
 
-    def _set_dragging(self, value):
-        self._dragging = value
+    # -- the mouse ------------------------------------------------------------
+
+    def _set_mouse_captured(self, captured):
+        """Take the pointer for looking, or hand it back.
+
+        Relative mouse mode is asked for rather than assumed: where the
+        platform has it, the pointer is unhooked from the screen and its motion
+        arrives as motion, which is what makes a fast turn keep turning instead
+        of stopping at the edge of the window. Where it does not -- WSL over
+        X11 is the case at hand -- the fallback is the old recipe of reading
+        the pointer and putting it back in the middle every frame, and
+        `_read_mouse` handles both by looking at what the window actually
+        granted rather than at what was asked for.
+        """
+        if captured == self._mouse_captured:
+            return
+        self._mouse_captured = captured
+
+        props = WindowProperties()
+        props.set_cursor_hidden(captured)
+        props.set_mouse_mode(WindowProperties.M_relative if captured
+                             else WindowProperties.M_absolute)
+        self.win.request_properties(props)
+
+        # Whatever the pointer was doing before belongs to the other mode.
+        self._pointer_origin = None
+        self._mouse_anchor = None
+        self._dragging = False
+
+    def _mouse_button(self, button, down):
+        if self.console.visible:
+            return
+        if not self._mouse_captured:
+            # A click on the window is how the pointer is taken back, and a
+            # drag is how the view is swung while it is not.
+            if down and button == 1 and not self.console.wants_mouse():
+                self._set_mouse_captured(True)
+                return
+            self._dragging = down
+            return
+
+        if button == 3:
+            self.keys["aim"] = down
+        elif button == 1:
+            # The trigger, and what it does is give the squad an order -- the
+            # same press and release the X key carries, so a tap sends and a
+            # hold whistles.
+            (self._squad_press if down else self._squad_release)()
+
+    def _read_mouse(self):
+        """Turn the pointer's movement into a look, and put it back if needed.
+
+        The delta is clamped: a window drag, a mode change or the first frame
+        after the capture can all produce one the size of the screen, and a
+        camera that answers those spins the view through half a turn for no
+        reason the player can see.
+        """
+        if not self._mouse_captured or not self.win.get_properties().get_foreground():
+            return
+        pointer = self.win.get_pointer(0)
+        current = (pointer.get_x(), pointer.get_y())
+
+        relative = (self.win.get_properties().get_mouse_mode()
+                    == WindowProperties.M_relative)
+        if relative:
+            # The pointer is free-running and reports where it has got to, so
+            # the delta is against the last reading rather than the middle.
+            origin = self._pointer_origin
+            self._pointer_origin = current
+        else:
+            centre = (self.win.get_x_size() // 2, self.win.get_y_size() // 2)
+            origin = self._pointer_origin
+            self._pointer_origin = centre
+            if not self.win.move_pointer(0, *centre):
+                # No pointer to move -- the window has lost it. Nothing to
+                # read this frame, and nothing to compare against next one.
+                self._pointer_origin = None
+                return
+
+        if origin is None:
+            return
+        dx = current[0] - origin[0]
+        dy = current[1] - origin[1]
+        if abs(dx) > MOUSE_JUMP or abs(dy) > MOUSE_JUMP:
+            return
+        # Panda3D's pointer counts down the screen and the camera counts up.
+        self.follow_camera.look_mouse(dx, -dy)
 
     def _toggle_skating(self):
         if self.console.visible:
@@ -728,9 +883,18 @@ class Game(ShowBase):
         self._skating = not self._skating
 
     def _escape(self):
-        """Back out of the console if it is open; otherwise quit."""
+        """Back out of whatever has the input, and quit only once nothing does.
+
+        Three steps rather than one, because a captured pointer is a mode the
+        player is in: quitting straight out of it would mean the key that gets
+        the cursor back is also the key that closes the game.
+        """
         if self.console.visible:
             self.console.hide()
+            return
+        if self._mouse_captured:
+            self._set_mouse_captured(False)
+            print("Mouse released -- click the window to look with it again.")
             return
         sys.exit()
 
@@ -798,7 +962,7 @@ class Game(ShowBase):
         )
 
     def _setup_crosshair(self):
-        """A reticle at the centre of the screen.
+        """A reticle at the centre of the screen, in two parts.
 
         Two passes of the same four strokes, a thick dark one under a thin
         light one, because a single-colour crosshair disappears against
@@ -806,11 +970,16 @@ class Game(ShowBase):
         white in the sky, dark green on the hill and both at once on the
         skyline. The outline costs one more draw and works everywhere.
 
+        The four ticks live under a node of their own so the spread can scale
+        them without touching the dot in the middle, which has to stay the size
+        it is: it marks a point, and a point that grows is not one.
+
         Drawn in aspect2d, whose centre is (0, 0) and whose vertical range is
         -1 to 1 either way, so it stays put and stays the same size as the
         window is resized.
         """
         self.crosshair = self.aspect2d.attach_new_node("crosshair")
+        self._crosshair_arms = self.crosshair.attach_new_node("arms")
         for thickness, colour in ((4.5, (0.0, 0.0, 0.0, 0.55)),
                                   (2.0, (1.0, 1.0, 1.0, 0.9))):
             segs = LineSegs()
@@ -822,8 +991,45 @@ class Game(ShowBase):
                 segs.move_to(dx * CROSSHAIR_GAP, 0.0, dz * CROSSHAIR_GAP)
                 segs.draw_to(dx * (CROSSHAIR_GAP + CROSSHAIR_ARM), 0.0,
                              dz * (CROSSHAIR_GAP + CROSSHAIR_ARM))
-            self.crosshair.attach_new_node(segs.create())
+            self._crosshair_arms.attach_new_node(segs.create())
+
+        # The dot, hidden until the sights are up. Drawn as a short fat stroke
+        # rather than as a disc: at this size the two are the same handful of
+        # pixels, and one of them is four vertices.
+        segs = LineSegs()
+        segs.set_thickness(5.0)
+        segs.set_color(1.0, 1.0, 1.0, 1.0)
+        segs.move_to(-CROSSHAIR_DOT, 0.0, 0.0)
+        segs.draw_to(CROSSHAIR_DOT, 0.0, 0.0)
+        self._crosshair_dot = self.crosshair.attach_new_node(segs.create())
+
         self.crosshair.set_transparency(TransparencyAttrib.M_alpha)
+        self._spread = 1.0
+        self._spread_vel = 0.0
+
+    def _update_crosshair(self, dt):
+        """Open the reticle with his movement and close it with the sights."""
+        aim = self.follow_camera.aim_amount
+        state = self.state
+        speed = min(abs(state.forward_vel) / max(HC.MAX_RUN_SPEED, 1.0), 1.0)
+
+        airborne = (state.floor is None
+                    or state.pos[1] - state.floor_height > 60.0)
+        target = 1.0 + (CROSSHAIR_SPREAD_RUNNING - 1.0) * speed
+        if airborne:
+            target += CROSSHAIR_SPREAD_AIR
+        # The sights do not merely subtract from the spread, they take it over:
+        # a settled aim is settled however fast he was going a moment ago.
+        target += (CROSSHAIR_SPREAD_AIM - target) * aim
+
+        self._spread, self._spread_vel = smooth_damp(
+            self._spread, target, self._spread_vel,
+            CROSSHAIR_SPREAD_SMOOTH, dt)
+        self._crosshair_arms.set_scale(self._spread)
+
+        alpha = CROSSHAIR_HIP_ALPHA + (1.0 - CROSSHAIR_HIP_ALPHA) * aim
+        self.crosshair.set_color_scale(1.0, 1.0, 1.0, alpha)
+        self._crosshair_dot.set_color_scale(1.0, 1.0, 1.0, aim * aim)
 
     # -- the squad -----------------------------------------------------------
 
@@ -1103,10 +1309,40 @@ class Game(ShowBase):
         t.add("enemy_limit", self.pipe_tuning, "limit", *ENEMY_LIMIT_RANGE,
               doc="how many each enemy pipe keeps alive", integer=True)
 
-        t.add("cam_distance", self.follow_camera, "distance", 250.0, 5000.0,
-              "how far the camera sits behind him")
-        t.add("cam_height", self.follow_camera, "height", -500.0, 1500.0,
-              "how far above him it looks from")
+        # The camera's, which are registered against the object rather than
+        # against its module because it reads them off itself: a slider that
+        # wrote to `sm64py.camera.HIP_DISTANCE` would move nothing, since the
+        # constant was copied into the instance when it was built.
+        cam = self.follow_camera
+        t.add("cam_distance", cam, "distance", 250.0, 4000.0,
+              "how far the camera sits behind him at the hip")
+        t.add("cam_aim_distance", cam, "aim_distance", 150.0, 2000.0,
+              "and how far behind him down the sights")
+        t.add("cam_height", cam, "height", -200.0, 800.0,
+              "how far above his feet the boom pivots")
+        t.add("cam_shoulder", cam, "shoulder", -600.0, 600.0,
+              "how far off the centre line he stands; negative swaps shoulders")
+        t.add("cam_aim_shoulder", cam, "aim_shoulder", -600.0, 600.0,
+              "the same, down the sights")
+        t.add("cam_fov", cam, "base_fov", 25.0, 100.0,
+              "field of view, degrees across")
+        t.add("cam_aim_fov", cam, "aim_fov", 15.0, 90.0,
+              "and what the sights pull it in to")
+        t.add("cam_follow", cam, "follow_smooth", 0.0, 0.5,
+              "seconds the camera takes to close on him -- 0 nails it to him")
+        t.add("cam_align", cam, "auto_align", 0.0, 2.0,
+              "how hard the view drifts back behind him; 0 turns it off")
+        t.add("cam_shake", cam, "shake_scale", 0.0, 3.0,
+              "how much a landing kicks the camera")
+
+        t.add("mouse_sens", cam, "mouse_sensitivity", 2.0, 90.0,
+              "degrees of view per hundred pixels of mouse")
+        t.add("mouse_smooth", cam, "mouse_smoothing", 0.0, 0.12,
+              "seconds a mouse delta is spread over; 0 is raw 1:1")
+        t.add("stick_sens", cam, "stick_speed", 40.0, 700.0,
+              "degrees per second at a full push of the look stick")
+        t.add("stick_pitch", cam, "stick_pitch_speed", 30.0, 500.0,
+              "the same, up and down")
         return t
 
     def _console_toggled(self, visible):
@@ -1124,11 +1360,17 @@ class Game(ShowBase):
             # A whistle half-grown when the console opened has no release
             # coming: the key-up lands while the console has the keyboard.
             self._cancel_aim()
+            # The console has sliders to drag, which needs a pointer.
+            self._was_captured = self._mouse_captured
+            self._set_mouse_captured(False)
             for name in self.keys:
                 self.keys[name] = False
+            self.follow_camera.set_aim(0.0)
             self._freeze_animation()
         else:
             self.crosshair.show()
+            if self._was_captured:
+                self._set_mouse_captured(True)
             if self._show_debug:
                 self.hud.show()
 
@@ -1218,7 +1460,11 @@ class Game(ShowBase):
             self.console.update(dt)
             return task.cont
 
-        self._update_camera_input(dt)
+        # Before the ticks, so the frame's own look and the frame's own aim are
+        # what the simulation is stepped against rather than the last one's.
+        self._update_aim_mode()
+        self._update_look(dt)
+        self._turn_to_aim(dt)
 
         # Step the simulation in whole 30 Hz ticks.
         self._accumulator += dt
@@ -1228,6 +1474,9 @@ class Game(ShowBase):
             # Remember where he was so the render can interpolate out of it.
             self._prev_pos = list(state.gfx_pos)
             self._prev_angle = list(state.gfx_angle)
+            falling = state.vel[1]
+            grounded = state.floor is not None and \
+                state.pos[1] - state.floor_height < 1.0
 
             self._poll_controller()
             state.camera_yaw = self.follow_camera.mario_yaw
@@ -1243,6 +1492,7 @@ class Game(ShowBase):
             # Drained inside the tick loop, not after it: a frame that runs
             # two ticks would otherwise drop the first tick's sounds.
             self.sounds.play_events(state)
+            self._kick_on_landing(grounded, falling)
             self._accumulator -= TICK_DT
             steps += 1
 
@@ -1261,11 +1511,12 @@ class Game(ShowBase):
         self.follow_camera.update(
             dt, target_pos=pos,
             recenter=self.keys["cam_center"] or self.gamepad.recenter)
-        self.follow_camera.apply_to(self.camera)
+        self.follow_camera.apply_to(self.camera, self.camLens)
 
         # After the camera has been placed: the aim is a ray out of it, and
         # taking it beforehand would be aiming through last frame's view.
         self._update_aim(dt, pos)
+        self._update_crosshair(dt)
 
         # Its own clock rather than the frame time, so a spell in the console
         # does not leave the sheet somewhere else when the game comes back.
@@ -1292,6 +1543,23 @@ class Game(ShowBase):
 
         return task.cont
 
+    def _kick_on_landing(self, was_grounded, falling):
+        """Shake the camera for a landing, in proportion to the fall.
+
+        Taken from the tick rather than from the action he ended up in: both
+        characters have several landing actions and the pair that matter here
+        -- was he in the air, and how fast was he going down -- are the same
+        two questions whichever of them he takes.
+        """
+        state = self.state
+        if was_grounded or falling > -LAND_SHAKE_MIN_SPEED:
+            return
+        if state.floor is None or state.pos[1] - state.floor_height > 1.0:
+            return
+        share = ((-falling - LAND_SHAKE_MIN_SPEED)
+                 / (LAND_SHAKE_FULL_SPEED - LAND_SHAKE_MIN_SPEED))
+        self.follow_camera.shake(min(share, 1.0) * LAND_SHAKE_AMOUNT)
+
     def _interpolated_transform(self, alpha):
         state = self.state
         current = state.gfx_pos
@@ -1315,42 +1583,80 @@ class Game(ShowBase):
         self._prev_angle = list(self.state.gfx_angle)
         self._accumulator = 0.0
 
-    def _update_camera_input(self, dt):
-        speed = 150.0
-        if self.keys["cam_left"]:
-            self.follow_camera.rotate(-speed * dt)
-        if self.keys["cam_right"]:
-            self.follow_camera.rotate(speed * dt)
+    def _update_look(self, dt):
+        """Everything that points the view, gathered into one call.
 
-        # The pad's right stick, per second rather than per drag: unlike the
-        # mouse it reports a position that is held, so the pan has to be scaled
-        # by dt or it would swing at whatever the frame rate happens to be.
-        #
-        # Both axes are negated, and for the same reason: `rotate` and `tilt`
-        # move the *camera*, while a stick is read as moving the *view*. Q and
-        # E are named after the camera and a mouse drag grabs the world, so
-        # both of those want the sign as it comes; pushing the stick right has
-        # to swing the view right, which is the camera going the other way.
-        cam_x, cam_y = self.gamepad.camera
-        if cam_x or cam_y:
-            self.follow_camera.rotate(-cam_x * CAMERA_YAW_SPEED * dt)
-            self.follow_camera.tilt(-cam_y * CAMERA_PITCH_SPEED * dt)
+        The three sources are deliberately not three code paths: the keys and
+        the pad's right stick are summed into one virtual look stick and go
+        through the camera's response curve and turn ramp together, so Q held
+        down accelerates into a turn exactly the way the stick does, and the
+        mouse -- which reports movement rather than a held position, and so
+        must not be scaled by dt -- is the one that goes its own way.
+        """
+        keys_x = (1.0 if self.keys["cam_right"] else 0.0) \
+            - (1.0 if self.keys["cam_left"] else 0.0)
+        pad_x, pad_y = self.gamepad.camera
+        self.follow_camera.look_stick(keys_x + pad_x, pad_y, dt)
 
-        # Dragging with a mouse button held swings the camera too -- unless
-        # the pointer is on the console or one of its sliders, where a drag
-        # means the slider and nothing else.
-        if (self._dragging and not self.console.wants_mouse()
+        self._read_mouse()
+
+        # Dragging with a mouse button held swings the view while the pointer
+        # is loose -- unless it is over the console or one of its sliders,
+        # where a drag means the slider and nothing else.
+        if (self._dragging and not self._mouse_captured
+                and not self.console.wants_mouse()
                 and self.mouseWatcherNode.has_mouse()):
             pos = self.mouseWatcherNode.get_mouse()
             current = (pos.get_x(), pos.get_y())
             if self._mouse_anchor is not None:
-                dx = current[0] - self._mouse_anchor[0]
-                dy = current[1] - self._mouse_anchor[1]
-                self.follow_camera.rotate(dx * 180.0)
-                self.follow_camera.tilt(-dy * 0.9)
+                # A drag grabs the world rather than the view, which is the
+                # opposite sign to the captured pointer and the right one for
+                # a hand that is holding something.
+                self.follow_camera.look(
+                    -(current[0] - self._mouse_anchor[0]) * DRAG_YAW,
+                    -(current[1] - self._mouse_anchor[1]) * DRAG_PITCH)
             self._mouse_anchor = current
         else:
             self._mouse_anchor = None
+
+    def _update_aim_mode(self):
+        """How far down the sights to be, from whichever control is asking.
+
+        The trigger wins when it is doing more than the buttons, which is what
+        lets a pad half press into a partial aim while a keyboard and mouse
+        get all or nothing from theirs.
+        """
+        amount = 1.0 if self.keys["aim"] else 0.0
+        self.follow_camera.set_aim(max(amount, self.gamepad.aim))
+
+    def _turn_to_aim(self, dt):
+        """Face him down the sights while he is standing in them.
+
+        Only while he is standing: he has no strafing clips, so a character
+        turned to the camera while he runs would slide sideways through a
+        forward run cycle. Standing still he has nothing to contradict, and
+        turning to look where the player is looking is what makes the crosshair
+        read as his rather than as an overlay on the screen.
+
+        Eased rather than snapped, and written to the simulation's facing
+        directly -- which is safe here and nowhere else: the idle actions do
+        not touch `face_angle`, so nothing is being fought over, and the next
+        tick's movement reads the result as though he had turned himself.
+        """
+        state = self.state
+        # The stationary flag rather than a list of actions, because both
+        # characters carry it and neither's list is this file's business: it is
+        # set on exactly the actions that hold him in one place, which is the
+        # same question being asked here.
+        if (self.follow_camera.aim_amount < 0.5
+                or abs(state.forward_vel) > AIM_TURN_MAX_SPEED
+                or not state.action & C.ACT_FLAG_STATIONARY):
+            return
+        delta = s16(self.follow_camera.mario_yaw - state.face_angle[1])
+        if abs(delta) < 0x0080:
+            return
+        step = delta * min(AIM_TURN_RATE * dt, 1.0)
+        state.face_angle[1] = s16(state.face_angle[1] + step)
 
     def _hud_text(self):
         """The readout, as text.
@@ -1378,7 +1684,9 @@ class Game(ShowBase):
             f"squad    {self._squad_text()}\n"
             f"fps      {self.clock.get_average_frame_rate():5.1f}\n"
             f"\n{self._control_legend()}\n"
-            f"Q/E camera  R recentre  F2 swap  F3 collision  F1 hud  ` console"
+            f"mouse look  {'RMB' if self._mouse_captured else 'F'} aim  "
+            f"R recentre  F2 swap  F3 collision  F1 hud  ` console"
+            f"{'' if self._mouse_captured else '   (Esc again to quit)'}"
         )
 
     def _enemies_left(self):
@@ -1430,7 +1738,7 @@ class Game(ShowBase):
         the Hero has no dive, no crouch and no skates, and a legend offering
         them reads as four broken keys.
         """
-        squad_keys = "X hold to whistle, tap to send"
+        squad_keys = "X/LMB hold to whistle, tap to send"
         if self.player.name == "hero":
             return ("WASD move   Space jump   Shift attack (again to chain, "
                     f"running to spin)   Ctrl sword   {squad_keys}")

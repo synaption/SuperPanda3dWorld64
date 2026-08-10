@@ -29,19 +29,22 @@ from sm64py.mario import constants as C
 # worn stick. Past the edge the magnitude is rescaled from 0 rather than
 # stepping straight to the deadzone value, so a slow walk is still available.
 STICK_DEADZONE = 0.18
-# Wider on the camera stick: a thumb resting on it should not pan the view.
-CAMERA_DEADZONE = 0.25
-
-# Degrees per second at full deflection, against the 150 the Q and E keys turn
-# at -- a stick that can be held part-way can afford a higher ceiling.
-CAMERA_YAW_SPEED = 200.0
-# Radians per second, against a pitch range (PITCH_MIN..PITCH_MAX) of 0.95, so
-# a full push sweeps the whole tilt in a little under a second.
-CAMERA_PITCH_SPEED = 1.2
+# Tighter than it was on the look stick, not wider. A quarter of the travel is
+# a lot to give away on the control that aims, and the response curve in
+# `FollowCamera.look_stick` already makes the first part of what is left move
+# the view slowly: the deadzone only has to cover the rest the stick has, not
+# stand in for a curve.
+CAMERA_DEADZONE = 0.12
 
 # Analog triggers report as an axis rather than a button on most drivers, and
 # as both on some. Half pressed is pressed.
 TRIGGER_THRESHOLD = 0.5
+
+# The dead travel at the top of the aim trigger, and where it counts as fully
+# pressed. Triggers rest a little off zero and stop a little short of one, and
+# a player holding the sights would otherwise find them at 96%.
+AIM_TRIGGER_FLOOR = 0.08
+AIM_TRIGGER_CEILING = 0.85
 
 
 def _apply_deadzone(x, y, deadzone):
@@ -73,6 +76,10 @@ class Gamepad(DirectObject):
         self.buttons = 0
         self.zombie = False
         self.recenter = False
+        # How far down the sights the left trigger is asking to be, 0 to 1. An
+        # amount rather than a flag because a trigger can give one: half
+        # pressed brings the camera half of the way in.
+        self.aim = 0.0
         # Edges, cleared by the next poll: see `pressed` and `released`.
         self._pressed = set()
         self._released = set()
@@ -133,6 +140,7 @@ class Gamepad(DirectObject):
         self.buttons = 0
         self.zombie = False
         self.recenter = False
+        self.aim = 0.0
         self._pressed.clear()
         self._released.clear()
         self._held.clear()
@@ -199,6 +207,7 @@ class Gamepad(DirectObject):
 
         self.zombie = self._button(GamepadButton.lshoulder())
         self.recenter = self._button(GamepadButton.rshoulder())
+        self.aim = self._aim_amount()
 
         held = set()
         if self._button(GamepadButton.face_y()):
@@ -212,16 +221,31 @@ class Gamepad(DirectObject):
         self._held = held
 
     def _triggers_down(self):
-        """Z, from whichever of the four things the driver calls a trigger.
+        """Z, from whichever of the two things the driver calls a trigger.
 
         Analog triggers come through as axes on evdev and as buttons on XInput,
         and a pad that reports both would otherwise work on one machine and not
         the other.
+
+        The right one only. Z used to come off either, and the left one is the
+        aim now -- which is where a shooter puts it, and which cannot also
+        crouch.
         """
-        if self._any_button(GamepadButton.ltrigger(), GamepadButton.rtrigger()):
+        if self._button(GamepadButton.rtrigger()):
             return True
-        return (self._axis(InputDevice.Axis.left_trigger) > TRIGGER_THRESHOLD
-                or self._axis(InputDevice.Axis.right_trigger) > TRIGGER_THRESHOLD)
+        return self._axis(InputDevice.Axis.right_trigger) > TRIGGER_THRESHOLD
+
+    def _aim_amount(self):
+        """How far the left trigger is pressed, rescaled into a clean 0 to 1.
+
+        A driver that reports the trigger as a button rather than an axis gets
+        all or nothing, which is the most it can say.
+        """
+        value = self._axis(InputDevice.Axis.left_trigger)
+        if value <= AIM_TRIGGER_FLOOR:
+            return 1.0 if self._button(GamepadButton.ltrigger()) else 0.0
+        span = max(AIM_TRIGGER_CEILING - AIM_TRIGGER_FLOOR, 1e-3)
+        return min((value - AIM_TRIGGER_FLOOR) / span, 1.0)
 
     def pressed(self, name):
         """True on the frame `name` went down, for the controls that latch."""

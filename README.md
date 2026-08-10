@@ -111,6 +111,8 @@ As the Hero:
 | | |
 |---|---|
 | `W` `A` `S` `D` / arrows | analog stick (camera-relative) |
+| mouse | look — the window takes the pointer at startup |
+| right mouse / `F` (held) | aim: the camera comes in over his shoulder, the view narrows, the crosshair closes up |
 | `Space` | jump; hold it and the jetpack takes over — see below |
 | `Left Shift` | attack; again mid-swing to chain the second, or while running for the spin kick |
 | `Left Ctrl` | draw or sheathe the sword |
@@ -129,20 +131,29 @@ Either way:
 
 | | |
 |---|---|
-| `X` (held) | aim: a circle grows where the view points, and the allies inside it when you let go follow you — see below |
-| `X` (tapped) | send the ones following to the spot being aimed at |
-| `Q` `E` / mouse drag | swing the camera |
-| `R` | re-centre the camera |
+| `X` / left mouse (held) | a circle grows where the crosshair points, and the allies inside it when you let go follow you — see below |
+| `X` / left mouse (tapped) | send the ones following to the spot being aimed at |
+| `Q` `E` | swing the camera without the mouse |
+| `R` | re-centre the camera behind him |
 | `` ` `` (backquote / tilde) | open the debug console, pausing the game |
 | `F1` | toggle the debug readout |
 | `F2` | swap between the Hero and Mario |
 | `F3` | toggle the collision overlay |
-| `Esc` | close the console, or quit |
+| `Esc` | close the console, then release the mouse, then quit |
 
-A crosshair marks the centre of the view. It is drawn twice, a thick dark pass
-under a thin light one, because a single-colour reticle vanishes against the
-castle grounds — white sky above the hill, dark green on it. It hides itself
-while the console is open, which is drawn in the same layer.
+The mouse is captured at startup, which is what makes it the look control
+rather than a pointer. `Esc` gives it back — the console needs it for its
+sliders and takes it automatically — and clicking the window takes it again.
+While it is loose, dragging with a button held still swings the view, so the
+game is playable without the capture at all.
+
+A crosshair marks the centre of the view, which is the same thing as the line
+the aim is taken along. It is drawn twice, a thick dark pass under a thin light
+one, because a single-colour reticle vanishes against the castle grounds —
+white sky above the hill, dark green on it. It does not hold still: it opens
+with his speed and with being in the air, and closes up when he stops and again
+when the sights come up, where a dot fades in at the middle of it. It hides
+itself while the console is open, which is drawn in the same layer.
 
 ### A gamepad
 
@@ -155,11 +166,12 @@ and the stick pushed the opposite way simply cancel out.
 |---|---|
 | left stick | analog stick, with a walk at the bottom of its travel |
 | d-pad | the same, at full deflection, when the stick is centred |
-| right stick | swing and tilt the camera |
+| right stick | look, with a response curve and a turn ramp — see the camera below |
+| left trigger | aim, by however far it is pressed |
 | `A` | jump, and the jetpack |
 | `B` | attack — Mario's B |
 | `X` | the squad, held or tapped as above |
-| either trigger | Z — crouch, ground pound, long jump |
+| right trigger | Z — crouch, ground pound, long jump |
 | right shoulder | re-centre the camera |
 | left shoulder (held) | shamble like a zombie |
 | `Y` | put the skates on, and take them off again |
@@ -183,6 +195,97 @@ has no event to throw and the tick loop reads held state. `python3
 tools/check_gamepad.py` exercises the mapping against a stub device, so the
 directions, the deadzone and the latching buttons can be checked with no pad
 plugged in.
+
+## The camera
+
+`sm64py/camera.py`. It used to be a follow camera in Lakitu's spirit — it
+trailed Mario, you could swing it around him, and its yaw was what the analog
+stick was measured against. That is the right camera for a platformer and the
+wrong one for a game you aim in, for one reason ahead of all the others: the
+player's own look input was *eased*. Pushing the stick set a target yaw and the
+camera crept toward it over a couple of hundred milliseconds, so the view was
+always somewhere you had asked to be a moment ago. On a platformer that reads
+as weight. On anything with a crosshair it reads as latency, because the
+crosshair is the thing being steered and it never arrives.
+
+So the rule the current one is built on:
+
+> **The player's look input is never smoothed. Everything else is.**
+
+A mouse delta or a stick push moves the view on the frame it arrives, in full,
+with no spring between the hand and the angle. What *is* smoothed is everything
+you did not ask for — the character walking around underneath, the ground
+rising into stairs, a wall sliding in behind the boom, the move into and out of
+the sights.
+
+**The pivot follows him rather than tracking him.** The boom hangs off a point
+at chest height that chases him with a critically damped spring — Unity's
+`SmoothDamp`, the same algebra, and critically damped rather than exponential
+for a reason worth stating: exponential smoothing is fastest at the instant the
+target moves and slows from there, so a target that changes velocity puts a
+corner in the output. A spring carries its own velocity across the change. That
+is the difference between a camera that follows and one that glides, and it
+costs four multiplies.
+
+Horizontally it closes in 55 ms, which is enough to take the stair-step off the
+30 Hz simulation without feeling loose. Vertically it is slower and has a **dead
+band**: his height has to change by more than a step before the camera answers
+at all, so kerbs, slopes and the ordinary bob of a run leave the horizon alone,
+and past the band it chases the *edge* of the band rather than him, so the
+recovery has nothing to rebound from. The air gets a wider band and a slower
+spring — a jump you can see the top of reads better than one the camera rides —
+and a hard leash at 520 units, because nothing above outruns a jetpack.
+
+**The boom pulls in hard and pushes out soft.** The segment from the pivot to
+where the camera wants to be is marched against the collision, and anything in
+the way shortens it. Coming in is instantaneous: a camera that eases into a
+wall spends those milliseconds inside it. Going back out takes a third of a
+second, because a camera that snaps out the moment a pillar clears is a jolt.
+That asymmetry is the whole of the occlusion behaviour.
+
+Ground is the exception, and is not treated as an obstruction at all. A
+hillside behind him would otherwise crowd the camera onto his shoulder every
+time he ran downhill; the answer to ground in the way is to go over it, so the
+camera rides up on a short smoothed lift instead. Only what it cannot go over
+shortens the boom.
+
+**The shoulder offset** puts him to one side so he is not standing on top of
+what you are aiming at. It is applied along the camera's own axes and folded
+into the collision march, so backing into a corner gives up the offset along
+with the length.
+
+**The sights** blend the whole rig — boom length, shoulder, field of view, look
+sensitivity, pitch limits — toward a tight over-the-shoulder framing over about
+a tenth of a second in and twice that out. `set_aim` takes an amount rather than
+a flag, so a trigger held half way gets half the move, which is a thing a
+trigger can do and a button cannot.
+
+**Sticks get a curve and a ramp.** The magnitude is squared and the direction
+kept, so the middle of the stick's travel is fine control and the rim is the
+full rate; and holding it near the rim ramps the rate up by 85% over about half
+a second, which is what lets one thumb both flick around and track something
+slowly. The mouse gets neither — it needs neither — beyond 20 ms of smoothing
+to take the stair-step off a 125 Hz mouse read at 200 fps, which is a slider
+(`mouse_smooth`) and can be set to zero for a raw 1:1 pointer.
+
+**The view drifts back behind him** while he runs, but only after the look
+control has been left alone for a second and only in proportion to his speed.
+It is what keeps a keyboard player — who can only turn the view with `Q` and
+`E` — from having to steer the camera as a second job. It is off entirely while
+aiming, where the view *is* the aim and a camera that quietly re-points it is a
+camera arguing with the player. `cam_align` turns it down, and to zero.
+
+The rest is small: a landing kicks the camera in proportion to the fall, a
+sprint widens the view by four degrees and lengthens the boom, and the whole
+lot is on console sliders (`cam_distance`, `cam_shoulder`, `cam_fov`,
+`cam_follow`, `mouse_sens`, `stick_sens` and a dozen more).
+
+`python3 tools/check_camera.py` runs the half of this that has a number
+attached, headless: that a look input lands on the frame it arrives and in
+full, that the same hand movement turns the same angle at 30 fps and at 240 for
+both the mouse and the stick, that everything which *is* smoothed settles
+rather than ringing, that the boom comes in on the frame it must and leaves
+slowly, and that the aim ray really is the middle of the screen.
 
 ## The jetpack
 
@@ -230,18 +333,21 @@ your side, and they already hunt goombas, so an ally posted somewhere is an
 ally fighting there. There are up to six about: the one the level places, and
 the five the castle-path pipe produces.
 
-**Aiming is the camera, not a cursor.** The camera looks at whoever is being
-played, so the crosshair sits on his back and the ray through it carries on
-past him. Tilting the view down brings the far end of that ray in; tilting it
-up throws it out to the cap. Left and right is the camera swing that was
-already there. That is the whole aim, and it is why the reticle never leaves
-the middle of the screen.
+**Aiming is the camera, not a cursor.** The crosshair is the middle of the
+screen and the aim is the ray out of it, which the camera hands over directly
+— `FollowCamera.aim_ray()`, built from the same yaw and pitch the view itself
+was built from, so the two cannot disagree. Tilting the view down brings the
+far end of that ray in; tilting it up throws it out to the cap. Left and right
+is where the view is pointed. That is the whole aim, and it is why the reticle
+never leaves the middle of the screen.
 
-What comes back is not the ray's own hit but a point in front of the player at
-the distance the ray chose: clamped into 250–2600 units, and walked back toward
-him 200 at a time until there is floor under it, which is what happens when the
-view is pointed out over the moat or off the edge of the map. A throw does not
-have to land exactly where it was pointed. It does have to land somewhere.
+What comes back is not the ray's own hit but a point in front of the player, on
+the bearing from *him* to that hit — so the camera sitting off his shoulder
+does not skew where the throw goes — at the distance the ray chose: clamped
+into 250–2600 units, and walked back toward him 200 at a time until there is
+floor under it, which is what happens when the view is pointed out over the
+moat or off the edge of the map. A throw does not have to land exactly where it
+was pointed. It does have to land somewhere.
 
 **The circle is traced over the ground it covers**, one collision query per
 point, so a whistle across the slope up to the castle follows the slope instead
@@ -364,7 +470,7 @@ sm64py/
   math_util.py     binary-angle trig, Panda3D coordinate bridge
   surfaces.py      collision triangles, spatial partition, floor/ceil/wall queries
   level.py         converted mesh -> Panda3D geometry
-  camera.py        following camera
+  camera.py        the third-person shooter camera: look, follow, boom, sights
   console.py       the debug console: captured output, commands, live sliders
   objects.py       trees, enemies and warp pipes: spawning, behaviour, stepping
   squad.py         aiming at the ground, and the allies whistled up and sent out
@@ -404,12 +510,13 @@ tools/
   check_sound.py           why the game is silent, layer by layer
   check_gamepad.py         the pad mapping, against a stub device
   check_squad.py           aiming, whistling and sending, on a flat plane
+  check_camera.py          the camera: look latency, following, occlusion, sights
 app/
   main.py          the runnable game
   gamepad.py       the pad, polled a frame at a time
 ```
 
-The seven `check_*` scripts all run headless and print what they measured.
+The eight `check_*` scripts all run headless and print what they measured.
 
 ## Notes on the port
 
@@ -1294,10 +1401,11 @@ python3 app/main.py    # with: clock-mode limited / clock-frame-rate 120
   from whichever is larger, Mario's speed or how far the stick is pushed, and a
   key is always full deflection — so it selects the run cycle immediately. That
   is faithful; it just needs an analog stick to show.
-- **The camera** is a following camera, not a port. The original is a large state
-  machine with per-area modes and hand-authored triggers. Mario's control feel
-  depends on the camera's yaw, which is wired up correctly, but the camera's own
-  behaviour is an approximation.
+- **The camera is not a port of the original's.** It never was, and it is now
+  deliberately something else: a third-person shooter's spring arm rather than
+  Lakitu. The original is a large state machine with per-area modes and
+  hand-authored triggers, and none of that is here. Mario's control feel
+  depends on the camera's yaw, which is wired up correctly either way.
 - **Objects are a thin slice.** Trees, goombas and scuttlebugs run, and warp
   pipes produce more of them; there are no coins, no other enemies, and a pipe
   is scenery that things come out of rather than something either character can

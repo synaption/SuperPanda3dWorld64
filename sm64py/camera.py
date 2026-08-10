@@ -1,32 +1,241 @@
-"""A following camera in the spirit of Lakitu's.
+"""A third-person shooter camera: a spring arm behind the shoulder.
 
-This is deliberately a simplification.  The original camera is a large state
-machine with per-area modes, cutscene handling and hand-authored triggers;
-what matters for the movement system is that the camera trails Mario, that
-the player can swing it around him, and that its yaw is what the analog stick
-is measured against.  Those are the parts implemented here.
+What was here before was a follow camera in Lakitu's spirit -- it trailed
+Mario, it could be swung around him, and its yaw was what the analog stick was
+measured against.  That is the right camera for a platformer and the wrong one
+for a game you aim in, for one reason above all the others: the player's own
+look input was *eased*.  Pushing the stick set a target yaw and the camera
+crept toward it over a couple of hundred milliseconds, so the view was always
+somewhere the player had asked to be a moment ago.  On a platformer that reads
+as weight.  On anything with a crosshair it reads as latency, because the
+crosshair is the thing being steered and it never arrives.
+
+So the rule this camera is built on:
+
+    **The player's look input is never smoothed.  Everything else is.**
+
+A mouse delta or a stick push moves the view on the frame it arrives, one to
+one, with no spring between the hand and the angle.  What *is* smoothed is
+everything the player did not ask for -- the character walking around under the
+camera, the ground rising into stairs, a wall sliding in behind the boom, the
+transition into and out of the sights.  Those are the motions that want easing,
+and easing them is what makes the result feel smooth rather than merely fast.
+
+The pieces:
+
+  * **A pivot that follows him, not tracks him.**  The boom hangs off a point
+    at chest height that chases the character with a critically damped spring
+    (`smooth_damp` below -- Unity's, the same algebra).  Horizontally it is
+    quick, 55 ms, which is enough to take the stair-step off the 30 Hz
+    simulation without feeling loose.  Vertically it is slower and has a dead
+    band: small changes in his height -- steps, kerbs, a slope -- do not move
+    the camera at all, which is what stops a run up the castle path from
+    pumping the horizon up and down.
+
+  * **A boom that pulls in hard and pushes out soft.**  The segment from the
+    pivot to where the camera wants to be is marched against the collision;
+    anything in the way shortens it.  Coming in is instantaneous, because a
+    camera that eases into a wall spends those milliseconds inside it.  Going
+    back out takes a third of a second, because a camera that snaps back out
+    the moment a pillar clears reads as a jolt.  That asymmetry is the whole
+    trick, and it is why the two are different constants.
+
+  * **A shoulder offset**, so he stands to one side of the screen instead of
+    on top of what you are aiming at.  It is applied along the camera's own
+    right and up axes, and the collision march runs to the offset position, so
+    backing into a corner folds the offset away with the rest of the boom.
+
+  * **Sights.**  `set_aim` blends the whole rig -- boom length, shoulder,
+    field of view, look sensitivity, pitch limits -- toward a tight
+    over-the-shoulder framing.  It takes an amount rather than a flag so an
+    analog trigger can be half pressed and get half the move.
+
+  * **A ray, and only one.**  The camera looks exactly along its own yaw and
+    pitch: no separate focus point above his head, no look-at that quietly
+    disagrees with where the boom is pointing.  That is what makes the
+    crosshair mean something -- `aim_ray()` is the line out of the middle of
+    the screen, and it is the same line the view was built from.
+
+Everything with a number in it is an attribute rather than a constant read at
+use, so the console's sliders can move it while the game runs.
 """
 
 import math
 
 from .math_util import (
-    atan2s, coss_f, degrees_to_s16, s16, sins_f, to_panda,
+    coss_f, degrees_to_s16, s16, sins_f, to_panda,
 )
 from .surfaces import WallCollisionData
 
-# Distance and height the camera prefers to sit at behind Mario.  The height
-# is kept low so the view stays close to horizontal and the horizon -- and
-# whatever Mario is running toward -- stays visible.
-DEFAULT_DISTANCE = 1500.0
-DEFAULT_HEIGHT = 230.0
+# -- framing -----------------------------------------------------------------
 
-MIN_DISTANCE = 250.0
-PITCH_MIN = -0.30
-PITCH_MAX = 0.65
+# How far above his feet the boom pivots.  Chest height on the Hero, who stands
+# a little over 200 units: the camera swings around the part of him that does
+# the aiming rather than around his ankles, which is what keeps the horizon
+# still while he turns.
+PIVOT_HEIGHT = 215.0
 
-# Smoothing rates, per second, for the camera's yaw and focus height.
-YAW_RATE = 8.0
-HEIGHT_RATE = 6.0
+# Boom length at the hip and down the sights.  Both are far shorter than the
+# 1500 the follow camera used, and that number is the clearest measure of what
+# has changed: a platformer's camera stands back so you can see the ledge you
+# are jumping to, and at 1500 units the Hero is a hundred pixels tall and what
+# he is pointing at is a smudge.  A shooter's camera stands where you can read
+# what is in front of him.
+HIP_DISTANCE = 820.0
+AIM_DISTANCE = 430.0
+
+# The shoulder offset, along the camera's own right and up axes, at the hip and
+# at the sights.  Positive right moves the *camera* right, which puts him on
+# the left of the screen and leaves the middle of it looking at open ground.
+#
+# The two land in very different places despite being nearly the same number,
+# which is worth knowing before either is changed: what decides where he sits
+# on screen is the offset against the *width the view covers at his distance*,
+# and the sights cut both the distance and the field of view.  85 units at the
+# sights pushes him twice as far toward the edge as 100 does at the hip.
+#
+# The negative lift is the other half of that.  The boom pivots well above his
+# head -- which is what a camera swinging around him wants -- and at the
+# sights, where the view covers barely two hundred units top to bottom, that
+# would drop him off the foot of the screen.  Dropping the camera instead of
+# the pivot lifts him back into the corner without touching the point the boom
+# turns around.
+HIP_SHOULDER = (100.0, 0.0)
+AIM_SHOULDER = (85.0, -25.0)
+
+# Field of view, horizontal degrees.  45 is what the game has always run at, so
+# the hip view is unchanged; the sights pull in to a little over two thirds of
+# it, which is a zoom you feel without it becoming a scope.
+HIP_FOV = 45.0
+AIM_FOV = 32.0
+
+# How much a flat sprint widens the view and lengthens the boom.  Small on
+# purpose: this is the kind of thing that is felt rather than seen, and a big
+# number turns every stop and start into a lurch.
+SPEED_REFERENCE = 38.0      # the Hero's default top speed, units per tick
+SPEED_FOV_KICK = 4.0
+SPEED_DOLLY = 110.0
+SPEED_SMOOTH = 0.45
+
+# Pitch, in radians, positive looking *down* (the camera rises as it looks
+# down, which is what the sign means geometrically).  Far wider than the old
+# -0.30..0.65: that range was set by a camera that had to keep itself out of
+# the floor by hand, and this one shortens the boom instead, so it can look
+# down at his feet and up over the castle.
+PITCH_MIN, PITCH_MAX = -0.80, 0.95
+AIM_PITCH_MIN, AIM_PITCH_MAX = -1.10, 1.15
+DEFAULT_PITCH = 0.10
+
+# -- following ---------------------------------------------------------------
+
+# Seconds for the pivot to close on him.  Horizontal is quick enough to feel
+# attached and slow enough to swallow the 33 ms simulation step and the
+# quarter-step pushback off a wall.
+FOLLOW_SMOOTH = 0.055
+
+# Vertical is its own problem.  A dead band means his height has to change by
+# more than a step before the camera answers at all, so stairs, kerbs and the
+# ordinary bob of a run leave the horizon alone; past the band the camera moves
+# to the edge of it rather than to him, which is what makes the recovery smooth
+# instead of a catch-up lurch.  The air gets a wider band and a slower spring:
+# a jump you can see the top of reads better than one the camera rides.
+GROUND_DEADZONE = 55.0
+GROUND_SMOOTH = 0.22
+AIR_DEADZONE = 130.0
+AIR_SMOOTH = 0.38
+# ...but never let him leave the frame.  A jetpack climb outruns any spring,
+# and this is the leash that keeps him on screen when it does.
+MAX_VERTICAL_LAG = 520.0
+# How far off the floor he has to be for the air rules to apply.
+AIRBORNE_HEIGHT = 60.0
+
+# -- the boom ----------------------------------------------------------------
+
+# How fat the camera is when the level is asked whether it fits.
+CAMERA_RADIUS = 90.0
+FLOOR_CLEARANCE = 90.0
+CEILING_CLEARANCE = 60.0
+# Seconds the camera takes to climb over ground it has run into.  See
+# `_ride_the_ground`; this is the one keep-out that is smoothed, and why.
+LIFT_SMOOTH = 0.08
+
+# Nearest the camera may ever sit to the pivot.  At this range it is nearly a
+# first-person view, which is the right answer when he is jammed into a corner
+# and there is nowhere else for the camera to be.
+MIN_DISTANCE = 190.0
+
+# Seconds for the boom to grow back once whatever shortened it has gone.  The
+# other direction has no constant because it has no delay: see the module
+# docstring.
+BOOM_RETURN = 0.32
+
+# How finely the pivot-to-camera segment is sampled for occlusion.  A step of
+# about 110 units against a camera radius of 90 means nothing thinner than the
+# camera can slip between two samples.
+OCCLUSION_STEP = 110.0
+OCCLUSION_MAX_SAMPLES = 14
+
+# -- look input --------------------------------------------------------------
+
+# Mouse: degrees of view per hundred pixels of movement.
+MOUSE_SENSITIVITY = 22.0
+# How long a mouse delta is spread over.  Two hundredths of a second is below
+# the threshold where it reads as lag and above the one where a 125 Hz mouse
+# sampled at 200 fps stair-steps.  Set it to zero for a raw 1:1 pointer.
+MOUSE_SMOOTHING = 0.02
+
+# Stick: degrees per second at full deflection, before the ramp.
+STICK_YAW_SPEED = 250.0
+STICK_PITCH_SPEED = 170.0
+# The response curve.  Squaring the magnitude and keeping the direction gives
+# fine aim near the centre and the full rate at the rim, which is the shape
+# every console shooter uses and the reason a stick can aim at all.
+STICK_EXPONENT = 2.0
+# Turn ramp: hold the stick near its rim and the turn rate climbs to this
+# multiple over this many seconds, then drops back the moment it is released.
+# Without it a stick has to choose between turning around quickly and tracking
+# something slowly; with it, it does both.
+STICK_RAMP_BOOST = 0.85
+STICK_RAMP_SECONDS = 0.45
+STICK_RAMP_THRESHOLD = 0.85
+STICK_RAMP_RELEASE = 6.0
+
+# What aiming does to the sensitivity of both.  Down the sights the same hand
+# movement covers less angle, which is the whole point of aiming.
+AIM_SENSITIVITY = 0.55
+
+# Seconds the two transitions take.  In is faster than out: raising a weapon is
+# a decision and lowering it is a relaxation, and matching the two makes the
+# aim feel mushy to press.
+AIM_IN_SMOOTH = 0.11
+AIM_OUT_SMOOTH = 0.18
+
+# -- auto-align --------------------------------------------------------------
+
+# The camera drifts back behind him while he runs, but only after he has left
+# the look control alone this long, and only in proportion to how fast he is
+# going.  It is what keeps a keyboard player -- who can only turn the view with
+# Q and E -- from having to steer the camera as a second job, and it has to be
+# gentle enough that it is never felt as the camera disagreeing.
+AUTO_ALIGN_DELAY = 1.1
+AUTO_ALIGN_RATE = 2.2
+AUTO_ALIGN_MIN_SPEED = 8.0
+
+# Recentring (R, or the right shoulder) is not a snap.  It is a quarter-second
+# spring onto his back, which arrives fast enough to be a command and slow
+# enough to be followed by eye.
+RECENTER_SMOOTH = 0.22
+
+# -- shake -------------------------------------------------------------------
+
+# A landing kick, decaying.  The three frequencies are deliberately not
+# multiples of each other so the sum never repeats inside the time it lasts,
+# which is what keeps it from reading as a wobble.
+SHAKE_DECAY = 1.6
+SHAKE_YAW = 1.5             # degrees at full trauma
+SHAKE_PITCH = 2.2
+SHAKE_ROLL = 1.1
+SHAKE_FREQUENCIES = (13.7, 17.3, 23.1)
 
 
 def _wrap_angle(value):
@@ -38,122 +247,601 @@ def _wrap_angle(value):
     return (value + 0x8000) % 0x10000 - 0x8000
 
 
-def _blend(rate, dt):
-    """Frame-rate independent smoothing factor.
+def smooth_damp(current, target, velocity, smooth_time, dt):
+    """A critically damped spring, solved rather than integrated.
 
-    A plain `rate * dt` changes how fast the camera settles when the frame
-    rate changes, and passes any jitter in dt straight through to the motion.
-    Exponential decay gives the same settling time at any frame rate.
+    Returns (value, velocity).  This is Unity's SmoothDamp and the algebra is
+    its algebra: the exact solution of a critically damped spring over the
+    step, with the exponential replaced by a Pade approximation that is
+    accurate to a part in ten thousand over any step this will ever see.
+
+    Critically damped rather than exponential -- `current += (target - current)
+    * rate * dt` and its frame-rate-independent cousin -- because the two
+    differ in exactly the way that is felt.  Exponential smoothing is fastest
+    at the instant the target moves and slows from there, so a target that
+    changes velocity produces a corner in the output.  A spring carries its own
+    velocity across the change, so the output is smooth in its first derivative
+    as well as its value.  That is the difference between a camera that follows
+    and a camera that glides, and it costs four multiplies.
     """
-    return 1.0 - math.exp(-rate * dt)
+    smooth_time = max(smooth_time, 1e-4)
+    omega = 2.0 / smooth_time
+    x = omega * dt
+    decay = 1.0 / (1.0 + x + 0.48 * x * x + 0.235 * x * x * x)
+
+    change = current - target
+    temp = (velocity + omega * change) * dt
+    velocity = (velocity - omega * temp) * decay
+    result = target + (change + temp) * decay
+
+    # Stop dead on the target rather than ringing through it.  Overshoot in a
+    # critically damped spring is numerical, not physical, and letting it stand
+    # shows up as a camera that shivers when it arrives.
+    if (target - current > 0.0) == (result > target):
+        result = target
+        velocity = 0.0
+    return result, velocity
+
+
+def _smooth_damp_angle(current, target, velocity, smooth_time, dt):
+    """`smooth_damp` on the short way round a circle of binary angles."""
+    target = current + _wrap_angle(target - current)
+    value, velocity = smooth_damp(current, target, velocity, smooth_time, dt)
+    return _wrap_angle(value), velocity
+
+
+def _approach(current, target, rate, dt):
+    """Move toward a target at a fixed rate per second, stopping on it."""
+    step = rate * dt
+    if current < target:
+        return min(current + step, target)
+    return max(current - step, target)
+
+
+def _clamp(value, lo, hi):
+    return lo if value < lo else (hi if value > hi else value)
+
+
+def _ease(t):
+    """Smoothstep, for blends the player watches rather than steers.
+
+    A linear blend into the sights starts and stops abruptly at both ends; this
+    is flat at both, so the move has no seam where it begins or where it lands.
+    """
+    t = _clamp(t, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
 
 
 class FollowCamera:
+    """The camera, and the only thing that decides where the view points.
+
+    Constructed with the character it should follow; hand it a different one
+    through `target` when the game switches which is being played.
+    """
+
     def __init__(self, surfaces, mario):
         self.surfaces = surfaces
-        self.mario = mario
+        self.target = mario
 
-        # Kept as a float in binary-angle units.  Rounding it to whole s16
-        # units each frame would truncate any easing step smaller than one
-        # unit to zero, so a slow pan stalls outright and then jumps: easing
-        # 30 degrees at 60 fps moved on only 53 of 239 frames, and never
-        # finished arriving.  Gameplay still sees a whole-unit angle through
-        # the mario_yaw property.
+        # -- what the console is allowed to move --------------------------
+        self.distance = HIP_DISTANCE
+        self.aim_distance = AIM_DISTANCE
+        self.height = PIVOT_HEIGHT
+        self.shoulder = HIP_SHOULDER[0]
+        self.aim_shoulder = AIM_SHOULDER[0]
+        self.base_fov = HIP_FOV
+        self.aim_fov = AIM_FOV
+        self.mouse_sensitivity = MOUSE_SENSITIVITY
+        self.mouse_smoothing = MOUSE_SMOOTHING
+        self.stick_speed = STICK_YAW_SPEED
+        self.stick_pitch_speed = STICK_PITCH_SPEED
+        self.follow_smooth = FOLLOW_SMOOTH
+        self.auto_align = 1.0
+        self.shake_scale = 1.0
+        self.invert_pitch = False
+
+        # -- angles --------------------------------------------------------
+        # Yaw is the bearing from the character *to* the camera, kept as a
+        # float in binary-angle units.  Rounding it to whole s16 units each
+        # frame would truncate any step smaller than one unit to zero, so a
+        # slow pan stalls and then jumps: easing 30 degrees at 60 fps moved on
+        # only 53 of 239 frames.  Gameplay still sees a whole-unit angle,
+        # through the `mario_yaw` property.
         self.yaw = float(s16(mario.face_angle[1] + 0x8000))
-        self.pitch = 0.06
-        self.distance = DEFAULT_DISTANCE
-        self.height = DEFAULT_HEIGHT
+        self.pitch = DEFAULT_PITCH
 
+        # -- state ---------------------------------------------------------
         self.pos = [0.0, 0.0, 0.0]
         self.focus = [0.0, 0.0, 0.0]
+        self.fov = self.base_fov
 
-        # Yaw the player is steering toward; the actual yaw eases into it.
-        self.target_yaw = self.yaw
+        self._pivot = [0.0, 0.0, 0.0]
+        self._pivot_vel = [0.0, 0.0, 0.0]
         self._initialised = False
 
+        self._boom = self.distance
+        self._boom_vel = 0.0
+        self._lift = 0.0
+        self._lift_vel = 0.0
+
+        self._aim = 0.0             # where the sights actually are, eased
+        self._aim_raw = 0.0         # the same, before the ease
+        self._aim_target = 0.0      # where the player is asking for them
+
+        self._speed_blend = 0.0
+        self._speed_vel = 0.0
+
+        self._ramp = 0.0            # the stick's turn ramp, 0..1
+        self._look_idle = 0.0       # seconds since the player last looked
+        self._pending_mouse = [0.0, 0.0]
+
+        self._recentring = False
+        self._recenter_held = False
+        self._recenter_vel = 0.0
+        self._recenter_pitch_vel = 0.0
+
+        self._trauma = 0.0
+        self._shake_time = 0.0
+
+    # -- compatibility --------------------------------------------------------
+
+    @property
+    def mario(self):
+        """The character being followed, under the name the old camera used."""
+        return self.target
+
+    @mario.setter
+    def mario(self, value):
+        self.target = value
+
+    # -- look input -----------------------------------------------------------
+
+    def look(self, right_degrees, up_degrees):
+        """Turn the view.  Positive is right and up, as the player sees it.
+
+        Applied immediately and in full.  This is the one input in the whole
+        camera that gets no smoothing of any kind, and the reason is the module
+        docstring's: a smoothed look input is latency wearing a costume.
+        """
+        if self.invert_pitch:
+            up_degrees = -up_degrees
+        scale = self.look_scale
+        # The view turning right is the camera swinging left around him, which
+        # is why the yaw -- a bearing to the camera -- takes the sign inverted.
+        self.yaw = _wrap_angle(self.yaw - degrees_to_s16(right_degrees * scale))
+        self.pitch = self._clamp_pitch(
+            self.pitch - math.radians(up_degrees * scale))
+        if right_degrees or up_degrees:
+            self._look_idle = 0.0
+            self._recentring = False
+
+    def look_mouse(self, dx_pixels, dy_pixels):
+        """Feed a mouse delta.  Positive dy is upward, as Panda3D reports it.
+
+        The delta is banked rather than applied, and `update` pays it out over
+        `mouse_smoothing` seconds.  At the default 20 ms that is most of it on
+        the frame it arrived and the remainder on the next, which is enough to
+        take the stair-step off a 125 Hz mouse being read at 200 fps without
+        putting anything the hand can feel between the two.
+        """
+        self._pending_mouse[0] += dx_pixels
+        self._pending_mouse[1] += dy_pixels
+
+    def look_stick(self, x, y, dt):
+        """Feed a look stick, already past its deadzone.  Positive is right/up.
+
+        Everything a stick needs to aim rather than merely turn is here: a
+        squared response so the middle of its travel is fine control, and a
+        ramp so holding it at the rim accelerates into a fast turn without
+        costing the slow one.
+        """
+        magnitude = math.hypot(x, y)
+        if magnitude <= 0.0:
+            # Drop the ramp quickly rather than instantly: flicking through
+            # centre while adjusting a turn should not cost the whole ramp.
+            self._ramp = max(0.0, self._ramp - STICK_RAMP_RELEASE * dt)
+            return
+
+        magnitude = min(magnitude, 1.0)
+        was = self._ramp
+        if magnitude >= STICK_RAMP_THRESHOLD:
+            self._ramp = min(1.0, self._ramp + dt / STICK_RAMP_SECONDS)
+        else:
+            self._ramp = max(0.0, self._ramp - STICK_RAMP_RELEASE * dt)
+
+        curved = magnitude ** STICK_EXPONENT / magnitude
+        # The ramp across the middle of the frame rather than at either end.
+        # Taking it at one end integrates a rate that is changing with a step
+        # of dt, and the error in that is a turn that comes out several percent
+        # different at 30 fps and at 240 -- which is exactly what this whole
+        # method exists to avoid.
+        boost = 1.0 + (was + self._ramp) * 0.5 * STICK_RAMP_BOOST
+        self.look(x * curved * self.stick_speed * boost * dt,
+                  y * curved * self.stick_pitch_speed * boost * dt)
+
+    @property
+    def look_scale(self):
+        """What the sights do to sensitivity, blended with them."""
+        return 1.0 + (AIM_SENSITIVITY - 1.0) * self._aim
+
     def rotate(self, delta_degrees):
-        self.target_yaw = s16(self.target_yaw + degrees_to_s16(delta_degrees))
+        """Swing the *camera* left or right.  The legacy sign: Q and E's."""
+        self.look(-delta_degrees, 0.0)
 
     def tilt(self, delta):
-        self.pitch = min(max(self.pitch + delta, PITCH_MIN), PITCH_MAX)
+        """Raise or lower the *camera*, in radians.  The legacy sign."""
+        self.look(0.0, -math.degrees(delta))
+
+    # -- the sights -----------------------------------------------------------
+
+    def set_aim(self, amount):
+        """How far down the sights to be, 0 to 1.
+
+        Takes an amount rather than a flag so an analog trigger half pressed
+        gets half the move, which is a thing a trigger can do and a button
+        cannot.
+        """
+        self._aim_target = _clamp(float(amount), 0.0, 1.0)
+
+    @property
+    def aiming(self):
+        """Is the player asking for the sights at all?"""
+        return self._aim_target > 0.01
+
+    @property
+    def aim_amount(self):
+        """Where the sights actually are, eased.  What the HUD should read."""
+        return self._aim
+
+    def shake(self, amount):
+        """Add trauma -- a landing, a hit.  Decays on its own from there."""
+        self._trauma = _clamp(self._trauma + amount, 0.0, 1.0)
+
+    # -- the frame ------------------------------------------------------------
 
     def update(self, dt, target_pos=None, recenter=False):
-        m = self.mario
-        # Follow the interpolated render position when one is supplied; the
-        # raw simulation position only moves in 30 Hz steps and would judder.
+        if dt <= 0.0:
+            return
+        m = self.target
+        # Follow the interpolated render position when one is supplied; the raw
+        # simulation position only moves in 30 Hz steps and would judder.
         pos = target_pos if target_pos is not None else m.pos
 
-        if recenter:
-            # Snap around behind Mario, the way pressing R does.
-            self.target_yaw = s16(m.face_angle[1] + 0x8000)
+        self._flush_mouse(dt)
+        self._update_aim_blend(dt)
+        self._update_recenter(dt, recenter)
+        self._update_auto_align(dt)
+        self._look_idle += dt
 
-        # Ease the yaw toward its target on the short way round.
-        delta = _wrap_angle(self.target_yaw - self.yaw)
-        self.yaw = _wrap_angle(self.yaw + delta * _blend(YAW_RATE, dt))
+        self._follow(dt, pos)
+        self._place(dt)
 
-        focus_x = pos[0]
-        focus_y = pos[1] + 120.0
-        focus_z = pos[2]
+        self._trauma = max(0.0, self._trauma - dt / SHAKE_DECAY)
+        self._shake_time += dt
 
-        # Ease the focus height so stairs and slopes do not jolt the view.
-        if self._initialised:
-            self.focus[0] = focus_x
-            self.focus[2] = focus_z
-            self.focus[1] += (focus_y - self.focus[1]) * _blend(HEIGHT_RATE, dt)
-        else:
-            self.focus = [focus_x, focus_y, focus_z]
+    def _flush_mouse(self, dt):
+        """Pay out the banked mouse delta over `mouse_smoothing` seconds."""
+        dx, dy = self._pending_mouse
+        if dx == 0.0 and dy == 0.0:
+            return
+        share = 1.0 if self.mouse_smoothing <= 0.0 \
+            else min(1.0, dt / self.mouse_smoothing)
+        self._pending_mouse = [dx * (1.0 - share), dy * (1.0 - share)]
+        scale = self.mouse_sensitivity / 100.0
+        self.look(dx * share * scale, dy * share * scale)
+
+    def _update_aim_blend(self, dt):
+        target = self._aim_target
+        smooth = AIM_IN_SMOOTH if target > self._aim else AIM_OUT_SMOOTH
+        # Eased on top of a fixed-rate approach: the rate decides how long the
+        # move takes -- a fixed one, so half pressing a trigger and letting go
+        # costs half the time rather than the same time -- and the ease decides
+        # its shape.  The pair is what makes raising the sights read as a
+        # movement rather than as a value changing.
+        self._aim_raw = _approach(self._aim_raw, target, 1.0 / smooth, dt)
+        self._aim = _ease(self._aim_raw)
+        # The sights are a decision to look at one thing; carry the pitch
+        # limits with them so the view is not fenced in on the way.
+        self.pitch = self._clamp_pitch(self.pitch)
+
+    def _clamp_pitch(self, pitch):
+        low = PITCH_MIN + (AIM_PITCH_MIN - PITCH_MIN) * self._aim
+        high = PITCH_MAX + (AIM_PITCH_MAX - PITCH_MAX) * self._aim
+        return _clamp(pitch, low, high)
+
+    def _update_recenter(self, dt, held):
+        """Spring onto his back, once per press rather than while held."""
+        if held and not self._recenter_held:
+            self._recentring = True
+            self._recenter_vel = 0.0
+            self._recenter_pitch_vel = 0.0
+        self._recenter_held = held
+        if not self._recentring:
+            return
+
+        target = float(s16(self.target.face_angle[1] + 0x8000))
+        self.yaw, self._recenter_vel = _smooth_damp_angle(
+            self.yaw, target, self._recenter_vel, RECENTER_SMOOTH, dt)
+        self.pitch, self._recenter_pitch_vel = smooth_damp(
+            self.pitch, DEFAULT_PITCH, self._recenter_pitch_vel,
+            RECENTER_SMOOTH, dt)
+        # Done when it is close enough that the rest would not be seen.  Held
+        # keys keep re-arming it, which is what makes holding R hold the view
+        # behind him.
+        if abs(_wrap_angle(target - self.yaw)) < 0x0040 and not held:
+            self._recentring = False
+
+    def _update_auto_align(self, dt):
+        """Drift back behind him while he runs and nobody is looking around.
+
+        Off entirely while aiming: down the sights the view *is* the aim, and
+        a camera that quietly re-points it is a camera fighting the player.
+        """
+        if (self._recentring or self.auto_align <= 0.0 or self._aim > 0.01
+                or self._look_idle < AUTO_ALIGN_DELAY):
+            return
+        speed = abs(getattr(self.target, "forward_vel", 0.0))
+        if speed < AUTO_ALIGN_MIN_SPEED:
+            return
+
+        strength = min(speed / SPEED_REFERENCE, 1.0) * self.auto_align
+        target = float(s16(self.target.face_angle[1] + 0x8000))
+        delta = _wrap_angle(target - self.yaw)
+        self.yaw = _wrap_angle(
+            self.yaw + delta * (1.0 - math.exp(-AUTO_ALIGN_RATE * strength * dt)))
+
+    def _follow(self, dt, pos):
+        """Move the pivot toward chest height on him."""
+        target_y = pos[1] + self.height
+        if not self._initialised:
+            self._pivot = [pos[0], target_y, pos[2]]
+            self._pivot_vel = [0.0, 0.0, 0.0]
             self._initialised = True
+            return
 
-        horizontal = self.distance * math.cos(self.pitch)
-        desired = [
-            self.focus[0] + horizontal * sins_f(self.yaw),
-            self.focus[1] + self.height + self.distance * math.sin(self.pitch),
-            self.focus[2] + horizontal * coss_f(self.yaw),
+        for axis in (0, 2):
+            self._pivot[axis], self._pivot_vel[axis] = smooth_damp(
+                self._pivot[axis], pos[axis], self._pivot_vel[axis],
+                self.follow_smooth, dt)
+
+        floor = getattr(self.target, "floor_height", None)
+        airborne = floor is None or (pos[1] - floor) > AIRBORNE_HEIGHT
+        band = AIR_DEADZONE if airborne else GROUND_DEADZONE
+        smooth = AIR_SMOOTH if airborne else GROUND_SMOOTH
+
+        # Inside the band the camera does not answer at all; outside it, it
+        # chases the edge of the band rather than him, so what is left when it
+        # arrives is the band itself and not a rebound.
+        gap = target_y - self._pivot[1]
+        if abs(gap) > band:
+            goal = target_y - math.copysign(band, gap)
+        else:
+            goal = self._pivot[1]
+        self._pivot[1], self._pivot_vel[1] = smooth_damp(
+            self._pivot[1], goal, self._pivot_vel[1], smooth, dt)
+
+        # The leash.  Nothing above outruns a jetpack.
+        lag = target_y - self._pivot[1]
+        if abs(lag) > MAX_VERTICAL_LAG:
+            self._pivot[1] = target_y - math.copysign(MAX_VERTICAL_LAG, lag)
+            self._pivot_vel[1] = 0.0
+
+    def _place(self, dt):
+        """Work out where the camera goes, and put it there."""
+        speed = abs(getattr(self.target, "forward_vel", 0.0))
+        self._speed_blend, self._speed_vel = smooth_damp(
+            self._speed_blend, min(speed / SPEED_REFERENCE, 1.0),
+            self._speed_vel, SPEED_SMOOTH, dt)
+        # A sprint only widens the hip view.  Down the sights the framing is
+        # the point of the mode and nothing else is allowed to move it.
+        hip = 1.0 - self._aim
+
+        forward = self.forward
+        right = self.right
+
+        length = (self.distance
+                  + (self.aim_distance - self.distance) * self._aim
+                  + SPEED_DOLLY * self._speed_blend * hip)
+        side = self.shoulder + (self.aim_shoulder - self.shoulder) * self._aim
+        lift = HIP_SHOULDER[1] + (AIM_SHOULDER[1] - HIP_SHOULDER[1]) * self._aim
+
+        # The boom root: the pivot, shifted along the camera's own axes.  Up is
+        # world up rather than the camera's, so looking down does not slide the
+        # framing sideways up the screen.
+        root = [
+            self._pivot[0] + right[0] * side,
+            self._pivot[1] + lift,
+            self._pivot[2] + right[2] * side,
         ]
+        desired = [root[i] - forward[i] * length for i in range(3)]
 
-        self.pos = self._resolve_collisions(desired)
+        # Everything from here is measured along the segment from the pivot,
+        # which is inside him and therefore known to be somewhere the camera
+        # could legally be.  Folding the shoulder offset into that segment is
+        # what makes backing into a corner give the offset up along with the
+        # length instead of grinding it into the wall.
+        dx = desired[0] - self._pivot[0]
+        dy = desired[1] - self._pivot[1]
+        dz = desired[2] - self._pivot[2]
+        full = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if full < 1e-4:
+            self.pos = list(self._pivot)
+            self.focus = [self._pivot[i] + forward[i] * 100.0 for i in range(3)]
+            self._update_fov(hip)
+            return
 
-    def _resolve_collisions(self, desired):
-        """Keep the camera out of walls and above the floor."""
-        data = WallCollisionData(desired[0], desired[1], desired[2], 0.0, 100.0)
-        self.surfaces.find_wall_collisions(data, for_camera=True)
-        x, y, z = data.x, desired[1], data.z
+        direction = (dx / full, dy / full, dz / full)
+        clear = self._clear_distance(direction, full)
 
-        # Duck under a ceiling first, then lift clear of the floor.  The floor
-        # gets the final say: in a gap too tight for both, being slightly
-        # inside the ceiling is survivable, dropping through the ground is not.
-        ceil_height, ceil = self.surfaces.find_ceil(x, y, z, for_camera=True)
-        if ceil is not None and y > ceil_height - 50.0:
-            y = ceil_height - 50.0
+        if clear < self._boom:
+            # In, on the frame it is needed.  A spring here is a camera that
+            # spends the first hundred milliseconds of every corner inside it.
+            self._boom = clear
+            self._boom_vel = 0.0
+        else:
+            self._boom, self._boom_vel = smooth_damp(
+                self._boom, clear, self._boom_vel, BOOM_RETURN, dt)
 
-        floor_height, floor = self.surfaces.find_floor(x, y, z, for_camera=True)
-        if floor is not None and y < floor_height + 125.0:
-            y = floor_height + 125.0
+        self.pos = [self._pivot[i] + direction[i] * self._boom for i in range(3)]
+        self.pos = self._safety_net(self._ride_the_ground(self.pos, dt))
+        # The point on the view ray level with him: what the old camera called
+        # its focus, and still what anything measuring the aim starts from.
+        self.focus = [self.pos[i] + forward[i] * self._boom for i in range(3)]
+        self._update_fov(hip)
 
-        # Never end up inside Mario.
-        dx, dz = x - self.focus[0], z - self.focus[2]
-        dist = math.hypot(dx, dz)
-        if dist < MIN_DISTANCE and dist > 0.001:
-            scale = MIN_DISTANCE / dist
-            x = self.focus[0] + dx * scale
-            z = self.focus[2] + dz * scale
+    def _update_fov(self, hip):
+        self.fov = (self.base_fov
+                    + (self.aim_fov - self.base_fov) * self._aim
+                    + SPEED_FOV_KICK * self._speed_blend * hip)
 
+    def _clear_distance(self, direction, full):
+        """How far along `direction` the camera can go before it hits something.
+
+        Marched rather than solved: the collision here is a soup of triangles
+        in a lateral grid with no ray query on it, and the two tests it does
+        have -- push a sphere out of the walls, find the floor under a point --
+        are exactly the two a camera cares about.  Sampling them along the
+        segment costs about a dozen queries a frame, which is a fifth of what
+        the squad reticle spends while it is up.
+
+        Note what is *not* in `_occupied`: standing on the ground.  A hillside
+        rising behind him would otherwise shorten the boom every time he ran
+        downhill, and the answer to ground in the way is to go over it, not to
+        crowd his shoulder -- which is what `_ride_the_ground` does.  Only
+        something the camera cannot go over shortens the boom.
+        """
+        samples = int(min(max(full / OCCLUSION_STEP, 3.0), OCCLUSION_MAX_SAMPLES))
+        step = full / samples
+        for i in range(1, samples + 1):
+            distance = step * i
+            point = (self._pivot[0] + direction[0] * distance,
+                     self._pivot[1] + direction[1] * distance,
+                     self._pivot[2] + direction[2] * distance)
+            if self._occupied(*point):
+                # Stop short of the sample that was inside something, by the
+                # camera's own radius: the sample before it is the last one
+                # known to be clear, and the truth is between the two.
+                return max(distance - CAMERA_RADIUS, MIN_DISTANCE)
+        return full
+
+    def _occupied(self, x, y, z):
+        """Is a camera-sized sphere here inside a wall or through a ceiling?"""
+        data = WallCollisionData(x, y, z, 0.0, CAMERA_RADIUS)
+        if self.surfaces.find_wall_collisions(data, for_camera=True):
+            return True
+
+        height, ceil = self.surfaces.find_ceil(
+            x, y - CAMERA_RADIUS, z, for_camera=True)
+        return ceil is not None and y > height - CEILING_CLEARANCE
+
+    def _ride_the_ground(self, pos, dt):
+        """Lift the camera over whatever ground it has ended up inside.
+
+        A slope behind him is not an obstruction, it is a thing to stand on.
+        Shortening the boom for it would mean the camera crowded his shoulder
+        every time he walked down a hill -- and it is a hill, so he can see over
+        it perfectly well from six feet up.
+
+        The lift is smoothed, and it is the one keep-out in here that is: what
+        it tracks is the ground under a point that is moving, so it changes with
+        every bump the camera passes over, and a hard clamp would transmit each
+        of them to the view.  Eighty milliseconds is short enough that the few
+        frames it spends catching up with a step in the terrain are frames the
+        camera is a little low rather than frames it is underground.
+        """
+        height, floor = self.surfaces.find_floor(
+            pos[0], pos[1] + CAMERA_RADIUS, pos[2], for_camera=True)
+        wanted = 0.0
+        if floor is not None:
+            wanted = max(height + FLOOR_CLEARANCE - pos[1], 0.0)
+        self._lift, self._lift_vel = smooth_damp(
+            self._lift, wanted, self._lift_vel, LIFT_SMOOTH, dt)
+        pos[1] += self._lift
+        return pos
+
+    def _safety_net(self, pos):
+        """Last resort: keep the camera out of what it has ended up inside.
+
+        The march and the lift are what actually keep the camera clear, and in
+        open ground neither of these fires.  This is for what they cannot cover
+        -- a surface that appears between the pivot and the camera without ever
+        crossing the segment, which the level's moving platforms can do -- and
+        it is deliberately a hard clamp, because a smoothed correction to being
+        underground is a smooth trip underground.
+        """
+        x, y, z = pos
+        height, ceil = self.surfaces.find_ceil(x, y, z, for_camera=True)
+        if ceil is not None and y > height - 50.0:
+            y = height - 50.0
+        height, floor = self.surfaces.find_floor(x, y, z, for_camera=True)
+        if floor is not None and y < height + 20.0:
+            y = height + 20.0
         return [x, y, z]
+
+    # -- what the rest of the game reads --------------------------------------
+
+    @property
+    def view_yaw(self):
+        """The bearing the camera looks along, as a float binary angle."""
+        return _wrap_angle(self.yaw + 0x8000)
+
+    @property
+    def forward(self):
+        """The unit vector out of the middle of the screen."""
+        flat = math.cos(self.pitch)
+        view = self.view_yaw
+        return (sins_f(view) * flat, -math.sin(self.pitch), coss_f(view) * flat)
+
+    @property
+    def right(self):
+        """The unit vector toward the right of the screen, level with it."""
+        view = self.view_yaw
+        return (-coss_f(view), 0.0, sins_f(view))
+
+    def aim_ray(self):
+        """The line out of the middle of the screen: (origin, direction).
+
+        The one thing a crosshair means.  It comes off the camera's own angles
+        rather than from subtracting two placed points, so it is exact even on
+        the frame the boom is being shoved through a wall.
+        """
+        return tuple(self.pos), self.forward
 
     @property
     def mario_yaw(self):
         """The yaw the analog stick should be interpreted relative to.
 
-        Stick-up must send Mario away from the camera, and the camera sits
-        behind him, so this is the camera's yaw turned around.
+        Stick-up must send him away from the camera, which is along the view.
 
         Rounded to a whole binary angle even though the camera tracks a float
         one: this feeds the movement code, which is meant to see the same
         quantised angle the original does.
         """
-        return s16(round(self.yaw) + 0x8000)
+        return s16(round(self.view_yaw))
 
-    def apply_to(self, node):
-        """Point a Panda3D camera node at Mario from the current position."""
+    def apply_to(self, node, lens=None):
+        """Point a Panda3D camera node along the view, and set its lens."""
         node.set_pos(*to_panda(*self.pos))
-        node.look_at(*to_panda(self.focus[0], self.focus[1] + 60.0, self.focus[2]))
+        forward = self.forward
+        node.look_at(*to_panda(self.pos[0] + forward[0] * 1000.0,
+                               self.pos[1] + forward[1] * 1000.0,
+                               self.pos[2] + forward[2] * 1000.0))
+
+        if self._trauma > 0.0 and self.shake_scale > 0.0:
+            # Trauma squared, so a small knock is much smaller than a large one
+            # rather than proportionally smaller -- which is what stops every
+            # footfall-sized event from registering as a shake.
+            amount = self._trauma * self._trauma * self.shake_scale
+            f1, f2, f3 = SHAKE_FREQUENCIES
+            t = self._shake_time
+            node.set_hpr(
+                node.get_h() + math.sin(t * f1) * SHAKE_YAW * amount,
+                node.get_p() + math.sin(t * f2 + 1.7) * SHAKE_PITCH * amount,
+                node.get_r() + math.sin(t * f3 + 3.1) * SHAKE_ROLL * amount,
+            )
+
+        # Only when it has actually moved: assigning to a lens rebuilds its
+        # projection matrix, and the field of view holds still for most of the
+        # game's running time.
+        if lens is not None and abs(lens.get_hfov() - self.fov) > 0.01:
+            lens.set_fov(self.fov)
