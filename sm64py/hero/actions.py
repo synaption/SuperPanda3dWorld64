@@ -317,6 +317,26 @@ def update_air_movement(m):
     m.vel[2] = m.slide_vel_z
 
 
+def update_jetpack_movement(m):
+    """Steer under thrust the way he steers on the ground.
+
+    The weak air control above is a jump's: he keeps the heading he took off
+    with and the stick only nudges him off it. Under power there is nothing
+    holding him to that heading, so the boosters get the running controls
+    outright -- the same turn toward the stick at `TURN_RATE`, the same
+    acceleration and the same top speed -- which is what lets him fly a circle
+    around the camera instead of drifting sideways with his back to it.
+    """
+    if m.input & C.INPUT_NONZERO_ANALOG:
+        update_ground_speed(m)
+    else:
+        # Coast to a stop rather than keeping the speed he flew in with, the
+        # same as letting go of the stick on the ground does.
+        m.forward_vel = approach_f32(m.forward_vel, 0.0, H.DECELERATION,
+                                     H.DECELERATION)
+        m.set_forward_vel(m.forward_vel)
+
+
 def land_from_air(m):
     """Which landing to play, and whether he keeps running through it."""
     if in_deep_water(m):
@@ -392,7 +412,7 @@ def act_fall(m):
 
 @action(H.ACT_HERO_JETPACK, "jetpack")
 def act_jetpack(m):
-    """Thrust up for as long as A is held, steering with the stick.
+    """Thrust up for as long as A is held, flown with the running controls.
 
     The thrust is written as an approach toward a rise speed, run before the
     air step rather than after it, which is what makes the number behave: the
@@ -412,7 +432,7 @@ def act_jetpack(m):
     m.vel[1] = approach_f32(m.vel[1], H.JETPACK_RISE_SPEED,
                             H.JETPACK_THRUST, H.JETPACK_THRUST)
 
-    update_air_movement(m)
+    update_jetpack_movement(m)
     step = perform_air_step(m)
 
     if step == C.AIR_STEP_LANDED:
@@ -420,7 +440,11 @@ def act_jetpack(m):
         # the way up should set him down rather than grind him along it.
         return land_from_air(m)
     if step == C.AIR_STEP_HIT_WALL:
-        m.forward_vel = 0.0
+        # Through the setter rather than the field alone, as the grounded
+        # actions do it: it clears the horizontal velocity the wall stopped as
+        # well as the speed behind it, so nothing else reads a frame of motion
+        # into a wall before the next one recomputes it.
+        m.set_forward_vel(0.0)
 
     m.action_timer += 1
     return False

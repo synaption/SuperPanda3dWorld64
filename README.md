@@ -146,6 +146,12 @@ a ledge, or halfway down from a jump he let go of — lights it from wherever he
 is, arresting the fall over a few frames and then climbing. A tap is still an
 ordinary jump, which is what the six-frame delay is for.
 
+He steers under thrust with the running controls rather than a jump's weak air
+control: the stick turns him at the same `TURN_RATE` and accelerates him to the
+same top speed, so he flies a circle around the camera facing where he is going
+instead of drifting sideways, and letting go of it coasts him to a stop in the
+air the way it does on the ground.
+
 There is no flying clip among his twenty, so he keeps the pose he is already
 in: `jump up` while he is rising, `jump down` while he is still coming down.
 
