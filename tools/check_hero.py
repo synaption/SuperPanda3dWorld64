@@ -181,7 +181,12 @@ def check_the_trigger_skates_him():
         if not actions or actions[-1] != name:
             actions.append(name)
 
+    clip, _loop, rate = A.resolve(run.hero)
     problems = []
+    if clip != A.RUN:
+        problems.append(f"it drew {clip!r} rather than the run")
+    if rate < 1.0:
+        problems.append(f"the run played at {rate:.2f}, slower than a run")
     if actions[:1] != ["skating"]:
         problems.append(f"{started} went to {actions[:1]}, not to the skates")
     if set(actions) != {"skating"}:
@@ -195,50 +200,78 @@ def check_the_trigger_skates_him():
     return not problems, ("; ".join(problems) if problems
                           else f"{started} -> skating at "
                                f"{run.hero.forward_vel:.0f} u/frame, "
-                               f"{lift:.1f} units of lift")
+                               f"{lift:.1f} units of lift, "
+                               f"{clip!r} at {rate:.2f}")
+
+
+def check_the_stride_survives_the_trigger():
+    """Going onto the skates at a run, and off them, must not reset the stride.
+
+    Both sides draw the same cycle, so a restart is not a change of animation,
+    it is the same one dropped back to the top of its stride -- a visible hitch
+    on a control that is held and let go of constantly.
+    """
+    run = Run()
+    for _ in range(60):
+        run.tick(forward=1.0)            # up to a run
+    before = A.action_anim(run.hero)
+
+    clips, resets = set(), 0
+    run.hero.anim_reset = False
+    for frame in range(60):
+        # Read and cleared the way `Game._update_animation` reads and clears
+        # it, so what is counted is restarts asked for rather than one flag
+        # left standing since an earlier transition.
+        run.tick(forward=1.0, thrust=10 <= frame < 40)
+        resets += run.hero.anim_reset
+        run.hero.anim_reset = False
+        clips.add(A.action_anim(run.hero))
+
+    problems = []
+    if clips != {A.RUN}:
+        problems.append(f"the clip changed: {sorted(clips)}")
+    if resets:
+        problems.append(f"the stride was reset {resets} times")
+    if run.hero.action_name != "walking":
+        problems.append(f"ended in {run.hero.action_name}, not back in a run")
+
+    return not problems, ("; ".join(problems) if problems else
+                          f"{before!r} runs unbroken through the trigger going "
+                          "down and coming back up")
 
 
 def check_a_takes_off_from_the_skates():
     """A out of a skate is the take-off, and there is no jump in front of it.
 
-    The clip is checked as well as the action, because "no jump animation at
-    the beginning" is not something the action ids can say on their own: the
-    skate and the flight draw the same held pose, and the take-off is only
-    seamless if the transition leaves it alone rather than restarting it.
+    `ACT_HERO_JUMP` never being entered is the whole of it, and it is not a
+    detail of bookkeeping: the jump carries its own take-off arc, its own
+    button-governed height and a landing at the end of it, and none of those
+    belong in front of a flight. What he draws going up is the flight's pose
+    rather than the jump's, which is the same clip -- there being no flying
+    clip in the set -- and reached from a different action.
     """
     run = Run()
     run.tick(thrust=True)
-    pose = A.action_anim(run.hero)
+    skate_pose = A.action_anim(run.hero)
 
-    actions, resets = [], 0
-    run.hero.anim_reset = False
+    actions = []
     for frame in range(120):
         run.tick(thrust=True, buttons=C.A_BUTTON if frame == 4 else 0)
-        # Read and cleared the way `Game._update_animation` reads and clears
-        # it, so what is counted is restarts asked for rather than one flag
-        # left standing since the first transition.
-        resets += run.hero.anim_reset
-        run.hero.anim_reset = False
         name = run.hero.action_name
         if not actions or actions[-1] != name:
             actions.append(name)
 
     problems = []
-    if "jump" in actions:
-        problems.append(f"it jumped on the way up: {actions}")
-    if "jetpack" not in actions:
-        problems.append(f"A never took him off the skates: {actions}")
-    if A.action_anim(run.hero) != pose:
-        problems.append(f"the pose changed: {pose!r} -> "
-                        f"{A.action_anim(run.hero)!r}")
-    if resets:
-        problems.append(f"the clip restarted {resets} times")
+    if actions != ["skating", "jetpack"]:
+        problems.append(f"took off through {actions}, not skating -> jetpack")
+    if skate_pose != A.RUN:
+        problems.append(f"the skate drew {skate_pose!r}, not the run")
     if run.height < 800.0:
         problems.append(f"only climbed {run.height:.0f} units")
 
     return not problems, ("; ".join(problems) if problems else
-                          f"skating -> jetpack holding {pose!r} throughout, "
-                          f"{run.height:.0f} units up")
+                          f"{skate_pose!r} -> {A.action_anim(run.hero)!r}, "
+                          f"skating -> jetpack, {run.height:.0f} units up")
 
 
 def check_jetpack():
@@ -419,6 +452,7 @@ CHECKS = [
     ("jump height follows the button", check_jump_height_is_variable),
     ("the jetpack flies, and only when held", check_jetpack),
     ("the trigger skates him", check_the_trigger_skates_him),
+    ("the stride survives the trigger", check_the_stride_survives_the_trigger),
     ("A takes off from the skates", check_a_takes_off_from_the_skates),
     ("a hill does not loop the landing", check_a_hill_does_not_loop_the_landing),
     ("attack chains into the second swing", check_attack_chain),

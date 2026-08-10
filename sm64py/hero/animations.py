@@ -84,12 +84,12 @@ ACTION_ANIMATIONS = {
     H.ACT_HERO_JUMP: JUMP_RISE,
     H.ACT_HERO_FALL: JUMP_FALL,
     H.ACT_HERO_JETPACK: _jetpack,
-    # The same held pose the flight rises in, and deliberately the same one:
-    # skating is thrust with the ground still under him, so his legs are
-    # gathered under him rather than striding, and moving between the two is
-    # the one transition in the set that must not restart its clip. See
-    # `hold_pose` in actions.py.
-    H.ACT_HERO_SKATING: JUMP_RISE,
+    # The run, at the cadence `play_rate` gives it for whatever speed the jets
+    # have him doing -- which on the skates is faster than his legs ever carry
+    # him, so it comes out at the top of its range and reads as a sprint.
+    # The feet are not planted, and cannot be: a skate is the one place in the
+    # set where the ground is meant to go by faster than the stride covers it.
+    H.ACT_HERO_SKATING: RUN,
     H.ACT_HERO_LAND: _landing,
     H.ACT_HERO_ATTACK: _attack,
     H.ACT_HERO_SPIN_KICK: SPIN_KICK,

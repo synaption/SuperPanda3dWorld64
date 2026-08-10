@@ -356,11 +356,25 @@ down the rise to the castle door is not what holding the trigger should feel
 like, so `SKATE_GRIP` cancels all but 1.5 of that pull before `update_sliding`
 adds it. A steep face still costs him speed; it does not reverse him.
 
-`A` out of a skate is the take-off, and it is not a jump: no jump action, no
-jump clip, and no clip restart either. The skate and the flight draw the same
-held pose, so `hold_pose()` suppresses the animation reset every other
-transition in the machine wants — otherwise the take-off would visibly replay
-on the spot, which is the jump animation the take-off is explicitly not.
+He draws the run while he skates, at whatever cadence `play_rate` gives it for
+the speed the jets have him doing — which is faster than his legs ever carry
+him, so it sits at the top of its range and reads as a sprint. His feet are not
+planted and cannot be: matching foot travel to ground covered is what keeps the
+walk and run cycles honest, and a skate is the one place in the set where the
+ground is *supposed* to go by faster than the stride covers it.
+
+Because a run and a skate at speed draw the same cycle, going onto the jets and
+off them again does not restart it. `set_hero_action` resets the animation on
+every change, which is what nineteen of the twenty transitions want and what
+this pair does not — a reset here is not a change of clip, it is the same clip
+dropped back to the top of the stride, on a control the player holds and lets
+go of constantly. `keep_the_stride()` is the exception, and `check_hero.py`
+watches the frame counter across both edges.
+
+`A` out of a skate is the take-off, and it is not a jump: `ACT_HERO_JUMP` is
+never entered, so there is no take-off arc governed by the button, no jump
+physics and no landing waiting at the end of one. He goes from the run straight
+into the flight's own pose.
 
 ### In the air it flies
 
@@ -1524,12 +1538,13 @@ python3 app/main.py    # with: clock-mode limited / clock-frame-rate 120
 - **Scuttlebug legs render as thin wire quads.** Fifteen of its animated parts
   carry flat `LAYER_ALPHA` display lists that the geo does not billboard, so
   unlike its body they have nothing to turn toward the camera.
-- **The Hero skates in a jump pose.** There is no skating clip among his twenty
-  and no equivalent of `author_skate.py` for his rig, so `ACT_HERO_SKATING`
-  holds `jump up` — a body with its legs gathered under it, which is what a
-  character riding thrust should look like and is not the same thing as an
-  animation for it. The camera does not see objects either: trees and warp
-  pipes are not in the collision set, so the boom will not pull in for them.
+- **The Hero has no skating clip and no flying one.** There are twenty in his
+  set and no equivalent of `author_skate.py` for his rig, so the skate borrows
+  the run and the flight borrows `jump up` — a body with its legs gathered
+  under it, which is what a character riding thrust should look like and is not
+  the same thing as an animation for it. The camera does not see objects
+  either: trees and warp pipes are not in the collision set, so the boom will
+  not pull in for them.
 - **Most cutscene and automatic actions** (poles, hanging, cannons), and the
   parts of swimming that need systems this port does not have: drowning and the
   breath meter (no health), metal-cap water walking, and carrying an object

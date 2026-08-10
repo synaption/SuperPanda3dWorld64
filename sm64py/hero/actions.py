@@ -112,14 +112,18 @@ def in_deep_water(m):
     return m.pos[1] < m.water_level - H.WADE_FLOAT_DEPTH
 
 
-def hold_pose(m):
+def keep_the_stride(m):
     """Complete a transition without restarting the clip. Returns True.
 
-    `set_hero_action` restarts the animation on every change, which is right
-    for nineteen of the twenty transitions in here and wrong for the ones
-    between the skate and the flight: both draw the same held pose, and letting
-    the clip reset would replay the take-off on the spot -- a jump animation in
-    front of a take-off that is explicitly not a jump.
+    `set_hero_action` restarts the animation on every change, which is what
+    nineteen of the twenty transitions in here want and what the run and the
+    skate do not: both draw the same run cycle, so resetting it drops him back
+    to the top of his stride on the frame the trigger moves. That is a visible
+    hitch on a control the player holds and lets go of constantly, and there is
+    nothing to restart -- it is the same clip on both sides.
+
+    Harmless on the transitions where it is not needed, since a clip that is
+    not the one already playing starts from its own first frame regardless.
     """
     m.anim_reset = False
     return True
@@ -128,15 +132,21 @@ def hold_pose(m):
 def launch_jetpack(m, lift=True):
     """Out of the skate and into the air, with no jump under it.
 
+    No jump under it in the sense that matters: `ACT_HERO_JUMP` is never
+    entered, so there is no take-off arc governed by the button, no jump
+    physics and no landing waiting at the end of one. What he draws on the way
+    up is the flight's own pose, which is `jump up` because there is no flying
+    clip among his twenty.
+
     `lift` is the difference between choosing to go up and simply running out
-    of ground. A launched by A gets the booster kick; skating off the edge of
+    of ground. A launch gets the booster kick; skating off the edge of
     something keeps whatever vertical velocity he had, so a ledge drops him the
     way a ledge should and the jets only stop him falling further.
     """
     set_hero_action(m, H.ACT_HERO_JETPACK, 0)
     if lift:
         m.vel[1] = max(m.vel[1], H.JETPACK_LAUNCH_SPEED)
-    return hold_pose(m)
+    return True
 
 
 def check_common_exits(m):
@@ -146,7 +156,8 @@ def check_common_exits(m):
     # rather than a jump. Reading A first would mean the two pressed together
     # jumped, and a jump is exactly the thing the launch is not.
     if m.controller.thrust:
-        return set_hero_action(m, H.ACT_HERO_SKATING, 0)
+        set_hero_action(m, H.ACT_HERO_SKATING, 0)
+        return keep_the_stride(m)
     if m.input & C.INPUT_A_PRESSED:
         return set_hero_action(m, H.ACT_HERO_JUMP, 0)
     if m.input & C.INPUT_OFF_FLOOR:
@@ -279,10 +290,12 @@ def act_skating(m):
     """
     if not m.controller.thrust:
         # Hand back whatever speed he had rather than dropping it, so stepping
-        # off the jets at pace carries into a run.
-        return set_hero_action(
+        # off the jets at pace carries into a run -- and carries the stride
+        # with it, since at that speed it is the same cycle on both sides.
+        set_hero_action(
             m, H.ACT_HERO_WALKING if m.forward_vel > 0.0 else H.ACT_HERO_IDLE,
             0)
+        return keep_the_stride(m)
     if m.input & C.INPUT_A_PRESSED:
         return launch_jetpack(m)
     if in_deep_water(m):
@@ -549,8 +562,7 @@ def act_jetpack(m):
         # way up puts him on his skates and he carries on up the hill; before
         # this it put him in the landing pose, from which the same trigger lit
         # the boosters again, and that loop was the whole of the bug.
-        set_hero_action(m, H.ACT_HERO_SKATING, 0)
-        return hold_pose(m)
+        return set_hero_action(m, H.ACT_HERO_SKATING, 0)
     if step == C.AIR_STEP_HIT_WALL:
         # Through the setter rather than the field alone, as the grounded
         # actions do it: it clears the horizontal velocity the wall stopped as
