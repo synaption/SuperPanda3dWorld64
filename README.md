@@ -137,6 +137,11 @@ Either way:
 | `F3` | toggle the collision overlay |
 | `Esc` | close the console, or quit |
 
+A crosshair marks the centre of the view. It is drawn twice, a thick dark pass
+under a thin light one, because a single-colour reticle vanishes against the
+castle grounds — white sky above the hill, dark green on it. It hides itself
+while the console is open, which is drawn in the same layer.
+
 ### A gamepad
 
 Plug one in — before starting or while playing, either works — and it drives

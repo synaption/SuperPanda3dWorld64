@@ -68,7 +68,9 @@ from panda3d.core import (
     DirectionalLight,
     Filename,
     Fog,
+    LineSegs,
     TextNode,
+    TransparencyAttrib,
     Vec4,
     WindowProperties,
     loadPrcFileData,
@@ -204,6 +206,13 @@ ACTION_NAMES = {v: k for k, v in vars(C).items() if k.startswith("ACT_")}
 # far higher. The numbers are unreadable at 60 Hz anyway.
 HUD_INTERVAL = 0.1
 
+# The crosshair, in aspect2d units -- a fortieth of the window's height across
+# the gap and a little over that again in each arm. Small on purpose: it marks
+# the centre of the view, and anything larger starts covering what is standing
+# there.
+CROSSHAIR_GAP = 0.012
+CROSSHAIR_ARM = 0.028
+
 loadPrcFileData("", "window-title SM64 movement in Panda3D")
 loadPrcFileData("", "framebuffer-multisample 1")
 loadPrcFileData("", "multisamples 4")
@@ -296,6 +305,7 @@ class Game(ShowBase):
 
         self._setup_lighting()
         self._setup_hud()
+        self._setup_crosshair()
         # Before the input, which asks the console whether it has the keyboard.
         self._setup_console()
         self._setup_input()
@@ -669,6 +679,34 @@ class Game(ShowBase):
             mayChange=True,
         )
 
+    def _setup_crosshair(self):
+        """A reticle at the centre of the screen.
+
+        Two passes of the same four strokes, a thick dark one under a thin
+        light one, because a single-colour crosshair disappears against
+        whatever it happens to be over -- and over the castle grounds that is
+        white in the sky, dark green on the hill and both at once on the
+        skyline. The outline costs one more draw and works everywhere.
+
+        Drawn in aspect2d, whose centre is (0, 0) and whose vertical range is
+        -1 to 1 either way, so it stays put and stays the same size as the
+        window is resized.
+        """
+        self.crosshair = self.aspect2d.attach_new_node("crosshair")
+        for thickness, colour in ((4.5, (0.0, 0.0, 0.0, 0.55)),
+                                  (2.0, (1.0, 1.0, 1.0, 0.9))):
+            segs = LineSegs()
+            segs.set_thickness(thickness)
+            segs.set_color(*colour)
+            # Four ticks around a gap rather than a solid cross: the gap is
+            # what keeps the thing being aimed at visible.
+            for dx, dz in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                segs.move_to(dx * CROSSHAIR_GAP, 0.0, dz * CROSSHAIR_GAP)
+                segs.draw_to(dx * (CROSSHAIR_GAP + CROSSHAIR_ARM), 0.0,
+                             dz * (CROSSHAIR_GAP + CROSSHAIR_ARM))
+            self.crosshair.attach_new_node(segs.create())
+        self.crosshair.set_transparency(TransparencyAttrib.M_alpha)
+
     # -- console -------------------------------------------------------------
 
     def _setup_console(self):
@@ -754,11 +792,16 @@ class Game(ShowBase):
         """
         if visible:
             self.hud.hide()
+            # The console's panel is drawn in aspect2d too, and the crosshair
+            # would sit on top of the text rather than behind it.
+            self.crosshair.hide()
             for name in self.keys:
                 self.keys[name] = False
             self._freeze_animation()
-        elif self._show_debug:
-            self.hud.show()
+        else:
+            self.crosshair.show()
+            if self._show_debug:
+                self.hud.show()
 
     def _freeze_animation(self):
         """Hold every clip on its current frame while the game is paused.
@@ -941,11 +984,16 @@ class Game(ShowBase):
 
         # The pad's right stick, per second rather than per drag: unlike the
         # mouse it reports a position that is held, so the pan has to be scaled
-        # by dt or it would swing at whatever the frame rate happens to be. The
-        # tilt takes the same sign the drag does, so pushing up looks up.
+        # by dt or it would swing at whatever the frame rate happens to be.
+        #
+        # Both axes are negated, and for the same reason: `rotate` and `tilt`
+        # move the *camera*, while a stick is read as moving the *view*. Q and
+        # E are named after the camera and a mouse drag grabs the world, so
+        # both of those want the sign as it comes; pushing the stick right has
+        # to swing the view right, which is the camera going the other way.
         cam_x, cam_y = self.gamepad.camera
         if cam_x or cam_y:
-            self.follow_camera.rotate(cam_x * CAMERA_YAW_SPEED * dt)
+            self.follow_camera.rotate(-cam_x * CAMERA_YAW_SPEED * dt)
             self.follow_camera.tilt(-cam_y * CAMERA_PITCH_SPEED * dt)
 
         # Dragging with a mouse button held swings the camera too -- unless
