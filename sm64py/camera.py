@@ -210,11 +210,11 @@ OCCLUSION_REFINE_STEPS = 5
 # separate precision-look mode.
 MOUSE_SENSITIVITY = 6.0
 # How long a mouse delta is spread over.  It has to cover the gap between the
-# render rate and the rate the pointer is actually sampled at: where those are
-# close, a hair of smoothing hides the last stair-step; where the renderer runs
-# far ahead of a slow pointer -- WSLg samples ours at about 60 Hz while frames
-# come several times faster -- each sample arrives as a coarse jump, and the
-# spread has to be a couple of sample intervals wide to overlap them into a
+# render rate and the rate the pointer position actually updates at: where
+# those are close, a hair of smoothing hides the last stair-step; where the
+# renderer runs well ahead of the pointer, the position reads the same for
+# several frames and then jumps, so each update arrives as a coarse step, and
+# the spread has to be a couple of those intervals wide to overlap them into a
 # glide.  Forty milliseconds is that width without reading as lag.  The console
 # slider `mouse_smooth` moves it live; set it to zero for a raw 1:1 pointer.
 MOUSE_SMOOTHING = 0.04

@@ -370,16 +370,19 @@ RETICLE_THICKNESS = 5.0
 # the whole thing vanishes on the frame the order is given and there is nothing
 # to see where it went.
 RETICLE_FLASH = 0.4
+FRAME_RATE_CAP = 120.0
 
 loadPrcFileData("", "window-title SM64 movement in Panda3D")
 loadPrcFileData("", "framebuffer-multisample 1")
 loadPrcFileData("", "multisamples 4")
-# Off by default: vsync removes tearing, but under WSLg the present goes
-# through a compositor that delivers frames at uneven points in a refresh while
-# still reporting high FPS -- which reads as camera judder despite the numbers.
-# Turning it off is what smooths the pacing here.  Set MARIO_VSYNC=1 to put it
-# back on a native display where the tearing matters more than the pacing.
+# Off by default: vsync removes tearing, but on the setup this was tuned on
+# (native Windows) turning it on delivers frames at uneven points in a refresh
+# while still reporting high FPS -- which reads as camera judder despite the
+# numbers.  Turning it off is what smoothed the pacing.  Set MARIO_VSYNC=1 to
+# put it back where tearing matters more than the pacing.
 loadPrcFileData("", f"sync-video {os.environ.get('MARIO_VSYNC', '0')}")
+loadPrcFileData("", "clock-mode limited")
+loadPrcFileData("", f"clock-frame-rate {FRAME_RATE_CAP:g}")
 
 
 class Player:
@@ -466,6 +469,10 @@ class PipeTuning:
 class Game(ShowBase):
     def __init__(self):
         ShowBase.__init__(self)
+        # Set the already-created global clock too, in case Panda3D was
+        # initialized by an embedding context before the PRC settings loaded.
+        self.clock.setMode(ClockObject.MLimited)
+        self.clock.setFrameRate(FRAME_RATE_CAP)
 
         self.disable_mouse()
         self.set_background_color(*SKY_COLOUR)
@@ -927,10 +934,10 @@ class Game(ShowBase):
     def _set_mouse_captured(self, captured):
         """Take the pointer for looking, or hand it back.
 
-        Use a confined pointer rather than trusting relative mode: several
-        window backends -- WSLg among them -- report relative mode as granted
-        while still letting the cursor escape the game window, and relative
-        mode also makes `_read_mouse` skip the recentre that keeps it in.
+        Use a confined pointer rather than trusting relative mode: some window
+        backends report relative mode as granted while still letting the cursor
+        escape the game window (seen here on native Windows), and relative mode
+        also makes `_read_mouse` skip the recentre that keeps it in.
         `_read_mouse` recentres the confined pointer before it reaches an edge,
         giving the same unlimited-look behaviour without losing capture.
         """
