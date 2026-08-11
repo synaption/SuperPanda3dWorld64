@@ -509,10 +509,11 @@ class Mario(Object):
         else:
             nearest = self.HUNT_RANGE
             anchor_x, anchor_z = self.pos[0], self.pos[2]
-        for obj in self.world.objects:
+        for obj in self.world.enemies:
+            # Already known to be a live goomba or scuttlebug -- the set holds
+            # nothing else, and the dead were pruned at the top of the tick --
+            # so this is a distance check and no more.
             if not obj.active or obj.defeated:
-                continue
-            if not isinstance(obj, (Goomba, Scuttlebug)):
                 continue
             distance = math.hypot(obj.pos[0] - anchor_x, obj.pos[2] - anchor_z)
             if distance < nearest:
@@ -821,8 +822,8 @@ class Interactions:
             mario.invinc_timer -= 1
             return
 
-        for obj in self.objects.objects:
-            if not obj.active or not isinstance(obj, (Goomba, Scuttlebug)):
+        for obj in self.objects.enemies:
+            if not obj.active:
                 continue
             # Already dead and playing it out. The count is run by the object
             # set, so it keeps running whether or not it is resolved here.
@@ -880,11 +881,21 @@ class ObjectSet:
     def __init__(self, surfaces):
         self.surfaces = surfaces
         self.objects = []
+        # The subset that can be fought, kept apart from the rest. Everything
+        # that hunts them -- every Mario on the field, and the interaction pass
+        # that resolves the player against them -- used to find them by walking
+        # the whole object list each tick, so the trees and the pipes were
+        # re-examined once per Mario per tick only to be skipped. This is that
+        # same set of enemies, pruned as they die rather than rebuilt, since a
+        # normal tick neither spawns nor kills one.
+        self.enemies = []
 
     def spawn(self, cls, x, y, z, yaw=0, **kwargs):
         obj = cls(self.surfaces, x, y, z, yaw, **kwargs)
         obj.world = self
         self.objects.append(obj)
+        if isinstance(obj, (Goomba, Scuttlebug)):
+            self.enemies.append(obj)
         return obj
 
     def load_special_objects(self, entries):
@@ -904,6 +915,14 @@ class ObjectSet:
         return spawned
 
     def update(self, mario):
+        # Drop the dead from the target list before anything reads it, so an
+        # enemy stops being something to run at on the tick it takes the blow
+        # rather than a tick later. Cheap: the list holds only enemies, and a
+        # tick that kills none leaves it untouched but for the walk.
+        if self.enemies:
+            self.enemies = [e for e in self.enemies
+                            if e.active and not e.defeated]
+
         # Over a copy of the list, because a pipe firing appends to it: the
         # new arrival is left to start on the following tick rather than being
         # updated on the one it was created in.

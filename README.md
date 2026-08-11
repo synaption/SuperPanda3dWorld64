@@ -36,3 +36,14 @@ guides, controls, asset workflows, and design notes.
 Some assets are derived from Nintendo game data and community texture work.
 Review the asset notice in the [project guide](docs/project-guide.md#assets)
 before publishing or redistributing the repository.
+
+
+
+***
+## Inspiration
+
+Demon Chaos - 65k enemies on screen at a time on PS2
+Pseudoregalia - great movement system, retro nastalgia asthetic
+Pikmen/Sons of Liberty - squad control mechanics
+Outer Wilds - seamless interplanetary travel
+

@@ -109,6 +109,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 # sits in is not on the path -- only the root inserted above is.
 from app.gamepad import Gamepad  # noqa: E402
 from sm64py import audio, console, objects, squad, surfaces  # noqa: E402
+from sm64py.impostor import ImpostorSet  # noqa: E402
 from sm64py.aim import AimController, melee_tracking  # noqa: E402
 from sm64py.camera import FollowCamera, smooth_damp  # noqa: E402
 from sm64py.hero import HeroState  # noqa: E402
@@ -140,7 +141,15 @@ HERO_MODEL = os.path.join(ASSETS, "hero", "hero.glb")
 HERO_CLIPS = os.path.join(ASSETS, "hero", "hero_clips.json")
 SOUNDS = os.path.join(ASSETS, "sounds", "mario64")
 ACTORS = os.path.join(ASSETS, "actors")
+IMPOSTORS = os.path.join(ASSETS, "impostors")
 LEVEL_OBJECTS = os.path.join(CASTLE_GROUNDS, "collision_objects.json")
+
+# Enemy models drawn as instanced sprites rather than as skinned actors, with
+# the draw scale their objects carry -- baked by tools/bake_impostor.py, drawn
+# by sm64py/impostor.py. A model with no bake on disk is simply drawn the old
+# way, so this is a list of which crowds have been prepared, not a requirement.
+IMPOSTOR_MODELS = {"goomba": objects.Goomba.draw_scale,
+                   "scuttlebug": objects.Scuttlebug.draw_scale}
 
 # What counts as an enemy: the things that can be fought, as against the trees
 # and the Marios, which are scenery and company respectively. Named once
@@ -235,12 +244,20 @@ PIPE_INTERVAL_SECONDS = 30.0
 PIPE_INTERVAL = int(PIPE_INTERVAL_SECONDS * TICK_RATE)
 PIPE_LIMIT = 5
 
-# What the enemy_rate and enemy_limit sliders are allowed to reach. Half a
-# second between spawns with a cap of thirty is a swarm, which is the
-# interesting end of both ranges; a limit of zero at the bottom of the other
-# turns the pipes off without needing a restart to get an empty field.
+# What the enemy_rate and enemy_limit sliders are allowed to reach. Now that
+# the enemies are drawn as instanced sprites rather than skinned actors, the
+# cap is a crowd rather than a handful -- the old ceiling of thirty was set by
+# what the renderer could carry, not by anything the simulation minds. A limit
+# of zero at the bottom turns the pipes off without a restart. To fill the
+# field at once rather than one every few seconds, see MARIO_ENEMY_STRESS.
 ENEMY_RATE_RANGE = (0.5, 120.0)
-ENEMY_LIMIT_RANGE = (0, 30)
+ENEMY_LIMIT_RANGE = (0, 2000)
+
+# A crowd spawned at startup, split between the enemy types and scattered over
+# the field, for looking at the sprite renderer under load without waiting for
+# the pipes to fill. Off by default; set the environment variable to a count.
+ENEMY_STRESS = int(os.environ.get("MARIO_ENEMY_STRESS", "0"))
+ENEMY_STRESS_SPREAD = 6000.0
 
 # Mario spawns where the level script places him, facing the castle.
 SPAWN = (-1328.0, 260.0, 4664.0)
@@ -452,14 +469,22 @@ class Game(ShowBase):
         self.objects = objects.ObjectSet(self.surfaces)
         self._spawn_objects()
         self.interactions = objects.Interactions(self.objects)
+        # The enemy crowds go to the instanced sprite renderer; whatever it has
+        # a bake for is left off the actor renderer below so it is not drawn
+        # twice. A missing bake leaves its model out of the set, and the actor
+        # renderer picks it up as before.
+        self.impostors = ImpostorSet(IMPOSTORS, self.render, IMPOSTOR_MODELS)
+        self.impostor_drawn = 0
         self.object_renderer = ObjectRenderer(
             ACTORS, self.loader, self.render,
             # Mario is an NPC now, and his model is the one the game already
             # ships rather than a second copy under assets/actors/.
             model_paths={"mario": MARIO_MODEL},
+            skip_models=set(self.impostors.fields),
         )
         drawn = self.object_renderer.build(self.objects)
-        print(f"Objects: {len(self.objects.objects)} spawned, {drawn} drawn")
+        print(f"Objects: {len(self.objects.objects)} spawned, {drawn} drawn as "
+              f"actors, {len(self.impostors.fields)} enemy types as impostors")
 
         self.collision_view = load_collision_geometry(
             os.path.join(CASTLE_GROUNDS, "collision.npz")
@@ -514,10 +539,36 @@ class Game(ShowBase):
                                interval=PIPE_INTERVAL, limit=PIPE_LIMIT)
             for cls, x, y, z in PIPE_SPAWNS
         ]
+        if ENEMY_STRESS:
+            self._spawn_stress_crowd(ENEMY_STRESS)
+
         # The ones the enemy sliders speak for; see PipeTuning.
         self.pipe_tuning = PipeTuning(
             pipe for pipe in self.pipes if pipe.spawns in ENEMY_TYPES
         )
+
+    def _spawn_stress_crowd(self, count):
+        """Scatter a crowd of enemies over the field, for testing under load.
+
+        Split evenly between the enemy types and dropped onto the floor
+        wherever they land; ones that come down over the moat or off the map
+        find no floor and are quietly skipped rather than falling out of the
+        world. The point is a lot of them on screen at once, not a fair fight.
+        """
+        import random
+        rng = random.Random(1)
+        types = list(ENEMY_TYPES)
+        placed = 0
+        for i in range(count):
+            cls = types[i % len(types)]
+            x = rng.uniform(-ENEMY_STRESS_SPREAD, ENEMY_STRESS_SPREAD)
+            z = rng.uniform(-ENEMY_STRESS_SPREAD, ENEMY_STRESS_SPREAD)
+            height, floor = self.surfaces.find_floor(x, 2000.0, z)
+            if floor is None:
+                continue
+            self.objects.spawn(cls, x, height, z, rng.randint(0, 0xFFFF))
+            placed += 1
+        print(f"Stress crowd: {placed} enemies placed")
 
     # -- players -------------------------------------------------------------
 
@@ -1652,6 +1703,10 @@ class Game(ShowBase):
         # Anything a pipe has produced needs a node before it can be drawn.
         self.object_renderer.refresh(self.objects)
         self.object_renderer.sync(self.follow_camera.pos)
+        # The enemy crowds are drawn straight from their simulation state, one
+        # instanced quad each, with no per-object node to create or refresh.
+        self.impostor_drawn = self.impostors.update(
+            self.objects, self.follow_camera.pos)
         self._update_camera_medium()
 
         self.player.node.set_pos(*to_panda(*pos))
@@ -1872,7 +1927,9 @@ class Game(ShowBase):
             f"   hits {self.interactions.hits_taken}\n"
             f"pipes    {self._pipe_text()}\n"
             f"squad    {self._squad_text()}\n"
-            f"fps      {self.clock.get_average_frame_rate():5.1f}\n"
+            f"sprites  {self.impostor_drawn} drawn as impostors\n"
+            f"fps      {self.clock.get_average_frame_rate():5.1f}"
+            f"   frame {self.clock.get_dt() * 1000.0:5.1f} ms\n"
             f"\n{self._control_legend()}\n"
             f"mouse look  {'RMB' if self._mouse_captured else 'F'} aim  "
             f"R recentre  F2 swap  F3 collision  F1 hud  ` console"

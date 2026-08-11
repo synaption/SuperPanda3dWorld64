@@ -362,12 +362,31 @@ class ObjectRenderer:
     render states.
     """
 
+    # Past this many units from the camera an animated object holds still: its
+    # clip stops advancing and its billboards stop turning. Both matter to the
+    # same end. These actors are skinned on the CPU -- the moment a joint is
+    # taken over for billboarding, Panda drops the whole character off the
+    # hardware path -- and the skin is recomputed only when a joint has moved.
+    # A walking goomba moves one every frame, and aiming its face moves another,
+    # so a field full of them is re-skinned in full each frame. Frozen, their
+    # joints are static and the cached skin is reused, which is the difference
+    # between a dozen on screen costing a dozen skins a frame and costing none.
+    # Far enough out that the stalled stride and the fixed facing do not read.
+    ANIM_LOD_DISTANCE = 3000.0
+
     def __init__(self, model_dir, loader, parent, coordinate_transform=to_panda,
-                 tuning=None, model_paths=None):
+                 tuning=None, model_paths=None, skip_models=None):
         self.model_dir = model_dir
         self.loader = loader
         self.parent = parent
         self.transform = coordinate_transform
+        # Models drawn some other way, and so left without an actor here. The
+        # enemies go this route: they are drawn as instanced sprites by
+        # sm64py/impostor.py, which is what lets there be thousands of them, and
+        # a skinned actor apiece would be exactly the cost that path exists to
+        # avoid. A model with no bake falls through to here and is drawn as an
+        # actor as before.
+        self.skip_models = set(skip_models or ())
         # Models that do not live in model_dir, by name. The player characters
         # are the case this exists for: Mario is an NPC now, and his .glb is
         # 13 MB of 209 clips sitting in assets/mario/ where the game already
@@ -494,25 +513,41 @@ class ObjectRenderer:
             return 0
         added = 0
         for index in range(self._built, total):
-            holder = self._build_one(object_set.objects[index], index)
+            obj = object_set.objects[index]
+            if obj.model in self.skip_models:
+                continue
+            holder = self._build_one(obj, index)
             if holder is not None:
-                self.nodes.append((object_set.objects[index], holder))
+                self.nodes.append((obj, holder))
                 added += 1
         self._built = total
         return added
 
     def sync(self, camera_pos=None):
         """Push every object's position, facing and visibility to its node."""
+        cam = self.transform(*camera_pos) if camera_pos is not None else None
+        cutoff = self.ANIM_LOD_DISTANCE * self.ANIM_LOD_DISTANCE
         for obj, node in self.nodes:
             if not obj.active:
                 node.hide()
                 continue
             node.show()
-            node.set_pos(*self.transform(*obj.draw_pos))
+            px, py, pz = self.transform(*obj.draw_pos)
+            node.set_pos(px, py, pz)
             node.set_h(s16_to_degrees(obj.draw_yaw))
+            # Whether it is far enough off to hold still. Worked out here, once,
+            # off the position just written, and read again by the two loops
+            # below so neither has to measure the distance a second time.
+            if cam is None:
+                obj._render_far = False
+            else:
+                dx, dy, dz = px - cam[0], py - cam[1], pz - cam[2]
+                obj._render_far = dx * dx + dy * dy + dz * dz > cutoff
 
         # Walk cycles keep pace with how fast the object is actually moving,
         # and an object that changes which clip it wants gets switched over.
+        # A distant one is frozen where it stands: its rate goes to zero so its
+        # joints stop moving and Panda stops re-skinning it every frame.
         for entry in self.actors:
             obj, actor, clip = entry
             wanted = getattr(obj, "anim", None)
@@ -520,9 +555,11 @@ class ObjectRenderer:
                     and actor.get_anim_control(wanted) is not None:
                 actor.loop(wanted)
                 entry[2] = clip = wanted
-            actor.set_play_rate(getattr(obj, "anim_rate", 1.0), clip)
+            rate = 0.0 if getattr(obj, "_render_far", False) \
+                else getattr(obj, "anim_rate", 1.0)
+            actor.set_play_rate(rate, clip)
 
-        self._aim_billboards(camera_pos)
+        self._aim_billboards(cam)
 
     def freeze(self):
         """Stop every object's clip where it stands.
@@ -534,13 +571,22 @@ class ObjectRenderer:
         for obj, actor, clip in self.actors:
             actor.set_play_rate(0.0, clip)
 
-    def _aim_billboards(self, camera_pos):
-        """Turn every billboard joint to face the camera."""
-        if camera_pos is None or not self.billboards:
+    def _aim_billboards(self, target):
+        """Turn every billboard joint to face the camera.
+
+        `target` is already in the parent's space -- `sync` transforms the
+        camera once and hands it down, since it needs the same point for its
+        own distance test. A frozen owner is left alone: aiming its face would
+        move a joint and undo the freeze, dragging the whole character back
+        onto the per-frame skinning path the distance cutoff exists to avoid.
+        """
+        if target is None or not self.billboards:
             return
-        target = self.transform(*camera_pos)
         for rig in self.billboards:
-            if rig.owner is None or rig.owner.active:
+            owner = rig.owner
+            if owner is None:
+                rig.aim(self.parent, target, self.tuning)
+            elif owner.active and not getattr(owner, "_render_far", False):
                 rig.aim(self.parent, target, self.tuning)
 
 

@@ -55,6 +55,10 @@ def check_tracking():
     objects.spawn(Scuttlebug, -500.0, 0.0, 500.0)
 
     renderer = ObjectRenderer(ACTORS, base.loader, base.render)
+    # This checks that the aiming turns the joints at all; the distance LOD,
+    # which would freeze one of these two test objects at the far camera and
+    # read as it having stopped tracking, is not what is under test here.
+    renderer.ANIM_LOD_DISTANCE = float("inf")
     renderer.build(objects)
 
     renderer.sync((0.0, 300.0, 3000.0))

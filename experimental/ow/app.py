@@ -4,10 +4,13 @@ All the behaviour lives in world/gravity/movement; this module only draws what
 they produce and feeds them input.
 """
 
+from collections import deque
+
 from direct.showbase.ShowBase import ShowBase
 from direct.gui.OnscreenText import OnscreenText
 from panda3d.core import (
     AmbientLight,
+    ClockObject,
     LQuaternion,
     NodePath,
     PointLight,
@@ -32,6 +35,8 @@ FAR_PLANE = 1.6e6
 #: Stars draw depth-test-off in the background bin, so this only has to be
 #: inside the far plane; it is not a real distance.
 STARFIELD_RADIUS = 8.0e5
+PERFORMANCE_WINDOW_SECONDS = 10.0
+FRAME_RATE_CAP = 120.0
 
 
 def configure():
@@ -43,7 +48,9 @@ def configure():
                 "win-size 1280 720",
                 "framebuffer-multisample 1",
                 "multisamples 4",
-                "sync-video 1",
+                "sync-video 0",
+                "clock-mode limited",
+                "clock-frame-rate 120",
                 "text-minfilter linear",
             ]
         ),
@@ -53,6 +60,10 @@ def configure():
 class OuterWildsApp(ShowBase):
     def __init__(self, variables=None):
         ShowBase.__init__(self)
+        # Explicitly configure the global clock as well as the PRC defaults:
+        # the clock exists before configure() runs in some embedding contexts.
+        self.clock.setMode(ClockObject.MLimited)
+        self.clock.setFrameRate(FRAME_RATE_CAP)
         self.disableMouse()
         self.setBackgroundColor(0.015, 0.017, 0.03, 1.0)
 
@@ -71,6 +82,11 @@ class OuterWildsApp(ShowBase):
         self._capture_mouse(True)
 
         self.show_hud = True
+        # Store real render-frame durations, rather than the capped duration
+        # handed to the simulation, so the HUD can accurately report hitches.
+        self._frame_times = deque()
+        self._performance_clock = 0.0
+        self._last_frame_time = 0.0
         self.taskMgr.add(self._update, "ow-update")
 
     # -- scene -------------------------------------------------------------
@@ -256,13 +272,40 @@ class OuterWildsApp(ShowBase):
     # -- frame -------------------------------------------------------------
 
     def _update(self, task):
-        dt = min(self.clock.getDt(), 0.25)
+        frame_dt = self.clock.getDt()
+        self._record_frame_time(frame_dt)
+        dt = min(frame_dt, 0.25)
         self._gather_input()
         self.world.advance(dt)
         self._sync_scene()
         if self.show_hud:
             self._update_hud()
         return task.cont
+
+    def _record_frame_time(self, frame_dt):
+        """Keep frame times in a rolling ten-second history for the HUD."""
+        # Clock dt should never be negative, but avoid letting a bad clock
+        # sample make the rolling-window timestamps move backward.
+        frame_dt = max(frame_dt, 0.0)
+        self._last_frame_time = frame_dt
+        self._performance_clock += frame_dt
+        self._frame_times.append((self._performance_clock, frame_dt))
+
+        cutoff = self._performance_clock - PERFORMANCE_WINDOW_SECONDS
+        while self._frame_times and self._frame_times[0][0] < cutoff:
+            self._frame_times.popleft()
+
+    def _performance_hud_lines(self):
+        frame_dt = self._last_frame_time
+        fps = 1.0 / frame_dt if frame_dt > 0.0 else 0.0
+        slowest_ms = max(dt for _, dt in self._frame_times) * 1000.0
+        slowest_fps = 1000.0 / slowest_ms if slowest_ms > 0.0 else 0.0
+        return [
+            "frame rate {:8.1f} FPS".format(fps),
+            "worst frame{:7.1f} ms ({:5.1f} FPS, last 10 s)".format(
+                slowest_ms, slowest_fps
+            ),
+        ]
 
     def _sync_scene(self):
         for node, body in zip(self.planet_nodes, self.world.planets):
@@ -286,6 +329,8 @@ class OuterWildsApp(ShowBase):
 
         grounded = movement.grounded
         lines = [
+            *self._performance_hud_lines(),
+            "",
             "mode       {}".format(
                 "ON FOOT -- {}".format(movement.ground_body.name)
                 if grounded else "flying"),

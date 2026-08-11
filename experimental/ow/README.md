@@ -25,7 +25,8 @@ python3 -m ow.main --selftest   # headless physics checks, no window needed
 | `R` | snap camera to where you are pointing | — |
 
 `F1` HUD · `F2` zero-g · `F3` mutual planet gravity · `F4` gravity sourcing ·
-`Esc` release the mouse, then quit.
+`Esc` release the mouse, then quit. The HUD also shows the current render
+frame rate and the slowest frame duration from the preceding ten seconds.
 
 The original binds only a gamepad for movement (`Gamepad_Left2D`); `Space`,
 `Left Ctrl`, `Left Shift` and the mouse are its keyboard bindings verbatim.

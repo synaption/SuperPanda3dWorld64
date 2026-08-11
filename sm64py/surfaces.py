@@ -396,6 +396,198 @@ class SurfaceSet:
 
         return int(len(hits))
 
+    # -- batched queries ----------------------------------------------------
+    #
+    # The scalar queries above answer one point at a time, and their cost is
+    # almost all numpy call overhead -- the triangle maths is cheap, but paying
+    # it per entity means thousands of tiny numpy calls a tick. These answer a
+    # whole array of points at once. The trick is that every point in the same
+    # 1024-unit cell tests the same ordered triangle list, so the points are
+    # grouped by cell (there are at most 16x16 of them) and each group is one
+    # vectorised pass over points-by-triangles. The overhead is paid per cell,
+    # not per point, which is the whole difference between a crowd that runs and
+    # one that does not. The results are identical to the scalar queries -- see
+    # tools/check_batch_surfaces.py, which holds them to that.
+
+    @staticmethod
+    def _s16(a):
+        """Truncate an array toward zero into s16, as the C cast does."""
+        return a.astype(np.int64).astype(np.int16).astype(np.int64)
+
+    def _cell_keys(self, xi, zi):
+        """A single cell index per point, and which points are in bounds."""
+        inb = ((xi > -LEVEL_BOUNDARY_MAX) & (xi < LEVEL_BOUNDARY_MAX)
+               & (zi > -LEVEL_BOUNDARY_MAX) & (zi < LEVEL_BOUNDARY_MAX))
+        cell_x = ((xi + LEVEL_BOUNDARY_MAX) // CELL_SIZE) & 0xF
+        cell_z = ((zi + LEVEL_BOUNDARY_MAX) // CELL_SIZE) & 0xF
+        return np.where(inb, cell_z * CELL_COUNT + cell_x, -1)
+
+    def find_floors(self, xs, ys, zs, for_camera=False):
+        """Highest floor at or below each point. Returns (heights, ids).
+
+        `ids` is the triangle index of the floor found, or -1 where there is
+        none -- the array counterpart of the (height, Surface) the scalar query
+        hands back, with the surface left as an index the caller can look up.
+        """
+        xs = np.asarray(xs, dtype=np.float64)
+        ys = np.asarray(ys, dtype=np.float64)
+        zs = np.asarray(zs, dtype=np.float64)
+        n = len(xs)
+        xi, yi, zi = self._s16(xs), self._s16(ys), self._s16(zs)
+
+        heights = np.full(n, HEIGHT_NONE, dtype=np.float64)
+        ids = np.full(n, -1, dtype=np.int64)
+
+        keys = self._cell_keys(xi, zi)
+        for key in np.unique(keys):
+            if key < 0:
+                continue
+            cz, cx = divmod(int(key), CELL_COUNT)
+            tris = self.cells[FLOOR_LIST][cz][cx]
+            if len(tris) == 0:
+                continue
+            pts = np.flatnonzero(keys == key)
+            h, tid = self._resolve_floor(
+                tris, xi[pts], yi[pts], zi[pts], for_camera)
+            heights[pts] = h
+            ids[pts] = tid
+
+        # An intangible floor hides what is under it; look again from below.
+        # Rare enough -- often absent from a level entirely -- that the handful
+        # of points that hit one are re-queried with the exact scalar path
+        # rather than a second vectorised pass.
+        if len(ids):
+            hit = ids >= 0
+            if hit.any():
+                intangible = hit & (self.type[np.where(hit, ids, 0)]
+                                    == SURFACE_INTANGIBLE)
+                for i in np.flatnonzero(intangible):
+                    tris = self._cell(FLOOR_LIST, int(xi[i]), int(zi[i]))
+                    h2, surf = self._find_floor_in(
+                        tris, int(xi[i]), int(heights[i] - 200.0),
+                        int(zi[i]), for_camera)
+                    heights[i] = h2
+                    ids[i] = surf.index if surf is not None else -1
+        return heights, ids
+
+    def _resolve_floor(self, tris, x, y, z, for_camera):
+        """For k points against one cell's m ordered floors, pick each's first.
+
+        Every array here is (k, m): a row per point, a column per triangle, in
+        the cell's own priority order, so taking the first passing column is the
+        same "first, not best" rule the scalar query follows.
+        """
+        x1, z1 = self.v1[tris, 0], self.v1[tris, 2]
+        x2, z2 = self.v2[tris, 0], self.v2[tris, 2]
+        x3, z3 = self.v3[tris, 0], self.v3[tris, 2]
+        xk, zk = x[:, None], z[:, None]
+
+        e1 = (z1 - zk) * (x2 - x1) - (x1 - xk) * (z2 - z1)
+        e2 = (z2 - zk) * (x3 - x2) - (x2 - xk) * (z3 - z2)
+        e3 = (z3 - zk) * (x1 - x3) - (x3 - xk) * (z1 - z3)
+        ok = (e1 >= 0) & (e2 >= 0) & (e3 >= 0)
+
+        nx, ny, nz = self.normal[tris, 0], self.normal[tris, 1], self.normal[tris, 2]
+        oo = self.origin_offset[tris]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            height = -(xk * nx + nz * zk + oo) / ny
+        ok &= ny != 0.0
+        ok &= (y[:, None] - (height - 78.0)) >= 0.0
+        if for_camera:
+            ok &= (self.flags[tris] & SURFACE_FLAG_NO_CAM_COLLISION) == 0
+        else:
+            ok &= self.type[tris] != SURFACE_CAMERA_BOUNDARY
+
+        has = ok.any(axis=1)
+        first = ok.argmax(axis=1)
+        rows = np.arange(len(x))
+        chosen_h = height[rows, first]
+        chosen_t = tris[first]
+        return (np.where(has, chosen_h, HEIGHT_NONE),
+                np.where(has, chosen_t, -1))
+
+    def find_walls(self, xs, ys, zs, offset_ys, radii, for_camera=False):
+        """Push every point out of the walls it overlaps.
+
+        Returns (xs_out, zs_out, counts). Each point is pushed by the sum of its
+        walls the way the scalar query accumulates them -- the tests read the
+        entry position, so the pushes are independent and their order does not
+        matter. Only the cell lookup truncates to s16; the geometry reads the
+        raw position, matching find_wall_collisions.
+        """
+        xs = np.asarray(xs, dtype=np.float64)
+        ys = np.asarray(ys, dtype=np.float64)
+        zs = np.asarray(zs, dtype=np.float64)
+        offset_ys = np.asarray(offset_ys, dtype=np.float64)
+        radii = np.asarray(radii, dtype=np.float64)
+        n = len(xs)
+
+        out_x, out_z = xs.copy(), zs.copy()
+        counts = np.zeros(n, dtype=np.int64)
+
+        xi, zi = self._s16(xs), self._s16(zs)
+        radius = np.minimum(radii, 200.0)
+        py = ys + offset_ys
+
+        keys = self._cell_keys(xi, zi)
+        for key in np.unique(keys):
+            if key < 0:
+                continue
+            cz, cx = divmod(int(key), CELL_COUNT)
+            tris = self.cells[WALL_LIST][cz][cx]
+            if len(tris) == 0:
+                continue
+            pts = np.flatnonzero(keys == key)
+            dx, dz, cnt = self._resolve_walls(
+                tris, xs[pts], py[pts], zs[pts], radius[pts], for_camera)
+            out_x[pts] = xs[pts] + dx
+            out_z[pts] = zs[pts] + dz
+            counts[pts] = cnt
+        return out_x, out_z, counts
+
+    def _resolve_walls(self, tris, px, py, pz, radius, for_camera):
+        """For k points against one cell's m walls: total push and hit count."""
+        lower, upper = self.lower_y[tris], self.upper_y[tris]
+        pyk = py[:, None]
+        ok = (pyk >= lower) & (pyk <= upper)
+
+        nx, ny, nz = self.normal[tris, 0], self.normal[tris, 1], self.normal[tris, 2]
+        oo = self.origin_offset[tris]
+        offset = nx * px[:, None] + ny * pyk + nz * pz[:, None] + oo
+        rad = radius[:, None]
+        ok &= (offset >= -rad) & (offset <= rad)
+        if for_camera:
+            ok &= (self.flags[tris] & SURFACE_FLAG_NO_CAM_COLLISION) == 0
+        else:
+            ok &= self.type[tris] != SURFACE_CAMERA_BOUNDARY
+        ok &= self._wall_face_mask_batch(tris, px, py, pz)
+
+        push = rad - offset
+        dx = np.where(ok, nx * push, 0.0).sum(axis=1)
+        dz = np.where(ok, nz * push, 0.0).sum(axis=1)
+        return dx, dz, ok.sum(axis=1)
+
+    def _wall_face_mask_batch(self, tris, x, y, z):
+        """_wall_face_mask over k points and m walls at once, giving (k, m)."""
+        y1, y2, y3 = self.v1[tris, 1], self.v2[tris, 1], self.v3[tris, 1]
+        x_proj = (self.flags[tris] & SURFACE_FLAG_X_PROJECTION) != 0
+
+        w1 = np.where(x_proj, -self.v1[tris, 2], self.v1[tris, 0])
+        w2 = np.where(x_proj, -self.v2[tris, 2], self.v2[tris, 0])
+        w3 = np.where(x_proj, -self.v3[tris, 2], self.v3[tris, 0])
+        point = np.where(x_proj[None, :], (-z)[:, None], x[:, None])
+        yk = y[:, None]
+
+        e1 = (y1 - yk) * (w2 - w1) - (w1 - point) * (y2 - y1)
+        e2 = (y2 - yk) * (w3 - w2) - (w2 - point) * (y3 - y2)
+        e3 = (y3 - yk) * (w1 - w3) - (w3 - point) * (y1 - y3)
+
+        positive = np.where(x_proj, self.normal[tris, 0] > 0.0,
+                            self.normal[tris, 2] > 0.0)
+        inside_neg = (e1 <= 0) & (e2 <= 0) & (e3 <= 0)
+        inside_pos = (e1 >= 0) & (e2 >= 0) & (e3 >= 0)
+        return np.where(positive[None, :], inside_neg, inside_pos)
+
     def _wall_face_mask(self, tris, x, y, z):
         """Containment test in the wall's dominant projection plane."""
         y1, y2, y3 = self.v1[tris, 1], self.v2[tris, 1], self.v3[tris, 1]
