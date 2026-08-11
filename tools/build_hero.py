@@ -21,6 +21,12 @@ which Panda3D renders as a flat silhouette; and the clip frame counts in
 hero_clips.json have to be resynced, since the game reads timing from the
 sidecar rather than from the .glb.
 
+**The skeleton has to grow its runtime pivots** (tools/aim_rig.py): the Hero
+aims by having his upper body turned at runtime, and the exported skeleton has
+nothing to turn it by -- Rigify's DEF bones come out of the export unparented,
+so no bone in the file carries the torso. The last stage inserts an AIM_TORSO
+pivot that does, and a WEAPON_SOCKET under the right hand. See docs/aim.md.
+
 **The clips have to be pinned to the spot** (tools/lock_root_motion.py): they
 were authored on a stage, so `Attack 2` alone carries 2.8 units of forward
 lunge. Left in, the character slides across the ground and snaps back on every
@@ -42,6 +48,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 import adopt_blender_export  # noqa: E402
+import aim_rig  # noqa: E402
 import lock_root_motion  # noqa: E402
 from blend_to_glb import resolve_blender  # noqa: E402
 
@@ -64,6 +71,8 @@ def main(argv):
                     help="keep the intermediate un-adopted .glb for inspection")
     ap.add_argument("--no-lock", action="store_true",
                     help="leave the authored root motion in the clips")
+    ap.add_argument("--no-aim-rig", action="store_true",
+                    help="leave out AIM_TORSO and WEAPON_SOCKET")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv[1:])
 
@@ -100,6 +109,11 @@ def main(argv):
 
     if not args.no_lock:
         rc = lock_root_motion.main(["lock", args.out])
+
+    if not args.no_aim_rig:
+        # After the lock, never before: locking works on the joints that have
+        # no parent among the joints, and the pivot gives the pelvis one.
+        rc = aim_rig.main(["aim_rig", args.out]) or rc
 
     if args.keep_raw:
         print("raw export kept at %s" % raw)

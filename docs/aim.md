@@ -1150,3 +1150,33 @@ lock-on weapons
 aim-assisted weapons
 
 It also leaves room to add IK, aim offsets, FCS behavior, and more advanced procedural animation later without rebuilding the core animation architecture.
+
+As Built
+
+What exists in this repo, and where the skeleton forced a different shape from the one above.
+
+The rig
+
+The Hero's exported skeleton is flat. Rigify's DEF bones in TheHero.blend are driven by constraints rather than by parenting, so `export_def_bones` emits all 53 of them as children of `rig`: the arms are not under the shoulders, the shoulders are not under the spine, and the pelvis is a sibling of the thighs. No bone in the file turns the upper body.
+
+Rebuilding the anatomical hierarchy above is not available. The clips hold one local transform per bone per frame, and re-expressing them under new parents means decomposing world matrices back into translation/rotation/scale, which the Rigify stretch bones make lossy -- their non-uniform scale leaves shear that a glTF TRS cannot hold. Measured over every clip and frame, it moves his fingertips by up to 315 mm.
+
+`tools/aim_rig.py` inserts AIM_TORSO instead, as a pivot with no keyframes sitting between the skeleton root and every joint above the hips. Because the thighs hang off the root rather than off the pelvis, the pelvis can join the upper body without taking the legs along, so the pivot carries the spine, the head, the arms, the cape and the sheath, and leaves the thighs, the pelvis bones, the belt and the sash behind. The whole insert reduces to a constant translation on thirteen joints and is exactly lossless.
+
+The cost is that the twist is rigid: the spine chain rides inside the group rather than bending through it, so the pelvis mesh turns with the chest instead of the curve distributing up the spine. Distributed aim rotation, aim offset poses and left-hand IK all need the DEF bones parented properly in the .blend first.
+
+The runtime
+
+`sm64py/aim.py` is the procedural layer -- `AimController`, an `AimProfile` per weapon, and the melee commitment curve. `app/main.py` feeds it the camera's aim ray and applies the body turn it asks for.
+
+    torso limit         60 degrees, then his feet come round
+    comfort limit       20 degrees, standing still
+    pitch               55% of the shot's elevation, clamped -45 to +60
+    response            a critically damped spring, 0.12 s
+    tracking            the sights' blend, or the melee curve, whichever is more
+
+All of it is on console sliders (`torso_limit`, `torso_response`, `torso_pitch`, `torso_comfort`, `torso_turn_rate`).
+
+Not built yet
+
+Upper/lower body subparts -- he has no clip that would use them until there is a weapon to hold. WEAPON_SOCKET exists, under DEF-hand.R, with nothing attached to it. No WeaponController, no muzzle, no melee hitboxes or weapon sweep; the melee tracking curve is wired up and steers the swing, but nothing yet reads it for hit detection.

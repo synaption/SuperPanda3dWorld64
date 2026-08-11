@@ -13,6 +13,7 @@ machine can reach has a clip to draw.
     python3 tools/check_hero.py
 """
 
+import math
 import os
 import sys
 
@@ -443,6 +444,115 @@ def check_stride_matches_ground_speed():
                           else "walk cycle matches the ground covered")
 
 
+def check_the_aim_pivot_carries_the_right_half():
+    """AIM_TORSO must hold every joint above the hips and none below.
+
+    The one thing about the restructure that a screenshot cannot show and that
+    nothing else would catch: a re-export growing a joint, or tools/aim_rig.py
+    being given a name it does not recognise, leaves a bone in the half of the
+    body it does not belong to -- an arm that stops following the aim, or a
+    thigh that starts. Both look like an animation bug and neither is.
+    """
+    sys.path.insert(0, HERE)
+    import aim_rig                                       # noqa: PLC0415
+    import rig                                           # noqa: PLC0415
+
+    gltf = rig.Gltf(os.path.join(ROOT, "assets", "hero", "hero.glb"))
+    for name in (aim_rig.PIVOT, aim_rig.SOCKET):
+        if name not in gltf.index:
+            return False, (f"no {name} joint; run "
+                           "python3 tools/aim_rig.py assets/hero/hero.glb")
+
+    pivot = gltf.index[aim_rig.PIVOT]
+    below = set()
+
+    def collect(node):
+        below.add(gltf.nodes[node].get("name"))
+        for child in gltf.nodes[node].get("children", []):
+            collect(child)
+
+    collect(pivot)
+
+    problems = []
+    for name in ("DEF-spine.006", "Head", "DEF-hand.L", "DEF-hand.R",
+                 "fingers.r", aim_rig.SOCKET):
+        if name not in below:
+            problems.append(f"{name} does not turn with the aim")
+    for name in ("DEF-thigh.L", "DEF-thigh.R", "DEF-foot.L", "DEF-toe.R",
+                 "Belt", "Sash.00"):
+        if name in below:
+            problems.append(f"{name} turns with the aim and should not")
+    if gltf.index[aim_rig.SOCKET] not in gltf.json["skins"][0]["joints"]:
+        problems.append(f"{aim_rig.SOCKET} is not a skin joint, so Panda3D "
+                        "will not expose it")
+
+    return not problems, ("; ".join(problems) if problems else
+                          f"{len(below) - 1} joints ride the pivot, the legs "
+                          "do not")
+
+
+def check_the_torso_stops_at_its_limit():
+    """The twist clamps, and the feet are asked for exactly the excess."""
+    from sm64py.aim import AimController                 # noqa: PLC0415
+    from sm64py.math_util import degrees_to_s16, s16_to_degrees  # noqa: PLC0415
+
+    class Pivot:
+        """Stands in for the joint. It is what the controller writes to, and
+        having one is what tells it there is a torso to twist at all."""
+
+        def set_hpr(self, *hpr):
+            self.hpr = hpr
+
+    aim = AimController(Pivot())
+    aim.set_tracking(1.0)
+    limit = aim.profile.yaw_limit
+
+    problems = []
+    # Aim 100 degrees off his facing, from three different facings: the answer
+    # is local, so it must not depend on which way he is standing.
+    for facing in (0.0, 90.0, -140.0):
+        yaw = math.radians(facing + 100.0)
+        aim.set_aim_direction((math.sin(yaw), 0.0, math.cos(yaw)),
+                              degrees_to_s16(facing))
+        if abs(aim.target_yaw - 100.0) > 0.5:
+            problems.append(f"facing {facing:.0f}, a 100 degree aim reads as "
+                            f"{aim.target_yaw:.1f}")
+        if abs(aim.local_yaw - limit) > 1e-6:
+            problems.append(f"the torso twists to {aim.local_yaw:.1f}, past "
+                            f"its {limit:.0f} degree limit")
+
+    # Standing, the feet come round for the excess; running, the torso is left
+    # to cover more of it before they are asked.
+    standing = s16_to_degrees(aim.body_turn(1.0 / 30.0, moving=False))
+    running = s16_to_degrees(aim.body_turn(1.0 / 30.0, moving=True))
+    if not standing > running > 0.0:
+        problems.append(f"a 100 degree aim turns him {standing:.1f} standing "
+                        f"and {running:.1f} running; both should be positive "
+                        "and standing should be the larger")
+
+    # Inside the torso's reach his feet stay where they are.
+    yaw = math.radians(aim.profile.yaw_limit - 5.0)
+    aim.set_aim_direction((math.sin(yaw), 0.0, math.cos(yaw)), 0)
+    if aim.body_turn(1.0 / 30.0, moving=True) != 0:
+        problems.append("his feet turn for an aim the torso could have covered")
+
+    # And a character with no pivot -- Mario -- turns for all of it.
+    bare = AimController(None)
+    bare.set_tracking(1.0)
+    bare.set_aim_direction((math.sin(yaw), 0.0, math.cos(yaw)), 0)
+    if bare.body_turn(1.0 / 30.0, moving=True) <= 0:
+        problems.append("a skeleton with no pivot does not turn on its feet")
+
+    # And an attack lets go of the aim as it commits.
+    from sm64py.aim import melee_tracking                # noqa: PLC0415
+    curve = [melee_tracking(t) for t in (0.0, 0.3, 0.6, 0.9)]
+    if not all(a >= b for a, b in zip(curve, curve[1:])) or curve[-1] != 0.0:
+        problems.append(f"melee tracking does not commit: {curve}")
+
+    return not problems, ("; ".join(problems) if problems else
+                          f"clamps at {limit:.0f} degrees, then turns his feet")
+
+
 CHECKS = [
     ("walking reaches a run", check_walking),
     ("stride matches ground speed", check_stride_matches_ground_speed),
@@ -457,6 +567,8 @@ CHECKS = [
     ("attack chains into the second swing", check_attack_chain),
     ("spin kick out of a run", check_spin_kick),
     ("every action has a clip", check_every_action_has_a_clip),
+    ("the aim pivot carries the right half", check_the_aim_pivot_carries_the_right_half),
+    ("the torso stops at its limit", check_the_torso_stops_at_its_limit),
 ]
 
 

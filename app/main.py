@@ -20,7 +20,10 @@ Controls, as the Hero:
     W / A / S / D or arrows   analog stick (camera-relative)
     mouse                     look
     Right mouse or F (held)   aim: the camera comes in over his shoulder, the
-                              view narrows and the crosshair closes up
+                              view narrows, the crosshair closes up, and his
+                              upper body turns to point where it does -- his
+                              legs keep running wherever they were running.
+                              See docs/aim.md and sm64py/aim.py
     Space                     jump, and only a jump -- unless he is skating,
                               where it takes off on the jets instead
     V (held)                  the jetpack. On the ground it puts him on his
@@ -106,6 +109,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 # sits in is not on the path -- only the root inserted above is.
 from app.gamepad import Gamepad  # noqa: E402
 from sm64py import audio, console, objects, squad, surfaces  # noqa: E402
+from sm64py.aim import AimController, melee_tracking  # noqa: E402
 from sm64py.camera import FollowCamera, smooth_damp  # noqa: E402
 from sm64py.hero import HeroState  # noqa: E402
 from sm64py.hero import actions as hero_actions  # noqa: E402
@@ -293,9 +297,12 @@ MOUSE_SETTLED = 8.0
 DRAG_YAW = 180.0
 DRAG_PITCH = 55.0
 
-# Turning him to face the sights: how fast, and the speed above which he is
-# moving under his own steam and is left alone. See `Game._turn_to_aim`.
-AIM_TURN_RATE = 9.0
+# The bone tools/aim_rig.py inserts for the procedural aim layer to write to.
+AIM_JOINT = "AIM_TORSO"
+
+# Above this speed he counts as moving under his own steam, which buys the
+# torso the full twist before his feet are asked to help. See
+# `Game._update_torso_aim` and sm64py/aim.py.
 AIM_TURN_MAX_SPEED = 2.0
 
 # A landing kicks the camera. Below the first speed nothing is felt and nothing
@@ -354,7 +361,7 @@ class Player:
     """
 
     def __init__(self, name, state, execute, anims, action_names,
-                 node, actor, yaw_offset):
+                 node, actor, yaw_offset, aim=None):
         self.name = name
         self.state = state
         self.execute = execute              # one tick of the action machine
@@ -363,6 +370,9 @@ class Player:
         self.node = node
         self.actor = actor
         self.yaw_offset = yaw_offset
+        # The procedural aim layer, or None for a skeleton without the pivot
+        # tools/aim_rig.py inserts -- Mario's, as things stand.
+        self.aim = aim
         # Which clip is playing, so a change can be told from a repeat.
         self.current_anim = None
 
@@ -535,13 +545,41 @@ class Game(ShowBase):
 
         self.players = [
             Player("hero", hero, hero_actions.execute_action, hero_animations,
-                   HC.ACTION_NAMES, hero_node, hero_actor, HERO_YAW_OFFSET),
+                   HC.ACTION_NAMES, hero_node, hero_actor, HERO_YAW_OFFSET,
+                   aim=AimController(self._aim_pivot(hero_actor))),
+            # Mario gets a controller with nothing to write to. His skeleton
+            # has no pivot and never will -- it is the decomp's, and its clips
+            # are the decomp's too -- but the half of the layer that turns a
+            # character on his feet needs no bone, and without it he would be
+            # the one character who cannot look where he is aiming.
             Player("mario", mario, execute_action, animations,
-                   ACTION_NAMES, mario_node, mario_actor, MODEL_YAW_OFFSET),
+                   ACTION_NAMES, mario_node, mario_actor, MODEL_YAW_OFFSET,
+                   aim=AimController(None)),
         ]
         # The Hero is who the game is about now; Mario is switched to.
         self.player = self.players[0]
         self.players[1].hide()
+
+    @staticmethod
+    def _aim_pivot(actor):
+        """The AIM_TORSO joint as something that can be written to, or None.
+
+        `controlJoint` takes the joint out of the animation's hands, which is
+        exactly right here and would be wrong on any other bone in the file:
+        AIM_TORSO carries no keyframes, so there is nothing to take. Anything
+        else and the clip would stop playing on it.
+
+        None when the model is missing altogether, or when it predates
+        tools/aim_rig.py -- the game runs either way, with the torso simply
+        pointing wherever the clip points it.
+        """
+        if actor is None:
+            return None
+        if actor.get_joints(jointName=AIM_JOINT):
+            return actor.control_joint(None, "modelRoot", AIM_JOINT)
+        print(f"no {AIM_JOINT} joint in the model; the upper body will not aim."
+              "\nBuild it with:\n  python3 tools/aim_rig.py assets/hero/hero.glb")
+        return None
 
     @property
     def state(self):
@@ -565,6 +603,10 @@ class Game(ShowBase):
         state.spawn(previous.pos[0], previous.pos[1], previous.pos[2],
                     s16_to_degrees(previous.face_angle[1]))
         self.player.current_anim = None
+        # He has just been put down somewhere facing a new way, so whatever the
+        # torso was twisted toward belongs to the last place he stood.
+        if self.player.aim is not None:
+            self.player.aim.reset()
         # The camera reads his facing and his speed -- to recentre, and to
         # drift back behind him while he runs -- so it has to be following the
         # character that is actually being played rather than the one it was
@@ -1352,6 +1394,22 @@ class Game(ShowBase):
         t.add("wade_scale", HC, "WADE_SPEED_SCALE", 0.05, 1.0,
               "what deep water leaves of his speed")
 
+        # The aim layer's feel, on the profile the Hero is actually carrying
+        # rather than on the module default, so a slider moves the character on
+        # screen. docs/aim.md's weapon-specific numbers all live on this object;
+        # when there is more than one weapon there will be more than one of it.
+        aim_profile = self.players[0].aim.profile
+        t.add("torso_limit", aim_profile, "yaw_limit", 15.0, 90.0,
+              "how far the torso twists before his feet have to help")
+        t.add("torso_response", aim_profile, "response", 0.02, 0.6,
+              "spring time of the torso, seconds -- smaller is snappier")
+        t.add("torso_pitch", aim_profile, "pitch_share", 0.0, 1.0,
+              "how much of the shot's elevation the torso leans into")
+        t.add("torso_comfort", aim_profile, "comfort_yaw", 0.0, 60.0,
+              "twist he will square up out of when standing still")
+        t.add("torso_turn_rate", aim_profile, "turn_rate", 0.5, 20.0,
+              "how fast his feet come round to the excess")
+
         # The squad's numbers are module-level in sm64py/squad.py and read on
         # the frame they are used, the same way the movement constants are, so
         # a drag lands on the next command rather than needing a restart.
@@ -1533,7 +1591,7 @@ class Game(ShowBase):
         # what the simulation is stepped against rather than the last one's.
         self._update_aim_mode()
         self._update_look(dt)
-        self._turn_to_aim(dt)
+        self._update_torso_aim(dt)
 
         # Step the simulation in whole 30 Hz ticks.
         self._accumulator += dt
@@ -1711,34 +1769,83 @@ class Game(ShowBase):
     def _toggle_zoom(self):
         self._aim_toggle = not self._aim_toggle
 
-    def _turn_to_aim(self, dt):
-        """Face him down the sights while he is standing in them.
+    def _tracking_strength(self):
+        """How much of the aim the upper body is currently following.
 
-        Only while he is standing: he has no strafing clips, so a character
-        turned to the camera while he runs would slide sideways through a
-        forward run cycle. Standing still he has nothing to contradict, and
-        turning to look where the player is looking is what makes the crosshair
-        read as his rather than as an overlay on the screen.
+        Two things ask for the torso, and the stronger of them wins.
 
-        Eased rather than snapped, and written to the simulation's facing
-        directly -- which is safe here and nowhere else: the idle actions do
-        not touch `face_angle`, so nothing is being fought over, and the next
-        tick's movement reads the result as though he had turned himself.
+        **The sights**, at whatever fraction they are blended in at, so the
+        upper body comes round with the camera as the view closes rather than
+        snapping to it the instant the button goes down. Out of the sights it
+        is zero: a torso that swivelled after the mouse while he was running
+        about would read as a bug rather than as aiming.
+
+        **A swing in progress**, at whatever docs/aim.md's commitment curve
+        allows this far into it. This is the melee half of the doc, and the
+        reason it is `max` rather than a product: the interesting case is a
+        sword swing with the sights *down*, where the attack steers toward the
+        crosshair during the windup and stops listening once the blade is out.
         """
         state = self.state
-        # The stationary flag rather than a list of actions, because both
-        # characters carry it and neither's list is this file's business: it is
-        # set on exactly the actions that hold him in one place, which is the
-        # same question being asked here.
-        if (self.follow_camera.aim_amount < 0.5
-                or abs(state.forward_vel) > AIM_TURN_MAX_SPEED
-                or not state.action & C.ACT_FLAG_STATIONARY):
+        strength = self.follow_camera.aim_amount
+        # The Hero's two attacks by name rather than by the attacking flag:
+        # Mario's punches carry it too, and his are the decomp's animations
+        # timed by the decomp's tables, with no windup this file may reinterpret.
+        if state.action in (HC.ACT_HERO_ATTACK, HC.ACT_HERO_SPIN_KICK):
+            length = HC.SPIN_KICK_FRAMES
+            if state.action == HC.ACT_HERO_ATTACK:
+                length = (HC.ATTACK1_FRAMES if state.combo_index == 0
+                          else HC.ATTACK2_FRAMES)
+            # From the action timer rather than from the clip's playhead: it is
+            # the number the attack's own hit windows are cut against, so the
+            # tracking and the gameplay agree about how far in he is.
+            strength = max(strength,
+                           melee_tracking(state.action_timer / max(length, 1)))
+        return strength
+
+    def _update_torso_aim(self, dt):
+        """Point the upper body down the sights, and the feet after it.
+
+        docs/aim.md's split, in the order it describes: the torso takes as much
+        of the aim as it is allowed, and whatever is left over is what the
+        character has to turn his feet for. `body_turn` returns that remainder
+        rather than applying it, so the writing to the simulation's facing
+        happens here, where the rest of the input does.
+
+        Writing to `face_angle` from the render frame is safe for the same
+        reason the old sight-turning was: nothing in the action machine sets it
+        except the movement code, which reads it fresh each tick and will treat
+        this as though he had turned himself.
+        """
+        player = self.player
+        if player.aim is None:
             return
-        delta = s16(self.follow_camera.mario_yaw - state.face_angle[1])
-        if abs(delta) < 0x0080:
-            return
-        step = delta * min(AIM_TURN_RATE * dt, 1.0)
-        state.face_angle[1] = s16(state.face_angle[1] + step)
+        state = player.state
+
+        _, direction = self.follow_camera.aim_ray()
+        player.aim.set_aim_direction(direction, state.face_angle[1])
+        player.aim.set_tracking(self._tracking_strength())
+
+        # Moving, he keeps the full twist: his legs are busy carrying him
+        # somewhere and turning them would send him there sideways. Standing,
+        # he is allowed to square up, and does.
+        moving = (abs(state.forward_vel) > AIM_TURN_MAX_SPEED
+                  or not state.action & C.ACT_FLAG_STATIONARY)
+        turn = player.aim.body_turn(dt, moving)
+        if turn:
+            state.face_angle[1] = s16(state.face_angle[1] + turn)
+
+        player.aim.update(dt)
+
+    def _torso_text(self):
+        """Where the aim layer has the upper body pointed."""
+        aim = self.player.aim
+        if aim is None or aim.joint is None:
+            return (f"no pivot in this skeleton; he turns on his feet"
+                    f"   (aim {aim.target_yaw:6.1f})" if aim else "none")
+        return (f"yaw {aim.yaw:6.1f}  pitch {aim.pitch:6.1f}"
+                f"   tracking {aim.tracking:4.2f}"
+                f"   (aim {aim.target_yaw:6.1f} / {aim.target_pitch:5.1f})")
 
     def _hud_text(self):
         """The readout, as text.
@@ -1758,6 +1865,7 @@ class Game(ShowBase):
             f"pos      {m.pos[0]:8.1f} {m.pos[1]:8.1f} {m.pos[2]:8.1f}\n"
             f"vel      fwd {m.forward_vel:6.2f}   y {m.vel[1]:7.2f}\n"
             f"yaw      {s16_to_degrees(m.face_angle[1]):7.1f} deg\n"
+            f"torso    {self._torso_text()}\n"
             f"floor    {floor_type}  height {m.floor_height:8.1f}\n"
             f"enemies  {self._enemies_left()} left"
             f"   defeated {self.interactions.defeated}"

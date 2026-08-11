@@ -609,6 +609,7 @@ tools/
   export_hero_gltf.py    the Hero -> .glb, run inside Blender
   adopt_blender_export.py  make a Blender .glb loadable by Panda3D
   lock_root_motion.py    take the authored travel out of a clip
+  aim_rig.py             give the Hero's skeleton its AIM_TORSO pivot
   rig.py                 posing Mario's skeleton from outside the decomp data
   retarget_anim.py       another rig's animation -> a clip on Mario's skeleton
   author_skate.py        the ice-skating cycle, written rather than borrowed
@@ -842,9 +843,13 @@ python3 tools/adopt_blender_export.py assets/hero/hero_raw.glb \
     --out assets/hero/hero.glb --sidecar assets/hero/hero_clips.json \
     --skeleton-root rig
 python3 tools/lock_root_motion.py assets/hero/hero.glb
+python3 tools/aim_rig.py assets/hero/hero.glb
 ```
 
-Four things about the source file make each step necessary, and every one of
+`tools/build_hero.py` runs all of it headless, which is the one to use after
+editing the .blend.
+
+Five things about the source file make each step necessary, and every one of
 them fails *silently* — the export succeeds, the game loads it, and the
 character is quietly wrong:
 
@@ -875,6 +880,22 @@ offset and the in-clip travel together. Height is left alone: the feet already
 sit on the origin plane, and the vertical differences between clips are real
 crouches and leaps. The attack's lunge is handed back as forward velocity in
 `sm64py/hero/actions.py`, where a wall can stop it.
+
+**The exported skeleton is flat.** Rigify's DEF bones in this file are not
+parented to each other — they are driven by constraints off the control rig —
+so `export_def_bones` has nothing to hang them from and all 53 come out as
+children of `rig`. The arms are not under the shoulders and the shoulders are
+not under the spine, which means no bone in the file turns the upper body, and
+so nothing can aim. `aim_rig.py` inserts an `AIM_TORSO` pivot that does, plus a
+`WEAPON_SOCKET` under the right hand. Because the thighs hang off `rig` rather
+than off the pelvis, the pelvis can join the upper body without taking the legs
+with it, and the whole insert reduces to a constant translation on thirteen
+joints — which is why it is exactly lossless where rebuilding an anatomical
+hierarchy is not (that moves his fingertips by up to 315 mm; the tool's
+docstring has the arithmetic). It runs last: `lock_root_motion.py` works on the
+joints that have no parent among the joints, and afterwards the pelvis has one.
+
+See `docs/aim.md` for the design and `sm64py/aim.py` for what reads the pivot.
 
 He is scaled on the Panda3D side (`HERO_SCALE` in `app/main.py`) rather than in
 the export, so it is one number to change instead of a re-export. 81 puts him
