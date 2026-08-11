@@ -324,12 +324,6 @@ CROSSHAIR_HIP_ALPHA = 0.55
 MOUSE_MARGIN = float(os.environ.get("MARIO_MOUSE_MARGIN", "0.8"))
 MOUSE_WARP_FRAMES = 4
 
-# Temporary: MARIO_MOUSE_DEBUG=1 traces the warp so we can see whether
-# move_pointer actually recentres the cursor on this backend and how many
-# frames it takes to land. Remove once the WSLg stepping is understood.
-MOUSE_DEBUG = os.environ.get("MARIO_MOUSE_DEBUG") == "1"
-_mouse_dbg_lines = 0
-
 # Degrees of view per unit of a loose-pointer drag, whose coordinates run -1 to
 # 1 across the window rather than in pixels.
 DRAG_YAW = 180.0
@@ -1016,9 +1010,6 @@ class Game(ShowBase):
         current = (pointer.get_x(), pointer.get_y())
         origin, self._pointer_origin = self._pointer_origin, current
 
-        if MOUSE_DEBUG:
-            self._mouse_trace(current)
-
         if self._warp_frames > 0:
             # A warp is in flight. Drop readings until one lands, then keep it
             # as the origin (above) so the next frame measures real hand
@@ -1059,28 +1050,9 @@ class Game(ShowBase):
         centre = self._window_centre()
         if (abs(current[0] - centre[0]) > centre[0] * MOUSE_MARGIN
                 or abs(current[1] - centre[1]) > centre[1] * MOUSE_MARGIN):
-            ok = self.win.move_pointer(0, *centre)
-            if MOUSE_DEBUG:
-                self._mouse_trace(current, warp_to=centre, move_pointer_ok=ok)
-            if ok:
+            if self.win.move_pointer(0, *centre):
                 self._warp_frames = MOUSE_WARP_FRAMES
                 self._warp_from = current
-
-    def _mouse_trace(self, current, warp_to=None, move_pointer_ok=None):
-        """Temporary WSLg warp trace; gated on MARIO_MOUSE_DEBUG. Cap the spam."""
-        global _mouse_dbg_lines
-        if _mouse_dbg_lines >= 400:
-            return
-        _mouse_dbg_lines += 1
-        centre = self._window_centre()
-        d = math.dist(current, centre)
-        mode = self.win.get_properties().get_mouse_mode()
-        if warp_to is not None:
-            print(f"[mouse] WARP issued at {current} d={d:.0f} "
-                  f"move_pointer_ok={move_pointer_ok} mode={mode}")
-        else:
-            print(f"[mouse] read {current} d_from_centre={d:.0f} "
-                  f"warp_frames={self._warp_frames} mode={mode}")
 
     def _window_centre(self):
         return (self.win.get_x_size() // 2, self.win.get_y_size() // 2)

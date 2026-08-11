@@ -209,10 +209,15 @@ OCCLUSION_REFINE_STEPS = 5
 # the sights), which makes one-pixel adjustments usable without requiring a
 # separate precision-look mode.
 MOUSE_SENSITIVITY = 6.0
-# How long a mouse delta is spread over.  Two hundredths of a second is below
-# the threshold where it reads as lag and above the one where a 125 Hz mouse
-# sampled at 200 fps stair-steps.  Set it to zero for a raw 1:1 pointer.
-MOUSE_SMOOTHING = 0.02
+# How long a mouse delta is spread over.  It has to cover the gap between the
+# render rate and the rate the pointer is actually sampled at: where those are
+# close, a hair of smoothing hides the last stair-step; where the renderer runs
+# far ahead of a slow pointer -- WSLg samples ours at about 60 Hz while frames
+# come several times faster -- each sample arrives as a coarse jump, and the
+# spread has to be a couple of sample intervals wide to overlap them into a
+# glide.  Forty milliseconds is that width without reading as lag.  The console
+# slider `mouse_smooth` moves it live; set it to zero for a raw 1:1 pointer.
+MOUSE_SMOOTHING = 0.04
 
 # Stick: degrees per second at full deflection, before the ramp.
 STICK_YAW_SPEED = 250.0
