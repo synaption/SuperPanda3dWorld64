@@ -1726,6 +1726,12 @@ class Game(ShowBase):
         # does not leave the sheet somewhere else when the game comes back.
         self._water_time += dt
         animate_water(self.water, self._water_time)
+        # Slide every object's drawn position across the tick it is between, the
+        # same blend the player is drawn at, so a reduced-rate crowd moves
+        # smoothly rather than stepping. Must precede the renderers, which read
+        # the interpolated position.
+        self.objects.interpolate(alpha)
+
         # Anything a pipe has produced needs a node before it can be drawn.
         self.object_renderer.refresh(self.objects)
         self.object_renderer.sync(self.follow_camera.pos)

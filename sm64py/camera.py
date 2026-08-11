@@ -203,8 +203,12 @@ OCCLUSION_REFINE_STEPS = 5
 
 # -- look input --------------------------------------------------------------
 
-# Mouse: degrees of view per hundred pixels of movement.
-MOUSE_SENSITIVITY = 22.0
+# Mouse: degrees of view per hundred pixels of movement.  Pointer positions
+# arrive as whole screen pixels, so this is also the smallest un-smoothed turn
+# the player can ask for.  Six gives a 0.06-degree increment (0.033 down
+# the sights), which makes one-pixel adjustments usable without requiring a
+# separate precision-look mode.
+MOUSE_SENSITIVITY = 6.0
 # How long a mouse delta is spread over.  Two hundredths of a second is below
 # the threshold where it reads as lag and above the one where a 125 Hz mouse
 # sampled at 200 fps stair-steps.  Set it to zero for a raw 1:1 pointer.

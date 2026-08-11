@@ -46,4 +46,5 @@ Demon Chaos - 65k enemies on screen at a time on PS2
 Pseudoregalia - great movement system, retro nastalgia asthetic
 Pikmen/Sons of Liberty - squad control mechanics
 Outer Wilds - seamless interplanetary travel
-
+EDF, Dynasty Warriors, Armored Core, Souls - combat, jetpack, dead body physics
+Sonic - Shadow Rocket Boots

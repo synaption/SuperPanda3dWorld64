@@ -11,7 +11,6 @@ from direct.gui.OnscreenText import OnscreenText
 from panda3d.core import (
     AmbientLight,
     ClockObject,
-    LQuaternion,
     NodePath,
     PointLight,
     TextNode,
@@ -309,13 +308,14 @@ class OuterWildsApp(ShowBase):
 
     def _sync_scene(self):
         for node, body in zip(self.planet_nodes, self.world.planets):
-            node.setPos(*body.position)
-        self.sun_light_np.setPos(*self.world.planets[-1].position)
+            node.setPos(*self.world.interpolated_position(body))
+        self.sun_light_np.setPos(*self.world.interpolated_position(self.world.planets[-1]))
 
         player = self.world.player
-        self.camera.setPos(*player.position)
-        self.camera.setQuat(LQuaternion(self.world.movement.camera_quat))
-        self.starfield.setPos(*player.position)
+        player_position = self.world.interpolated_position(player)
+        self.camera.setPos(*player_position)
+        self.camera.setQuat(self.world.interpolated_camera_quat())
+        self.starfield.setPos(*player_position)
 
     def _update_hud(self):
         world = self.world

@@ -146,6 +146,24 @@ def check_look_survives_the_frame_rate():
     return ok, f"{turned[0]:.2f} deg at 30 fps, {turned[1]:.2f} at 240"
 
 
+def check_a_single_mouse_pixel_is_a_fine_adjustment():
+    """One pointer pixel must not make a coarse turn of the camera.
+
+    Screen-pointer APIs report integer coordinates, so the mouse sensitivity
+    determines the smallest possible mouse turn.  This protects the default
+    from drifting back to a value that makes tiny aiming corrections jump.
+    """
+    camera, hero = a_camera()
+    settled(camera)
+    before = camera.yaw
+    camera.look_mouse(1.0, 0.0)
+    run(camera, 0.2)
+    turned = abs(s16_to_degrees(cam._wrap_angle(before - camera.yaw)))
+    expected = cam.MOUSE_SENSITIVITY / 100.0
+    ok = turned <= 0.15 and abs(turned - expected) < 0.01
+    return ok, f"one pixel turns {turned:.3f} degrees"
+
+
 def check_stick_survives_the_frame_rate():
     """And the same stick push held the same *time* turns the same angle.
 
@@ -601,6 +619,8 @@ def check_recentring_arrives():
 CHECKS = [
     ("a look lands this frame", check_look_lands_this_frame),
     ("the mouse ignores the frame rate", check_look_survives_the_frame_rate),
+    ("a mouse pixel is a fine adjustment",
+     check_a_single_mouse_pixel_is_a_fine_adjustment),
     ("the stick ignores the frame rate", check_stick_survives_the_frame_rate),
     ("the stick ramps into a turn", check_the_stick_ramps),
     ("the curve leaves a slow turn", check_the_curve_leaves_a_slow_turn),

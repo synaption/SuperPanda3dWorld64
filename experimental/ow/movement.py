@@ -178,6 +178,10 @@ class SpaceMovementComponent:
         #: Look elevation on foot, degrees, clamped away from straight up.
         self.ground_pitch = 0.0
         self._jump_timer = 0.0
+        #: A held jump input must be released before it can become jetpack
+        #: thrust. Otherwise holding Space for a normal jump launches the
+        #: player into flight as soon as they leave the ground.
+        self._jump_requires_release = False
 
     # -- axes of the direction arrow --------------------------------------
 
@@ -222,7 +226,7 @@ class SpaceMovementComponent:
 
     # -- IA_Move / IA_UpDown / IA_Brake ------------------------------------
 
-    def apply_thrust(self, state, dt):
+    def apply_thrust(self, state, dt, suppress_upward_thrust=False):
         """Queue this frame's jetpack forces onto the player's body."""
         v = self.variables
         body = self.physics_ref
@@ -236,7 +240,7 @@ class SpaceMovementComponent:
                 direction.normalize()
                 body.add_force(direction * v.move_acceleration)
 
-        if state.up_down:
+        if state.up_down and not (suppress_upward_thrust and state.up_down > 0.0):
             body.add_force(self.up * (state.up_down * v.up_down_acceleration))
 
         if state.brake:
@@ -356,14 +360,17 @@ class SpaceMovementComponent:
             change *= limit / change.length()
         self.physics_ref.speed = tangential + change + normal * into
 
-        if state.up_down > 0.0:
+        if state.up_down > 0.0 and not self._jump_requires_release:
             self.physics_ref.speed += normal * JUMP_SPEED
             self._jump_timer = JUMP_LOCKOUT
+            self._jump_requires_release = True
             self.grounded = False
 
     # -- the whole per-step update ----------------------------------------
 
     def update(self, state, dt, ground_body=None, ground_normal=None):
+        if state.up_down <= 0.0:
+            self._jump_requires_release = False
         self._jump_timer = max(0.0, self._jump_timer - dt)
         grounded = ground_body is not None and self._jump_timer <= 0.0
 
@@ -380,5 +387,7 @@ class SpaceMovementComponent:
             self._walk(state, dt, ground_body, ground_normal)
         else:
             self.apply_look(state, dt)
-            self.apply_thrust(state, dt)
+            self.apply_thrust(
+                state, dt, suppress_upward_thrust=self._jump_requires_release
+            )
         self.update_camera(dt)

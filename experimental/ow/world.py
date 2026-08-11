@@ -5,7 +5,7 @@ headlessly (see `python -m ow.main --selftest`). The renderer reads positions
 and orientations back out of here each frame.
 """
 
-from panda3d.core import LVector3d
+from panda3d.core import LQuaternion, LVector3d
 
 from .constants import (
     DEFAULT_GRAVITY_MODE,
@@ -17,7 +17,7 @@ from .constants import (
 )
 from .gravity import GravityComponent, GravityWorld
 from .level import PLAYER_START, demo_system
-from .movement import InputState, SpaceMovementComponent
+from .movement import InputState, SpaceMovementComponent, slerp
 
 
 class World:
@@ -55,11 +55,18 @@ class World:
 
         self._accumulator = 0.0
         self.elapsed = 0.0
+        # Rendering normally runs faster than the 60 Hz simulation.  Keep the
+        # two most recent simulation poses so presentation can fill in the
+        # frames between ticks instead of showing each pose twice at 120 FPS.
+        self._previous_positions = [LVector3d(body.position) for body in self.gravity.bodies]
+        self._previous_camera_quat = LQuaternion(self.movement.camera_quat)
 
     # -- ticking -----------------------------------------------------------
 
     def step(self, dt):
         """Advance one fixed step: input forces first, then integration."""
+        self._previous_positions = [LVector3d(body.position) for body in self.gravity.bodies]
+        self._previous_camera_quat = LQuaternion(self.movement.camera_quat)
         ground_body, ground_normal = self.player.find_ground(self.gravity.bodies)
         self.movement.update(self.input, dt, ground_body, ground_normal)
         # Mouse motion is a displacement already spent, not a held state, so
@@ -84,6 +91,25 @@ class World:
         if self._accumulator > FIXED_TIMESTEP * MAX_STEPS_PER_FRAME:
             self._accumulator = 0.0
         return steps
+
+    @property
+    def interpolation_alpha(self):
+        """How far the renderer is between the two latest fixed-step poses."""
+        return min(1.0, max(0.0, self._accumulator / FIXED_TIMESTEP))
+
+    def interpolated_position(self, body):
+        """Return a smooth render-only position for a gravity body."""
+        index = self.gravity.bodies.index(body)
+        previous = self._previous_positions[index]
+        return previous + (body.position - previous) * self.interpolation_alpha
+
+    def interpolated_camera_quat(self):
+        """Return the camera orientation matching the interpolated pose."""
+        return slerp(
+            self._previous_camera_quat,
+            self.movement.camera_quat,
+            self.interpolation_alpha,
+        )
 
     # -- gravity sourcing --------------------------------------------------
 

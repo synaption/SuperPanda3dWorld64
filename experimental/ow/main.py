@@ -290,15 +290,14 @@ def selftest():
 
     sim.input.clear()
     sim.input.up_down = 1.0
-    sim.step(FIXED_TIMESTEP)
-    sim.input.clear()
     peak, landed = 0.0, False
     for _ in range(int(5.0 / FIXED_TIMESTEP)):
         sim.step(FIXED_TIMESTEP)
         peak = max(peak, (sim.player.position - target.position).length() - contact)
         landed = landed or sim.movement.grounded
-    check("jumping leaves the ground and comes back down",
-          peak > 50.0 and landed, "peak {:.0f} cm".format(peak))
+    sim.input.clear()
+    check("holding jump stays a normal jump instead of engaging the jetpack",
+          50.0 < peak < 250.0 and landed, "peak {:.0f} cm".format(peak))
 
     print("demo system")
     sim = World()

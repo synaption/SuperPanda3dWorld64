@@ -57,6 +57,13 @@ class Object:
     # is what keeps the population up and a pipe's tick is a bare countdown --
     # nothing worth culling, and everything to lose by freezing it.
     always_active = False
+    # How many ticks the current update stands in for. One under a full-rate
+    # tick; the reduced-rate level-of-detail bands raise it so a single update
+    # moves the object -- and steps its animation -- as far as the ticks it is
+    # replacing would have. `move` reads it to scale the step; see ObjectSet.
+    time_scale = 1
+    # Offset into the level-of-detail schedule, assigned by ObjectSet.spawn.
+    lod_phase = 0
 
     def __init__(self, surfaces, x, y, z, yaw=0):
         self.surfaces = surfaces
@@ -90,6 +97,20 @@ class Object:
 
         self.snap_to_floor()
 
+        # Render interpolation. The simulation moves in whole ticks, and under
+        # crowd level-of-detail a distant object moves in even larger jumps once
+        # every several ticks -- drawn raw, that is a visible teleport. So the
+        # drawn position (`draw_pos`, read only by the renderer) slides across
+        # the step instead: `render_prev` to `render_next` over the `render_span`
+        # ticks the step stands in for, positioned each frame by ObjectSet.
+        # interpolate. Gameplay never reads these; it uses `pos`, the truth.
+        here = (self.pos[0], self.pos[1], self.pos[2])
+        self.render_prev = here
+        self.render_next = here
+        self.render_pos = here
+        self.render_tick0 = 0
+        self.render_span = 1
+
     # -- shared movement ----------------------------------------------------
 
     def snap_to_floor(self):
@@ -112,12 +133,21 @@ class Object:
         return delta
 
     def move(self):
-        """Advance by the current velocity. Returns True if a wall was hit."""
-        step_x = self.forward_vel * sins(self.yaw)
-        step_z = self.forward_vel * coss(self.yaw)
+        """Advance by the current velocity. Returns True if a wall was hit.
+
+        Under crowd level-of-detail a distant object updates on only some ticks,
+        so `time_scale` is the number of ticks this one step is standing in for;
+        the step, and gravity's pull on it, are multiplied by it so the object
+        covers the same ground it would have at full rate. A larger step tests
+        collision over a longer reach -- a far crowd can clip a thin wall it
+        would have been stopped by up close -- which is the intended trade for
+        not simulating it every tick.
+        """
+        step_x = self.forward_vel * sins(self.yaw) * self.time_scale
+        step_z = self.forward_vel * coss(self.yaw) * self.time_scale
 
         next_pos = [self.pos[0] + step_x,
-                    self.pos[1] + self.vel_y,
+                    self.pos[1] + self.vel_y * self.time_scale,
                     self.pos[2] + step_z]
 
         data = WallCollisionData(next_pos[0], next_pos[1], next_pos[2],
@@ -138,7 +168,8 @@ class Object:
             self.on_ground = True
         else:
             self.on_ground = False
-            self.vel_y = max(self.vel_y + OBJECT_GRAVITY, TERMINAL_VELOCITY)
+            self.vel_y = max(self.vel_y + OBJECT_GRAVITY * self.time_scale,
+                             TERMINAL_VELOCITY)
 
         self.pos = next_pos
         return hit_wall
@@ -174,7 +205,11 @@ class Object:
 
     @property
     def draw_pos(self):
-        return self.pos
+        # The interpolated render position, refreshed once a frame by
+        # ObjectSet.interpolate. Falls back to the live position for any object
+        # drawn without a simulation driving it (the tooling that renders a
+        # static scene never calls interpolate).
+        return self.render_pos
 
     @property
     def draw_yaw(self):
@@ -894,22 +929,28 @@ class ObjectSet:
     # Crowd level-of-detail. An enemy far from the player is not watched
     # closely, so it is not worth a full behaviour tick every frame -- and the
     # cost of running one for all of them is what caps the crowd. Inside the
-    # full range everything updates every tick; through the middle band an
-    # object updates one tick in LOD_MID_STRIDE, its phase staggered so the band
-    # does not all step together; past the far range a grounded object holds
-    # where it stands until the player comes back. Distances are squared once
-    # here so the per-object test is a multiply, not a hypot.
-    LOD_FULL_RANGE = 2500.0
-    LOD_FAR_RANGE = 6000.0
+    # near range everything updates every tick; further out an object runs on
+    # one tick in `stride`, but that tick counts for the whole stride -- it
+    # moves the enemy the full distance and steps its animation the full number
+    # of frames -- so a distant crowd travels at its true speed in fewer,
+    # larger, choppier steps rather than freezing. Nothing is ever frozen.
+    # Distances are squared once here so the per-object test is a multiply.
+    LOD_NEAR_RANGE = 3000.0    # full rate inside this
+    LOD_MID_RANGE = 7000.0     # one tick in LOD_MID_STRIDE out to here
     LOD_MID_STRIDE = 3
-    _LOD_FULL_SQ = LOD_FULL_RANGE * LOD_FULL_RANGE
-    _LOD_FAR_SQ = LOD_FAR_RANGE * LOD_FAR_RANGE
+    LOD_FAR_STRIDE = 6         # beyond LOD_MID_RANGE
+    _LOD_NEAR_SQ = LOD_NEAR_RANGE * LOD_NEAR_RANGE
+    _LOD_MID_SQ = LOD_MID_RANGE * LOD_MID_RANGE
 
     def __init__(self, surfaces):
         self.surfaces = surfaces
         # Turned off by the deterministic tooling, which wants every object
         # stepped every tick regardless of where the player stands.
         self.lod_enabled = True
+        # A free-running tick count, so a reduced-rate object's turn comes up on
+        # a predictable schedule regardless of how its own timer is being bumped
+        # to keep its animation in step.
+        self.tick = 0
         self.objects = []
         # The subset that can be fought, kept apart from the rest. Everything
         # that hunts them -- every Mario on the field, and the interaction pass
@@ -923,6 +964,10 @@ class ObjectSet:
     def spawn(self, cls, x, y, z, yaw=0, **kwargs):
         obj = cls(self.surfaces, x, y, z, yaw, **kwargs)
         obj.world = self
+        # A stable per-object offset for the level-of-detail schedule, handed
+        # out in sequence so neighbours land on different ticks and a reduced
+        # rate band does not update all at once.
+        obj.lod_phase = len(self.objects)
         self.objects.append(obj)
         if isinstance(obj, (Goomba, Scuttlebug)):
             self.enemies.append(obj)
@@ -953,12 +998,13 @@ class ObjectSet:
             self.enemies = [e for e in self.enemies
                             if e.active and not e.defeated]
 
+        self.tick += 1
         px, pz = mario.pos[0], mario.pos[2]
 
         # Over a copy of the list, because a pipe firing appends to it: the
         # new arrival is left to start on the following tick rather than being
         # updated on the one it was created in.
-        for i, obj in enumerate(list(self.objects)):
+        for obj in list(self.objects):
             if not obj.active:
                 continue
             if obj.dying:
@@ -974,23 +1020,81 @@ class ObjectSet:
                 # Thrown by a pipe and still in the air. Its behaviour gets it
                 # back the moment it lands.
                 obj.coast()
+                self._open_segment(obj, 1)
                 continue
 
-            # Crowd level-of-detail: cull the behaviour tick by distance from
-            # the player. Airborne objects are never frozen -- a dormant one
-            # left in mid-air would hang there -- and always_active objects (the
-            # pipes) opt out entirely.
+            # Crowd level-of-detail: the further from the player, the fewer
+            # ticks the object runs on. Airborne objects keep full rate -- the
+            # larger compensating step does not sit well with an arc -- and the
+            # pipes opt out entirely.
+            stride = 1
             if self.lod_enabled and not obj.always_active and obj.on_ground:
                 dx = obj.pos[0] - px
                 dz = obj.pos[2] - pz
                 dist_sq = dx * dx + dz * dz
-                if dist_sq > self._LOD_FAR_SQ:
-                    continue
-                if dist_sq > self._LOD_FULL_SQ and (i + obj.timer) % \
-                        self.LOD_MID_STRIDE:
+                if dist_sq > self._LOD_MID_SQ:
+                    stride = self.LOD_FAR_STRIDE
+                elif dist_sq > self._LOD_NEAR_SQ:
+                    stride = self.LOD_MID_STRIDE
+                if stride > 1 and (self.tick + obj.lod_phase) % stride:
+                    # Not this object's turn in its reduced-rate band. It holds
+                    # position until its scheduled tick, when one update carries
+                    # it the whole way.
                     continue
 
-            obj.update(mario)
+            if stride > 1:
+                # One update standing in for `stride` ticks: `move` multiplies
+                # the step by it, and the animation is advanced the same number
+                # of frames so the walk cycle keeps pace with the ground covered.
+                # The larger jump is then smoothed out over those ticks by the
+                # render interpolation, so the enemy travels smoothly rather than
+                # in visible steps.
+                obj.time_scale = stride
+                obj.update(mario)
+                obj.time_scale = 1
+                obj.timer += stride - 1
+            else:
+                obj.update(mario)
+            self._open_segment(obj, stride)
+
+    def _open_segment(self, obj, span):
+        """Start a render-interpolation segment for a sim step just taken.
+
+        The drawn position was, by now, sitting on the previous segment's end
+        (`render_next`); that becomes the start, the step just taken becomes the
+        new end, and the segment runs for `span` ticks -- the number this step
+        stood in for -- so interpolate slides across exactly the ground covered.
+        """
+        obj.render_prev = obj.render_next
+        obj.render_next = (obj.pos[0], obj.pos[1], obj.pos[2])
+        obj.render_tick0 = self.tick
+        obj.render_span = span
+
+    def interpolate(self, alpha):
+        """Refresh every object's drawn position for a frame between ticks.
+
+        Called once per rendered frame with the same fraction the player is
+        drawn at (`accumulator / TICK_DT`). Each object slides along its current
+        segment, so a crowd updated at a reduced rate moves smoothly on screen
+        instead of jumping on the ticks it happens to run. Gameplay is untouched
+        -- this writes `render_pos`, which only the renderer reads.
+        """
+        tick = self.tick
+        for obj in self.objects:
+            if not obj.active:
+                continue
+            span = obj.render_span or 1
+            frac = (tick - obj.render_tick0 + alpha) / span
+            a = obj.render_prev
+            b = obj.render_next
+            if frac >= 1.0:
+                obj.render_pos = b
+            elif frac <= 0.0:
+                obj.render_pos = a
+            else:
+                obj.render_pos = (a[0] + (b[0] - a[0]) * frac,
+                                  a[1] + (b[1] - a[1]) * frac,
+                                  a[2] + (b[2] - a[2]) * frac)
 
     def of_model(self, model):
         return [o for o in self.objects if o.model == model]

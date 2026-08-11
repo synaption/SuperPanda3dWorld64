@@ -204,9 +204,11 @@ class ImpostorField:
         # Gathered into columns and turned into cells with numpy rather than
         # object by object: the per-frame Python cost is one pass to read the
         # positions, and the arithmetic on them is vectorised.
-        px = np.fromiter((o.pos[0] for o in live), np.float32, n)
-        py = np.fromiter((o.pos[1] for o in live), np.float32, n)
-        pz = np.fromiter((o.pos[2] for o in live), np.float32, n)
+        # draw_pos, not pos: the interpolated render position, so a crowd on a
+        # reduced level-of-detail tick rate slides smoothly rather than jumping.
+        px = np.fromiter((o.draw_pos[0] for o in live), np.float32, n)
+        py = np.fromiter((o.draw_pos[1] for o in live), np.float32, n)
+        pz = np.fromiter((o.draw_pos[2] for o in live), np.float32, n)
         yaw = np.fromiter((s16_to_degrees(o.draw_yaw) for o in live),
                           np.float32, n)
         # Enemies carry one clip; step its frames off their own timer so a field

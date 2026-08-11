@@ -32,6 +32,9 @@ The original binds only a gamepad for movement (`Gamepad_Left2D`); `Space`,
 `Left Ctrl`, `Left Shift` and the mouse are its keyboard bindings verbatim.
 WASD and `Q` are added here so the port is playable without a pad.
 
+On foot, holding `Space` performs one normal jump; release it before pressing
+again to use upward jetpack thrust after leaving the ground.
+
 ## How it works
 
 Two orientations, and keeping them apart is the whole trick:
