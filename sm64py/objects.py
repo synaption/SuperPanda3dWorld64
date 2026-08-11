@@ -16,7 +16,7 @@ import random
 
 import numpy as np
 
-from .math_util import atan2s, coss, s16, sins
+from .math_util import DEGREES_PER_UNIT, atan2s, coss, s16, sins
 from .surfaces import WallCollisionData
 
 # Objects fall at this rate until they land, matching the object gravity the
@@ -127,6 +127,11 @@ class Object:
         self.render_pos = here
         self.render_tick0 = 0
         self.render_span = 1
+        # Facing changes in the fixed simulation too.  Position interpolation
+        # alone leaves a turning object visibly snapping at 30 Hz.
+        self.render_yaw_prev = self.yaw
+        self.render_yaw_next = self.yaw
+        self.render_yaw = self.yaw
 
     # -- shared movement ----------------------------------------------------
 
@@ -245,7 +250,12 @@ class Object:
 
     @property
     def draw_yaw(self):
-        return self.yaw
+        return self.render_yaw
+
+    @property
+    def draw_yaw_degrees(self):
+        """Smooth render-facing angle in Panda's degree units."""
+        return self.render_yaw * DEGREES_PER_UNIT
 
 
 class Tree(Object):
@@ -582,15 +592,10 @@ class Mario(Object):
         else:
             nearest = self.HUNT_RANGE
             anchor_x, anchor_z = self.pos[0], self.pos[2]
-        for obj in self.world.enemies:
-            # Already known to be a live goomba or scuttlebug -- the set holds
-            # nothing else, and the dead were pruned at the top of the tick --
-            # so this is a distance check and no more.
-            if not obj.active or obj.defeated:
-                continue
-            distance = math.hypot(obj.pos[0] - anchor_x, obj.pos[2] - anchor_z)
-            if distance < nearest:
-                self.target, nearest = obj, distance
+        # The set's spatial grid visits only the cells within reach, rather than
+        # this Mario walking every enemy on the field -- the same nearest enemy,
+        # found without the Mario-by-enemy sweep a squad among thousands cost.
+        self.target = self.world.nearest_enemy(anchor_x, anchor_z, nearest)
         return self.target
 
     def _fight(self):
@@ -974,6 +979,14 @@ class ObjectSet:
     _LOD_NEAR_SQ = LOD_NEAR_RANGE * LOD_NEAR_RANGE
     _LOD_MID_SQ = LOD_MID_RANGE * LOD_MID_RANGE
 
+    # A Mario hunting for something to hit used to scan every enemy on the field,
+    # so a squad of them among thousands of enemies cost a Mario-by-enemy sweep a
+    # tick. The enemies are instead hashed into a coarse grid of this cell size,
+    # rebuilt once the first hunter asks for it each tick, and a hunt only visits
+    # the cells its range reaches. 2000 keeps a 3500-unit hunt to a 5x5 block and
+    # a 1000-unit squad leash to 3x3, while holding few enough enemies per cell.
+    ENEMY_GRID_CELL = 2000.0
+
     def __init__(self, surfaces):
         self.surfaces = surfaces
         # Turned off by the deterministic tooling, which wants every object
@@ -999,6 +1012,12 @@ class ObjectSet:
         # same set of enemies, pruned as they die rather than rebuilt, since a
         # normal tick neither spawns nor kills one.
         self.enemies = []
+        # Coarse spatial hash of the enemies for the hunters to query, built at
+        # most once a tick and only when something actually hunts. `_grid_tick`
+        # stamps the tick it was last built for, so several Marios in a tick
+        # share one build and a tick with no hunter never pays for one.
+        self._enemy_grid = {}
+        self._grid_tick = -1
         # Per-tick scratch for batched movement: the objects that planned a step
         # this tick and the columns their step is resolved from. Refilled at the
         # top of every update; see `update` and `_resolve_moves`.
@@ -1168,11 +1187,12 @@ class ObjectSet:
         offs = np.array(self._mv_off, dtype=np.float64)
         rad = np.array(self._mv_rad, dtype=np.float64)
 
-        out_x, out_z, counts = self.surfaces.find_walls(xs, ys, zs, offs, rad)
-        # The floor is looked for from 50 units above the stepped position, the
-        # same reach the scalar query uses; the landing test below compares the
-        # raw stepped height, not that lifted one.
-        heights, ids = self.surfaces.find_floors(out_x, ys + 50.0, out_z)
+        # Walls then floors for the whole crowd in one call, split across worker
+        # threads when the crowd is large. The floor is looked for from 50 units
+        # above the wall-corrected position, the same reach the scalar query
+        # uses; the landing test below compares the raw stepped height.
+        out_x, out_z, counts, heights, ids = self.surfaces.resolve_crowd(
+            xs, ys, zs, offs, rad, floor_lift=50.0)
 
         surfaces = self.surfaces
         for i, obj in enumerate(objs):
@@ -1213,6 +1233,8 @@ class ObjectSet:
         """
         obj.render_prev = obj.render_next
         obj.render_next = (obj.pos[0], obj.pos[1], obj.pos[2])
+        obj.render_yaw_prev = obj.render_yaw_next
+        obj.render_yaw_next = obj.yaw
         obj.render_tick0 = self.tick
         obj.render_span = span
 
@@ -1235,12 +1257,70 @@ class ObjectSet:
             b = obj.render_next
             if frac >= 1.0:
                 obj.render_pos = b
+                obj.render_yaw = obj.render_yaw_next
             elif frac <= 0.0:
                 obj.render_pos = a
+                obj.render_yaw = obj.render_yaw_prev
             else:
                 obj.render_pos = (a[0] + (b[0] - a[0]) * frac,
                                   a[1] + (b[1] - a[1]) * frac,
                                   a[2] + (b[2] - a[2]) * frac)
+                obj.render_yaw = (
+                    obj.render_yaw_prev
+                    + s16(obj.render_yaw_next - obj.render_yaw_prev) * frac
+                )
+
+    def _build_enemy_grid(self):
+        """Hash the live enemies into a grid of their last-committed positions.
+
+        Built from `pos`, which a batched tick does not touch until it commits
+        after the behaviour loop, so every hunter this tick reads the same
+        pre-tick layout the old whole-list scan did.
+        """
+        cs = self.ENEMY_GRID_CELL
+        grid = {}
+        for e in self.enemies:
+            if not e.active or e.defeated:
+                continue
+            key = (int(e.pos[0] // cs), int(e.pos[2] // cs))
+            bucket = grid.get(key)
+            if bucket is None:
+                grid[key] = [e]
+            else:
+                bucket.append(e)
+        self._enemy_grid = grid
+        self._grid_tick = self.tick
+
+    def nearest_enemy(self, ax, az, max_range):
+        """The nearest live enemy within `max_range` of (ax, az), or None.
+
+        Visits only the grid cells the range reaches instead of the whole enemy
+        list. `active`/`defeated` are rechecked here so an enemy another hunter
+        felled earlier in the same tick is not chased; the grid itself is left as
+        built. Ties in exact distance fall to grid order rather than list order,
+        which is immaterial -- two enemies at identical range is a measure-zero
+        coincidence with no gameplay meaning.
+        """
+        if self._grid_tick != self.tick:
+            self._build_enemy_grid()
+        cs = self.ENEMY_GRID_CELL
+        grid = self._enemy_grid
+        reach = int(max_range // cs) + 1
+        cx0, cz0 = int(ax // cs), int(az // cs)
+        best = None
+        best_d = max_range
+        for dcx in range(-reach, reach + 1):
+            for dcz in range(-reach, reach + 1):
+                bucket = grid.get((cx0 + dcx, cz0 + dcz))
+                if not bucket:
+                    continue
+                for e in bucket:
+                    if not e.active or e.defeated:
+                        continue
+                    distance = math.hypot(e.pos[0] - ax, e.pos[2] - az)
+                    if distance < best_d:
+                        best, best_d = e, distance
+        return best
 
     def of_model(self, model):
         return [o for o in self.objects if o.model == model]

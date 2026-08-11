@@ -921,14 +921,11 @@ class Game(ShowBase):
     def _set_mouse_captured(self, captured):
         """Take the pointer for looking, or hand it back.
 
-        Relative mouse mode is asked for rather than assumed: where the
-        platform has it, the pointer is unhooked from the screen and its motion
-        arrives as motion, which is what makes a fast turn keep turning instead
-        of stopping at the edge of the window. Where it does not -- WSL over
-        X11 is the case at hand -- the fallback is the old recipe of reading
-        the pointer and putting it back in the middle every frame, and
-        `_read_mouse` handles both by looking at what the window actually
-        granted rather than at what was asked for.
+        Use a confined pointer rather than trusting relative mode: several
+        window backends report relative mode while still letting the cursor
+        escape the game window.  `_read_mouse` recentres the confined pointer
+        before it reaches an edge, giving the same unlimited-look behaviour
+        without losing capture.
         """
         if captured == self._mouse_captured:
             return
@@ -936,7 +933,7 @@ class Game(ShowBase):
 
         props = WindowProperties()
         props.set_cursor_hidden(captured)
-        props.set_mouse_mode(WindowProperties.M_relative if captured
+        props.set_mouse_mode(WindowProperties.M_confined if captured
                              else WindowProperties.M_absolute)
         self.win.request_properties(props)
 
@@ -1664,11 +1661,10 @@ class Game(ShowBase):
             self.console.update(dt)
             return task.cont
 
-        # Before the ticks, so the frame's own look and the frame's own aim are
-        # what the simulation is stepped against rather than the last one's.
+        # Before the ticks, so the frame's own look mode and mouse delta are
+        # queued before simulation advances.
         self._update_aim_mode()
         self._update_look(dt)
-        self._update_torso_aim(dt)
 
         # Step the simulation in whole 30 Hz ticks.
         self._accumulator += dt
@@ -1716,6 +1712,11 @@ class Game(ShowBase):
             dt, target_pos=pos,
             recenter=self.keys["cam_center"] or self.gamepad.recenter)
         self.follow_camera.apply_to(self.camera, self.camLens)
+
+        # The mouse delta is applied by FollowCamera.update.  Aim only after
+        # that has happened, otherwise the torso tracks the previous rendered
+        # view and feels detached from the crosshair.
+        self._update_torso_aim(dt)
 
         # After the camera has been placed: the aim is a ray out of it, and
         # taking it beforehand would be aiming through last frame's view.

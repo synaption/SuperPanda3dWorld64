@@ -20,7 +20,7 @@ from panda3d.core import (
 )
 
 from . import billboard
-from .math_util import s16_to_degrees, to_panda
+from .math_util import to_panda
 
 # Render layers, in the order the geo layout draws them.
 LAYER_ORDER = [
@@ -534,7 +534,7 @@ class ObjectRenderer:
             node.show()
             px, py, pz = self.transform(*obj.draw_pos)
             node.set_pos(px, py, pz)
-            node.set_h(s16_to_degrees(obj.draw_yaw))
+            node.set_h(obj.draw_yaw_degrees)
             # Whether it is far enough off to hold still. Worked out here, once,
             # off the position just written, and read again by the two loops
             # below so neither has to measure the distance a second time.

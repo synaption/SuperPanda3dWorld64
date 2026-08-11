@@ -42,9 +42,19 @@ before publishing or redistributing the repository.
 ***
 ## Inspiration
 
-Demon Chaos - 65k enemies on screen at a time on PS2
-Pseudoregalia - great movement system, retro nastalgia asthetic
-Pikmen/Sons of Liberty - squad control mechanics
-Outer Wilds - seamless interplanetary travel
-EDF, Dynasty Warriors, Armored Core, Souls - combat, jetpack, dead body physics
-Sonic - Shadow Rocket Boots
+- Demon Chaos - 65k enemies on screen at a time on PS2
+- Pseudoregalia - great movement system, retro nastalgia asthetic
+- Pikmen/Sons of Liberty - squad control mechanics
+- Outer Wilds - seamless interplanetary travel
+- EDF, Dynasty Warriors, Armored Core, Souls - combat, jetpack, dead body physics
+- Sonic - Shadow Rocket Boots
+
+## Tech
+
+Nearby enemies — maybe 50–300: real gameplay entities with full AI, collision, skeletal animation, attacks, hit reactions, etc.
+
+Mid-distance enemies — perhaps a few thousand: simplified CPU simulation, very cheap steering/collision, lower animation fidelity.
+
+Huge distant army — tens of thousands: effectively GPU particles that happen to look like soldiers. One or a handful of meshes rendered through hardware instancing, with positions/state held in GPU buffers. Panda3D explicitly supports geometry instance counts and shader buffers.
+
+Very distant units: billboards/impostors or extremely low-poly models.

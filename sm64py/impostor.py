@@ -26,7 +26,7 @@ from panda3d.core import (Geom, GeomNode, GeomTriangles, GeomVertexData,
                           GeomVertexFormat, GeomVertexWriter,
                           OmniBoundingVolume, SamplerState, Shader, Texture)
 
-from .math_util import s16_to_degrees, to_panda
+from .math_util import to_panda
 
 # gl_InstanceID is core from GLSL 1.40; 150 is what the rest of a modern Panda
 # build offers, and gives texelFetch for reading the per-instance table.
@@ -209,7 +209,7 @@ class ImpostorField:
         px = np.fromiter((o.draw_pos[0] for o in live), np.float32, n)
         py = np.fromiter((o.draw_pos[1] for o in live), np.float32, n)
         pz = np.fromiter((o.draw_pos[2] for o in live), np.float32, n)
-        yaw = np.fromiter((s16_to_degrees(o.draw_yaw) for o in live),
+        yaw = np.fromiter((o.draw_yaw_degrees for o in live),
                           np.float32, n)
         # Enemies carry one clip; step its frames off their own timer so a field
         # of them is not marching in lockstep. `timer` is per object.
