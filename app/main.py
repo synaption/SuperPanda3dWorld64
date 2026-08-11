@@ -313,12 +313,22 @@ CROSSHAIR_HIP_ALPHA = 0.55
 # Keeping the pointer off the edges of the window, where it would stop
 # reporting movement, on the platforms without a relative mouse mode. It is
 # shoved back to the middle once it leaves this share of the way out from the
-# centre; a warp is then in flight for up to this many frames, and readings are
-# dropped until one lands within this many pixels of where it was sent. See
-# `Game._read_mouse` for why any of that is necessary.
-MOUSE_MARGIN = 0.5
+# centre; a warp is then in flight for up to this many frames, until a reading
+# lands nearer the centre than the edge it came from. See `Game._read_mouse`.
+#
+# The margin sits high because M_confined is confirmed to hold the cursor on
+# this backend, so the warp only has to fire before the pointer reaches the
+# edge and stops *reporting* -- not to stop it escaping. A high margin means
+# rarer warps, and a warp is the one thing here that costs a frame of look.
+# Drop it toward 0.5 only if a backend lets the cursor out at the edge.
+MOUSE_MARGIN = float(os.environ.get("MARIO_MOUSE_MARGIN", "0.8"))
 MOUSE_WARP_FRAMES = 4
-MOUSE_SETTLED = 8.0
+
+# Temporary: MARIO_MOUSE_DEBUG=1 traces the warp so we can see whether
+# move_pointer actually recentres the cursor on this backend and how many
+# frames it takes to land. Remove once the WSLg stepping is understood.
+MOUSE_DEBUG = os.environ.get("MARIO_MOUSE_DEBUG") == "1"
+_mouse_dbg_lines = 0
 
 # Degrees of view per unit of a loose-pointer drag, whose coordinates run -1 to
 # 1 across the window rather than in pixels.
@@ -370,11 +380,12 @@ RETICLE_FLASH = 0.4
 loadPrcFileData("", "window-title SM64 movement in Panda3D")
 loadPrcFileData("", "framebuffer-multisample 1")
 loadPrcFileData("", "multisamples 4")
-# Present on the display cadence by default.  An uncapped renderer can report
-# high FPS while delivering frames at uneven points in a refresh, which reads
-# as camera judder.  Set MARIO_VSYNC=0 only to diagnose tearing or a driver
-# issue.
-loadPrcFileData("", f"sync-video {os.environ.get('MARIO_VSYNC', '1')}")
+# Off by default: vsync removes tearing, but under WSLg the present goes
+# through a compositor that delivers frames at uneven points in a refresh while
+# still reporting high FPS -- which reads as camera judder despite the numbers.
+# Turning it off is what smooths the pacing here.  Set MARIO_VSYNC=1 to put it
+# back on a native display where the tearing matters more than the pacing.
+loadPrcFileData("", f"sync-video {os.environ.get('MARIO_VSYNC', '0')}")
 
 
 class Player:
@@ -901,6 +912,7 @@ class Game(ShowBase):
         self._mouse_anchor = None
         self._pointer_origin = None
         self._warp_frames = 0
+        self._warp_from = (0, 0)
         self._dragging = False
         self.accept("mouse1", self._mouse_button, [1, True])
         self.accept("mouse1-up", self._mouse_button, [1, False])
@@ -921,9 +933,12 @@ class Game(ShowBase):
     def _set_mouse_captured(self, captured):
         """Take the pointer for looking, or hand it back.
 
-        Relative mouse mode keeps look input as unbroken motion rather than a
-        series of position samples and warps.  If a backend does not honour
-        it, `_read_mouse` falls back to recentering an absolute pointer.
+        Use a confined pointer rather than trusting relative mode: several
+        window backends -- WSLg among them -- report relative mode as granted
+        while still letting the cursor escape the game window, and relative
+        mode also makes `_read_mouse` skip the recentre that keeps it in.
+        `_read_mouse` recentres the confined pointer before it reaches an edge,
+        giving the same unlimited-look behaviour without losing capture.
         """
         if captured == self._mouse_captured:
             return
@@ -931,13 +946,14 @@ class Game(ShowBase):
 
         props = WindowProperties()
         props.set_cursor_hidden(captured)
-        props.set_mouse_mode(WindowProperties.M_relative if captured
+        props.set_mouse_mode(WindowProperties.M_confined if captured
                              else WindowProperties.M_absolute)
         self.win.request_properties(props)
 
         # Whatever the pointer was doing before belongs to the other mode.
         self._pointer_origin = None
         self._warp_frames = 0
+        self._warp_from = (0, 0)
         self._mouse_anchor = None
         self._dragging = False
 
@@ -1000,12 +1016,26 @@ class Game(ShowBase):
         current = (pointer.get_x(), pointer.get_y())
         origin, self._pointer_origin = self._pointer_origin, current
 
+        if MOUSE_DEBUG:
+            self._mouse_trace(current)
+
         if self._warp_frames > 0:
-            # A warp is in flight. Drop readings until one arrives near where
-            # it was sent -- that one is a good position to measure the next
-            # frame against, so it is kept as the origin above.
+            # A warp is in flight. Drop readings until one lands, then keep it
+            # as the origin (above) so the next frame measures real hand
+            # movement against it.
+            #
+            # "Landed" is the pointer being nearer the centre it was sent to
+            # than the edge it was sent from -- not its being *at* the centre.
+            # The hand goes on moving during the warp, so by the time the
+            # landed frame is read the pointer is already tens of pixels off
+            # centre; a tight "within N pixels of centre" test (this used to be
+            # 8) almost never fired against a moving hand, so every warp burned
+            # its whole frame budget and dropped five or six frames of look
+            # instead of the one whose delta is the warp jump.  That was the
+            # stepping.
             self._warp_frames -= 1
-            if math.dist(current, self._window_centre()) < MOUSE_SETTLED:
+            centre = self._window_centre()
+            if math.dist(current, centre) < math.dist(current, self._warp_from):
                 self._warp_frames = 0
             elif self._warp_frames == 0:
                 # Given up on: a warp that never landed leaves the pointer
@@ -1029,8 +1059,28 @@ class Game(ShowBase):
         centre = self._window_centre()
         if (abs(current[0] - centre[0]) > centre[0] * MOUSE_MARGIN
                 or abs(current[1] - centre[1]) > centre[1] * MOUSE_MARGIN):
-            if self.win.move_pointer(0, *centre):
+            ok = self.win.move_pointer(0, *centre)
+            if MOUSE_DEBUG:
+                self._mouse_trace(current, warp_to=centre, move_pointer_ok=ok)
+            if ok:
                 self._warp_frames = MOUSE_WARP_FRAMES
+                self._warp_from = current
+
+    def _mouse_trace(self, current, warp_to=None, move_pointer_ok=None):
+        """Temporary WSLg warp trace; gated on MARIO_MOUSE_DEBUG. Cap the spam."""
+        global _mouse_dbg_lines
+        if _mouse_dbg_lines >= 400:
+            return
+        _mouse_dbg_lines += 1
+        centre = self._window_centre()
+        d = math.dist(current, centre)
+        mode = self.win.get_properties().get_mouse_mode()
+        if warp_to is not None:
+            print(f"[mouse] WARP issued at {current} d={d:.0f} "
+                  f"move_pointer_ok={move_pointer_ok} mode={mode}")
+        else:
+            print(f"[mouse] read {current} d_from_centre={d:.0f} "
+                  f"warp_frames={self._warp_frames} mode={mode}")
 
     def _window_centre(self):
         return (self.win.get_x_size() // 2, self.win.get_y_size() // 2)
