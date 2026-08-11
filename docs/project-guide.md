@@ -536,11 +536,12 @@ them, so a drag lands on the next 30 Hz tick.
 | `clear` | empty the log |
 | `help` | the same list, in the console |
 
-`Tab` completes a name, the arrow keys recall previous commands, the **scroll
-wheel** goes back through the log — a marker on the divider says how far back
-you are, and new output does not slide the lines you are reading — and the
-keyboard belongs to the console while it is open, so typing `run_speed` does
-not walk the Hero across the field.
+`Tab` completes a name; **up/down** recall previous commands; **left/right**
+move the insertion cursor; and `Ctrl+C` copies the command line to the system
+clipboard. The **scroll wheel** goes back through the log — a marker on the
+divider says how far back you are, and new output does not slide the lines you
+are reading — and the keyboard belongs to the console while it is open, so
+typing `run_speed` does not walk the Hero across the field.
 
 The pause is the simulation simply not being stepped: no ticks, no accumulated
 time to replay on the way out, and the clips are held on their current frame

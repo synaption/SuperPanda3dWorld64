@@ -14,6 +14,8 @@ keeps the simulation runnable headless for testing.
 import math
 import random
 
+import numpy as np
+
 from .math_util import atan2s, coss, s16, sins
 from .surfaces import WallCollisionData
 
@@ -64,6 +66,13 @@ class Object:
     time_scale = 1
     # Offset into the level-of-detail schedule, assigned by ObjectSet.spawn.
     lod_phase = 0
+    # Set by ObjectSet for the duration of a crowd update. While it holds the
+    # set, `move` only *plans* its step -- it hands the intended position to the
+    # set, which resolves the whole crowd's floor and wall queries in one
+    # vectorised pass rather than one query per object. None means resolve the
+    # step immediately, the scalar path the launched objects and the headless
+    # tooling take.
+    move_batch = None
 
     def __init__(self, surfaces, x, y, z, yaw=0):
         self.surfaces = surfaces
@@ -94,6 +103,14 @@ class Object:
         # behaviours below read them several times each.
         self.dist_to_mario = 0.0
         self.angle_to_mario = 0
+        # Under batched movement the wall a step hit is resolved after the
+        # behaviour has run, so the behaviour reacts to the previous tick's
+        # result. Held here between ticks; false until the first step lands.
+        self._hit_wall = False
+        # Whether this tick's behaviour actually planned a step, so ObjectSet
+        # knows which objects the batch will commit and which (a tree) it must
+        # open a render segment for itself.
+        self._moved_this_tick = False
 
         self.snap_to_floor()
 
@@ -150,6 +167,19 @@ class Object:
                     self.pos[1] + self.vel_y * self.time_scale,
                     self.pos[2] + step_z]
 
+        if self.move_batch is not None:
+            # A crowd update is open: hand the intended step to the set and let
+            # it resolve the floor and wall queries for the whole crowd in one
+            # vectorised pass. The return is the previous tick's wall hit -- a
+            # distant enemy turning off a wall a tick late is invisible, and the
+            # per-tick pushout still keeps it from pressing through. `time_scale`
+            # and `vel_y` are captured now because the commit runs after the
+            # loop has reset them.
+            self._moved_this_tick = True
+            self.move_batch.add_move(self, next_pos, self.height * 0.5,
+                                     self.radius, self.time_scale, self.vel_y)
+            return self._hit_wall
+
         data = WallCollisionData(next_pos[0], next_pos[1], next_pos[2],
                                  self.height * 0.5, self.radius)
         hit_wall = self.surfaces.find_wall_collisions(data) > 0
@@ -159,6 +189,7 @@ class Object:
             next_pos[0], next_pos[1] + 50.0, next_pos[2])
         if floor is None:
             # Walked off the edge of the world; stay put rather than fall out.
+            self._hit_wall = True
             return True
 
         self.floor_height, self.floor = height, floor
@@ -172,6 +203,7 @@ class Object:
                              TERMINAL_VELOCITY)
 
         self.pos = next_pos
+        self._hit_wall = hit_wall
         return hit_wall
 
     def update(self, mario):
@@ -947,6 +979,13 @@ class ObjectSet:
         # Turned off by the deterministic tooling, which wants every object
         # stepped every tick regardless of where the player stands.
         self.lod_enabled = True
+        # Resolve the crowd's floor and wall queries in one vectorised pass per
+        # tick rather than one query per object -- the difference between a
+        # crowd that runs and one that does not. Turned off restores the exact
+        # per-object scalar path, which reacts to walls the same tick and reads
+        # each object against the last one's committed move; kept as an escape
+        # hatch for anything that wants that stricter ordering.
+        self.batched = True
         # A free-running tick count, so a reduced-rate object's turn comes up on
         # a predictable schedule regardless of how its own timer is being bumped
         # to keep its animation in step.
@@ -960,6 +999,17 @@ class ObjectSet:
         # same set of enemies, pruned as they die rather than rebuilt, since a
         # normal tick neither spawns nor kills one.
         self.enemies = []
+        # Per-tick scratch for batched movement: the objects that planned a step
+        # this tick and the columns their step is resolved from. Refilled at the
+        # top of every update; see `update` and `_resolve_moves`.
+        self._mv_obj = []
+        self._mv_x = []
+        self._mv_y = []
+        self._mv_z = []
+        self._mv_off = []
+        self._mv_rad = []
+        self._mv_span = []
+        self._mv_vy = []
 
     def spawn(self, cls, x, y, z, yaw=0, **kwargs):
         obj = cls(self.surfaces, x, y, z, yaw, **kwargs)
@@ -1001,6 +1051,17 @@ class ObjectSet:
         self.tick += 1
         px, pz = mario.pos[0], mario.pos[2]
 
+        # Empty the batch scratch: this tick's steps are gathered into it as the
+        # behaviours run, then resolved together once the loop is done.
+        self._mv_obj.clear()
+        self._mv_x.clear()
+        self._mv_y.clear()
+        self._mv_z.clear()
+        self._mv_off.clear()
+        self._mv_rad.clear()
+        self._mv_span.clear()
+        self._mv_vy.clear()
+
         # Over a copy of the list, because a pipe firing appends to it: the
         # new arrival is left to start on the following tick rather than being
         # updated on the one it was created in.
@@ -1017,8 +1078,9 @@ class ObjectSet:
                     obj.active = False
                 continue
             if obj.launched:
-                # Thrown by a pipe and still in the air. Its behaviour gets it
-                # back the moment it lands.
+                # Thrown by a pipe and still in the air. Resolved immediately,
+                # off the batch, because an arc wants its landing detected the
+                # tick it happens -- that is what ends the launch.
                 obj.coast()
                 self._open_segment(obj, 1)
                 continue
@@ -1042,6 +1104,10 @@ class ObjectSet:
                     # it the whole way.
                     continue
 
+            # A crowd update is open for the length of the behaviour: `move`
+            # plans its step into the batch rather than resolving it here.
+            obj._moved_this_tick = False
+            obj.move_batch = self if self.batched else None
             if stride > 1:
                 # One update standing in for `stride` ticks: `move` multiplies
                 # the step by it, and the animation is advanced the same number
@@ -1055,7 +1121,87 @@ class ObjectSet:
                 obj.timer += stride - 1
             else:
                 obj.update(mario)
-            self._open_segment(obj, stride)
+            obj.move_batch = None
+            if not obj._moved_this_tick:
+                # A behaviour that never moved (a tree) still needs its render
+                # segment kept current; the movers get theirs when the batch
+                # commits their new position.
+                self._open_segment(obj, stride)
+
+        self._resolve_moves()
+
+    def add_move(self, obj, next_pos, offset_y, radius, span, vel_y):
+        """Take one object's planned step, for `_resolve_moves` to commit.
+
+        Called by `Object.move` while a crowd update is open. `next_pos` is the
+        step's intended landing before collision; `offset_y`/`radius` size its
+        collision cylinder; `span` is the number of ticks the step stands in for
+        and `vel_y` its vertical speed, both captured now because the loop resets
+        them before the batch is resolved.
+        """
+        self._mv_obj.append(obj)
+        self._mv_x.append(next_pos[0])
+        self._mv_y.append(next_pos[1])
+        self._mv_z.append(next_pos[2])
+        self._mv_off.append(offset_y)
+        self._mv_rad.append(radius)
+        self._mv_span.append(span)
+        self._mv_vy.append(vel_y)
+
+    def _resolve_moves(self):
+        """Resolve every step planned this tick in one wall and one floor pass.
+
+        The scalar `Object.move` queries the surfaces once per object; here the
+        whole crowd's steps are pushed out of walls and dropped onto floors with
+        the vectorised `find_walls`/`find_floors`, which pay the numpy overhead
+        per grid cell instead of per object -- the difference between a crowd
+        that runs and one that does not. The per-object commit that follows is
+        the same landing, gravity and wall-hit bookkeeping the scalar path does.
+        """
+        objs = self._mv_obj
+        if not objs:
+            return
+
+        xs = np.array(self._mv_x, dtype=np.float64)
+        ys = np.array(self._mv_y, dtype=np.float64)
+        zs = np.array(self._mv_z, dtype=np.float64)
+        offs = np.array(self._mv_off, dtype=np.float64)
+        rad = np.array(self._mv_rad, dtype=np.float64)
+
+        out_x, out_z, counts = self.surfaces.find_walls(xs, ys, zs, offs, rad)
+        # The floor is looked for from 50 units above the stepped position, the
+        # same reach the scalar query uses; the landing test below compares the
+        # raw stepped height, not that lifted one.
+        heights, ids = self.surfaces.find_floors(out_x, ys + 50.0, out_z)
+
+        surfaces = self.surfaces
+        for i, obj in enumerate(objs):
+            span = self._mv_span[i]
+            tid = int(ids[i])
+            if tid < 0:
+                # No floor under the stepped position: walked off the edge of
+                # the world. Stay put and report a hit, exactly as the scalar
+                # move does when find_floor comes back empty.
+                obj._hit_wall = True
+                self._open_segment(obj, span)
+                continue
+
+            height = float(heights[i])
+            obj.floor_height = height
+            obj.floor = surfaces.surface(tid)
+            next_y = ys[i]
+            if next_y <= height:
+                next_y = height
+                obj.vel_y = 0.0
+                obj.on_ground = True
+            else:
+                obj.on_ground = False
+                obj.vel_y = max(self._mv_vy[i] + OBJECT_GRAVITY * span,
+                                TERMINAL_VELOCITY)
+
+            obj.pos = [float(out_x[i]), float(next_y), float(out_z[i])]
+            obj._hit_wall = counts[i] > 0
+            self._open_segment(obj, span)
 
     def _open_segment(self, obj, span):
         """Start a render-interpolation segment for a sim step just taken.

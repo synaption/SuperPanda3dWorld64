@@ -313,6 +313,11 @@ class Console(DirectObject):
 
         self.visible = False
         self._input = ""
+        # An index between characters, rather than always appending at the
+        # end.  Keeping this separately makes the command line behave like a
+        # normal text field when a command needs a small correction.
+        self._input_cursor = 0
+        self._clipboard_root = None
         self._history = []
         self._history_index = 0
         self._refresh_timer = 0.0
@@ -444,6 +449,13 @@ class Console(DirectObject):
         self.accept("backspace-repeat", self._backspace)
         self.accept("enter", self._submit)
         self.accept("tab", self._complete)
+        self.accept("arrow_left", self._move_cursor, [-1])
+        self.accept("arrow_left-repeat", self._move_cursor, [-1])
+        self.accept("arrow_right", self._move_cursor, [1])
+        self.accept("arrow_right-repeat", self._move_cursor, [1])
+        self.accept("home", self._move_to_start)
+        self.accept("end", self._move_to_end)
+        self.accept("control-c", self._copy_input)
         self.accept("arrow_up", self._recall, [-1])
         self.accept("arrow_down", self._recall, [1])
         self.accept("wheel_up", self._scroll_by, [SCROLL_LINES])
@@ -459,8 +471,9 @@ class Console(DirectObject):
         self.visible = False
         self._root.hide()
         for event in ("keystroke", "backspace", "backspace-repeat", "enter",
-                      "tab", "arrow_up", "arrow_down", "wheel_up",
-                      "wheel_down"):
+                      "tab", "arrow_left", "arrow_left-repeat", "arrow_right",
+                      "arrow_right-repeat", "home", "end", "control-c",
+                      "arrow_up", "arrow_down", "wheel_up", "wheel_down"):
             self.ignore(event)
         self._notify()
 
@@ -506,12 +519,58 @@ class Console(DirectObject):
         # is not one anybody needs to type in here.
         if key in ("`", "~") or key < " " or key == "\x7f":
             return
-        self._input += key
+        self._input = (self._input[:self._input_cursor] + key
+                       + self._input[self._input_cursor:])
+        self._input_cursor += len(key)
         self._refresh_input()
 
     def _backspace(self):
-        self._input = self._input[:-1]
+        if self._input_cursor:
+            self._input = (self._input[:self._input_cursor - 1]
+                           + self._input[self._input_cursor:])
+            self._input_cursor -= 1
         self._refresh_input()
+
+    def _move_cursor(self, amount):
+        """Move the insertion point without changing the command."""
+        self._input_cursor = max(
+            0, min(len(self._input), self._input_cursor + amount))
+        self._force_refresh()
+
+    def _move_to_start(self):
+        self._move_cursor(-self._input_cursor)
+
+    def _move_to_end(self):
+        self._move_cursor(len(self._input) - self._input_cursor)
+
+    def _copy_input(self):
+        """Copy the command being edited to the system clipboard.
+
+        `pyperclip` supplies the platform-specific clipboard backend when one
+        is installed.  Tk is a fallback for a normal game window on systems
+        without xclip, wl-copy, or a similar helper.  Both are imported only
+        here, so the headless tools never require a desktop clipboard.
+        """
+        if not self._input:
+            return
+        try:
+            import pyperclip
+            pyperclip.copy(self._input)
+            return
+        except Exception as exc:
+            pyperclip_error = exc
+        try:
+            import tkinter
+            if self._clipboard_root is None:
+                self._clipboard_root = tkinter.Tk()
+                self._clipboard_root.withdraw()
+            self._clipboard_root.clipboard_clear()
+            self._clipboard_root.clipboard_append(self._input)
+            # Process the ownership claim straight away.  `update` keeps
+            # servicing paste requests for Tk-based clipboards afterwards.
+            self._clipboard_root.update()
+        except Exception as exc:
+            self.log.echo(f"copy failed: {pyperclip_error}; {exc}", "err")
 
     def _scroll_by(self, lines):
         """Wheel the log back and forward. `window` does the clamping."""
@@ -528,6 +587,7 @@ class Console(DirectObject):
             self._input = ""
         else:
             self._input = self._history[self._history_index]
+        self._input_cursor = len(self._input)
         self._refresh_input()
 
     def _complete(self):
@@ -547,6 +607,7 @@ class Console(DirectObject):
                 completed += matches[0][i]
             self.log.echo("  ".join(matches))
         self._input = f"{head} {completed}" if head else completed
+        self._input_cursor = len(self._input)
         self._force_refresh()
 
     # -- commands ------------------------------------------------------------
@@ -554,6 +615,7 @@ class Console(DirectObject):
     def _submit(self):
         line = self._input.strip()
         self._input = ""
+        self._input_cursor = 0
         # Whatever it prints should be visible, wherever the wheel had got to.
         self._scroll = 0
         if line:
@@ -633,7 +695,8 @@ class Console(DirectObject):
             "  clear             empty the log\n"
             "sliders stay up when the console is closed, so you can drag one\n"
             "while playing -- the game is paused for as long as this is open.\n"
-            "Tab completes a name, up and down recall commands, the wheel\n"
+            "Left and right move the cursor; Ctrl+C copies the command. Tab\n"
+            "completes a name, up and down recall commands, and the wheel\n"
             "scrolls back through everything the game has printed."
         )
 
@@ -771,6 +834,13 @@ class Console(DirectObject):
 
     def update(self, dt):
         """Called once a frame, open or not."""
+        if self._clipboard_root is not None:
+            try:
+                self._clipboard_root.update()
+            except Exception:
+                # Losing a display must not stop the game from updating; a
+                # later copy can make a fresh clipboard owner if one returns.
+                self._clipboard_root = None
         if not self.visible:
             # A slider can still be dragged with the panel down, and DirectGui
             # runs its own mouse handling, so the caption still has to follow.
@@ -799,7 +869,10 @@ class Console(DirectObject):
         self._refresh_readout()
 
     def _refresh_input(self):
-        self._input_text.setText(f"> {self._input}" + ("_" if self._cursor else ""))
+        before = self._input[:self._input_cursor]
+        after = self._input[self._input_cursor:]
+        self._input_text.setText(
+            f"> {before}" + ("_" if self._cursor else "") + after)
 
     def _refresh_readout(self):
         if self._readout is not None:
