@@ -689,6 +689,30 @@ jump
 fall
 land
 
+Flying
+
+fly_takeoff
+fly_hover
+fly_forward
+fly_backward
+fly_strafe_left
+fly_strafe_right
+fly_ascend
+fly_descend
+fly_land
+
+Skating
+
+skate_start
+skate_stride
+skate_glide
+skate_turn_left
+skate_turn_right
+skate_brake
+skate_jump
+skate_land
+skate_stop
+
 Rifle
 
 rifle_idle
@@ -741,6 +765,10 @@ weapon sockets
 Create separate Blender Actions for:
 
 locomotion
+
+flying
+
+skating
 
 ranged attack animations
 

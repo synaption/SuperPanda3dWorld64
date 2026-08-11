@@ -24,12 +24,39 @@ faces.
 """
 
 import json
+import math
 import struct
 
 import numpy as np
 
 # The game ticks at 30 Hz and every clip is authored to it.
 FRAME_RATE = 30.0
+
+
+def panda_frame_count(last_key_time):
+    """How many frames Panda3D will actually build for a clip that long.
+
+    panda3d-gltf throws the glTF key times away and resamples every channel
+    onto its own uniform grid, sizing the table as
+
+        num_frames = max(ceil(max_time * fps), 1)     # gltf/_converter.py
+
+    which reads the last key's *time* as the clip's *duration*. A clip authored
+    as N poses one tick apart has its last key at (N-1)/FRAME_RATE, so Panda
+    builds an N-1 frame bundle and never shows that final pose. Counting keys
+    instead -- the obvious thing, and what this used to do -- leaves the sidecar
+    one frame ahead of the AnimBundle the game is playing, and the extra frame
+    is one the Actor cannot be posed to.
+
+    For a cyclic clip the truncation is right anyway: its last pose is a repeat
+    of its first, and dropping it is what makes the loop not stutter.
+
+    The time must arrive as float32 (straight off the accessor, or through
+    float(), which widens exactly) or the ceil can disagree with Panda's on
+    clips whose length lands on a frame boundary -- which is most of them.
+    """
+    return max(math.ceil(last_key_time * FRAME_RATE), 1)
+
 
 # Mario's A-pose clip, which stands in for the bind pose he does not usefully
 # have, and MARIO_ANIM_WALKING, whose average clearance sets the height a made

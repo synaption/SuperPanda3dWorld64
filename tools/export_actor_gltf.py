@@ -28,6 +28,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import rig
 import sm64_anim
 from geo_layout import animated_parts, build_tree, parse_geo_layouts
 from glb import (
@@ -676,16 +677,26 @@ def main(argv):
     # Playback metadata the glTF itself has nowhere to put. The start frame
     # matters: several clips are authored with lead-in frames the game never
     # shows, and playing from zero drops Mario through the floor mid-landing.
+    #
+    # The decomp header's frame count is not the count the game can play.
+    # _write_animation lays the poses out at f / FRAME_RATE, putting the last
+    # one at (frames - 1) / FRAME_RATE, and Panda3D reads that as the clip's
+    # duration and builds a table one frame shorter (rig.panda_frame_count).
+    # Everything the header says is clamped into that, or the game addresses
+    # frames the AnimBundle does not have. The last time goes through float32
+    # first, because that is the width it is stored at and the ceil turns on
+    # its last bit.
     if animations:
-        clips = {
-            name: {
-                "frames": anim.frame_count,
-                "start_frame": anim.start_frame,
-                "loop_start": anim.loop_start,
-                "loop_end": anim.loop_end,
+        clips = {}
+        for name, anim in animations.items():
+            last = float(np.float32((anim.frame_count - 1) / FRAME_RATE))
+            playable = rig.panda_frame_count(last)
+            clips[name] = {
+                "frames": playable,
+                "start_frame": min(anim.start_frame, max(playable - 1, 0)),
+                "loop_start": min(anim.loop_start, max(playable - 1, 0)),
+                "loop_end": min(anim.loop_end or playable, playable),
             }
-            for name, anim in animations.items()
-        }
         sidecar = os.path.splitext(args.out)[0] + "_clips.json"
         with open(sidecar, "w", encoding="utf-8") as fh:
             json.dump(clips, fh, indent=2, sort_keys=True)

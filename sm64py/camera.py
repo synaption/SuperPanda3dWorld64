@@ -83,7 +83,7 @@ from .surfaces import WallCollisionData
 # a little over 200 units: the camera swings around the part of him that does
 # the aiming rather than around his ankles, which is what keeps the horizon
 # still while he turns.
-PIVOT_HEIGHT = 215.0
+PIVOT_HEIGHT = 160.0
 
 # Boom length at the hip and down the sights.  Both are far shorter than the
 # 1500 the follow camera used, and that number is the clearest measure of what
@@ -101,8 +101,8 @@ AIM_DISTANCE = 430.0
 # The two land in very different places despite being nearly the same number,
 # which is worth knowing before either is changed: what decides where he sits
 # on screen is the offset against the *width the view covers at his distance*,
-# and the sights cut both the distance and the field of view.  85 units at the
-# sights pushes him twice as far toward the edge as 100 does at the hip.
+# and the sights cut both the distance and the field of view. The same offset
+# at the sights therefore pushes him farther toward the edge than at the hip.
 #
 # The negative lift is the other half of that.  The boom pivots well above his
 # head -- which is what a camera swinging around him wants -- and at the
@@ -110,8 +110,8 @@ AIM_DISTANCE = 430.0
 # would drop him off the foot of the screen.  Dropping the camera instead of
 # the pivot lifts him back into the corner without touching the point the boom
 # turns around.
-HIP_SHOULDER = (100.0, 0.0)
-AIM_SHOULDER = (85.0, -25.0)
+HIP_SHOULDER = (70.0, 0.0)
+AIM_SHOULDER = (70.0, -25.0)
 
 # Field of view, horizontal degrees.  45 is what the game has always run at, so
 # the hip view is unchanged; the sights pull in to a little over two thirds of

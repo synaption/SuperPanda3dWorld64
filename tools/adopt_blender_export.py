@@ -14,8 +14,11 @@ mesh back under the skeleton root, which is where the decomp exporter puts it.
 **Some clips come back a frame shorter.** Sampling and re-emitting a clip can
 drop its final frame, and the game reads frame counts from the `_clips.json`
 sidecar rather than the .glb. A stale count runs an action past the end of its
-clip. The sidecar's `start_frame` values cannot be recovered from a .glb at all
--- they come from the decomp's animation headers, and eighteen clips have a
+clip. Counts are what Panda3D's loader will build rather than how many keys the
+clip has -- not the same number, see rig.panda_frame_count.
+
+The sidecar's `start_frame` values cannot be recovered from a .glb at all --
+they come from the decomp's animation headers, and eighteen clips have a
 non-zero one -- so they are carried across from the previous sidecar rather
 than regenerated.
 
@@ -111,13 +114,17 @@ def unemit_materials(gltf):
 
 
 def clip_lengths(gltf):
-    """Frame count per clip, read back off the animation samplers."""
+    """Frame count per clip, as Panda3D will build it off the samplers.
+
+    Not the number of keys: the loader resamples onto its own grid and sizes
+    the table from the clip's length alone. See rig.panda_frame_count.
+    """
     out = {}
     for anim in gltf.json.get("animations", []):
         longest = 0.0
         for sampler in anim["samplers"]:
             longest = max(longest, float(gltf.read(sampler["input"])[-1, 0]))
-        out[anim["name"]] = round(longest * rig.FRAME_RATE) + 1
+        out[anim["name"]] = rig.panda_frame_count(longest)
     return out
 
 

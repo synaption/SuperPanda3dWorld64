@@ -100,11 +100,12 @@ def check_walking():
         speeds.append(run.hero.forward_vel)
     tail = speeds[100:]
     settled = sum(tail) / len(tail)
-    clip = A.action_anim(run.hero)
+    clip, _loop, rate = A.resolve(run.hero)
     ok = (H.RUN_SPEED < settled <= H.MAX_RUN_SPEED
-          and run.hero.action == H.ACT_HERO_WALKING and clip == A.RUN)
+          and run.hero.action == H.ACT_HERO_WALKING and clip == A.RUN
+          and rate == 1.0)
     return ok, (f"settles at {settled:.1f} u/frame "
-                f"(max {H.MAX_RUN_SPEED}), playing {clip!r}")
+                f"(max {H.MAX_RUN_SPEED}), playing {clip!r} at {rate:.1f}x")
 
 
 def check_stop():
@@ -403,17 +404,15 @@ def check_every_action_has_a_clip():
 
 
 def check_stride_matches_ground_speed():
-    """One clip cycle per stride covered, up to the play-rate cap.
+    """One walk cycle per stride covered, up to the play-rate cap.
 
     Recomputed from the .glb rather than trusted, because the divisors in
     animations.py are measurements of these clips and a re-export can change
     them. Measuring the planted foot's travel relative to the spine gives the
     stride; the divisor that keeps it honest is stride / (30 * duration).
 
-    This checks the divisors, not what is finally played: above
-    MAX_PLAY_RATE the feet slide on purpose, because a human stride at Mario's
-    top speed needs a cadence that reads as whirring. Below it -- all of
-    walking, and running up to about half speed -- the contact is exact.
+    This checks the walk divisor against the authored clip. The run deliberately
+    stays at its authored 1.0 playback rate instead of matching ground speed.
     """
     sys.path.insert(0, HERE)
     import rig                                          # noqa: PLC0415
@@ -441,7 +440,7 @@ def check_stride_matches_ground_speed():
             problems.append(f"{clip!r} wants {wanted:.2f}, has {divisor:.2f}")
 
     return not problems, ("; ".join(problems) if problems
-                          else "walk and run cycles match the ground covered")
+                          else "walk cycle matches the ground covered")
 
 
 CHECKS = [

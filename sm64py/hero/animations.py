@@ -102,8 +102,9 @@ ACTION_ANIMATIONS = {
 
 # -- playback rate ----------------------------------------------------------
 
-# Cycle clips are played at a rate proportional to speed, so the stride keeps
-# up with the ground he covers instead of sliding.
+# The walk cycle is played at a rate proportional to speed, so the stride keeps
+# up with the ground he covers instead of sliding. The run stays at its authored
+# 1.0 rate so it looks the same in game as it does in Blender.
 #
 # These are measured off the clips rather than borrowed from Mario's. Copying
 # his divisors and scaling them by clip length -- which is how the retargeted
@@ -118,32 +119,16 @@ ACTION_ANIMATIONS = {
 #     divisor = stride / (30 * clip_duration)
 #
 # with the stride in game units. Measuring the planted foot's travel relative
-# to the spine gives 160 units per cycle for the walk over 1.30s, and 267 over
-# 1.37s for the run. tools/check_hero.py recomputes both from the .glb and
-# fails if they drift, so a re-exported clip cannot quietly start skating.
+# to the spine gives 160 units per cycle for the walk over 1.30s.
+# tools/check_hero.py recomputes it from the .glb and fails if it drifts.
 SPEED_SCALED = {
     WALK: 4.11,
-    RUN: 6.52,
 }
 
 MIN_PLAY_RATE = 1.0 / 16.0
 
-# What the divisors ask for and what the legs can do part company well before
-# top speed. Planting the feet means one cycle per stride covered, and at 38
-# units a frame that is better than four cycles a second, because his stride is
-# a human 267 units and Mario's speed was never meant for a character this
-# size. Played honestly the run whirs; clamped flat at 1.0 -- which is what
-# this used to do -- it stops responding to speed at all, and since the run
-# only ever plays above 15 units a frame, where the ideal rate is already 2.3,
-# the clamp bound over the whole of its range. He ran at one fixed cadence from
-# the moment the clip came in to full sprint.
-#
-# So the excess over 1.0 is compressed rather than thrown away. Below that --
-# all of the slow walk -- the rate is untouched and the contact is still exact;
-# above it the rate keeps climbing, just far more slowly than the ground does.
-# The exponent is the knob: 0 is the old flat cap, 1 is honest foot-planting,
-# and 0.25 takes the run from 1.23 at the walk-run threshold to 1.55 at a
-# sprint. He accelerates visibly, and slides doing it.
+# Compress unusually high rates instead of allowing a tuning change to turn
+# the walk into a blur.
 SLIDE_COMPRESSION = 0.25
 
 # A ceiling on the compressed rate, so a future speed increase cannot turn the
