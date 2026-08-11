@@ -1,4 +1,7 @@
-Responsive Aiming & Attack Animation Design
+# Responsive aiming and attack animation design
+
+> [Documentation home](README.md) · [Project guide](project-guide.md) ·
+> [Quick start](../README.md)
 
 Overview
 
