@@ -370,11 +370,11 @@ RETICLE_FLASH = 0.4
 loadPrcFileData("", "window-title SM64 movement in Panda3D")
 loadPrcFileData("", "framebuffer-multisample 1")
 loadPrcFileData("", "multisamples 4")
-# Off by default: vsync removes tearing, but it ties each frame to the refresh,
-# so a frame that overruns its interval waits for the next one and reads as a
-# stutter. Turning it off was what cleared up the microstutters here, and it is
-# how the ModernGL front end has always run. Set MARIO_VSYNC=1 to put it back.
-loadPrcFileData("", f"sync-video {os.environ.get('MARIO_VSYNC', '0')}")
+# Present on the display cadence by default.  An uncapped renderer can report
+# high FPS while delivering frames at uneven points in a refresh, which reads
+# as camera judder.  Set MARIO_VSYNC=0 only to diagnose tearing or a driver
+# issue.
+loadPrcFileData("", f"sync-video {os.environ.get('MARIO_VSYNC', '1')}")
 
 
 class Player:
@@ -921,11 +921,9 @@ class Game(ShowBase):
     def _set_mouse_captured(self, captured):
         """Take the pointer for looking, or hand it back.
 
-        Use a confined pointer rather than trusting relative mode: several
-        window backends report relative mode while still letting the cursor
-        escape the game window.  `_read_mouse` recentres the confined pointer
-        before it reaches an edge, giving the same unlimited-look behaviour
-        without losing capture.
+        Relative mouse mode keeps look input as unbroken motion rather than a
+        series of position samples and warps.  If a backend does not honour
+        it, `_read_mouse` falls back to recentering an absolute pointer.
         """
         if captured == self._mouse_captured:
             return
@@ -933,7 +931,7 @@ class Game(ShowBase):
 
         props = WindowProperties()
         props.set_cursor_hidden(captured)
-        props.set_mouse_mode(WindowProperties.M_confined if captured
+        props.set_mouse_mode(WindowProperties.M_relative if captured
                              else WindowProperties.M_absolute)
         self.win.request_properties(props)
 
