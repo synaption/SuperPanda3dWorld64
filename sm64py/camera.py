@@ -196,6 +196,10 @@ FOLD_SMOOTH = 0.18
 # camera can slip between two samples.
 OCCLUSION_STEP = 110.0
 OCCLUSION_MAX_SAMPLES = 14
+# Once the coarse march finds an occupied sample, this many bisection passes
+# locate the boundary.  The march keeps the common no-obstacle path cheap; the
+# refinement removes its 110-unit quantisation when a wall or slope is close.
+OCCLUSION_REFINE_STEPS = 5
 
 # -- look input --------------------------------------------------------------
 
@@ -757,16 +761,35 @@ class FollowCamera:
         """
         samples = int(min(max(full / OCCLUSION_STEP, 3.0), OCCLUSION_MAX_SAMPLES))
         step = full / samples
+        previous = 0.0
         for i in range(1, samples + 1):
             distance = step * i
             point = (root[0] - forward[0] * distance,
                      root[1] - forward[1] * distance,
                      root[2] - forward[2] * distance)
             if self._occupied(*point):
-                # Stop short of the sample that was inside something, by the
-                # camera's own radius: the sample before it is the last one
-                # known to be clear, and the truth is between the two.
-                return max(distance - CAMERA_RADIUS, MIN_DISTANCE)
+                # The march only tells us that the boundary is somewhere in
+                # this step.  Snapping to its beginning used to quantise the
+                # boom in ~110-unit jumps as the player moved beside a wall.
+                # Refine just this last interval; five passes leave less than
+                # four units of uncertainty at the largest normal step.
+                clear, blocked = previous, distance
+                for _ in range(OCCLUSION_REFINE_STEPS):
+                    middle = (clear + blocked) * 0.5
+                    middle_point = (
+                        root[0] - forward[0] * middle,
+                        root[1] - forward[1] * middle,
+                        root[2] - forward[2] * middle,
+                    )
+                    if self._occupied(*middle_point):
+                        blocked = middle
+                    else:
+                        clear = middle
+                # Stay a little inside the known-clear side.  The collision
+                # queries are discrete too, so landing exactly on their edge
+                # can flicker from one frame to the next.
+                return max(clear - 1.0, MIN_DISTANCE)
+            previous = distance
         return full
 
     def _occupied(self, x, y, z):

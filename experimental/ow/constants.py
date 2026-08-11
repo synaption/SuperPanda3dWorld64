@@ -16,6 +16,12 @@ from dataclasses import dataclass
 # strength of gravity.
 GRAVITY_CONSTANT = 1.0e7
 
+# Gravity uses the original's 1 / r gameplay falloff close to a body.  Once a
+# traveller is this far above its collision surface, keep the pull at the
+# value it had there instead of letting it weaken further.  This is a surface
+# clearance (not a centre-to-centre distance), in centimetres.
+GRAVITY_LINEAR_FALLOFF_DISTANCE = 100_000.0
+
 # The player's own mass. Gravitational acceleration is G*M/r either way -- the
 # attracted body's mass cancels -- but the jetpack numbers below are *forces*,
 # so a mass of 1 is what makes them read as accelerations in cm/s^2.

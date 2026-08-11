@@ -80,10 +80,12 @@ playing. The game is paused for as long as the console is open. `help` inside
 it lists the rest.
 """
 
+from collections import deque
 import json
 import math
 import os
 import sys
+import time
 
 from direct.actor.Actor import Actor
 from direct.showbase.ShowBase import ShowBase
@@ -221,6 +223,11 @@ MODEL_YAW_OFFSET = 0.0
 # is what keeps a shared collision radius and a shared jump height honest.
 HERO_SCALE = 81.0
 
+# Mario's export is already in game units.  Keep him deliberately smaller
+# than the Hero, and keep this in step with MarioState.motion_scale so what
+# the player sees and how far he moves tell the same story.
+MARIO_SCALE = 2.0 / 3.0
+
 # Which way the Hero's model faces once loaded -- the same way Mario does, so
 # the same (absent) correction. Measured rather than assumed: in the exported
 # .glb his toe joints sit forward of his ankles along +Z, and +Z is the way
@@ -273,6 +280,10 @@ ACTION_NAMES = {v: k for k, v in vars(C).items() if k.startswith("ACT_")}
 # the following cull traversal, which measured ~0.4 ms per frame and spiked
 # far higher. The numbers are unreadable at 60 Hz anyway.
 HUD_INTERVAL = 0.1
+
+# Keep enough real time to make an isolated hitch visible in the debug readout
+# without letting an old loading spike colour the rest of a play session.
+FRAME_HISTORY_SECONDS = 5.0
 
 # The crosshair, in aspect2d units -- a fortieth of the window's height across
 # the gap and a little over that again in each arm. Small on purpose: it marks
@@ -516,6 +527,7 @@ class Game(ShowBase):
         self._mouse_anchor = None
         self._hud_timer = 0.0
         self._water_time = 0.0
+        self._frame_history = deque()
         self._reset_interpolation()
 
         # Everything is in the scene graph by now, so get it onto the GPU
@@ -590,7 +602,7 @@ class Game(ShowBase):
         mario.spawn(*SPAWN, SPAWN_YAW)
         animations.load_clip_metadata(MARIO_CLIPS)
         mario_node, mario_actor = self._build_actor(
-            MARIO_MODEL, MODEL_YAW_OFFSET, "mario",
+            MARIO_MODEL, MODEL_YAW_OFFSET, "mario", scale=MARIO_SCALE,
             build_hint="python3 tools/export_actor_gltf.py --actor mario "
                        "--anims all -o assets/mario/mario.glb")
 
@@ -1609,8 +1621,22 @@ class Game(ShowBase):
 
     # -- loop ----------------------------------------------------------------
 
+    def _record_frame(self, frame_dt):
+        """Retain frame durations from the last few seconds of real time."""
+        now = time.monotonic()
+        self._frame_history.append((now, max(frame_dt, 0.0)))
+        cutoff = now - FRAME_HISTORY_SECONDS
+        while self._frame_history and self._frame_history[0][0] < cutoff:
+            self._frame_history.popleft()
+
+    def _slowest_frame(self):
+        """The longest rendered frame in the rolling history, in seconds."""
+        return max((dt for _, dt in self._frame_history), default=0.0)
+
     def _update(self, task):
-        dt = min(self.clock.get_dt(), 0.25)
+        frame_dt = self.clock.get_dt()
+        self._record_frame(frame_dt)
+        dt = min(frame_dt, 0.25)
 
         # Once a frame, before anything reads it, and held neutral while the
         # console has the input -- the pad has no key-up to arrive later, so a
@@ -1912,6 +1938,9 @@ class Game(ShowBase):
         m = self.state
         action = self.player.action_name
         floor_type = f"0x{m.floor.type:04X}" if m.floor else "none"
+        slowest_frame = self._slowest_frame()
+        slowest_ms = slowest_frame * 1000.0
+        slowest_fps = 1.0 / slowest_frame if slowest_frame else 0.0
 
         return (
             f"playing  {self.player.name}  (F2 to swap)"
@@ -1930,6 +1959,7 @@ class Game(ShowBase):
             f"sprites  {self.impostor_drawn} drawn as impostors\n"
             f"fps      {self.clock.get_average_frame_rate():5.1f}"
             f"   frame {self.clock.get_dt() * 1000.0:5.1f} ms\n"
+            f"worst 5s {slowest_ms:5.1f} ms ({slowest_fps:5.1f} fps)\n"
             f"\n{self._control_legend()}\n"
             f"mouse look  {'RMB' if self._mouse_captured else 'F'} aim  "
             f"R recentre  F2 swap  F3 collision  F1 hud  ` console"

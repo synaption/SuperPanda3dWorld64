@@ -52,6 +52,11 @@ class Object:
     #   None   - ordinary geometry
     #   "axis" - turns about the vertical only, so it never tips over
     billboard = None
+    # Exempt from crowd level-of-detail: updated in full every tick no matter
+    # how far it is from the player. The pipes set this, because their spawning
+    # is what keeps the population up and a pipe's tick is a bare countdown --
+    # nothing worth culling, and everything to lose by freezing it.
+    always_active = False
 
     def __init__(self, surfaces, x, y, z, yaw=0):
         self.surfaces = surfaces
@@ -289,8 +294,9 @@ class Mario(Object):
     """
 
     model = "mario"
-    radius = 37.0
-    height = 160.0
+    draw_scale = 2.0 / 3.0
+    radius = 37.0 * draw_scale
+    height = 160.0 * draw_scale
 
     # MARIO_ANIM_IDLE_HEAD_CENTER and MARIO_ANIM_WALKING, the two his own
     # action code uses for standing about and for walking.
@@ -592,7 +598,7 @@ class Mario(Object):
         self.forward_vel += max(-0.4, min(
             0.4, self.SWIM_SPEED - self.forward_vel))
 
-        target_y = water_level - self.SWIM_DEPTH
+        target_y = water_level - self.SWIM_DEPTH * self.draw_scale
         self.vel_y = max(-3.0, min(3.0, target_y - self.pos[1]))
         if self.move():
             self.target_yaw = s16(self.yaw + 0x8000
@@ -694,6 +700,9 @@ class WarpPipe(Object):
     # The collision the original gives it: a 306-unit square, 205 tall.
     radius = 150.0
     height = 205.0
+    # A pipe keeps its countdown running at any distance, so a crowd is still
+    # waiting when the player arrives rather than only starting to fill then.
+    always_active = True
 
     # Gravity takes 4 a frame back, so a launch at v peaks v*v/8 units up and
     # is in the air for v/2 frames: 60 clears the 205-unit rim by as much
@@ -832,14 +841,18 @@ class Interactions:
 
             dx = mario.pos[0] - obj.pos[0]
             dz = mario.pos[2] - obj.pos[2]
-            reach = obj.radius + 37.0          # 37 is Mario's own hitbox radius
+            # Mario's collision body follows his visual scale; the Hero keeps
+            # the original size through its motion_scale of one.
+            mario_scale = mario.motion_scale
+            reach = obj.radius + 37.0 * mario_scale
             if dx * dx + dz * dz > reach * reach:
                 continue
 
             top = obj.pos[1] + obj.height
             # Vertical overlap: his feet below the enemy's head, his head above
             # its feet. Without this he is "touching" it from a storey up.
-            if mario.pos[1] > top or mario.pos[1] + 160.0 < obj.pos[1]:
+            if (mario.pos[1] > top
+                    or mario.pos[1] + 160.0 * mario_scale < obj.pos[1]):
                 continue
 
             stomping = (mario.vel[1] < 0.0
@@ -878,8 +891,25 @@ PRESET_MODELS = {"special_bubble_tree": Tree}
 class ObjectSet:
     """Every object in the area, updated once per tick."""
 
+    # Crowd level-of-detail. An enemy far from the player is not watched
+    # closely, so it is not worth a full behaviour tick every frame -- and the
+    # cost of running one for all of them is what caps the crowd. Inside the
+    # full range everything updates every tick; through the middle band an
+    # object updates one tick in LOD_MID_STRIDE, its phase staggered so the band
+    # does not all step together; past the far range a grounded object holds
+    # where it stands until the player comes back. Distances are squared once
+    # here so the per-object test is a multiply, not a hypot.
+    LOD_FULL_RANGE = 2500.0
+    LOD_FAR_RANGE = 6000.0
+    LOD_MID_STRIDE = 3
+    _LOD_FULL_SQ = LOD_FULL_RANGE * LOD_FULL_RANGE
+    _LOD_FAR_SQ = LOD_FAR_RANGE * LOD_FAR_RANGE
+
     def __init__(self, surfaces):
         self.surfaces = surfaces
+        # Turned off by the deterministic tooling, which wants every object
+        # stepped every tick regardless of where the player stands.
+        self.lod_enabled = True
         self.objects = []
         # The subset that can be fought, kept apart from the rest. Everything
         # that hunts them -- every Mario on the field, and the interaction pass
@@ -923,10 +953,12 @@ class ObjectSet:
             self.enemies = [e for e in self.enemies
                             if e.active and not e.defeated]
 
+        px, pz = mario.pos[0], mario.pos[2]
+
         # Over a copy of the list, because a pipe firing appends to it: the
         # new arrival is left to start on the following tick rather than being
         # updated on the one it was created in.
-        for obj in list(self.objects):
+        for i, obj in enumerate(list(self.objects)):
             if not obj.active:
                 continue
             if obj.dying:
@@ -943,6 +975,21 @@ class ObjectSet:
                 # back the moment it lands.
                 obj.coast()
                 continue
+
+            # Crowd level-of-detail: cull the behaviour tick by distance from
+            # the player. Airborne objects are never frozen -- a dormant one
+            # left in mid-air would hang there -- and always_active objects (the
+            # pipes) opt out entirely.
+            if self.lod_enabled and not obj.always_active and obj.on_ground:
+                dx = obj.pos[0] - px
+                dz = obj.pos[2] - pz
+                dist_sq = dx * dx + dz * dz
+                if dist_sq > self._LOD_FAR_SQ:
+                    continue
+                if dist_sq > self._LOD_FULL_SQ and (i + obj.timer) % \
+                        self.LOD_MID_STRIDE:
+                    continue
+
             obj.update(mario)
 
     def of_model(self, model):

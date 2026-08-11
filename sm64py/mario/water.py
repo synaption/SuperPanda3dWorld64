@@ -42,7 +42,8 @@ WATER_STEP_CANCELLED = 4
 
 
 def swimming_near_surface(m):
-    return (m.water_level - SURFACE_OFFSET) - m.pos[1] < 400.0
+    scale = m.motion_scale
+    return (m.water_level - SURFACE_OFFSET * scale) - m.pos[1] < 400.0 * scale
 
 
 def get_buoyancy(m):
@@ -118,9 +119,9 @@ def update_swimming_speed(m, decel_threshold):
 
 def perform_water_step(m):
     """Move Mario by his velocity, clamped to stay under the surface."""
-    next_pos = [m.pos[i] + m.vel[i] for i in range(3)]
+    next_pos = [m.pos[i] + m.vel[i] * m.motion_scale for i in range(3)]
 
-    ceiling = m.water_level - SURFACE_OFFSET
+    ceiling = m.water_level - SURFACE_OFFSET * m.motion_scale
     if next_pos[1] > ceiling:
         next_pos[1] = ceiling
         m.vel[1] = 0.0
@@ -130,7 +131,8 @@ def perform_water_step(m):
 
 def _perform_water_full_step(m, next_pos):
     # Walls are tested from higher up his body than on the ground.
-    wall = resolve_and_return_wall_collisions(m, next_pos, 10.0, 110.0)
+    wall = resolve_and_return_wall_collisions(
+        m, next_pos, 10.0 * m.motion_scale, 110.0 * m.motion_scale)
     floor_height, floor = m.surfaces.find_floor(*next_pos)
     ceil_height, _ = m.find_ceil(next_pos, floor_height)
 
@@ -138,20 +140,21 @@ def _perform_water_full_step(m, next_pos):
         return WATER_STEP_CANCELLED
 
     if next_pos[1] >= floor_height:
-        if ceil_height - next_pos[1] >= WATER_HEADROOM:
+        if ceil_height - next_pos[1] >= WATER_HEADROOM * m.motion_scale:
             m.pos = list(next_pos)
             m.floor, m.floor_height = floor, floor_height
             return WATER_STEP_HIT_WALL if wall is not None else WATER_STEP_NONE
 
-        if ceil_height - floor_height < WATER_HEADROOM:
+        if ceil_height - floor_height < WATER_HEADROOM * m.motion_scale:
             return WATER_STEP_CANCELLED
 
         # Too tight to fit: pulled down to hang off the ceiling instead.
-        m.pos = [next_pos[0], ceil_height - WATER_HEADROOM, next_pos[2]]
+        m.pos = [next_pos[0], ceil_height - WATER_HEADROOM * m.motion_scale,
+                 next_pos[2]]
         m.floor, m.floor_height = floor, floor_height
         return WATER_STEP_HIT_CEILING
 
-    if ceil_height - floor_height < WATER_HEADROOM:
+    if ceil_height - floor_height < WATER_HEADROOM * m.motion_scale:
         return WATER_STEP_CANCELLED
 
     m.pos = [next_pos[0], floor_height, next_pos[2]]
@@ -184,7 +187,7 @@ def set_water_plunge_action(m):
     """Enter the water, shedding most of the speed carried in."""
     m.forward_vel /= 4.0
     m.vel[1] /= 2.0
-    m.pos[1] = m.water_level - PLUNGE_DEPTH
+    m.pos[1] = m.water_level - PLUNGE_DEPTH * m.motion_scale
     m.face_angle[2] = 0
     m.angle_vel = [0, 0, 0]
 
@@ -202,7 +205,8 @@ def check_water_jump(m):
         return False
     # Pulling back, which is positive here because the stick is mirrored --
     # see update_swimming_pitch.
-    if (probe >= m.water_level - SURFACE_OFFSET and m.face_angle[0] >= 0
+    if (probe >= m.water_level - SURFACE_OFFSET * m.motion_scale
+            and m.face_angle[0] >= 0
             and m.controller.stick_y > 60.0):
         m.angle_vel = [0, 0, 0]
         m.vel[1] = 62.0
@@ -376,7 +380,8 @@ def act_water_jump(m):
     elif result == C.AIR_STEP_HIT_WALL:
         m.set_forward_vel(15.0)
     # Falling back toward the water means the jump failed to clear it.
-    elif m.vel[1] < 0.0 and m.pos[1] < m.water_level - PLUNGE_DEPTH:
+    elif (m.vel[1] < 0.0
+          and m.pos[1] < m.water_level - PLUNGE_DEPTH * m.motion_scale):
         return set_water_plunge_action(m)
     return False
 
@@ -391,7 +396,7 @@ def check_common_water_cancels(m):
         return False
     if m.action == C.ACT_WATER_JUMP:
         return False
-    if m.pos[1] < m.water_level - PLUNGE_DEPTH:
+    if m.pos[1] < m.water_level - PLUNGE_DEPTH * m.motion_scale:
         return set_water_plunge_action(m)
     return False
 

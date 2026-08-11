@@ -23,8 +23,8 @@ import os
 import numpy as np
 
 from panda3d.core import (Geom, GeomNode, GeomTriangles, GeomVertexData,
-                          GeomVertexFormat, GeomVertexWriter, SamplerState,
-                          Shader, Texture)
+                          GeomVertexFormat, GeomVertexWriter,
+                          OmniBoundingVolume, SamplerState, Shader, Texture)
 
 from .math_util import s16_to_degrees, to_panda
 
@@ -66,7 +66,10 @@ void main() {
     gl_Position = p3d_ViewProjectionMatrix * vec4(world, 1.0);
 
     float u = (float(col) + (ax + 0.5)) / float(cols);
-    float v = (float(row) + (1.0 - ay)) / float(rows);
+    // Panda's texture coordinates start at the bottom of the atlas, as does
+    // the quad.  Keeping both directions aligned preserves the bake's upright
+    // pixels; reversing `ay` here turned every enemy upside down.
+    float v = (float(row) + ay) / float(rows);
     texcoord = vec2(u, v);
 }
 """
@@ -133,9 +136,14 @@ class ImpostorField:
                                          VERTEX_SHADER, FRAGMENT_SHADER))
         # Baked with the scene's light already in it, so light it no further.
         self.node.set_light_off()
-        # It fills its own cell to the corners at every angle, so it must never
-        # be culled by a bound that assumes a small quad -- the instances stand
-        # wherever their table puts them, far from this node's origin.
+        # The instances stand wherever their table puts them, all over the
+        # level, but the node itself sits at the origin with a point for a
+        # bound. Left to that bound Panda culls the whole field the moment the
+        # origin leaves the frustum -- the crowd blinks out whenever the camera
+        # looks away from world centre. An omni bound says "always visible" so
+        # every instance is considered every frame; set_final stops the cull
+        # from descending past it.
+        self.node.node().set_bounds(OmniBoundingVolume())
         self.node.node().set_final(True)
         self.node.set_two_sided(True)
 
@@ -212,7 +220,13 @@ class ImpostorField:
         # presents the same face. Measured in the horizontal plane only.
         cam = to_panda(*cam_game)
         azimuth = np.degrees(np.arctan2(cam[0] - cx, cam[1] - cy))
-        rel = self.angle_sign * yaw - azimuth + self.angle_offset
+        # The camera's bearing adds to the heading, it does not subtract: the
+        # baked row is the object's facing seen *from* the camera, so turning
+        # the object and orbiting the camera move the chosen cell the same way.
+        # Head on, azimuth is 180 and its sign cannot be told apart -- which is
+        # why a straight-ahead calibration looks right either way and the
+        # mirror only shows once an object is off to the side.
+        rel = self.angle_sign * yaw + azimuth + self.angle_offset
         row = np.mod(np.round(rel * self.angles / 360.0), self.angles).astype(
             np.int64)
         col = np.mod(timer, self.frames)

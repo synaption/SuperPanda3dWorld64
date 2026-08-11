@@ -82,6 +82,10 @@ m/s² — the constants were tuned around that substitution, and "fixing" the
 exponent breaks the level. `--selftest` asserts the linear law so nobody
 tidies it away later.
 
+The field stops weakening **1 km above a planet's collision surface** and
+remains constant farther away. Adjust `GRAVITY_LINEAR_FALLOFF_DISTANCE` in
+`ow/constants.py` to tune that height.
+
 ### Walking, and why gravity had to change
 
 The original has no ground mode: you are a sphere with a jetpack, and landing

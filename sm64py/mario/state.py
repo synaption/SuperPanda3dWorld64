@@ -78,6 +78,13 @@ class Controller:
 class MarioState:
     """Everything the action state machine reads and writes each frame."""
 
+    # Mario is smaller than the level's original collision character.  The
+    # action machine keeps its familiar SM64 values, while the step routines
+    # convert them to world distance through this multiplier.  That scales
+    # every kind of travel together -- walking, jumps, slides and swimming --
+    # without changing timing windows or animation choices.
+    motion_scale = 2.0 / 3.0
+
     #: Which of this character's actions puts ice underfoot wherever he stands.
     #: Named rather than written into `get_floor_class` directly because the
     #: Hero skates too, on his own action id and off a different control, and
@@ -330,8 +337,10 @@ class MarioState:
 
         # Two passes at different heights so Mario is pushed clear of walls
         # around both his torso and his feet.
-        find_wall_collisions(self, self.pos, 60.0, 50.0)
-        find_wall_collisions(self, self.pos, 30.0, 24.0)
+        find_wall_collisions(self, self.pos, 60.0 * self.motion_scale,
+                             50.0 * self.motion_scale)
+        find_wall_collisions(self, self.pos, 30.0 * self.motion_scale,
+                             24.0 * self.motion_scale)
 
         self.floor_height, self.floor = self.surfaces.find_floor(*self.pos)
 
@@ -351,13 +360,14 @@ class MarioState:
         if self.floor is not None:
             self.floor_angle = atan2s(self.floor.normal[2], self.floor.normal[0])
 
-            if self.pos[1] > self.water_level - 40 and self.floor_is_slippery():
+            if (self.pos[1] > self.water_level - 40.0 * self.motion_scale
+                    and self.floor_is_slippery()):
                 self.input |= C.INPUT_ABOVE_SLIDE
 
-            if self.pos[1] > self.floor_height + 100.0:
+            if self.pos[1] > self.floor_height + 100.0 * self.motion_scale:
                 self.input |= C.INPUT_OFF_FLOOR
 
-            if self.pos[1] < self.water_level - 10:
+            if self.pos[1] < self.water_level - 10.0 * self.motion_scale:
                 self.input |= C.INPUT_IN_WATER
 
     def find_ceil(self, pos, floor_height):
@@ -367,9 +377,10 @@ class MarioState:
         he has already passed under from blocking him.
         """
         x, y, z = pos
-        if floor_height + 80.0 <= y:
+        if floor_height + 80.0 * self.motion_scale <= y:
             return self.surfaces.find_ceil(x, y, z)
-        return self.surfaces.find_ceil(x, floor_height + 80.0, z)
+        return self.surfaces.find_ceil(
+            x, floor_height + 80.0 * self.motion_scale, z)
 
     # -- helpers used by actions -------------------------------------------
 

@@ -23,6 +23,7 @@ class HeroState(MarioState):
     """The Hero, standing on the same floors Mario does."""
 
     voice_profile = "hero"
+    motion_scale = 1.0
 
     # He skates on the jetpack rather than on a pair of skates, but the ice is
     # the same ice: `MarioState.get_floor_class` reads this to know which

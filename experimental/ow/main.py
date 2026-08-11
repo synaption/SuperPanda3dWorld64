@@ -35,6 +35,7 @@ def selftest():
         FIXED_TIMESTEP,
         GRAVITY_ALL,
         GRAVITY_CONSTANT,
+        GRAVITY_LINEAR_FALLOFF_DISTANCE,
         GROUND_TOLERANCE,
         WALK_SPEED,
     )
@@ -52,19 +53,30 @@ def selftest():
 
     print("gravity")
     a = GravityComponent("a", 2.0, position=(0, 0, 0))
-    b = GravityComponent("b", 5.0, position=(1000.0, 0, 0))
+    b = GravityComponent("b", 5.0, position=(100.0, 0, 0))
     force = a.gravitational_force_toward(b)
-    expected = GRAVITY_CONSTANT * 2.0 * 5.0 / 1000.0
-    check("Fg = G*m*M/r (linear falloff, per the original's comment)",
+    expected = GRAVITY_CONSTANT * 2.0 * 5.0 / 100.0
+    check("Fg = G*m*M/r inside the linear-falloff range",
           abs(force.length() - expected) < 1e-6,
           "{} != {}".format(force.length(), expected))
     check("force points at the other body", force.getX() > 0 and abs(force.getY()) < 1e-9)
 
     # Halving the distance should double the force, not quadruple it.
-    b.position = LVector3d(500.0, 0, 0)
+    b.position = LVector3d(50.0, 0, 0)
     half = a.gravitational_force_toward(b).length()
     check("halving r doubles Fg (not 4x)", abs(half / expected - 2.0) < 1e-9,
           "ratio {}".format(half / expected))
+
+    # Farther than the configured clearance from a body's surface, preserve
+    # the boundary pull rather than weakening it further.
+    b.radius = 100.0
+    b.position = LVector3d(b.radius + GRAVITY_LINEAR_FALLOFF_DISTANCE, 0, 0)
+    at_limit = a.gravitational_force_toward(b).length()
+    b.position = LVector3d(300_000.0, 0, 0)
+    far = a.gravitational_force_toward(b).length()
+    check("gravity becomes constant past the linear-falloff distance",
+          abs(far - at_limit) < 1e-9 * at_limit,
+          "{} != {}".format(far, at_limit))
 
     print("attracted mass cancels")
     accelerations = []
@@ -201,6 +213,11 @@ def selftest():
           (sim.player.position - target.position).length() >= contact - 1e-6,
           "ended {:.1f} cm from centre".format(
               (sim.player.position - target.position).length()))
+    outward_speed = sim.player.speed.dot(
+        (sim.player.position - target.position).normalized()
+    )
+    check("a hard landing cannot rebound off the surface", outward_speed <= 1e-6,
+          "outward speed {:.1f} cm/s".format(outward_speed))
 
     print("nearest-body gravity")
     sim = World()

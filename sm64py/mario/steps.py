@@ -50,8 +50,10 @@ def stationary_ground_step(m):
 def _perform_ground_quarter_step(m, next_pos):
     # The lower check keeps Mario off small steps; the upper one is what
     # actually counts as "hitting a wall" for gameplay purposes.
-    resolve_and_return_wall_collisions(m, next_pos, 30.0, 24.0)
-    upper_wall = resolve_and_return_wall_collisions(m, next_pos, 60.0, 50.0)
+    scale = m.motion_scale
+    resolve_and_return_wall_collisions(m, next_pos, 30.0 * scale, 24.0 * scale)
+    upper_wall = resolve_and_return_wall_collisions(m, next_pos, 60.0 * scale,
+                                                    50.0 * scale)
 
     floor_height, floor = m.surfaces.find_floor(*next_pos)
     ceil_height, _ = m.find_ceil(next_pos, floor_height)
@@ -61,9 +63,9 @@ def _perform_ground_quarter_step(m, next_pos):
     if floor is None:
         return C.GROUND_STEP_HIT_WALL_STOP_QSTEPS
 
-    if next_pos[1] > floor_height + 100.0:
+    if next_pos[1] > floor_height + 100.0 * scale:
         # Walked off a ledge.
-        if next_pos[1] + 160.0 >= ceil_height:
+        if next_pos[1] + 160.0 * scale >= ceil_height:
             return C.GROUND_STEP_HIT_WALL_STOP_QSTEPS
 
         m.pos[:] = next_pos
@@ -72,7 +74,7 @@ def _perform_ground_quarter_step(m, next_pos):
         return C.GROUND_STEP_LEFT_GROUND
 
     # Not enough headroom to stand here.
-    if floor_height + 160.0 >= ceil_height:
+    if floor_height + 160.0 * scale >= ceil_height:
         return C.GROUND_STEP_HIT_WALL_STOP_QSTEPS
 
     m.pos[0], m.pos[1], m.pos[2] = next_pos[0], floor_height, next_pos[2]
@@ -99,9 +101,9 @@ def perform_ground_step(m):
         # and speeds him up going down it.
         ny = m.floor.normal[1] if m.floor is not None else 1.0
         next_pos = [
-            m.pos[0] + ny * (m.vel[0] / 4.0),
+            m.pos[0] + ny * (m.vel[0] * m.motion_scale / 4.0),
             m.pos[1],
-            m.pos[2] + ny * (m.vel[2] / 4.0),
+            m.pos[2] + ny * (m.vel[2] * m.motion_scale / 4.0),
         ]
 
         step_result = _perform_ground_quarter_step(m, next_pos)
@@ -132,13 +134,14 @@ def check_ledge_grab(m, wall, intended_pos, next_pos):
 
     # The floor search starts well above Mario, so a ledge somewhat higher
     # than expected can be caught.
-    ledge_x = next_pos[0] - wall.normal[0] * 60.0
-    ledge_z = next_pos[2] - wall.normal[2] * 60.0
+    ledge_x = next_pos[0] - wall.normal[0] * 60.0 * m.motion_scale
+    ledge_z = next_pos[2] - wall.normal[2] * 60.0 * m.motion_scale
     ledge_y, ledge_floor = m.surfaces.find_floor(
-        ledge_x, next_pos[1] + 160.0, ledge_z
+        ledge_x, next_pos[1] + 160.0 * m.motion_scale, ledge_z
     )
 
-    if ledge_floor is None or ledge_y - next_pos[1] <= 100.0:
+    if (ledge_floor is None
+            or ledge_y - next_pos[1] <= 100.0 * m.motion_scale):
         return False
 
     m.pos[:] = [ledge_x, ledge_y, ledge_z]
@@ -153,8 +156,11 @@ def check_ledge_grab(m, wall, intended_pos, next_pos):
 def _perform_air_quarter_step(m, intended_pos, step_arg):
     next_pos = list(intended_pos)
 
-    upper_wall = resolve_and_return_wall_collisions(m, next_pos, 150.0, 50.0)
-    lower_wall = resolve_and_return_wall_collisions(m, next_pos, 30.0, 50.0)
+    scale = m.motion_scale
+    upper_wall = resolve_and_return_wall_collisions(m, next_pos, 150.0 * scale,
+                                                    50.0 * scale)
+    lower_wall = resolve_and_return_wall_collisions(m, next_pos, 30.0 * scale,
+                                                    50.0 * scale)
 
     floor_height, floor = m.surfaces.find_floor(*next_pos)
     ceil_height, ceil = m.find_ceil(next_pos, floor_height)
@@ -170,14 +176,14 @@ def _perform_air_quarter_step(m, intended_pos, step_arg):
         return C.AIR_STEP_HIT_WALL
 
     if next_pos[1] <= floor_height:
-        if ceil_height - floor_height > 160.0:
+        if ceil_height - floor_height > 160.0 * scale:
             m.pos[0], m.pos[2] = next_pos[0], next_pos[2]
             m.floor = floor
             m.floor_height = floor_height
         m.pos[1] = floor_height
         return C.AIR_STEP_LANDED
 
-    if next_pos[1] + 160.0 > ceil_height:
+    if next_pos[1] + 160.0 * scale > ceil_height:
         # Bonked the ceiling: keep horizontal motion but stop rising.
         if m.vel[1] >= 0.0:
             m.vel[1] = 0.0
@@ -250,9 +256,9 @@ def perform_air_step(m, step_arg=0):
 
     for _ in range(4):
         intended_pos = [
-            m.pos[0] + m.vel[0] / 4.0,
-            m.pos[1] + m.vel[1] / 4.0,
-            m.pos[2] + m.vel[2] / 4.0,
+            m.pos[0] + m.vel[0] * m.motion_scale / 4.0,
+            m.pos[1] + m.vel[1] * m.motion_scale / 4.0,
+            m.pos[2] + m.vel[2] * m.motion_scale / 4.0,
         ]
 
         quarter_result = _perform_air_quarter_step(m, intended_pos, step_arg)

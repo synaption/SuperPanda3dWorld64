@@ -323,6 +323,31 @@ def check_the_boom_goes_out_slowly():
                 f"{recovered:.0f} a second later")
 
 
+def check_obstruction_distance_is_not_quantised():
+    """A wall sliding past the boom changes its clearance continuously.
+
+    The broad collision march is deliberately sparse, since it normally finds
+    nothing.  Its first blocked sample used to become the answer directly,
+    making clearance hold still and then jump by one entire sample as the
+    player moved.  The final sample interval must be refined before it drives
+    the camera position.
+    """
+    camera, hero = a_camera(ground_with_a_wall())
+    forward = (0.0, 0.0, -1.0)  # the boom therefore extends toward +Z
+    distances = [
+        camera._clear_distance((0.0, cam.PIVOT_HEIGHT, z), forward,
+                               cam.HIP_DISTANCE)
+        for z in range(0, 81, 5)
+    ]
+    changes = [abs(after - before)
+               for before, after in zip(distances, distances[1:])]
+    spread = max(distances) - min(distances)
+    largest = max(changes, default=0.0)
+    ok = spread > 70.0 and largest < 9.0
+    return ok, (f"clearance changed {spread:.1f} units overall, with no step "
+                f"larger than {largest:.1f} units")
+
+
 def check_the_camera_stays_above_the_ground():
     """Look down as far as it goes and the camera is still out of the floor."""
     camera, hero = a_camera()
@@ -585,6 +610,8 @@ CHECKS = [
     ("big climbs are followed", check_big_climbs_are_followed),
     ("the boom comes in at once", check_the_boom_comes_in_at_once),
     ("the boom goes out slowly", check_the_boom_goes_out_slowly),
+    ("obstruction distance is not quantised",
+     check_obstruction_distance_is_not_quantised),
     ("the camera stays above ground", check_the_camera_stays_above_the_ground),
     ("the sights pull in and let go", check_the_sights_pull_in_and_let_go),
     ("half an amount is half the aim", check_half_an_amount_is_half_the_aim),

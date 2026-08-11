@@ -13,7 +13,8 @@ comment on the Fg node:
 
 So the falloff is linear, not inverse-square. That is deliberate and it is what
 makes the demo system's surface gravity land near 1 g while still being
-noticeable between planets -- do not "fix" it.
+noticeable between planets.  The port retains that behaviour close to a body,
+then clamps it at a chosen surface clearance so distant gravity is constant.
 """
 
 import math
@@ -24,6 +25,7 @@ from .constants import (
     COLLISION_SKIN,
     DEFAULT_GRAVITY_MODE,
     GRAVITY_CONSTANT,
+    GRAVITY_LINEAR_FALLOFF_DISTANCE,
     GRAVITY_NEAREST,
     GROUND_TOLERANCE,
 )
@@ -81,6 +83,7 @@ class GravityComponent:
         is_planet=False,
         collides=True,
         gravity_constant=GRAVITY_CONSTANT,
+        gravity_linear_falloff_distance=GRAVITY_LINEAR_FALLOFF_DISTANCE,
         gravity_mode=DEFAULT_GRAVITY_MODE,
     ):
         self.name = name
@@ -95,6 +98,9 @@ class GravityComponent:
         self.collides = collides
         self.previous_position = vec3d(position)
         self.gravity_constant = gravity_constant
+        #: Surface clearance where the 1 / r field becomes a constant pull.
+        #: Set to ``math.inf`` to retain unlimited 1 / r falloff.
+        self.gravity_linear_falloff_distance = float(gravity_linear_falloff_distance)
         #: GRAVITY_NEAREST or GRAVITY_ALL; see gravity_sources().
         self.gravity_mode = gravity_mode
 
@@ -119,12 +125,22 @@ class GravityComponent:
     # -- CalculateFg -------------------------------------------------------
 
     def gravitational_force_toward(self, other):
-        """Fg = (G * m * M) / r, directed at `other`. Zero if coincident."""
+        """Pull toward ``other``: 1 / r near it, constant beyond its range.
+
+        The range is measured from the other body's surface, which makes the
+        same tuning meaningful for planets of different sizes.  Clamping the
+        denominator makes the transition continuous: at the range boundary,
+        both formulas yield exactly the same force.
+        """
         delta = other.position - self.position
         distance = delta.length()
         if distance <= 0.0:
             return LVector3d(0, 0, 0)
-        magnitude = (self.gravity_constant * self.mass_self * other.mass_self) / distance
+        linear_limit = other.radius + other.gravity_linear_falloff_distance
+        effective_distance = min(distance, linear_limit)
+        magnitude = (
+            self.gravity_constant * self.mass_self * other.mass_self
+        ) / effective_distance
         return (delta / distance) * magnitude
 
     def accumulate_gravity(self, bodies, planets_attract_each_other=False):

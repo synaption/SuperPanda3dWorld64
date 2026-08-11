@@ -1,10 +1,11 @@
 """The demo system, read out of L_DemoLevel.umap.
 
-Positions, scales and masses are the ones authored in the Unreal level. Unreal
-is left-handed and Panda is right-handed, so Y is negated on the way in; the
-system is otherwise identical, including the fact that nothing starts with any
-orbital velocity -- the whole thing is released from rest and falls together.
-Give a body an `initial_speed` if you want it to orbit instead.
+Positions, scales and masses are the ones authored in the Unreal level, then
+doubled for this roomier version of the system. Unreal is left-handed and Panda
+is right-handed, so Y is negated on the way in; the system is otherwise
+identical, including the fact that nothing starts with any orbital velocity --
+the whole thing is released from rest and falls together. Give a body an
+`initial_speed` if you want it to orbit instead.
 
 Names are ours. The original level leaves the planets unnamed.
 """
@@ -13,8 +14,13 @@ from dataclasses import dataclass, field
 
 from .constants import PLANET_COLLISION_UNIT_RADIUS, PLANET_MESH_UNIT_RADIUS
 
-#: PlayerStart, converted to Panda's handedness.
-PLAYER_START = (-249300.0, -33165.0, 6285.0)
+#: Applied to all body positions/radii/masses and the player start.  Mass
+#: scales with radius so the 1 / r law preserves each body's surface gravity.
+SYSTEM_SCALE = 2.0
+
+#: PlayerStart, converted to Panda's handedness and scaled with the system.
+_AUTHORED_PLAYER_START = (-249300.0, -33165.0, 6285.0)
+PLAYER_START = tuple(value * SYSTEM_SCALE for value in _AUTHORED_PLAYER_START)
 
 
 @dataclass
@@ -84,4 +90,15 @@ def demo_system():
     for i, body in enumerate(bodies):
         if not body.emissive:
             body.color = _PALETTE[i % len(_PALETTE)]
-    return bodies
+    return [
+        Body(
+            body.name,
+            body.mass * SYSTEM_SCALE,
+            tuple(value * SYSTEM_SCALE for value in body.position),
+            body.scale * SYSTEM_SCALE,
+            initial_speed=body.initial_speed,
+            color=body.color,
+            emissive=body.emissive,
+        )
+        for body in bodies
+    ]
