@@ -81,6 +81,7 @@ it lists the rest.
 """
 
 from collections import deque
+import gc
 import json
 import math
 import os
@@ -384,6 +385,24 @@ loadPrcFileData("", f"sync-video {os.environ.get('MARIO_VSYNC', '0')}")
 loadPrcFileData("", "clock-mode limited")
 loadPrcFileData("", f"clock-frame-rate {FRAME_RATE_CAP:g}")
 
+# Native Windows defaults its scheduler-timer granularity to ~15.6 ms, and the
+# frame limiter above paces by sleeping the remainder of each frame. A sleep
+# shorter than the granularity wakes late -- rounded up to the next ~15.6 ms
+# tick -- so a frame meant to land at 8 ms overshoots past 15, which is the
+# ~20 ms hitch the readout shows on every kind of frame, tick or render-only.
+# timeBeginPeriod(1) asks Windows for 1 ms timers so the limiter can sleep to
+# the cap precisely; the paired end call restores it at exit rather than
+# leaving the whole system on the fine timer. No-op off Windows.
+# MARIO_TIMER=0 skips it, to A/B the hitch against the readout's worst-frame.
+if sys.platform == "win32" and os.environ.get("MARIO_TIMER", "1") != "0":
+    import atexit
+    import ctypes
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+        atexit.register(ctypes.windll.winmm.timeEndPeriod, 1)
+    except (AttributeError, OSError) as exc:
+        print(f"Could not raise the Windows timer resolution: {exc}")
+
 
 class Player:
     """One playable character: what simulates it, and what draws it.
@@ -547,6 +566,23 @@ class Game(ShowBase):
         preload(self.render, self.win.get_gsg())
 
         self._setup_audio()
+
+        # Python's cyclic garbage collector is a periodic frame-time spike
+        # waiting to happen once a crowd is live: a gen-2 pass walks every
+        # container it tracks, and with thousands of enemies that is a lot to
+        # walk, landing on no particular frame -- which reads as an irregular
+        # hitch on top of the regular tick-frame one.
+        #
+        # Everything alive at this point is permanent -- the level, the loaded
+        # models, the object pool, the sound bank -- so freeze() moves it all
+        # out of the collector's reach for good, and the raised thresholds let
+        # what is allocated during play (per-tick scratch, interpolation lists)
+        # collect far less often. Set MARIO_GC=1 to restore the stock collector
+        # for an A/B against the readout's worst-frame split.
+        if os.environ.get("MARIO_GC", "0") != "1":
+            gc.collect()
+            gc.freeze()
+            gc.set_threshold(50_000, 500, 1000)
 
         self.task_mgr.add(self._update, "update")
 
@@ -1646,20 +1682,62 @@ class Game(ShowBase):
     # -- loop ----------------------------------------------------------------
 
     def _record_frame(self, frame_dt):
-        """Retain frame durations from the last few seconds of real time."""
+        """Retain frame durations from the last few seconds of real time.
+
+        Returns the entry so the caller can fill in, once the tick loop has
+        run, how many 30 Hz ticks this frame stepped -- the third field, left
+        at zero here. That count is what attributes a spike: a slow frame that
+        ran a tick is the simulation bunching onto it; a slow frame that ran
+        none did no simulation at all, so its cost is GC or the renderer.
+        """
         now = time.monotonic()
-        self._frame_history.append((now, max(frame_dt, 0.0)))
+        entry = [now, max(frame_dt, 0.0), 0]
+        self._frame_history.append(entry)
         cutoff = now - FRAME_HISTORY_SECONDS
         while self._frame_history and self._frame_history[0][0] < cutoff:
             self._frame_history.popleft()
+        return entry
 
-    def _slowest_frame(self):
-        """The longest rendered frame in the rolling history, in seconds."""
-        return max((dt for _, dt in self._frame_history), default=0.0)
+    def _frame_stats(self):
+        """Characterise the last few seconds of frames, or None while warming.
+
+        A single worst-frame number cannot be A/B'd by eye: it is the height of
+        the tallest spike and says nothing about how *often* one lands, and a
+        judder that is felt is a frequent spike, not a rare tall one. So this
+        returns the shape instead --
+
+        - median: the typical frame, what "smooth" would be all the time;
+        - p99: what all but the worst 1% stay under -- the felt ceiling;
+        - worst: the single tallest, kept because it still bounds the hitch;
+        - slow_per_sec: how many frames a second run over twice the median,
+          i.e. render at less than half the typical rate. THIS is the number
+          that moves when a fix lands -- a rare blip reads near zero, a
+          constant judder reads in the tens;
+        - slow_on_tick / slow_total: of those slow frames, how many stepped a
+          30 Hz tick, so the sim can still be told apart from everything else.
+
+        Twice-median as the threshold matches the complaint in its own terms:
+        "frames that render at less than half my typical render time."
+        """
+        hist = self._frame_history
+        if len(hist) < 2:
+            return None
+        durations = sorted(e[1] for e in hist)
+        n = len(durations)
+        median = durations[n // 2]
+        p99 = durations[min(n - 1, int(n * 0.99))]
+        worst = durations[-1]
+
+        span = hist[-1][0] - hist[0][0]
+        threshold = median * 2.0
+        slow = [e for e in hist if e[1] > threshold]
+        slow_per_sec = len(slow) / span if span > 0 else 0.0
+        slow_on_tick = sum(1 for e in slow if e[2])
+        return median, p99, worst, slow_per_sec, len(slow), slow_on_tick
 
     def _update(self, task):
         frame_dt = self.clock.get_dt()
-        self._record_frame(frame_dt)
+        frame_entry = self._record_frame(frame_dt)
         dt = min(frame_dt, 0.25)
 
         # Once a frame, before anything reads it, and held neutral while the
@@ -1728,6 +1806,10 @@ class Game(ShowBase):
             if state.floor is None or state.pos[1] < DEATH_PLANE:
                 state.spawn(*SPAWN, SPAWN_YAW)
                 self._reset_interpolation()
+
+        # Attribute this frame's cost: how many ticks it ended up stepping, so
+        # the readout can say how many slow frames ran a tick. See _frame_stats.
+        frame_entry[2] = steps
 
         # The simulation only moves in 33 ms steps, so drawing its raw output
         # judders on a faster display. Draw a blend between the last two ticks
@@ -1972,9 +2054,16 @@ class Game(ShowBase):
         m = self.state
         action = self.player.action_name
         floor_type = f"0x{m.floor.type:04X}" if m.floor else "none"
-        slowest_frame = self._slowest_frame()
-        slowest_ms = slowest_frame * 1000.0
-        slowest_fps = 1.0 / slowest_frame if slowest_frame else 0.0
+        stats = self._frame_stats()
+        if stats is None:
+            frames_line = "frames   (warming up)\n"
+        else:
+            median, p99, worst, slow_ps, slow_n, slow_tick = stats
+            frames_line = (
+                f"frames   med {median * 1000.0:4.1f}  p99 {p99 * 1000.0:5.1f}"
+                f"  max {worst * 1000.0:5.1f} ms   "
+                f"slow {slow_ps:4.1f}/s ({slow_tick}/{slow_n} on ticks)\n"
+            )
 
         return (
             f"playing  {self.player.name}  (F2 to swap)"
@@ -1993,7 +2082,7 @@ class Game(ShowBase):
             f"sprites  {self.impostor_drawn} drawn as impostors\n"
             f"fps      {self.clock.get_average_frame_rate():5.1f}"
             f"   frame {self.clock.get_dt() * 1000.0:5.1f} ms\n"
-            f"worst 5s {slowest_ms:5.1f} ms ({slowest_fps:5.1f} fps)\n"
+            f"{frames_line}"
             f"\n{self._control_legend()}\n"
             f"mouse look  {'RMB' if self._mouse_captured else 'F'} aim  "
             f"R recentre  F2 swap  F3 collision  F1 hud  ` console"
