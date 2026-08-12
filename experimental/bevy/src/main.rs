@@ -1,17 +1,22 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod animation;
+mod audio;
 mod camera;
+mod console;
 mod enemy;
+mod input;
 mod level;
 mod player;
 
 use bevy::{
+    diagnostic::FrameTimeDiagnosticsPlugin,
     prelude::*,
     window::{CursorGrabMode, PrimaryWindow},
 };
 use camera::FollowCamera;
 use enemy::Enemy;
+use input::InputState;
 use player::{Controller, Player, PlayerVisual, PreviousPose, RenderPose};
 use std::path::PathBuf;
 
@@ -40,6 +45,10 @@ fn main() {
             aiming: false,
             debug: true,
         })
+        .init_resource::<console::GameTuning>()
+        .init_resource::<console::ConsoleState>()
+        .init_resource::<input::InputState>()
+        .init_resource::<audio::SoundQueue>()
         .insert_resource(Time::<Fixed>::from_hz(30.0))
         .add_plugins(
             DefaultPlugins
@@ -57,8 +66,22 @@ fn main() {
                     ..default()
                 }),
         )
+        .add_plugins(FrameTimeDiagnosticsPlugin)
         .add_systems(Startup, setup)
-        .add_systems(FixedUpdate, player::movement)
+        // The console claims the keyboard first, then every device is polled
+        // into one snapshot, before any schedule that reads player intent.
+        .add_systems(PreUpdate, (console::input, input::gather).chain())
+        .add_systems(
+            FixedUpdate,
+            (
+                player::movement,
+                enemy::combat,
+                enemy::update,
+                enemy::spawn_from_pipes,
+            )
+                .chain()
+                .run_if(console::is_closed),
+        )
         .add_systems(
             Update,
             (
@@ -66,9 +89,21 @@ fn main() {
                 camera::update,
                 animation::claim_players,
                 animation::update,
-                enemy::update,
                 controls,
                 update_hud,
+            )
+                .chain()
+                .run_if(console::is_closed),
+        )
+        .add_systems(
+            Update,
+            (
+                console::pause_animations,
+                enemy::sync_animation_visibility,
+                // Sound drains unconditionally: events raised on the tick the
+                // console opened should still be heard.
+                audio::play,
+                console::draw,
             )
                 .chain(),
         )
@@ -90,6 +125,7 @@ fn setup(
 ) {
     let (collision, render) = level::load();
     commands.insert_resource(animation::CharacterAnimations::load(&assets));
+    audio::preload(&mut commands, &assets);
     commands.insert_resource(collision);
     commands.spawn(SceneBundle {
         scene: assets.load("bevy/castle.glb#Scene0"),
@@ -160,11 +196,16 @@ fn setup(
         Vec3::new(-55.1, 5.4, -39.2),
         Vec3::new(46.8, 5.4, -68.1),
     ] {
-        commands.spawn(SceneBundle {
-            scene: assets.load("actors/warp_pipe.glb#Scene0"),
-            transform: Transform::from_translation(position).with_scale(Vec3::splat(0.01)),
-            ..default()
-        });
+        commands.spawn((
+            enemy::WarpPipe {
+                timer: Timer::from_seconds(7.0, TimerMode::Repeating),
+            },
+            SceneBundle {
+                scene: assets.load("actors/warp_pipe.glb#Scene0"),
+                transform: Transform::from_translation(position).with_scale(Vec3::splat(0.01)),
+                ..default()
+            },
+        ));
     }
     commands.spawn(DirectionalLightBundle {
         directional_light: DirectionalLight {
@@ -231,6 +272,8 @@ fn setup(
             ..default()
         }),
     );
+    commands.spawn(console::panel_bundle());
+    commands.spawn(console::tuning_tray_bundle());
     if let Ok(mut window) = windows.get_single_mut() {
         window.cursor.grab_mode = CursorGrabMode::Locked;
         window.cursor.visible = false;
@@ -238,12 +281,16 @@ fn setup(
 }
 
 fn controls(
-    keys: Res<Input<KeyCode>>,
+    mut input: ResMut<InputState>,
     mut state: ResMut<GameState>,
     mut visuals: Query<(&ActiveCharacter, &mut Visibility), With<PlayerVisual>>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    console: Res<console::ConsoleState>,
 ) {
-    if keys.just_pressed(KeyCode::F2) {
+    if console.open || console.closed_this_frame {
+        return;
+    }
+    if InputState::take(&mut input.swap) {
         state.active = if state.active == ActiveCharacter::Hero {
             ActiveCharacter::Mario
         } else {
@@ -257,10 +304,10 @@ fn controls(
             };
         }
     }
-    if keys.just_pressed(KeyCode::F1) {
+    if InputState::take(&mut input.debug) {
         state.debug = !state.debug;
     }
-    if keys.just_pressed(KeyCode::Escape) {
+    if InputState::take(&mut input.cursor) {
         if let Ok(mut window) = windows.get_single_mut() {
             let locked = window.cursor.grab_mode != CursorGrabMode::None;
             window.cursor.grab_mode = if locked {
@@ -275,12 +322,14 @@ fn controls(
 
 fn update_hud(
     state: Res<GameState>,
+    input: Res<InputState>,
     player: Query<&Controller, With<Player>>,
     mut text: Query<&mut Text, With<Hud>>,
 ) {
     let ctrl = player.single();
     text.single_mut().sections[0].value = if state.debug {
-        format!("Super Bevy World 64\n{:?}  ·  {:?}\nWASD move · mouse look · Space jump · V jetpack/skate\nShift attack · F/right mouse aim · F2 switch · Esc cursor", state.active, ctrl.motion)
+        let device = if input.pad { "gamepad" } else { "keyboard" };
+        format!("Super Bevy World 64\n{:?}  ·  {:?}  ·  Health {}  ·  {device}\nWASD move · mouse look · Space jump · V jetpack/skate\nShift attack · F/right mouse aim · ` console · F2 switch · Esc cursor", state.active, ctrl.motion, ctrl.health)
     } else {
         String::new()
     };

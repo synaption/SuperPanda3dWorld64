@@ -5,13 +5,35 @@ edition = "2021"
 rust-version = "1.75"
 
 [dependencies]
-# Keep the feature set focused on this port. Besides reducing build time, this
-# avoids pulling audio/gamepad platform crates before those systems are ported.
+# Keep the feature set focused on this port: every feature here backs a system
+# that exists.
 bevy = { version = "0.12.1", default-features = false, features = [
     "multi-threaded", "bevy_asset", "bevy_scene", "bevy_winit",
     "bevy_core_pipeline", "bevy_pbr", "bevy_gltf", "bevy_render",
     "bevy_text", "bevy_ui", "animation", "png", "x11", "tonemapping_luts",
 ] }
+
+# Windows is where the game is played, and there both device backends build
+# against the OS with no extra packages, so both are always on.
+[target.'cfg(windows)'.dependencies]
+bevy = { version = "0.12.1", default-features = false, features = [
+    "bevy_audio", "wav", "bevy_gilrs",
+] }
+
+[features]
+default = []
+# Sound and gamepad backends on Linux compile against ALSA and udev
+# development headers (`libasound2-dev`, `libudev-dev`). The repository's WSL
+# environment has neither and cannot install them, and requiring them would
+# make `cargo test` unbuildable there, so a Linux host opts in instead:
+#
+#   cargo run --features sound,gamepad
+#
+# Nothing else is conditional. The sound *tables* and the input snapshot are
+# always compiled and tested; only the device backends come and go. Without
+# `gamepad` no pad is ever reported and every pad field reads neutral.
+sound = ["bevy/bevy_audio", "bevy/wav"]
+gamepad = ["bevy/bevy_gilrs"]
 
 [profile.dev]
 opt-level = 1

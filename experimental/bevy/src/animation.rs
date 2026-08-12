@@ -3,8 +3,8 @@ use bevy::prelude::*;
 
 #[derive(Resource)]
 pub struct CharacterAnimations {
-    hero: [Handle<AnimationClip>; 7],
-    mario: [Handle<AnimationClip>; 7],
+    hero: [Handle<AnimationClip>; 8],
+    mario: [Handle<AnimationClip>; 8],
 }
 
 #[derive(Component)]
@@ -17,12 +17,13 @@ const FALL: usize = 3;
 const SKATE: usize = 4;
 const FLY: usize = 5;
 const ATTACK: usize = 6;
+const SWIM: usize = 7;
 
 impl CharacterAnimations {
     pub fn load(assets: &AssetServer) -> Self {
-        let hero = [4, 14, 13, 8, 14, 13, 0]
+        let hero = [4, 14, 13, 8, 14, 13, 0, 8]
             .map(|index| assets.load(format!("hero/hero.glb#Animation{index}")));
-        let mario = [197, 114, 77, 86, 210, 77, 103]
+        let mario = [197, 114, 77, 86, 210, 77, 103, 42]
             .map(|index| assets.load(format!("mario/mario.glb#Animation{index}")));
         Self { hero, mario }
     }
@@ -36,6 +37,7 @@ impl CharacterAnimations {
             Motion::Skate => SKATE,
             Motion::Fly => FLY,
             Motion::Attack => ATTACK,
+            Motion::Swim => SWIM,
         };
         match character {
             ActiveCharacter::Hero => self.hero[index].clone_weak(),
@@ -60,6 +62,9 @@ pub fn claim_players(
             }
             if let Ok(enemy) = enemies.get(ancestor) {
                 player.play(enemy.animation.clone_weak()).repeat();
+                commands
+                    .entity(entity)
+                    .insert(crate::enemy::EnemyAnimationRoot(ancestor));
                 break None;
             }
             let Ok(parent) = hierarchy.get(ancestor) else {

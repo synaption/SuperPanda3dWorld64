@@ -96,6 +96,15 @@ cp \
 cp "$REPO_ROOT/assets/hero/hero.glb" "$DIST_DIR/assets/hero/"
 cp "$REPO_ROOT/assets/mario/mario.glb" "$DIST_DIR/assets/mario/"
 
+# Only the samples the sound tables actually name, read out of the tables
+# themselves so the two cannot drift: the sound directories hold thousands of
+# files and the game plays a couple of dozen.
+while read -r sample; do
+    [[ -n "$sample" ]] || continue
+    mkdir -p "$DIST_DIR/assets/sounds/$(dirname "$sample")"
+    cp "$REPO_ROOT/assets/sounds/$sample" "$DIST_DIR/assets/sounds/$sample"
+done < <(grep -o '"[A-Za-z0-9_/]*\.wav"' "$SCRIPT_DIR/src/audio.rs" | tr -d '"' | sort -u)
+
 rm -f "$ZIP_PATH"
 (
     cd "$SCRIPT_DIR/dist"
