@@ -48,6 +48,11 @@ pub struct InputState {
     pub boost: bool,
     pub aim: bool,
     pub recenter: bool,
+    /// The squad button, held. Its *release* is the command, and how long it
+    /// was down is what tells a whistle from an order, so the falling edge is
+    /// published alongside the hold.
+    pub squad: bool,
+    pub squad_released: bool,
     pub swap: bool,
     pub debug: bool,
     pub cursor: bool,
@@ -95,19 +100,21 @@ pub fn apply_deadzone(value: Vec2, deadzone: f32) -> Vec2 {
 /// the device.
 #[allow(clippy::too_many_arguments)]
 pub fn gather(
-    keys: Res<Input<KeyCode>>,
-    buttons: Res<Input<MouseButton>>,
-    mut mouse: EventReader<MouseMotion>,
-    gamepads: Res<Gamepads>,
-    pad_buttons: Res<Input<GamepadButton>>,
-    axes: Res<Axis<GamepadAxis>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    mut mouse: MessageReader<MouseMotion>,
+    // A pad is an entity now, and it carries its own button and axis state
+    // rather than being an id looked up in two global resources. Reading the
+    // first one there is keeps the port's behaviour: one player, whichever pad
+    // arrived first, picked up mid-game without a restart.
+    pads: Query<&Gamepad>,
     console: Res<ConsoleState>,
     mut state: ResMut<InputState>,
 ) {
     // Accumulated mouse motion is per frame, never latched: a look that was
     // not consumed this frame is stale by the next one.
     let mouse_delta: Vec2 = mouse.read().map(|motion| motion.delta).sum();
-    let pad = gamepads.iter().next();
+    let pad = pads.iter().next();
     state.pad = pad.is_some();
 
     // The grave key toggles the console and must not also reach the game, so
@@ -118,38 +125,40 @@ pub fn gather(
     }
 
     let mut move_axis = Vec2::new(
-        f32::from(keys.any_pressed([KeyCode::D, KeyCode::Right]))
-            - f32::from(keys.any_pressed([KeyCode::A, KeyCode::Left])),
-        f32::from(keys.any_pressed([KeyCode::W, KeyCode::Up]))
-            - f32::from(keys.any_pressed([KeyCode::S, KeyCode::Down])),
+        f32::from(keys.any_pressed([KeyCode::KeyD, KeyCode::ArrowRight]))
+            - f32::from(keys.any_pressed([KeyCode::KeyA, KeyCode::ArrowLeft])),
+        f32::from(keys.any_pressed([KeyCode::KeyW, KeyCode::ArrowUp]))
+            - f32::from(keys.any_pressed([KeyCode::KeyS, KeyCode::ArrowDown])),
     );
     let mut look_stick = Vec2::ZERO;
-    let mut boost = keys.pressed(KeyCode::V);
-    let mut aim = keys.pressed(KeyCode::F) || buttons.pressed(MouseButton::Right);
+    let mut boost = keys.pressed(KeyCode::KeyV);
+    let mut aim = keys.pressed(KeyCode::KeyF) || buttons.pressed(MouseButton::Right);
     let mut jump = keys.just_pressed(KeyCode::Space);
     let mut attack =
         keys.just_pressed(KeyCode::ShiftLeft) || buttons.just_pressed(MouseButton::Left);
-    let mut recenter = keys.just_pressed(KeyCode::R);
+    let mut recenter = keys.just_pressed(KeyCode::KeyR);
     let mut swap = keys.just_pressed(KeyCode::F2);
+    let mut squad = keys.pressed(KeyCode::KeyX);
+    let mut squad_released = keys.just_released(KeyCode::KeyX);
 
     if let Some(pad) = pad {
-        let axis = |kind| axes.get(GamepadAxis::new(pad, kind)).unwrap_or(0.0);
-        let button = |kind| pad_buttons.pressed(GamepadButton::new(pad, kind));
-        let just = |kind| pad_buttons.just_pressed(GamepadButton::new(pad, kind));
+        let axis = |kind| pad.get(kind).unwrap_or(0.0);
+        let button = |kind| pad.pressed(kind);
+        let just = |kind| pad.just_pressed(kind);
 
         let stick = Vec2::new(
-            axis(GamepadAxisType::LeftStickX),
-            axis(GamepadAxisType::LeftStickY),
+            axis(GamepadAxis::LeftStickX),
+            axis(GamepadAxis::LeftStickY),
         );
         let stick = if stick == Vec2::ZERO {
             // The d-pad stands in for the stick when the stick is centred, at
             // full deflection: it is the same control the arrow keys are, and
             // it is what a player reaches for to line up a jump.
             Vec2::new(
-                f32::from(button(GamepadButtonType::DPadRight))
-                    - f32::from(button(GamepadButtonType::DPadLeft)),
-                f32::from(button(GamepadButtonType::DPadUp))
-                    - f32::from(button(GamepadButtonType::DPadDown)),
+                f32::from(button(GamepadButton::DPadRight))
+                    - f32::from(button(GamepadButton::DPadLeft)),
+                f32::from(button(GamepadButton::DPadUp))
+                    - f32::from(button(GamepadButton::DPadDown)),
             )
         } else {
             apply_deadzone(stick, STICK_DEADZONE)
@@ -159,8 +168,8 @@ pub fn gather(
         }
         look_stick = apply_deadzone(
             Vec2::new(
-                axis(GamepadAxisType::RightStickX),
-                axis(GamepadAxisType::RightStickY),
+                axis(GamepadAxis::RightStickX),
+                axis(GamepadAxis::RightStickY),
             ),
             CAMERA_DEADZONE,
         );
@@ -168,15 +177,17 @@ pub fn gather(
         // Face buttons follow the Panda3D mapping: south jumps, east swings,
         // north holds the skates. The port drives skating and flight from one
         // control, so the booster trigger feeds the same flag as north.
-        jump |= just(GamepadButtonType::South);
-        attack |= just(GamepadButtonType::East);
-        swap |= just(GamepadButtonType::Start);
-        recenter |= just(GamepadButtonType::RightTrigger);
-        boost |= button(GamepadButtonType::North)
-            || button(GamepadButtonType::LeftTrigger2)
-            || axis(GamepadAxisType::LeftZ).abs() > THRUST_THRESHOLD;
-        aim |= button(GamepadButtonType::RightTrigger2)
-            || axis(GamepadAxisType::RightZ).abs() > TRIGGER_THRESHOLD;
+        jump |= just(GamepadButton::South);
+        attack |= just(GamepadButton::East);
+        swap |= just(GamepadButton::Start);
+        recenter |= just(GamepadButton::RightTrigger);
+        squad |= button(GamepadButton::West);
+        squad_released |= pad.just_released(GamepadButton::West);
+        boost |= button(GamepadButton::North)
+            || button(GamepadButton::LeftTrigger2)
+            || axis(GamepadAxis::LeftZ).abs() > THRUST_THRESHOLD;
+        aim |= button(GamepadButton::RightTrigger2)
+            || axis(GamepadAxis::RightZ).abs() > TRIGGER_THRESHOLD;
     }
 
     state.move_axis = move_axis.clamp_length_max(1.0);
@@ -184,11 +195,13 @@ pub fn gather(
     state.look_stick = look_stick;
     state.boost = boost;
     state.aim = aim;
+    state.squad = squad;
     // Edges accumulate rather than overwrite: a press seen on a frame whose
     // consumer has not run yet must survive into the frame that consumes it.
     state.jump |= jump;
     state.attack |= attack;
     state.recenter |= recenter;
+    state.squad_released |= squad_released;
     state.swap |= swap;
     state.debug |= keys.just_pressed(KeyCode::F1);
     state.cursor |= keys.just_pressed(KeyCode::Escape);

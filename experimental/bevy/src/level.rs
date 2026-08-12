@@ -30,13 +30,16 @@ struct CollisionCell {
     all: Vec<usize>,
 }
 
+/// One axis-aligned body of water. Water is not part of the level mesh: the
+/// collision data carries these boxes, gameplay swims inside them and the
+/// renderer draws a sheet across the top of each.
 #[derive(Clone, Copy, Debug)]
 pub struct WaterBox {
-    min_x: f32,
-    min_z: f32,
-    max_x: f32,
-    max_z: f32,
-    surface_y: f32,
+    pub min_x: f32,
+    pub min_z: f32,
+    pub max_x: f32,
+    pub max_z: f32,
+    pub surface_y: f32,
 }
 
 pub struct RenderLevel {
@@ -231,7 +234,7 @@ impl LevelData {
         let mut best = None;
         for &index in &self.cell(point.x, point.z).floors {
             if let Some(y) = surface_y(self.triangles[index], point.x, point.z) {
-                if y <= point.y + 0.5 && best.map_or(true, |old| y > old) {
+                if y <= point.y + 0.5 && best.is_none_or(|old| y > old) {
                     best = Some(y);
                 }
             }
@@ -253,7 +256,7 @@ impl LevelData {
         let mut best: Option<f32> = None;
         for &index in &self.cell(point.x, point.z).floors {
             if let Some(y) = surface_y(self.triangles[index], point.x, point.z) {
-                if y >= point.y + clearance && best.map_or(true, |old| y < old) {
+                if y >= point.y + clearance && best.is_none_or(|old| y < old) {
                     best = Some(y);
                 }
             }
@@ -544,7 +547,7 @@ mod tests {
             let v = (v0.x * v2.y - v2.x * v0.y) / den;
             if u >= -0.001 && v >= -0.001 && u + v <= 1.001 {
                 let y = tri.a.y + u * (tri.b.y - tri.a.y) + v * (tri.c.y - tri.a.y);
-                if y <= point.y + 0.5 && best.map_or(true, |old| y > old) {
+                if y <= point.y + 0.5 && best.is_none_or(|old| y > old) {
                     best = Some(y);
                 }
             }

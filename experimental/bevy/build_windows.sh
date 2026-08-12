@@ -2,19 +2,18 @@
 set -euo pipefail
 
 # Build and package Super Bevy World 64 for 64-bit Windows from Linux/WSL.
-# The distro Rust compiler can have a different internal identity from the
-# official Windows standard library even when both say "1.75.0", so this script
-# installs a matching official compiler and both standard libraries under
-# target/.windows-toolchain. Nothing is installed system-wide.
+#
+# This used to download an official Rust compiler and both standard libraries
+# into target/, because the distro's Rust 1.75 and the official Windows
+# rust-std of the same version had different internal identities and would not
+# link against each other. Bevy 0.19 needs Rust 1.95, which is past anything a
+# distro here ships, so the build already runs on a rustup toolchain -- and one
+# toolchain providing both the host and the Windows target is exactly what that
+# apparatus was faking. It is gone; `rustup target add` is the whole of it now.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
-RUST_VERSION="1.75.0"
-HOST_TARGET="x86_64-unknown-linux-gnu"
 WINDOWS_TARGET="x86_64-pc-windows-gnu"
-TOOLCHAIN_DIR="$SCRIPT_DIR/target/.windows-toolchain/$RUST_VERSION"
-DOWNLOAD_DIR="$SCRIPT_DIR/target/.windows-downloads/$RUST_VERSION"
-UNPACK_DIR="$SCRIPT_DIR/target/.windows-unpack/$RUST_VERSION"
 DIST_DIR="$SCRIPT_DIR/dist/windows"
 ZIP_PATH="$SCRIPT_DIR/dist/SuperBevyWorld64-windows-x64.zip"
 
@@ -26,53 +25,21 @@ require_command() {
 }
 
 require_command cargo
-require_command curl
+require_command rustup
 require_command python3
-require_command tar
+# The GNU target links with MinGW's linker rather than one Rust ships.
 require_command x86_64-w64-mingw32-gcc
 
-download_component() {
-    local component="$1"
-    local target="$2"
-    local archive="$DOWNLOAD_DIR/${component}-${RUST_VERSION}-${target}.tar.xz"
-    local url="https://static.rust-lang.org/dist/${component}-${RUST_VERSION}-${target}.tar.xz"
-
-    if [[ ! -s "$archive" ]]; then
-        echo "Downloading $component $RUST_VERSION for $target" >&2
-        curl -fL --retry 3 --output "$archive.part" "$url"
-        mv "$archive.part" "$archive"
-    fi
-    printf '%s\n' "$archive"
-}
-
-install_component() {
-    local component="$1"
-    local target="$2"
-    local archive
-    local source_dir="$UNPACK_DIR/${component}-${target}"
-    archive="$(download_component "$component" "$target")"
-
-    mkdir -p "$source_dir"
-    tar -xJf "$archive" -C "$source_dir"
-    "$source_dir/${component}-${RUST_VERSION}-${target}/install.sh" \
-        --prefix="$TOOLCHAIN_DIR" --disable-ldconfig
-}
-
-mkdir -p "$DOWNLOAD_DIR" "$UNPACK_DIR" "$TOOLCHAIN_DIR"
-
-if [[ ! -x "$TOOLCHAIN_DIR/bin/rustc" ]] || \
-   [[ ! -d "$TOOLCHAIN_DIR/lib/rustlib/$HOST_TARGET" ]] || \
-   [[ ! -d "$TOOLCHAIN_DIR/lib/rustlib/$WINDOWS_TARGET" ]]; then
-    install_component rustc "$HOST_TARGET"
-    install_component rust-std "$HOST_TARGET"
-    install_component rust-std "$WINDOWS_TARGET"
+if ! rustup target list --installed | grep -qx "$WINDOWS_TARGET"; then
+    echo "Installing the $WINDOWS_TARGET standard library" >&2
+    rustup target add "$WINDOWS_TARGET"
 fi
 
 echo "Regenerating Bevy castle assets"
 python3 "$SCRIPT_DIR/tools/convert_level.py"
 
 echo "Building $WINDOWS_TARGET release executable"
-RUSTC="$TOOLCHAIN_DIR/bin/rustc" cargo build \
+cargo build \
     --manifest-path "$SCRIPT_DIR/Cargo.toml" \
     --release --locked --target "$WINDOWS_TARGET" \
     --config "target.$WINDOWS_TARGET.linker=\"x86_64-w64-mingw32-gcc\""
@@ -86,7 +53,8 @@ mkdir -p \
 
 cp "$SCRIPT_DIR/target/$WINDOWS_TARGET/release/super-bevy-world-64.exe" \
     "$DIST_DIR/SuperBevyWorld64.exe"
-cp "$REPO_ROOT/assets/bevy/castle.glb" "$DIST_DIR/assets/bevy/"
+cp "$REPO_ROOT/assets/bevy/castle.glb" "$REPO_ROOT/assets/bevy/water.png" \
+    "$DIST_DIR/assets/bevy/"
 cp \
     "$REPO_ROOT/assets/actors/tree.glb" \
     "$REPO_ROOT/assets/actors/warp_pipe.glb" \

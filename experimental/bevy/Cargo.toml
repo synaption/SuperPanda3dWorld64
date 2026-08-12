@@ -2,23 +2,54 @@
 name = "super-bevy-world-64"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# Bevy 0.19 declares 1.95. The repository's rustup toolchain is newer than that
+# and carries the Windows cross-target as well, so this is a floor rather than
+# something that has to be installed.
+rust-version = "1.95"
 
 [dependencies]
 # Keep the feature set focused on this port: every feature here backs a system
 # that exists.
-bevy = { version = "0.12.1", default-features = false, features = [
-    "multi-threaded", "bevy_asset", "bevy_scene", "bevy_winit",
+#
+# `std` and `async_executor` are not optional the way the rest are. Bevy can be
+# built for platforms that have neither, so with `default-features = false`
+# they have to be asked for by name or nothing links at all.
+bevy = { version = "0.19", default-features = false, features = [
+    "std", "async_executor",
+    "multi_threaded", "bevy_asset", "bevy_scene", "bevy_winit",
     "bevy_core_pipeline", "bevy_pbr", "bevy_gltf", "bevy_render",
-    "bevy_text", "bevy_ui", "animation", "png", "x11", "tonemapping_luts",
+    "bevy_text", "bevy_ui", "png", "x11",
+    # The tonemapping LUTs are KTX2 files compressed with zstd, and the
+    # decompressor is no longer chosen for you -- naming neither is a hard
+    # compile error rather than a silent fallback. The Rust implementation
+    # rather than the C one, so the MinGW cross-build stays a pure Rust build
+    # with no second toolchain to install.
+    "tonemapping_luts", "zstd_rust",
+    # Skeletal animation, and the glTF loader's half of it: the clips this port
+    # plays are all authored in the GLBs, so the loader half is what makes the
+    # tables it looks names up in exist at all.
+    "bevy_animation", "gltf_animation",
+    # Keyboard and mouse are each their own backend now rather than part of one
+    # input plugin, and an unnamed one is simply never reported.
+    "keyboard", "mouse",
+    # Every `TextFont` in this port leaves `font` unset, which means the default
+    # font source, and that only resolves to a face when this feature embeds
+    # one. Without it a text node draws its background and no glyphs -- a
+    # console that is a black bar with nothing written on it.
+    "default_font",
 ] }
 
 # Windows is where the game is played, and there both device backends build
 # against the OS with no extra packages, so both are always on.
 [target.'cfg(windows)'.dependencies]
-bevy = { version = "0.12.1", default-features = false, features = [
-    "bevy_audio", "wav", "bevy_gilrs",
+bevy = { version = "0.19", default-features = false, features = [
+    "bevy_audio", "wav", "bevy_gilrs", "gamepad",
 ] }
+
+[dev-dependencies]
+# Only the clip-name test reads a glTF's JSON chunk directly, which is how it
+# checks the animation tables against the exports without a renderer.
+serde_json = "1"
 
 [features]
 default = []
@@ -32,8 +63,13 @@ default = []
 # Nothing else is conditional. The sound *tables* and the input snapshot are
 # always compiled and tested; only the device backends come and go. Without
 # `gamepad` no pad is ever reported and every pad field reads neutral.
+#
+# Each of these now needs two Bevy features rather than one: the device backend
+# and the input source that reports it. `bevy_gilrs` without `gamepad` is a
+# driver whose events nothing collects, and `bevy_audio` is no longer implied
+# by having 3D or UI switched on.
 sound = ["bevy/bevy_audio", "bevy/wav"]
-gamepad = ["bevy/bevy_gilrs"]
+gamepad = ["bevy/bevy_gilrs", "bevy/gamepad"]
 
 [profile.dev]
 opt-level = 1

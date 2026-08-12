@@ -13,6 +13,12 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[3]
 OUT = Path(__file__).resolve().parents[1] / "assets" / "castle.bin"
 GLB_OUT = ROOT / "assets" / "bevy" / "castle.glb"
+# The water sheet's texture. Water is not part of the level mesh, so it is not
+# in the GLB above and is copied out of the reference pack on its own.
+WATER_TEXTURE = ROOT / (
+    "reference/RENDER96-HD-TEXTURE-PACK/gfx/textures/segment2/"
+    "segment2.11C58.rgba16.png")
+WATER_OUT = ROOT / "assets" / "bevy" / "water.png"
 SCALE = 0.01
 sys.path.insert(0, str(ROOT))
 from tools.glb import GLB, FLOAT, UNSIGNED_INT, ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER
@@ -67,6 +73,22 @@ def main():
     OUT.write_bytes(out)
     print(f"wrote {OUT} ({len(out):,} bytes, {len(trees)} trees)")
     write_render_glb(mesh)
+    write_water_texture()
+
+
+def write_water_texture():
+    """Copy the water texture beside the converted level.
+
+    Skipped rather than fatal when the reference pack is absent: the committed
+    copy is what the game loads, and a checkout without the large reference
+    sources can still regenerate everything else.
+    """
+    if not WATER_TEXTURE.exists():
+        print(f"skipped {WATER_OUT} (no {WATER_TEXTURE.name} in reference/)")
+        return
+    WATER_OUT.parent.mkdir(parents=True, exist_ok=True)
+    WATER_OUT.write_bytes(WATER_TEXTURE.read_bytes())
+    print(f"wrote {WATER_OUT} ({WATER_OUT.stat().st_size:,} bytes)")
 
 
 def write_render_glb(mesh):
@@ -140,7 +162,16 @@ def write_render_glb(mesh):
             }
         if not group.get("lighting"):
             material["extensions"] = {"KHR_materials_unlit": {}}
-        if group.get("layer") in ("ALPHA", "TRANSPARENT_DECAL"):
+        # SM64's ALPHA layer is alpha *tested*, not blended: the fence and the
+        # castle doorway are cutouts with binary alpha. Blending them puts
+        # them in the renderer's transparent queue, where they are sorted
+        # per object against the water sheet behind them and flicker as the
+        # camera moves. Masked geometry draws in the opaque pass and writes
+        # depth, so the water sorts behind it correctly and stays put.
+        if group.get("layer") == "ALPHA":
+            material["alphaMode"] = "MASK"
+            material["alphaCutoff"] = 0.5
+        elif group.get("layer") == "TRANSPARENT_DECAL":
             material["alphaMode"] = "BLEND"
 
         material_index = len(glb.json["materials"])

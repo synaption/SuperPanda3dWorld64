@@ -218,7 +218,7 @@ mod backend {
     use bevy::{
         audio::{PlaybackMode, Volume},
         prelude::*,
-        utils::HashMap,
+        platform::collections::HashMap,
     };
 
     /// Samples held loaded for the whole run. Loading is asynchronous, so a
@@ -256,15 +256,19 @@ mod backend {
                 let Some(source) = bank.samples.get(path) else {
                     continue;
                 };
-                commands.spawn(AudioBundle {
-                    source: source.clone(),
-                    settings: PlaybackSettings {
+                // Two components rather than one bundle, and a volume that
+                // says which scale it is on: `Linear` is the plain multiplier
+                // the old relative volume was, as against the decibel form the
+                // same type now also offers.
+                commands.spawn((
+                    AudioPlayer(source.clone()),
+                    PlaybackSettings {
                         mode: PlaybackMode::Despawn,
-                        volume: Volume::new_relative(tuning.sfx_volume),
+                        volume: Volume::Linear(tuning.sfx_volume),
                         speed: 1.0 + rng.signed() * PITCH_SPREAD,
                         ..default()
                     },
-                });
+                ));
             }
         }
     }

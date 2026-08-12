@@ -28,7 +28,7 @@ fn stick_curve(deflection: f32) -> f32 {
 #[allow(clippy::too_many_arguments)]
 pub fn update(
     time: Res<Time>,
-    keys: Res<Input<KeyCode>>,
+    keys: Res<ButtonInput<KeyCode>>,
     mut input: ResMut<InputState>,
     mut cameras: Query<(&mut Transform, &mut FollowCamera), Without<Player>>,
     player: Res<RenderPose>,
@@ -36,20 +36,22 @@ pub fn update(
     mut state: ResMut<GameState>,
     tuning: Res<GameTuning>,
 ) {
-    let (mut camera, mut follow) = cameras.single_mut();
+    let Ok((mut camera, mut follow)) = cameras.single_mut() else {
+        return;
+    };
     follow.yaw -= input.look_mouse.x * tuning.mouse_sens;
     follow.pitch = (follow.pitch - input.look_mouse.y * tuning.mouse_sens * 0.8333)
         .clamp(PITCH_LIMITS.0, PITCH_LIMITS.1);
     // The stick is a rate rather than a displacement, so it is scaled by the
     // frame's length where the mouse is not.
-    let stick = time.delta_seconds() * tuning.pad_look;
+    let stick = time.delta_secs() * tuning.pad_look;
     follow.yaw -= stick_curve(input.look_stick.x) * stick;
     follow.pitch = (follow.pitch + stick_curve(input.look_stick.y) * stick * 0.8333)
         .clamp(PITCH_LIMITS.0, PITCH_LIMITS.1);
-    if keys.pressed(KeyCode::Q) {
+    if keys.pressed(KeyCode::KeyQ) {
         follow.yaw += 0.035;
     }
-    if keys.pressed(KeyCode::E) {
+    if keys.pressed(KeyCode::KeyE) {
         follow.yaw -= 0.035;
     }
     if InputState::take(&mut input.recenter) {

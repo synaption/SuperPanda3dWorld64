@@ -1,0 +1,369 @@
+//! The water sheet, and the view from under it.
+//!
+//! Ported from `sm64py/level.py`'s `build_water_surface`/`animate_water` and
+//! the camera medium in `app/main.py`. Water is not part of the level mesh --
+//! it is the axis-aligned boxes the collision data carries, drawn as one flat
+//! quad at each box's height, unlit and half transparent, seen from both sides
+//! because most of the time it is looked at from underneath.
+//!
+//! Every constant here is the Panda3D build's, converted from SM64 units to
+//! the port's world scale of 1/100.
+
+use crate::level::{LevelData, WaterBox};
+use bevy::{
+    asset::RenderAssetUsages,
+    image::{ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor},
+    light::{NotShadowCaster, NotShadowReceiver},
+    mesh::{Indices, PrimitiveTopology},
+    pbr::{DistanceFog, FogFalloff},
+    prelude::*,
+};
+
+/// The alpha the moving-texture data gives the water quads, 0x96 of 0xFF.
+const WATER_ALPHA: f32 = 0x96 as f32 / 255.0;
+
+/// How many times the texture repeats per world unit. The original sizes its
+/// UVs per quad rather than per box; repeating on a fixed world scale keeps
+/// the wave size consistent whatever the box measures.
+const UV_SCALE: f32 = 1.0 / 20.48;
+
+/// How fast the surface drifts, in world units per second, and which way.
+///
+/// A translation rather than a spin, and for a concrete reason: rotating the
+/// UVs moves every point by its distance from the centre of rotation, so one
+/// corner of a 150-unit water box crawls while the opposite corner races. The
+/// two bodies drift apart so they do not read as one sheet.
+const DRIFT_SPEED: f32 = 0.25;
+const DRIFT_DIRECTIONS: [Vec2; 2] = [Vec2::new(0.60, 0.80), Vec2::new(-0.80, 0.60)];
+
+/// Sky and underwater colours, shared with the fog and the clear colour.
+pub const SKY_COLOUR: Color = Color::srgb(0.32, 0.60, 0.86);
+pub const UNDERWATER_COLOUR: Color = Color::srgb(0.06, 0.28, 0.36);
+
+/// Where the haze starts and where it becomes total, above and below water.
+/// Underwater the view closes in hard: that is what sells being submerged far
+/// more than the surface quad does, because the water is a single flat sheet
+/// with nothing behind it and the camera below the line would otherwise look
+/// identical to the camera above it.
+const AIR_FOG: (f32, f32) = (90.0, 200.0);
+const UNDERWATER_FOG: (f32, f32) = (2.0, 42.0);
+
+/// A drawn water sheet, holding what the drift needs to move it.
+#[derive(Component)]
+pub struct WaterSurface {
+    direction: Vec2,
+    /// The UVs at rest, so drift is an offset from a fixed base rather than an
+    /// accumulation that loses precision as the session runs on.
+    base_uvs: [[f32; 2]; 4],
+}
+
+/// The fog the camera is currently in, so the swap only runs on a change.
+#[derive(Resource, Default, PartialEq, Clone, Copy)]
+pub struct CameraMedium {
+    submerged: bool,
+}
+
+/// Air fog for the camera at startup. Bevy applies fog per camera rather than
+/// per scene, so the camera carries this and [`camera_medium`] retunes it.
+pub fn air_fog() -> DistanceFog {
+    DistanceFog {
+        color: SKY_COLOUR,
+        falloff: FogFalloff::Linear {
+            start: AIR_FOG.0,
+            end: AIR_FOG.1,
+        },
+        ..default()
+    }
+}
+
+/// Where a box's sheet sits in the world. The mesh is built around this
+/// rather than in world coordinates, because Bevy sorts transparent objects by
+/// the distance to their *origin*: a sheet whose vertices are in world space
+/// has its origin at the map origin, which is nowhere near the water and makes
+/// it sort against the fence and the castle doorway as if it were there.
+fn centre(water: &WaterBox) -> Vec3 {
+    Vec3::new(
+        (water.min_x + water.max_x) * 0.5,
+        water.surface_y,
+        (water.min_z + water.max_z) * 0.5,
+    )
+}
+
+/// Builds the quad for one box: four corners at the surface height, local to
+/// [`centre`], with UVs taken from *world* position so the texture tiles at a
+/// fixed size however the sheet is placed.
+fn quad(water: &WaterBox) -> Mesh {
+    let origin = centre(water);
+    let corners = [
+        [water.min_x, water.min_z],
+        [water.max_x, water.min_z],
+        [water.max_x, water.max_z],
+        [water.min_x, water.max_z],
+    ];
+    let positions: Vec<[f32; 3]> = corners
+        .iter()
+        .map(|[x, z]| [x - origin.x, 0.0, z - origin.z])
+        .collect();
+    let uvs: Vec<[f32; 2]> = corners
+        .iter()
+        .map(|[x, z]| [x * UV_SCALE, z * UV_SCALE])
+        .collect();
+    // A mesh now declares which worlds keep a copy of it, and `MAIN_WORLD` is
+    // load-bearing here rather than a default worth trimming: `drift` rewrites
+    // this sheet's UVs every frame through `Assets<Mesh>`, and a mesh kept only
+    // in the render world has nothing left on the CPU side to rewrite -- the
+    // lookup returns `None` and the water silently stops moving.
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; 4]);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(Indices::U32(vec![0, 1, 2, 0, 2, 3]));
+    mesh
+}
+
+/// Spawns one sheet per water box. Called from startup with the loaded level.
+pub fn spawn(
+    commands: &mut Commands,
+    assets: &AssetServer,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    level: &LevelData,
+) {
+    // The sheet tiles, and Bevy clamps by default, so the sampler has to be
+    // asked for repetition at load time.
+    let texture = assets
+        .load_builder()
+        .with_settings(|settings: &mut ImageLoaderSettings| {
+            settings.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+                address_mode_u: ImageAddressMode::Repeat,
+                address_mode_v: ImageAddressMode::Repeat,
+                ..default()
+            });
+        })
+        .load("bevy/water.png");
+    for (index, water) in level.water_boxes.iter().enumerate() {
+        let mesh = quad(water);
+        let base_uvs = uvs_of(&mesh);
+        let material = materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 1.0, 1.0, WATER_ALPHA),
+            base_color_texture: Some(texture.clone()),
+            alpha_mode: AlphaMode::Blend,
+            // The level mesh carries baked vertex colour and the water is a
+            // flat sheet, so neither wants lighting.
+            unlit: true,
+            // Seen from underneath as well, which is most of the time while
+            // swimming.
+            double_sided: true,
+            cull_mode: None,
+            ..default()
+        });
+        commands.spawn((
+            WaterSurface {
+                direction: DRIFT_DIRECTIONS[index % DRIFT_DIRECTIONS.len()],
+                base_uvs,
+            },
+            // A transparent sheet has no business darkening the lakebed.
+            NotShadowCaster,
+            NotShadowReceiver,
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(material),
+            Transform::from_translation(centre(water)),
+        ));
+    }
+}
+
+fn uvs_of(mesh: &Mesh) -> [[f32; 2]; 4] {
+    let mut base = [[0.0; 2]; 4];
+    if let Some(bevy::render::mesh::VertexAttributeValues::Float32x2(uvs)) =
+        mesh.attribute(Mesh::ATTRIBUTE_UV_0)
+    {
+        for (slot, uv) in base.iter_mut().zip(uvs) {
+            *slot = *uv;
+        }
+    }
+    base
+}
+
+/// Drifts each sheet's texture across the surface.
+///
+/// The offset is written into the mesh's UVs because Bevy's standard material
+/// has no texture transform of its own. Four vertices per body of water makes
+/// that cheaper than the custom material and shader the alternative would
+/// need.
+pub fn drift(
+    time: Res<Time>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    surfaces: Query<(&WaterSurface, &Mesh3d)>,
+) {
+    // World units the sheet has travelled, converted into texture repeats.
+    let distance = DRIFT_SPEED * time.elapsed_secs() * UV_SCALE;
+    for (surface, handle) in &surfaces {
+        let Some(mut mesh) = meshes.get_mut(&handle.0) else {
+            continue;
+        };
+        let offset = surface.direction * distance;
+        let moved: Vec<[f32; 2]> = surface
+            .base_uvs
+            .iter()
+            .map(|uv| [uv[0] + offset.x, uv[1] + offset.y])
+            .collect();
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, moved);
+    }
+}
+
+/// Swaps the fog and the sky for whichever side of the surface the camera is
+/// on.
+///
+/// Tested against the camera rather than the player: swimming just below the
+/// surface leaves the camera in open air looking down through it, and tinting
+/// the whole world in that case looks wrong.
+pub fn camera_medium(
+    level: Res<LevelData>,
+    mut medium: ResMut<CameraMedium>,
+    mut clear: ResMut<ClearColor>,
+    mut cameras: Query<(&Transform, &mut DistanceFog), With<Camera3d>>,
+) {
+    let Ok((camera, mut fog)) = cameras.single_mut() else {
+        return;
+    };
+    let submerged = level
+        .water_level(camera.translation.x, camera.translation.z)
+        .is_some_and(|surface| camera.translation.y < surface);
+    if submerged == medium.submerged {
+        return;
+    }
+    medium.submerged = submerged;
+    let (colour, range) = if submerged {
+        (UNDERWATER_COLOUR, UNDERWATER_FOG)
+    } else {
+        (SKY_COLOUR, AIR_FOG)
+    };
+    fog.color = colour;
+    fog.falloff = FogFalloff::Linear {
+        start: range.0,
+        end: range.1,
+    };
+    clear.0 = colour;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn box_at(surface_y: f32) -> WaterBox {
+        WaterBox {
+            min_x: -71.29,
+            min_z: -72.22,
+            max_x: 82.53,
+            max_z: -0.58,
+            surface_y,
+        }
+    }
+
+    #[test]
+    fn a_sheet_covers_its_box_at_the_surface_height() {
+        let water = box_at(-0.81);
+        let mesh = quad(&water);
+        let Some(bevy::render::mesh::VertexAttributeValues::Float32x3(positions)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("the quad has no positions");
+        };
+        assert_eq!(positions.len(), 4);
+        let origin = centre(&water);
+        assert_eq!(
+            origin.y, water.surface_y,
+            "the sheet is at the wrong height"
+        );
+        for [x, y, z] in positions {
+            // Local to the sheet's own origin, which is what makes it sort
+            // against nearby transparent geometry rather than against the map
+            // origin.
+            assert_eq!(*y, 0.0, "the sheet is not flat");
+            // Rebuilt world position, within rounding of the box's edge.
+            let (world_x, world_z) = (x + origin.x, z + origin.z);
+            assert!(world_x >= water.min_x - 1e-3 && world_x <= water.max_x + 1e-3);
+            assert!(world_z >= water.min_z - 1e-3 && world_z <= water.max_z + 1e-3);
+        }
+        // Both triangles, so the quad is not a single visible half.
+        assert_eq!(mesh.indices().map(|i| i.len()), Some(6));
+    }
+
+    #[test]
+    fn uvs_tile_by_world_size_rather_than_by_box() {
+        // The wave size must not stretch with the body of water: a box twice
+        // as wide gets twice as many repeats, not larger waves.
+        let narrow = quad(&WaterBox {
+            max_x: -71.29 + 20.48,
+            ..box_at(0.0)
+        });
+        let wide = quad(&WaterBox {
+            max_x: -71.29 + 40.96,
+            ..box_at(0.0)
+        });
+        let span = |mesh: &Mesh| {
+            let uvs = uvs_of(mesh);
+            uvs.iter().map(|uv| uv[0]).fold(f32::MIN, f32::max)
+                - uvs.iter().map(|uv| uv[0]).fold(f32::MAX, f32::min)
+        };
+        assert!((span(&narrow) - 1.0).abs() < 1e-4, "{}", span(&narrow));
+        assert!((span(&wide) - 2.0).abs() < 1e-4, "{}", span(&wide));
+    }
+
+    #[test]
+    fn the_two_bodies_drift_apart() {
+        // One shared direction would read as a single sheet under the castle.
+        assert!(DRIFT_DIRECTIONS[0].dot(DRIFT_DIRECTIONS[1]).abs() < 0.01);
+        for direction in DRIFT_DIRECTIONS {
+            assert!((direction.length() - 1.0).abs() < 1e-3, "{direction:?}");
+        }
+    }
+
+    #[test]
+    fn the_castle_moat_has_water_to_draw() {
+        let (level, _) = crate::level::load();
+        assert!(!level.water_boxes.is_empty(), "nothing to draw");
+        for water in &level.water_boxes {
+            assert!(water.max_x > water.min_x && water.max_z > water.min_z);
+        }
+    }
+
+    /// A sheet buried in the lakebed is drawn and still invisible, which is
+    /// exactly what a units or axis mistake in the conversion would produce.
+    /// So check the surface against the level it sits in: a good part of each
+    /// box must have its floor *below* the surface, which is the part where
+    /// water is what you see.
+    ///
+    /// Not all of it, and that is not a defect. SM64's water boxes are plain
+    /// rectangles laid over a bay of the map, so each one also covers dry
+    /// ground that rises through the sheet and open space off the edge with no
+    /// floor under it at all. The moat is the part that reads as water.
+    #[test]
+    fn each_body_of_water_is_exposed_over_a_real_stretch_of_lakebed() {
+        let (level, _) = crate::level::load();
+        for (index, water) in level.water_boxes.iter().enumerate() {
+            let mut submerged = 0;
+            let mut probes = 0;
+            for gz in 0..40 {
+                for gx in 0..40 {
+                    let x = water.min_x + (water.max_x - water.min_x) * (gx as f32 / 39.0);
+                    let z = water.min_z + (water.max_z - water.min_z) * (gz as f32 / 39.0);
+                    probes += 1;
+                    if level
+                        .floor_height(Vec3::new(x, water.surface_y, z))
+                        .is_some_and(|bed| bed < water.surface_y)
+                    {
+                        submerged += 1;
+                    }
+                }
+            }
+            let share = submerged as f32 / probes as f32;
+            assert!(
+                share > 0.15,
+                "water box {index} covers {:.0}% submerged ground; the sheet would be \
+                 buried or floating over nothing",
+                share * 100.0
+            );
+        }
+    }
+}

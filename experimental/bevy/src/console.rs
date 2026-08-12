@@ -10,9 +10,12 @@ use crate::{
 };
 use bevy::{
     diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
-    input::mouse::{MouseScrollUnit, MouseWheel},
+    input::{
+        keyboard::{Key, KeyboardInput},
+        mouse::{MouseScrollUnit, MouseWheel},
+        ButtonState,
+    },
     prelude::*,
-    window::ReceivedCharacter,
 };
 use std::collections::VecDeque;
 
@@ -103,7 +106,7 @@ pub const SPECS: &[TunableSpec] = &[
         low: 0.5,
         high: 12.0,
         step: 0.2,
-        doc: "Hero deep-water speed",
+        doc: "Hero wading speed",
     },
     TunableSpec {
         name: "cam_distance",
@@ -155,6 +158,20 @@ pub const SPECS: &[TunableSpec] = &[
         doc: "sound effect volume",
     },
     TunableSpec {
+        name: "ally_count",
+        low: 0.0,
+        high: 200.0,
+        step: 1.0,
+        doc: "Marios in the field",
+    },
+    TunableSpec {
+        name: "ally_speed",
+        low: 0.5,
+        high: 30.0,
+        step: 0.2,
+        doc: "ally walking speed",
+    },
+    TunableSpec {
         name: "enemy_speed",
         low: 0.0,
         high: 10.0,
@@ -184,17 +201,24 @@ pub const SPECS: &[TunableSpec] = &[
     },
     TunableSpec {
         name: "enemy_rate",
-        low: 1.0,
+        low: 1.0 / 30.0,
         high: 60.0,
-        step: 1.0,
+        step: 1.0 / 30.0,
         doc: "pipe spawn interval in seconds",
     },
     TunableSpec {
         name: "enemy_limit",
         low: 0.0,
-        high: 500.0,
+        high: 5_000.0,
         step: 1.0,
         doc: "global live enemy cap",
+    },
+    TunableSpec {
+        name: "pipe_brood",
+        low: 0.0,
+        high: 50.0,
+        step: 1.0,
+        doc: "how many allies the Mario pipe keeps alive",
     },
 ];
 
@@ -210,6 +234,9 @@ pub struct GameTuning {
     pub jet_thrust: f32,
     pub jet_rise: f32,
     pub mario_swim: f32,
+    /// The Hero does not swim, he wades: `WADE_SPEED_SCALE` in
+    /// `sm64py/hero/constants.py` is 0.45 of his walk, which is where the
+    /// default below comes from.
     pub hero_wade: f32,
     pub cam_distance: f32,
     pub cam_aim_distance: f32,
@@ -218,12 +245,17 @@ pub struct GameTuning {
     pub mouse_sens: f32,
     pub pad_look: f32,
     pub sfx_volume: f32,
+    pub ally_count: f32,
+    pub ally_speed: f32,
     pub enemy_speed: f32,
     pub enemy_lod_near: f32,
     pub enemy_lod_far: f32,
     pub enemy_draw: f32,
     pub enemy_rate: f32,
     pub enemy_limit: f32,
+    /// How many allies the Mario warp pipe keeps alive. Enemy pipes instead
+    /// answer directly to the field-wide `enemy_limit` above.
+    pub pipe_brood: f32,
 }
 
 impl Default for GameTuning {
@@ -239,7 +271,7 @@ impl Default for GameTuning {
             jet_thrust: 2.4,
             jet_rise: 6.0,
             mario_swim: 5.5,
-            hero_wade: 3.2,
+            hero_wade: 5.13,
             cam_distance: 9.5,
             cam_aim_distance: 5.7,
             cam_height: 1.35,
@@ -247,12 +279,15 @@ impl Default for GameTuning {
             mouse_sens: 0.003,
             pad_look: 2.6,
             sfx_volume: 0.7,
+            ally_count: 8.0,
+            ally_speed: 7.0,
             enemy_speed: 1.8,
             enemy_lod_near: 35.0,
             enemy_lod_far: 70.0,
             enemy_draw: 140.0,
             enemy_rate: 7.0,
-            enemy_limit: 12.0,
+            enemy_limit: 20.0,
+            pipe_brood: 5.0,
         }
     }
 }
@@ -278,12 +313,15 @@ impl GameTuning {
             "mouse_sens" => self.mouse_sens,
             "pad_look" => self.pad_look,
             "sfx_volume" => self.sfx_volume,
+            "ally_count" => self.ally_count,
+            "ally_speed" => self.ally_speed,
             "enemy_speed" => self.enemy_speed,
             "enemy_lod_near" => self.enemy_lod_near,
             "enemy_lod_far" => self.enemy_lod_far,
             "enemy_draw" => self.enemy_draw,
             "enemy_rate" => self.enemy_rate,
             "enemy_limit" => self.enemy_limit,
+            "pipe_brood" => self.pipe_brood,
             _ => return None,
         })
     }
@@ -313,12 +351,15 @@ impl GameTuning {
             "mouse_sens" => self.mouse_sens = value,
             "pad_look" => self.pad_look = value,
             "sfx_volume" => self.sfx_volume = value,
+            "ally_count" => self.ally_count = value,
+            "ally_speed" => self.ally_speed = value,
             "enemy_speed" => self.enemy_speed = value,
             "enemy_lod_near" => self.enemy_lod_near = value,
             "enemy_lod_far" => self.enemy_lod_far = value,
             "enemy_draw" => self.enemy_draw = value,
             "enemy_rate" => self.enemy_rate = value,
             "enemy_limit" => self.enemy_limit = value,
+            "pipe_brood" => self.pipe_brood = value,
             _ => unreachable!(),
         }
         Ok((previous, value))
@@ -330,6 +371,10 @@ pub struct ConsoleState {
     pub open: bool,
     pub closed_this_frame: bool,
     input: String,
+    /// Where the caret sits in `input`, as a byte offset. Always on a character
+    /// boundary: every move steps by whole characters, so a multi-byte one
+    /// cannot be split down the middle and panic the string operations.
+    cursor: usize,
     log: VecDeque<String>,
     history: Vec<String>,
     history_at: usize,
@@ -347,6 +392,7 @@ impl Default for ConsoleState {
             open: false,
             closed_this_frame: false,
             input: String::new(),
+            cursor: 0,
             log,
             history: Vec::new(),
             history_at: 0,
@@ -359,6 +405,66 @@ impl Default for ConsoleState {
 }
 
 impl ConsoleState {
+    // -- line editing -------------------------------------------------------
+    //
+    // A caret rather than an append-only line. Typing a variable name and
+    // realising the number in the middle of it is wrong should not mean
+    // deleting back to it and typing the rest again.
+    //
+    // All of this is plain string work on `input` and `cursor` with no Bevy
+    // anywhere, so the whole of it is exercised by tests that never open a
+    // window -- the same split the rest of the console keeps.
+
+    /// The text either side of the caret.
+    pub fn split(&self) -> (&str, &str) {
+        self.input.split_at(self.cursor)
+    }
+
+    /// Puts a typed character in at the caret and steps over it.
+    fn insert(&mut self, character: char) {
+        self.input.insert(self.cursor, character);
+        self.cursor += character.len_utf8();
+    }
+
+    /// Deletes the character before the caret, the way Backspace does.
+    fn backspace(&mut self) {
+        let Some(character) = self.input[..self.cursor].chars().next_back() else {
+            return;
+        };
+        self.cursor -= character.len_utf8();
+        self.input.remove(self.cursor);
+    }
+
+    /// Deletes the character the caret sits on, the way Delete does.
+    fn delete(&mut self) {
+        if self.cursor < self.input.len() {
+            self.input.remove(self.cursor);
+        }
+    }
+
+    /// Moves the caret one character left or right, stopping at either end.
+    fn step(&mut self, direction: i8) {
+        self.cursor = match direction {
+            ..=-1 => self.input[..self.cursor]
+                .chars()
+                .next_back()
+                .map_or(0, |character| self.cursor - character.len_utf8()),
+            _ => self.input[self.cursor..]
+                .chars()
+                .next()
+                .map_or(self.input.len(), |character| {
+                    self.cursor + character.len_utf8()
+                }),
+        };
+    }
+
+    /// Replaces the line and puts the caret at the end of it, which is what
+    /// recalling a command from the history or clearing the line both want.
+    fn set_input(&mut self, line: String) {
+        self.input = line;
+        self.cursor = self.input.len();
+    }
+
     fn echo(&mut self, message: impl Into<String>) {
         for line in message.into().lines() {
             if self.log.len() == LOG_LIMIT {
@@ -375,7 +481,7 @@ impl ConsoleState {
         }
         self.echo(format!("> {line}"));
         match words[0].to_ascii_lowercase().as_str() {
-            "help" | "?" => self.echo("commands: <name> [value], vars, reset <name|all>, close <name|all>, clear\nSelect a variable then use Left/Right (Shift = 10x) to tune it. Wheel/PageUp/PageDown scroll the log."),
+            "help" | "?" => self.echo("commands: <name> [value], vars, reset <name|all>, close <name|all>, clear\nLeft/Right/Home/End move the caret; Up/Down recall; Tab completes.\nSelect a variable then use [ and ] (Shift = 10x) to tune it. Wheel/PageUp/PageDown scroll the log."),
             "vars" | "list" => {
                 for spec in SPECS {
                     self.echo(format!("  {:<18} {:>7.3}  [{:.3} .. {:.3}]  {}", spec.name, tuning.get(spec.name).unwrap(), spec.low, spec.high, spec.doc));
@@ -451,15 +557,24 @@ impl ConsoleState {
         }
     }
 
+    /// Completes the word the caret is in, rather than the end of the line: the
+    /// caret is where the typing is happening, and completing somewhere else
+    /// would rewrite a word the user had already moved on from.
     fn complete(&mut self) {
-        let prefix = self.input.split_whitespace().last().unwrap_or("");
+        let head = &self.input[..self.cursor];
+        let prefix = head
+            .rsplit(|character: char| character.is_whitespace())
+            .next()
+            .unwrap_or("");
         let matches: Vec<_> = SPECS
             .iter()
             .filter(|s| s.name.starts_with(prefix))
             .collect();
         if matches.len() == 1 {
-            let start = self.input.len() - prefix.len();
-            self.input.replace_range(start.., matches[0].name);
+            let start = self.cursor - prefix.len();
+            self.input
+                .replace_range(start..self.cursor, matches[0].name);
+            self.cursor = start + matches[0].name.len();
         } else if !matches.is_empty() {
             self.echo(
                 matches
@@ -477,60 +592,75 @@ pub struct ConsolePanel;
 #[derive(Component)]
 pub struct TuningTray;
 
-/// The console panel's marker and UI bundle. Keeping all built-in TextBundle
-/// fields inside the bundle prevents duplicate-component panics at startup.
-pub fn panel_bundle() -> (ConsolePanel, TextBundle) {
+/// The console panel's marker and the components that draw it.
+///
+/// A tuple of components rather than a bundle now that bundles are gone. The
+/// old warning about keeping every built-in field inside one bundle has become
+/// the language's problem rather than this function's: naming a component twice
+/// in one tuple does not compile, where the duplicate it used to guard against
+/// was a panic at startup.
+///
+/// `GlobalZIndex` rather than `ZIndex`: the console draws over the whole game
+/// and must be ordered against every other root, not against its siblings.
+pub fn panel_bundle() -> (
+    ConsolePanel,
+    Node,
+    Text,
+    TextFont,
+    TextColor,
+    BackgroundColor,
+    GlobalZIndex,
+    Visibility,
+) {
     (
         ConsolePanel,
-        TextBundle {
-            style: Style {
-                position_type: PositionType::Absolute,
-                left: Val::Px(12.0),
-                right: Val::Px(12.0),
-                top: Val::Px(10.0),
-                padding: UiRect::all(Val::Px(14.0)),
-                ..default()
-            },
-            text: Text::from_section(
-                "",
-                TextStyle {
-                    font_size: 17.0,
-                    color: Color::rgb(0.88, 0.92, 1.0),
-                    ..default()
-                },
-            ),
-            background_color: BackgroundColor(Color::rgba(0.015, 0.02, 0.04, 0.94)),
-            z_index: ZIndex::Global(100),
-            visibility: Visibility::Hidden,
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(12.0),
+            right: Val::Px(12.0),
+            top: Val::Px(10.0),
+            padding: UiRect::all(Val::Px(14.0)),
             ..default()
         },
+        Text::new(""),
+        TextFont {
+            font_size: FontSize::Px(17.0),
+            ..default()
+        },
+        TextColor(Color::srgb(0.88, 0.92, 1.0)),
+        BackgroundColor(Color::srgba(0.015, 0.02, 0.04, 0.94)),
+        GlobalZIndex(100),
+        Visibility::Hidden,
     )
 }
 
 /// Persistent controls shown below the console while gameplay is running.
-pub fn tuning_tray_bundle() -> (TuningTray, TextBundle) {
+pub fn tuning_tray_bundle() -> (
+    TuningTray,
+    Node,
+    Text,
+    TextFont,
+    TextColor,
+    BackgroundColor,
+    GlobalZIndex,
+) {
     (
         TuningTray,
-        TextBundle {
-            style: Style {
-                position_type: PositionType::Absolute,
-                right: Val::Px(18.0),
-                bottom: Val::Px(18.0),
-                padding: UiRect::all(Val::Px(8.0)),
-                ..default()
-            },
-            text: Text::from_section(
-                "",
-                TextStyle {
-                    font_size: 16.0,
-                    color: Color::rgb(1.0, 0.92, 0.62),
-                    ..default()
-                },
-            ),
-            background_color: BackgroundColor(Color::rgba(0.02, 0.025, 0.05, 0.72)),
-            z_index: ZIndex::Global(90),
+        Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(18.0),
+            bottom: Val::Px(18.0),
+            padding: UiRect::all(Val::Px(8.0)),
             ..default()
         },
+        Text::new(""),
+        TextFont {
+            font_size: FontSize::Px(16.0),
+            ..default()
+        },
+        TextColor(Color::srgb(1.0, 0.92, 0.62)),
+        BackgroundColor(Color::srgba(0.02, 0.025, 0.05, 0.72)),
+        GlobalZIndex(90),
     )
 }
 
@@ -538,24 +668,92 @@ pub fn is_closed(console: Res<ConsoleState>) -> bool {
     !console.open
 }
 
+/// The keys that repeat while they are held down.
+const EDIT_KEYS: &[KeyCode] = &[
+    KeyCode::ArrowLeft,
+    KeyCode::ArrowRight,
+    KeyCode::Backspace,
+    KeyCode::Delete,
+    KeyCode::ArrowUp,
+    KeyCode::ArrowDown,
+];
+
+/// How long a key has to be held before it starts repeating, and how fast it
+/// repeats once it does. A terminal's numbers, near enough.
+const REPEAT_DELAY: f32 = 0.4;
+const REPEAT_INTERVAL: f32 = 0.04;
+
+/// Auto-repeat for the editing keys.
+///
+/// Bevy reports a press and a release with nothing in between, so a held arrow
+/// key moves the caret exactly one character however long it is held -- which
+/// makes getting back to the start of a long line a matter of tapping. One key
+/// repeats at a time, the last one pressed, which is what a terminal does.
+///
+/// Kept as counts of what is owed rather than a "fire now" flag, so a slow
+/// frame delivers the repeats it covered instead of swallowing them.
+#[derive(Default)]
+pub struct KeyRepeat {
+    key: Option<KeyCode>,
+    held: f32,
+    fired: u32,
+}
+
+impl KeyRepeat {
+    /// Advances the clock and says which key should act this frame, and how
+    /// many times.
+    fn poll(&mut self, keys: &ButtonInput<KeyCode>, dt: f32) -> (Option<KeyCode>, u32) {
+        if let Some(key) = EDIT_KEYS
+            .iter()
+            .copied()
+            .find(|key| keys.just_pressed(*key))
+        {
+            *self = Self {
+                key: Some(key),
+                held: 0.0,
+                fired: 0,
+            };
+            return (Some(key), 1);
+        }
+        let Some(key) = self.key.filter(|key| keys.pressed(*key)) else {
+            self.key = None;
+            return (None, 0);
+        };
+        self.held += dt;
+        if self.held < REPEAT_DELAY {
+            return (Some(key), 0);
+        }
+        let due = ((self.held - REPEAT_DELAY) / REPEAT_INTERVAL) as u32 + 1;
+        let owed = due.saturating_sub(self.fired);
+        self.fired = due;
+        (Some(key), owed)
+    }
+}
+
 pub fn input(
-    keys: Res<Input<KeyCode>>,
-    mut chars: EventReader<ReceivedCharacter>,
-    mut wheel: EventReader<MouseWheel>,
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    mut typed: MessageReader<KeyboardInput>,
+    mut wheel: MessageReader<MouseWheel>,
     mut console: ResMut<ConsoleState>,
     mut tuning: ResMut<GameTuning>,
+    mut repeat: Local<KeyRepeat>,
 ) {
     console.closed_this_frame = false;
-    if keys.just_pressed(KeyCode::Grave) {
+    if keys.just_pressed(KeyCode::Backquote) {
         console.open = !console.open;
         if console.open {
             console.echo("simulation paused");
         }
     }
+    // Brackets tune the pinned control whether the console is open or shut. The
+    // arrow keys used to do it while it was open, and cannot any more: they
+    // move the caret, and a console you cannot move the caret in is a console
+    // you retype every line in.
+    let direction = i8::from(keys.just_pressed(KeyCode::BracketRight))
+        - i8::from(keys.just_pressed(KeyCode::BracketLeft));
+    adjust_selected(direction, &keys, &console, &mut tuning);
     if !console.open {
-        let direction = i8::from(keys.just_pressed(KeyCode::BracketRight))
-            - i8::from(keys.just_pressed(KeyCode::BracketLeft));
-        adjust_selected(direction, &keys, &console, &mut tuning);
         return;
     }
     if keys.just_pressed(KeyCode::Escape) {
@@ -563,8 +761,9 @@ pub fn input(
         console.closed_this_frame = true;
         return;
     }
-    if keys.just_pressed(KeyCode::Return) {
+    if keys.just_pressed(KeyCode::Enter) {
         let line = std::mem::take(&mut console.input);
+        console.cursor = 0;
         if !line.trim().is_empty() {
             console.scroll = 0;
             console.history.push(line.clone());
@@ -572,23 +771,38 @@ pub fn input(
             console.execute(&line, &mut tuning);
         }
     }
-    if keys.just_pressed(KeyCode::Back) {
-        console.input.pop();
-    }
     if keys.just_pressed(KeyCode::Tab) {
         console.complete();
     }
-    if keys.just_pressed(KeyCode::Up) && !console.history.is_empty() {
-        console.history_at = console.history_at.saturating_sub(1);
-        console.input = console.history[console.history_at].clone();
+    if keys.just_pressed(KeyCode::Home) {
+        console.cursor = 0;
     }
-    if keys.just_pressed(KeyCode::Down) {
-        console.history_at = (console.history_at + 1).min(console.history.len());
-        console.input = if console.history_at == console.history.len() {
-            String::new()
-        } else {
-            console.history[console.history_at].clone()
-        };
+    if keys.just_pressed(KeyCode::End) {
+        console.cursor = console.input.len();
+    }
+    let (key, times) = repeat.poll(&keys, time.delta_secs());
+    for _ in 0..times {
+        match key {
+            Some(KeyCode::ArrowLeft) => console.step(-1),
+            Some(KeyCode::ArrowRight) => console.step(1),
+            Some(KeyCode::Backspace) => console.backspace(),
+            Some(KeyCode::Delete) => console.delete(),
+            Some(KeyCode::ArrowUp) if !console.history.is_empty() => {
+                console.history_at = console.history_at.saturating_sub(1);
+                let line = console.history[console.history_at].clone();
+                console.set_input(line);
+            }
+            Some(KeyCode::ArrowDown) => {
+                console.history_at = (console.history_at + 1).min(console.history.len());
+                let line = if console.history_at == console.history.len() {
+                    String::new()
+                } else {
+                    console.history[console.history_at].clone()
+                };
+                console.set_input(line);
+            }
+            _ => {}
+        }
     }
     let wheel_lines: f32 = wheel
         .read()
@@ -613,20 +827,39 @@ pub fn input(
         };
         console.scroll = console.scroll.saturating_sub(amount);
     }
-    let direction =
-        i8::from(keys.just_pressed(KeyCode::Right)) - i8::from(keys.just_pressed(KeyCode::Left));
-    adjust_selected(direction, &keys, &console, &mut tuning);
-    for event in chars.read() {
-        let character = event.char;
-        if !character.is_control() && character != '`' && character != '~' {
-            console.input.push(character);
+    // Typed text is read off the keyboard event's *logical* key rather than
+    // from a separate character event, which is the stream that no longer
+    // exists. Logical is the right half of the pair here: `key_code` is the
+    // physical key and would type an American layout on every keyboard in the
+    // world, where `Key::Character` is whatever the layout actually commits --
+    // and it can commit more than one char at a time, which is what a dead key
+    // resolving or an IME does.
+    //
+    // Space is its own logical key rather than a `Character`, so it has to be
+    // named; without that the console silently refuses to type a space.
+    for event in typed.read() {
+        if event.state != ButtonState::Pressed {
+            continue;
+        }
+        match &event.logical_key {
+            Key::Character(text) => {
+                for character in text.chars() {
+                    // The backquote opens the console and must not also type
+                    // itself into the line it just opened.
+                    if !character.is_control() && character != '`' && character != '~' {
+                        console.insert(character);
+                    }
+                }
+            }
+            Key::Space => console.insert(' '),
+            _ => {}
         }
     }
 }
 
 fn adjust_selected(
     direction: i8,
-    keys: &Input<KeyCode>,
+    keys: &ButtonInput<KeyCode>,
     console: &ConsoleState,
     tuning: &mut GameTuning,
 ) {
@@ -650,9 +883,9 @@ fn adjust_selected(
 pub fn pause_animations(console: Res<ConsoleState>, mut players: Query<&mut AnimationPlayer>) {
     for mut player in &mut players {
         if console.open {
-            player.pause();
+            player.pause_all();
         } else {
-            player.resume();
+            player.resume_all();
         }
     }
 }
@@ -669,16 +902,20 @@ pub fn draw(
     mut panel: Query<(&mut Text, &mut Visibility), (With<ConsolePanel>, Without<TuningTray>)>,
     mut tray: Query<&mut Text, (With<TuningTray>, Without<ConsolePanel>)>,
 ) {
-    let (mut text, mut visibility) = panel.single_mut();
+    let Ok((mut text, mut visibility)) = panel.single_mut() else {
+        return;
+    };
     *visibility = if console.open {
         Visibility::Visible
     } else {
         Visibility::Hidden
     };
     if console.open {
-        let (controller, transform) = player.single();
+        let Ok((controller, transform)) = player.single() else {
+            return;
+        };
         let fps = diagnostics
-            .get(FrameTimeDiagnosticsPlugin::FPS)
+            .get(&FrameTimeDiagnosticsPlugin::FPS)
             .and_then(|diagnostic| diagnostic.smoothed())
             .unwrap_or(0.0);
         let log = console
@@ -691,8 +928,11 @@ pub fn draw(
             .cloned()
             .collect::<Vec<_>>()
             .join("\n");
-        text.sections[0].value = format!(
-            "BEVY DEBUG CONSOLE  ·  paused · log scroll {}\n{:?} · {:?} · health {} · enemies {} · {fps:.1} fps\npos {:.2}, {:.2}, {:.2}\n\n{log}\n\n> {}_",
+        // The caret is drawn where it actually is rather than always at the end
+        // of the line, which is the only way moving it is visible at all.
+        let (before, after) = console.split();
+        **text = format!(
+            "BEVY DEBUG CONSOLE  ·  paused · log scroll {}\n{:?} · {:?} · health {} · enemies {} · {fps:.1} fps\npos {:.2}, {:.2}, {:.2}\n\n{log}\n\n> {before}|{after}",
             console.scroll,
             state.active,
             controller.motion,
@@ -701,10 +941,12 @@ pub fn draw(
             transform.translation.x,
             transform.translation.y,
             transform.translation.z,
-            console.input
         );
     }
-    tray.single_mut().sections[0].value = console
+    let Ok(mut tray) = tray.single_mut() else {
+        return;
+    };
+    **tray = console
         .pinned
         .iter()
         .map(|name| {
@@ -742,6 +984,102 @@ mod tests {
         assert_eq!(console.selected.as_deref(), Some("cam_distance"));
         console.execute("close all", &mut tuning);
         assert!(console.pinned.is_empty());
+    }
+
+    /// Types a line the way the character events do.
+    fn type_line(console: &mut ConsoleState, line: &str) {
+        for character in line.chars() {
+            console.insert(character);
+        }
+    }
+
+    /// The caret moves, and typing happens where it is. Without this the only
+    /// way to fix the middle of a line is to delete back to it.
+    #[test]
+    fn the_caret_moves_and_text_lands_where_it_is() {
+        let mut console = ConsoleState::default();
+        type_line(&mut console, "cam_distance 12");
+        for _ in 0..2 {
+            console.step(-1);
+        }
+        type_line(&mut console, "9.");
+        assert_eq!(console.input, "cam_distance 9.12");
+        assert_eq!(console.split(), ("cam_distance 9.", "12"));
+    }
+
+    /// Backspace takes the character before the caret and Delete takes the one
+    /// under it, and neither runs off the end of the line.
+    #[test]
+    fn backspace_and_delete_work_either_side_of_the_caret() {
+        let mut console = ConsoleState::default();
+        type_line(&mut console, "hero");
+        console.step(-1);
+        console.backspace();
+        assert_eq!(console.input, "heo");
+        console.delete();
+        assert_eq!(console.input, "he");
+        // The caret is at the end now: neither key has anything left to take.
+        console.delete();
+        assert_eq!(console.input, "he");
+        console.step(-1);
+        console.step(-1);
+        console.step(-1);
+        console.backspace();
+        assert_eq!(console.input, "he");
+        assert_eq!(console.split(), ("", "he"));
+    }
+
+    /// Completing works on the word the caret is in, not on the end of the
+    /// line, and leaves the caret after what it inserted.
+    #[test]
+    fn completion_follows_the_caret() {
+        let mut console = ConsoleState::default();
+        type_line(&mut console, "cam_h 3");
+        for _ in 0..2 {
+            console.step(-1);
+        }
+        console.complete();
+        assert_eq!(console.input, "cam_height 3");
+        assert_eq!(console.split(), ("cam_height", " 3"));
+    }
+
+    /// A recalled command is ready to be edited at its end rather than with the
+    /// caret left wherever the last line happened to put it -- which, on a
+    /// shorter line, would be in the middle of this one.
+    #[test]
+    fn recalling_a_command_puts_the_caret_at_the_end() {
+        let mut console = ConsoleState::default();
+        type_line(&mut console, "hi");
+        console.step(-1);
+        console.set_input("cam_distance 12".into());
+        assert_eq!(console.split(), ("cam_distance 12", ""));
+    }
+
+    /// A held key repeats, and a slow frame delivers every repeat it covered
+    /// rather than one. Tapping to the start of a long line is what this
+    /// spares.
+    #[test]
+    fn a_held_key_repeats_after_a_pause() {
+        let mut repeat = KeyRepeat::default();
+        let mut keys = ButtonInput::<KeyCode>::default();
+        keys.press(KeyCode::ArrowLeft);
+        assert_eq!(repeat.poll(&keys, 0.016), (Some(KeyCode::ArrowLeft), 1));
+        keys.clear();
+        // Held, but not yet long enough to start repeating.
+        let mut moves = 0;
+        for _ in 0..20 {
+            moves += repeat.poll(&keys, 0.016).1;
+        }
+        assert_eq!(moves, 0, "it repeated before the delay was up");
+        // Past the delay, and a long frame owes every repeat it covered.
+        assert!(repeat.poll(&keys, 0.2,).1 >= 1);
+        let caught_up = repeat.poll(&keys, 0.2).1;
+        assert!(
+            caught_up >= 4,
+            "a 200 ms frame delivered {caught_up} repeats at one every 40 ms"
+        );
+        keys.release(KeyCode::ArrowLeft);
+        assert_eq!(repeat.poll(&keys, 0.016), (None, 0));
     }
 
     #[test]

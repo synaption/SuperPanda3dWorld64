@@ -4,10 +4,12 @@ LLMs should not edit this file, only humans.
 you don't change next.md.  only I change next.md.  
 Do not edit the readme.md below ***
 
-use ECS (not esper)
+use ECS 
+use bevy, but use python and bash for standalone scripting and utilities that do not have to ship with the game.  
 composition > inharitance.  
 document everything
 things need to be testable without rendering.  
+Keep tests basic for now.  we do not need 100% coverage.  Focus on basic smoke test and preformance.  
 make sure there are good comments.  
 keep the gitignore up to date
 use datastructures and algorithems where apropriate
