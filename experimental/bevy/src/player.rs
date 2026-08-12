@@ -257,11 +257,17 @@ pub fn movement(
             }
             ctrl.grounded = false;
         }
-        // No stroke and no jump: a wade has neither. Whatever vertical speed
-        // he entered the water with bleeds off, and the surface takes over
-        // from gravity below.
         Submersion::Wading => {
-            ctrl.velocity.y = approach(ctrl.velocity.y, 0.0, WADE_SETTLE * FIXED_DT);
+            if jump_pressed {
+                // The Hero stays upright because he has no swim animation,
+                // but deep water must not swallow the jump control. Treat it
+                // as the same upward stroke Mario gets underwater.
+                ctrl.velocity.y = (ctrl.velocity.y + 3.8).min(6.0);
+                ctrl.grounded = false;
+                sounds.push(Sfx::Stroke);
+            } else {
+                ctrl.velocity.y = approach(ctrl.velocity.y, 0.0, WADE_SETTLE * FIXED_DT);
+            }
         }
         Submersion::Dry => {
             if jump_pressed && ctrl.grounded {
@@ -294,11 +300,12 @@ pub fn movement(
     }
     ctrl.attack_left = (ctrl.attack_left - FIXED_DT).max(0.0);
     transform.translation.y += ctrl.velocity.y * FIXED_DT;
-    if ctrl.submersion == Submersion::Wading {
+    if ctrl.submersion == Submersion::Wading && ctrl.velocity.y <= 0.0 {
         // Held at the surface rather than sinking. Approached instead of
         // snapped, so running off a bank into deep water does not pop him up
         // to it; and only a pull, so a bottom shallower than the float depth
-        // still wins below and he walks along it.
+        // still wins below and he walks along it. An underwater jump is left
+        // alone while rising instead of being pulled straight back down.
         let float_line = water_level.unwrap() - WADE_FLOAT_DEPTH;
         transform.translation.y =
             approach(transform.translation.y, float_line, WADE_RISE * FIXED_DT);
@@ -698,6 +705,24 @@ mod tests {
         tick(&mut world, 90);
         assert_eq!(submersion_of(&mut world), Submersion::Swimming);
         assert_eq!(player(&mut world).3, Motion::Swim);
+    }
+
+    #[test]
+    fn jump_moves_the_hero_up_in_deep_water() {
+        let mut world = world_with(pool(6.0), Vec3::ZERO);
+        tick(&mut world, 60);
+        let (before, ..) = player(&mut world);
+        world.resource_mut::<InputState>().jump = true;
+        tick(&mut world, 6);
+        let (after, velocity, grounded, _) = player(&mut world);
+        assert!(
+            after.y > before.y + 0.2,
+            "the underwater jump moved from {} to {} with velocity {velocity:?}",
+            before.y,
+            after.y
+        );
+        assert!(velocity.y > 0.0, "the underwater jump lost its upward speed");
+        assert!(!grounded, "the underwater jump stayed grounded");
     }
 
     /// Water shallower than he floats in is simply slow ground: the bottom is

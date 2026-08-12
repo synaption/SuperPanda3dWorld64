@@ -313,7 +313,7 @@ fn setup(
     commands.spawn((
         DirectionalLight {
             illuminance: 18_000.0,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),
