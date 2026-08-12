@@ -12,4 +12,6 @@ make sure there are good comments.
 keep the gitignore up to date
 use datastructures and algorithems where apropriate
 
-Use headless testing even for rendering, especially for modernGL or else it keeps bringing up windows on my desktop.  
+Use headless testing even for rendering or else it keeps bringing up windows on my desktop.  
+
+I am using windows to run the program, not wsl.  

@@ -1,0 +1,20 @@
+[package]
+name = "super-bevy-world-64"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[dependencies]
+# Keep the feature set focused on this port. Besides reducing build time, this
+# avoids pulling audio/gamepad platform crates before those systems are ported.
+bevy = { version = "0.12.1", default-features = false, features = [
+    "multi-threaded", "bevy_asset", "bevy_scene", "bevy_winit",
+    "bevy_core_pipeline", "bevy_pbr", "bevy_gltf", "bevy_render",
+    "bevy_text", "bevy_ui", "animation", "png", "x11", "tonemapping_luts",
+] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
