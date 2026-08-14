@@ -17,3 +17,5 @@ use datastructures and algorithems where apropriate
 Use headless testing even for rendering or else it keeps bringing up windows on my desktop.  
 
 I am using windows to run the program, not wsl.  
+
+careful not to let bevy make too much debuging garbage because it costs 10s of GB and then I run out of space
