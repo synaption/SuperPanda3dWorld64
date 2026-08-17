@@ -393,11 +393,11 @@ class MeshBuilder:
         # S10.5 texel coordinates -> normalised UV, left in the N64's own
         # convention: origin top-left, V increasing downward.
         #
-        # That matches glTF exactly, so the actor exporter uses these as-is.
-        # Panda3D's native texture coordinates run from the bottom-left, so
-        # sm64py/level.py flips V when it builds geometry directly. Flipping
-        # here instead would silently mirror every actor texture -- the giveaway
-        # was Mario's cap logo reading as a W.
+        # That matches glTF exactly, so the actor exporter uses these as-is and
+        # nothing here flips V. A renderer whose own convention runs from the
+        # bottom-left has to flip on its side of the file; flipping here would
+        # silently mirror every actor texture instead -- the giveaway was
+        # Mario's cap logo reading as a W.
         key = (entry, tile_w, tile_h, self.bone)
         index = self._emitted.get(key)
         if index is None:

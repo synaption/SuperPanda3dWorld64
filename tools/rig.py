@@ -33,29 +33,25 @@ import numpy as np
 FRAME_RATE = 30.0
 
 
-def panda_frame_count(last_key_time):
-    """How many frames Panda3D will actually build for a clip that long.
+def frame_count(last_key_time):
+    """How many poses a clip that long holds, at the authoring rate.
 
-    panda3d-gltf throws the glTF key times away and resamples every channel
-    onto its own uniform grid, sizing the table as
+    Clips are authored as N poses one tick apart, which puts the last key at
+    (N-1)/FRAME_RATE rather than N/FRAME_RATE -- so recovering N from a time
+    means rounding to the nearest tick and adding the pose at t=0 back on.
 
-        num_frames = max(ceil(max_time * fps), 1)     # gltf/_converter.py
+    This used to subtract that final pose instead, because panda3d-gltf threw
+    the glTF key times away, resampled every channel onto its own grid, and
+    sized the table as `ceil(max_time * fps)` -- reading the last key's *time*
+    as the clip's *duration* and building an N-1 frame bundle whose last
+    authored pose could never be posed to. Nothing resamples the clips now:
+    Bevy plays the glTF samplers as written, keys and times both, so the count
+    that describes a clip is simply how many poses are in it.
 
-    which reads the last key's *time* as the clip's *duration*. A clip authored
-    as N poses one tick apart has its last key at (N-1)/FRAME_RATE, so Panda
-    builds an N-1 frame bundle and never shows that final pose. Counting keys
-    instead -- the obvious thing, and what this used to do -- leaves the sidecar
-    one frame ahead of the AnimBundle the game is playing, and the extra frame
-    is one the Actor cannot be posed to.
-
-    For a cyclic clip the truncation is right anyway: its last pose is a repeat
-    of its first, and dropping it is what makes the loop not stutter.
-
-    The time must arrive as float32 (straight off the accessor, or through
-    float(), which widens exactly) or the ceil can disagree with Panda's on
-    clips whose length lands on a frame boundary -- which is most of them.
+    Rounding rather than ceiling, because a re-exported clip's last key time is
+    a float that lands a hair either side of the tick it was authored on.
     """
-    return max(math.ceil(last_key_time * FRAME_RATE), 1)
+    return max(round(last_key_time * FRAME_RATE) + 1, 1)
 
 
 # Mario's A-pose clip, which stands in for the bind pose he does not usefully

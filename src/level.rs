@@ -92,7 +92,7 @@ impl<'a> Reader<'a> {
 }
 
 pub fn load() -> (LevelData, RenderLevel) {
-    let bytes = include_bytes!("../assets/castle.bin");
+    let bytes = include_bytes!("../assets/bevy/castle.bin");
     assert_eq!(&bytes[..4], b"SBW1");
     let mut r = Reader { bytes, at: 4 };
     let _positions = r.floats(3);

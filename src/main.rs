@@ -1,5 +1,12 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+//! Super Bevy World 64.
+//!
+//! Comments throughout cite paths under `app/` and `sm64py/`. Those are the
+//! Panda3D implementation this game was ported from, which was removed once
+//! the port took over; they are provenance for a constant or a rule rather
+//! than files to open, and `git log` still has them if one needs reading.
+
 mod animation;
 mod audio;
 mod billboard;
@@ -206,7 +213,7 @@ fn asset_path() -> PathBuf {
         .ok()
         .and_then(|exe| exe.parent().map(|parent| parent.join("assets")))
         .filter(|path| path.join("hero/hero.glb").is_file())
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets"))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"))
 }
 
 fn setup(

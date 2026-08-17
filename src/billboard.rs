@@ -303,7 +303,7 @@ mod tests {
     // -- reading the glTF directly, so none of this needs a renderer ---------
 
     fn gltf(path: &str) -> serde_json::Value {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
         let bytes = std::fs::read(root.join(path)).expect("missing glb");
         let length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
         serde_json::from_slice(&bytes[20..20 + length]).expect("bad glb json")

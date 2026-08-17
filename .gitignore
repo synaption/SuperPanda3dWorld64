@@ -12,6 +12,14 @@
 /assets/**/*.tmp
 /assets/**/*.bak
 
+# Rust / Cargo. The crate lives at the repository root, so this is the game's
+# own build tree. Cargo.lock IS tracked -- this is a binary, not a library, and
+# a reproducible build is worth more here than floating dependency versions.
+/target/
+
+# Packaged builds produced by build_windows.sh.
+/dist/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -19,7 +27,6 @@ __pycache__/
 *.so
 .Python
 build/
-dist/
 *.egg-info/
 .eggs/
 
@@ -39,13 +46,8 @@ ENV/
 htmlcov/
 .tox/
 
-# Panda3D / runtime output
-*.bam
-*.prc.local
-panda3d.log
+# Runtime output
 screenshots/
-# Panda3D's default screenshot naming, rather than a blanket *.png -- that
-# would silently swallow any image you actually meant to commit.
 screenshot-*.png
 screenshot-*.jpg
 *-screenshot-*.png

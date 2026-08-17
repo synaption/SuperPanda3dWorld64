@@ -10,8 +10,11 @@ import struct
 import sys
 import numpy as np
 
-ROOT = Path(__file__).resolve().parents[3]
-OUT = Path(__file__).resolve().parents[1] / "assets" / "castle.bin"
+ROOT = Path(__file__).resolve().parents[1]
+# All three outputs live together under assets/bevy/. castle.bin is the only
+# one the crate reads at build time -- level.rs embeds it with include_bytes!
+# -- while the other two are loaded from disk at runtime.
+OUT = ROOT / "assets" / "bevy" / "castle.bin"
 GLB_OUT = ROOT / "assets" / "bevy" / "castle.glb"
 # The water sheet's texture. Water is not part of the level mesh, so it is not
 # in the GLB above and is copied out of the reference pack on its own.

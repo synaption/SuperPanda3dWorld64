@@ -1,6 +1,6 @@
 """Give the Hero's exported skeleton the runtime pivots docs/aim.md asks for.
 
-docs/aim.md wants an `AIM_TORSO` bone carrying no authored motion, so Panda3D
+docs/aim.md wants an `AIM_TORSO` bone carrying no authored motion, so the game
 can turn the upper body toward the aim while the clips underneath keep playing,
 and a `WEAPON_SOCKET` under the right hand for a weapon to hang off. Neither
 exists in the export, and neither can simply be added in Blender, because of
@@ -210,9 +210,9 @@ def restructure(gltf):
     gltf.nodes[hand].setdefault("children", []).append(socket)
 
     # -- and both of them as joints -----------------------------------------
-    # Panda3D builds its Character from the skin's joint list, and a node left
-    # out of it arrives as scenery rather than as something exposeJoint and
-    # controlJoint can find. No vertex is weighted to either, so appending is
+    # A skinned character is built from the skin's joint list, and a node left
+    # out of it arrives as scenery rather than as a joint the animation and
+    # aiming code can drive. No vertex is weighted to either, so appending is
     # free: weights index this list by position and nothing indexes the end.
     skin = gltf.json["skins"][0]
     bind = gltf.read(skin["inverseBindMatrices"])

@@ -678,19 +678,18 @@ def main(argv):
     # matters: several clips are authored with lead-in frames the game never
     # shows, and playing from zero drops Mario through the floor mid-landing.
     #
-    # The decomp header's frame count is not the count the game can play.
-    # _write_animation lays the poses out at f / FRAME_RATE, putting the last
-    # one at (frames - 1) / FRAME_RATE, and Panda3D reads that as the clip's
-    # duration and builds a table one frame shorter (rig.panda_frame_count).
-    # Everything the header says is clamped into that, or the game addresses
-    # frames the AnimBundle does not have. The last time goes through float32
-    # first, because that is the width it is stored at and the ceil turns on
-    # its last bit.
+    # The count is recovered from the times the poses are actually written at
+    # rather than copied out of the decomp header, so the sidecar describes the
+    # clip in the file. _write_animation lays the poses out at f / FRAME_RATE,
+    # putting the last at (frames - 1) / FRAME_RATE, and rig.frame_count reads
+    # that back (see there). Everything the header says is clamped into it, or
+    # the sidecar names frames the clip does not have. The last time goes
+    # through float32 first, because that is the width it is stored at.
     if animations:
         clips = {}
         for name, anim in animations.items():
             last = float(np.float32((anim.frame_count - 1) / FRAME_RATE))
-            playable = rig.panda_frame_count(last)
+            playable = rig.frame_count(last)
             clips[name] = {
                 "frames": playable,
                 "start_frame": min(anim.start_frame, max(playable - 1, 0)),

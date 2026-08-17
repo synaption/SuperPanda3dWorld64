@@ -17,9 +17,9 @@ widget objects as scene roots.
 
 **The .glb has to be adopted** (tools/adopt_blender_export.py): Blender writes
 the Hero's Emission-node material as emissive-only, with a black base colour,
-which Panda3D renders as a flat silhouette; and the clip frame counts in
-hero_clips.json have to be resynced, since the game reads timing from the
-sidecar rather than from the .glb.
+which renders as a flat silhouette under any renderer that lights its actors;
+and the clip frame counts in hero_clips.json have to be resynced, since the
+sidecar carries playback timing the .glb has nowhere to put.
 
 **The skeleton has to grow its runtime pivots** (tools/aim_rig.py): the Hero
 aims by having his upper body turned at runtime, and the exported skeleton has

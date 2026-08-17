@@ -16,8 +16,8 @@ already sit on the origin plane, and the vertical differences between clips are
 real crouches and leaps, not offsets.
 
 An action that should cover ground during its clip -- the attack lunge -- gets
-that back as forward velocity in `sm64py/hero/actions.py`, where it can be
-stopped by a wall like any other movement.
+that back as forward velocity in `src/player.rs`, where it can be stopped by a
+wall like any other movement.
 
 Only the skeleton's *root* joints are shifted, and all of them by the same
 amount, so the body keeps its shape; everything below a root moves with its

@@ -1,12 +1,18 @@
-"""Copy the sound samples this port needs out of an extracted asset tree.
+"""Copy the sound samples this game needs out of an extracted asset tree.
 
 The decomp itself ships no audio -- its samples come from a ROM at build time,
 exactly as its textures do. sm64pcbuilder2 extracts them, and this pulls the
-handful the port actually plays into assets/sounds/, converting AIFF to WAV on
-the way because that is what Panda3D's audio loader wants.
+handful the game actually plays into assets/sounds/mario64/, converting AIFF to
+WAV on the way because WAV is what Bevy's audio decoder reads.
 
 Only the files named below are copied. Nothing is redistributed: the source
-tree stays where it is and the output lands in assets/, which is gitignored.
+tree stays where it is and the output lands in assets/, which is tracked -- see
+the asset notice in the README before publishing the repository.
+
+The output names are the ones `SAMPLES` in `src/audio.rs` asks for, spelled out
+here rather than derived from SM64 sound ids. The ids were how the Panda3D
+build addressed its sound bank; the Rust tables name files directly, so the id
+arithmetic in between had nothing left to connect and is gone.
 
 Usage:
     python3 tools/import_sounds.py
@@ -20,56 +26,59 @@ import sys
 import wave
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, ".."))
-
-from sm64py import audio  # noqa: E402
-from sm64py.mario import constants as C  # noqa: E402
+PROJECT_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 
 DEFAULT_SOURCE = os.path.join(
-    HERE, "..", "reference", "sm64pcbuilder2", "assets", "US", "sound", "samples")
-DEFAULT_OUTPUT = os.path.join(HERE, "..", "assets", "sounds", "mario64")
+    PROJECT_ROOT, "reference", "sm64pcbuilder2", "assets", "US", "sound", "samples")
+DEFAULT_OUTPUT = os.path.join(PROJECT_ROOT, "assets", "sounds", "mario64")
 
-# Terrain code -> sample. Mapped by name rather than by index on purpose: the
-# sample bank is not ordered by terrain code. Its file 02 is stone, while
-# terrain code 2 is water, and it carries a metal step that no terrain code
-# selects. Lining the two up numerically would put the wrong sound underfoot
-# on four of the eight surfaces.
-TERRAIN_SAMPLES = {
-    C.SOUND_TERRAIN_DEFAULT: "sfx_terrain/00_step_default",
-    C.SOUND_TERRAIN_GRASS: "sfx_terrain/01_step_grass",
+# Terrain -> source sample. Mapped by name rather than by index on purpose: the
+# sample bank is not ordered by SM64's terrain codes. Its file 02 is stone,
+# while terrain code 2 is water, and it carries a metal step that no terrain
+# code selects. Lining the two up numerically would put the wrong sound
+# underfoot on four of the eight surfaces.
+TERRAINS = {
+    "default": "sfx_terrain/00_step_default",
+    "grass": "sfx_terrain/01_step_grass",
     # SM64 has no water *step* sample; stepping in shallow water splashes.
-    C.SOUND_TERRAIN_WATER: "sfx_water/01_splash",
-    C.SOUND_TERRAIN_STONE: "sfx_terrain/02_step_stone",
-    C.SOUND_TERRAIN_SPOOKY: "sfx_terrain/03_step_spooky",
-    C.SOUND_TERRAIN_SNOW: "sfx_terrain/04_step_snow",
-    C.SOUND_TERRAIN_ICE: "sfx_terrain/05_step_ice",
-    C.SOUND_TERRAIN_SAND: "sfx_terrain/07_step_sand",
-}
-
-# Non-terrain sounds. The voice files are named by the same hex byte that
-# appears in the sound id, which is how the mario sound bank is indexed.
-DIRECT_SAMPLES = {
-    C.SOUND_ACTION_SWIM: "sfx_water/02_swim",
-    C.SOUND_ACTION_SWIM_FAST: "sfx_water/02_swim",
-    C.SOUND_ACTION_WATER_PLUNGE: "sfx_water/00_plunge",
-    C.SOUND_ACTION_SURFACE_BREAK: "sfx_water/01_splash",
-    C.SOUND_MARIO_YAH_WAH_HOO: "sfx_mario/00",
-    C.SOUND_MARIO_HOOHOO: "sfx_mario/03",
-    C.SOUND_MARIO_YAHOO: "sfx_mario/04",
-    C.SOUND_MARIO_OOOF: "sfx_mario/05",
-    C.SOUND_MARIO_HAHA: "sfx_mario/11",
+    "water": "sfx_water/01_splash",
+    "stone": "sfx_terrain/02_step_stone",
+    "spooky": "sfx_terrain/03_step_spooky",
+    "snow": "sfx_terrain/04_step_snow",
+    "ice": "sfx_terrain/05_step_ice",
+    "sand": "sfx_terrain/07_step_sand",
 }
 
 # Every terrain-dependent action draws on the same footfall samples; the
-# original varies them by envelope and pitch rather than by sample.
+# original varies them by envelope and pitch rather than by sample. Each name
+# here is written out once per terrain, as `<action>_<terrain>.wav`.
 TERRAIN_ACTIONS = (
-    C.SOUND_ACTION_TERRAIN_JUMP,
-    C.SOUND_ACTION_TERRAIN_LANDING,
-    C.SOUND_ACTION_TERRAIN_STEP,
-    C.SOUND_ACTION_TERRAIN_STEP_TIPTOE,
-    C.SOUND_ACTION_TERRAIN_BODY_HIT_GROUND,
-    C.SOUND_ACTION_TERRAIN_HEAVY_LANDING,
+    "jump",
+    "landing",
+    "step",
+    "tiptoe_step",
+    "body_hit_ground",
+    "heavy_landing",
 )
+
+# Output stem -> source sample, for the sounds that do not vary with terrain.
+# The voice files are named by the same hex byte that indexed them in the
+# mario sound bank.
+DIRECT = {
+    "swim_stroke": "sfx_water/02_swim",
+    "fast_swim_stroke": "sfx_water/02_swim",
+    "water_plunge": "sfx_water/00_plunge",
+    "surface_splash": "sfx_water/01_splash",
+    "mario_yah_wah_hoo": "sfx_mario/00",
+    "mario_hoohoo": "sfx_mario/03",
+    "mario_yahoo": "sfx_mario/04",
+    "mario_ooof": "sfx_mario/05",
+    "mario_haha": "sfx_mario/11",
+}
+
+# Where the samples came from, so it is possible to tell an imported set from a
+# hand-assembled one without diffing audio.
+SOURCE_MARKER = ".source"
 
 
 def _extended80(raw):
@@ -138,17 +147,12 @@ def convert(src, dst):
 
 
 def wanted_samples():
-    """(resolved sound id -> sample name) for everything the port can play."""
-    wanted = {}
-    for sound_id in TERRAIN_ACTIONS:
-        for terrain, sample in TERRAIN_SAMPLES.items():
-            wanted[audio.resolve(sound_id, terrain)] = sample
-    for sound_id, sample in DIRECT_SAMPLES.items():
-        wanted[audio.resolve(sound_id, C.SOUND_TERRAIN_DEFAULT)] = sample
+    """Output stem -> source sample, for everything the game can play."""
+    wanted = dict(DIRECT)
+    for action in TERRAIN_ACTIONS:
+        for terrain, sample in TERRAINS.items():
+            wanted[f"{action}_{terrain}"] = sample
     return wanted
-
-
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _as_project_relative(path):
@@ -176,21 +180,17 @@ def main(argv):
     written = 0
     missing = []
     seconds = 0.0
-    for resolved, sample in sorted(wanted.items()):
+    for stem, sample in sorted(wanted.items()):
         src = os.path.join(source, sample + ".aiff")
         if not os.path.exists(src):
             missing.append(sample)
             continue
-        dst = os.path.join(output, audio.sound_key(resolved) + ".wav")
-        seconds += convert(src, dst)
+        seconds += convert(src, os.path.join(output, stem + ".wav"))
         written += 1
 
-    # Record where these came from, so the game can say whether it is playing
-    # real samples or the synthesised stand-ins rather than guessing. Written
-    # relative to the project where possible: this file is tracked, and an
-    # absolute path would commit one machine's home directory.
-    with open(os.path.join(output, audio.SOURCE_MARKER), "w",
-              encoding="utf-8") as fh:
+    # Written relative to the project where possible: this file is tracked, and
+    # an absolute path would commit one machine's home directory.
+    with open(os.path.join(output, SOURCE_MARKER), "w", encoding="utf-8") as fh:
         fh.write(_as_project_relative(source) + "\n")
 
     unique = sorted(set(wanted.values()))

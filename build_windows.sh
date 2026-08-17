@@ -11,11 +11,10 @@ set -euo pipefail
 # toolchain providing both the host and the Windows target is exactly what that
 # apparatus was faking. It is gone; `rustup target add` is the whole of it now.
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WINDOWS_TARGET="x86_64-pc-windows-gnu"
-DIST_DIR="$SCRIPT_DIR/dist/windows"
-ZIP_PATH="$SCRIPT_DIR/dist/SuperBevyWorld64-windows-x64.zip"
+DIST_DIR="$REPO_ROOT/dist/windows"
+ZIP_PATH="$REPO_ROOT/dist/SuperBevyWorld64-windows-x64.zip"
 
 require_command() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -36,11 +35,11 @@ if ! rustup target list --installed | grep -qx "$WINDOWS_TARGET"; then
 fi
 
 echo "Regenerating Bevy castle assets"
-python3 "$SCRIPT_DIR/tools/convert_level.py"
+python3 "$REPO_ROOT/tools/convert_level.py"
 
 echo "Building $WINDOWS_TARGET release executable"
 cargo build \
-    --manifest-path "$SCRIPT_DIR/Cargo.toml" \
+    --manifest-path "$REPO_ROOT/Cargo.toml" \
     --release --locked --target "$WINDOWS_TARGET" \
     --config "target.$WINDOWS_TARGET.linker=\"x86_64-w64-mingw32-gcc\""
 
@@ -51,7 +50,7 @@ mkdir -p \
     "$DIST_DIR/assets/hero" \
     "$DIST_DIR/assets/mario"
 
-cp "$SCRIPT_DIR/target/$WINDOWS_TARGET/release/super-bevy-world-64.exe" \
+cp "$REPO_ROOT/target/$WINDOWS_TARGET/release/super-bevy-world-64.exe" \
     "$DIST_DIR/SuperBevyWorld64.exe"
 cp "$REPO_ROOT/assets/bevy/castle.glb" "$REPO_ROOT/assets/bevy/water.png" \
     "$DIST_DIR/assets/bevy/"
@@ -71,11 +70,11 @@ while read -r sample; do
     [[ -n "$sample" ]] || continue
     mkdir -p "$DIST_DIR/assets/sounds/$(dirname "$sample")"
     cp "$REPO_ROOT/assets/sounds/$sample" "$DIST_DIR/assets/sounds/$sample"
-done < <(grep -o '"[A-Za-z0-9_/]*\.wav"' "$SCRIPT_DIR/src/audio.rs" | tr -d '"' | sort -u)
+done < <(grep -o '"[A-Za-z0-9_/]*\.wav"' "$REPO_ROOT/src/audio.rs" | tr -d '"' | sort -u)
 
 rm -f "$ZIP_PATH"
 (
-    cd "$SCRIPT_DIR/dist"
+    cd "$REPO_ROOT/dist"
     python3 -m zipfile -c "$(basename "$ZIP_PATH")" windows
 )
 

@@ -1,38 +1,51 @@
 # Documentation wiki
 
-This wiki contains the detailed documentation for Super Panda3D World 64.
-Start with the page that matches what you want to do:
+This wiki contains the detailed documentation for Super Bevy World 64. Start
+with the page that matches what you want to do:
 
 ## Getting started
 
 - [Project overview and quick start](../README.md) — what the project is and
-  how to launch it.
+  how to build and launch it.
+- [Building and running](project-guide.md#building-and-running) — the
+  toolchain, the optional sound and gamepad features, and the Windows
+  cross-build.
 - [Controls](project-guide.md#controls) — keyboard, mouse, and gamepad input.
 - [Debug console](project-guide.md#the-debug-console) — in-game inspection and
-  tuning tools.
+  live tuning.
 
 ## Gameplay and design
 
-- [Camera](project-guide.md#the-camera) — third-person camera behavior and
-  responsive look input.
-- [Jetpack and skates](project-guide.md#the-jetpack) — traversal rules and
-  design rationale.
-- [Squad](project-guide.md#the-squad) — ally selection and commands.
+- [Timing and the port](project-guide.md#timing-and-the-port) — the fixed 30 Hz
+  tick, latched input, and the original quirks kept on purpose.
+- [Water](project-guide.md#water) — the surface sheets, the underwater view,
+  and why the two characters treat deep water differently.
+- [The Marios](project-guide.md#the-marios) — squad selection and commands.
+- [Warp pipes](project-guide.md#warp-pipes) — what each produces, and the arc
+  it is thrown out on.
+- [Combat](project-guide.md#combat) — hit resolution and the immunity window.
+- [Billboards](project-guide.md#billboards) — turning flat quads to face the
+  camera, at object and at joint level.
 - [Aiming and attack animation design](aim.md) — planned animation layering,
-  aim correction, and weapon behavior.
+  aim correction, and weapon behaviour. Design only; the procedural layer is
+  not built in this engine yet.
 
 ## Development reference
 
 - [Project guide](project-guide.md) — the complete technical reference,
-  including project layout and porting notes.
-- [Assets and regeneration](project-guide.md#assets) — bundled assets,
-  provenance, and conversion commands.
-- [Actor and Hero exports](project-guide.md#exporting-actors-for-blender) —
-  Blender, actor, and Hero export workflows.
-- [Asset workbench](project-guide.md#the-asset-workbench) — inspecting and
-  tuning assets.
-- [Verification](project-guide.md#verified-behaviour) — checked runtime
-  behavior and diagnostics.
+  including project layout, architecture, and porting notes.
+- [Asset pipeline](pipeline.md) — what is committed under `assets/`, how to
+  regenerate it, and the actor and Hero export workflows.
+- [Assets and provenance](pipeline.md#what-is-committed) — what is bundled,
+  where it came from, and the notice to read before publishing.
+- [Exporting actors](pipeline.md#exporting-actors) and
+  [Exporting the Hero](pipeline.md#exporting-the-hero) — the two export paths
+  and why each step exists.
+- [Bevy 0.19 upgrade notes](bevy-0.19-upgrade.md) — what the engine upgrade
+  changed and what it broke.
+- [Performance](project-guide.md#performance) — collision partitioning, AI
+  rates, and crowd LOD.
+- [Not done yet](project-guide.md#not-done-yet) — what is still unported.
 
 ## Contributing to the wiki
 

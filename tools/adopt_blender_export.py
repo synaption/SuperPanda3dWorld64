@@ -1,21 +1,23 @@
-"""Make a Blender-exported .glb loadable by Panda3D, and resync the sidecar.
+"""Normalise a Blender-exported .glb, and resync the sidecar.
 
 Blender's glTF exporter is not a faithful round trip of what
-tools/export_actor_gltf.py writes. Three differences break the game, and all
-of them are silent -- the file loads, and the actor is simply wrong on screen:
+tools/export_actor_gltf.py writes. Three differences matter, and all of them
+are silent -- the file loads, and the actor is simply wrong on screen:
 
 **The mesh comes back as a sibling of the skeleton.** The exporter wraps
 everything in a new node and hangs the skinned mesh and the joint root off it
-side by side. Panda3D's glTF loader builds its Character from the joint
-hierarchy and only adopts geometry sitting *underneath* it, so a sibling mesh
-renders but never binds and the Actor animates nothing. This reparents the
-mesh back under the skeleton root, which is where the decomp exporter puts it.
+side by side. This reparents the mesh back under the skeleton root, which is
+where the decomp exporter puts it. It was written because Panda3D's loader
+built its Character from the joint hierarchy and never bound a sibling mesh at
+all; a loader that binds through the skin's joint list instead does not care.
+It stays because the point of this pass is that both export paths produce a
+file of the same shape, whoever is reading it.
 
 **Some clips come back a frame shorter.** Sampling and re-emitting a clip can
-drop its final frame, and the game reads frame counts from the `_clips.json`
-sidecar rather than the .glb. A stale count runs an action past the end of its
-clip. Counts are what Panda3D's loader will build rather than how many keys the
-clip has -- not the same number, see rig.panda_frame_count.
+drop its final frame, and the `_clips.json` sidecar carries playback timing
+the .glb has nowhere to put, so a stale count there describes a clip that no
+longer exists. Counts are measured from the samplers' length rather than by
+counting keys -- not the same number, see rig.frame_count.
 
 The sidecar's `start_frame` values cannot be recovered from a .glb at all --
 they come from the decomp's animation headers, and eighteen clips have a
@@ -103,8 +105,8 @@ def unemit_materials(gltf):
         material["emissiveFactor"] = [0.0, 0.0, 0.0]
 
         # An emissive-only material carries no metallic/roughness, and glTF
-        # defaults both to 1.0 -- a fully metallic surface. Panda3D's
-        # fixed-function pipeline renders that as a white silhouette with the
+        # defaults both to 1.0 -- a fully metallic surface. A PBR renderer
+        # takes that at its word and gives back a white silhouette with the
         # texture washed out of it, which is exactly what the Hero looked like
         # before these were written down.
         pbr.setdefault("metallicFactor", 0.0)
@@ -114,17 +116,19 @@ def unemit_materials(gltf):
 
 
 def clip_lengths(gltf):
-    """Frame count per clip, as Panda3D will build it off the samplers.
+    """Frame count per clip, measured off the samplers rather than the keys.
 
-    Not the number of keys: the loader resamples onto its own grid and sizes
-    the table from the clip's length alone. See rig.panda_frame_count.
+    A re-emitted clip can carry a different number of keys than it was
+    authored with -- channels get split, merged, or resampled on the way
+    through Blender -- while its length in seconds survives. See
+    rig.frame_count.
     """
     out = {}
     for anim in gltf.json.get("animations", []):
         longest = 0.0
         for sampler in anim["samplers"]:
             longest = max(longest, float(gltf.read(sampler["input"])[-1, 0]))
-        out[anim["name"]] = rig.panda_frame_count(longest)
+        out[anim["name"]] = rig.frame_count(longest)
     return out
 
 

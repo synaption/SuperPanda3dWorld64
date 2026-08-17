@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Launch the Bevy port from any working directory. On Windows-compatible Bash
+# Launch the game from any working directory. On Windows-compatible Bash
 # environments (including WSL), prefer the packaged executable and its bundled
 # assets. On a native Unix host, build and run the current source with Cargo.
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-BEVY_DIR="$SCRIPT_DIR/experimental/bevy"
-GAME_EXE="$BEVY_DIR/dist/windows/SuperBevyWorld64.exe"
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+GAME_EXE="$REPO_ROOT/dist/windows/SuperBevyWorld64.exe"
 
 usage() {
     cat <<'EOF'
@@ -24,7 +23,7 @@ run_source() {
         echo "error: Cargo is required to run the Bevy game from source" >&2
         exit 1
     fi
-    cd -- "$BEVY_DIR"
+    cd -- "$REPO_ROOT"
     exec cargo run --release
 }
 
@@ -32,7 +31,7 @@ run_packaged() {
     if [[ ! -f "$GAME_EXE" ]]; then
         echo "error: packaged game not found at:" >&2
         echo "  $GAME_EXE" >&2
-        echo "build it with experimental/bevy/build_windows.sh" >&2
+        echo "build it with ./build_windows.sh" >&2
         exit 1
     fi
     cd -- "$(dirname -- "$GAME_EXE")"

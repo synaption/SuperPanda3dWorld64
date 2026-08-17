@@ -3,9 +3,19 @@
 > [Documentation home](README.md) · [Project guide](project-guide.md) ·
 > [Quick start](../README.md)
 
+> **Status.** This is a design document, and it was written against the
+> Panda3D implementation the game was ported from. The design intent stands
+> and the rig work is done — `tools/aim_rig.py` still exports the `AIM_TORSO`
+> pivot and the `WEAPON_SOCKET` — but the procedural layer described under
+> "The runtime" below was Panda3D-side and has **not** been ported to Bevy.
+> Nothing currently drives the pivot. Where the text names a Panda3D API
+> (`Actor` subparts, `exposeJoint`, `controlJoint`, `NodePath`), read it as the
+> shape of the problem rather than as the call to make; `src/billboard.rs`
+> solves the equivalent joint-driving problem in Bevy and is the closer model.
+
 Overview
 
-This document describes a responsive aiming and attack animation system for a third-person action game using Panda3D and Blender.
+This document describes a responsive aiming and attack animation system for a third-person action game.
 
 The intended combat feel draws from games such as Earth Defense Force and Armored Core, where the player may move independently of the direction they are attacking, and different weapons can use different levels of aiming assistance.
 
@@ -1170,7 +1180,7 @@ The cost is that the twist is rigid: the spine chain rides inside the group rath
 
 The runtime
 
-`sm64py/aim.py` is the procedural layer -- `AimController`, an `AimProfile` per weapon, and the melee commitment curve. `app/main.py` feeds it the camera's aim ray and applies the body turn it asks for.
+**Not ported.** The procedural layer -- `AimController`, an `AimProfile` per weapon, and the melee commitment curve -- was built on the Panda3D side, fed the camera's aim ray, and applied the body turn it asked for. It went with that implementation and has no Bevy equivalent yet; the game has an aim *mode* that frames the camera, and nothing that turns the torso. What it was tuned to, for whoever ports it:
 
     torso limit         60 degrees, then his feet come round
     comfort limit       20 degrees, standing still
@@ -1178,7 +1188,7 @@ The runtime
     response            a critically damped spring, 0.12 s
     tracking            the sights' blend, or the melee curve, whichever is more
 
-All of it is on console sliders (`torso_limit`, `torso_response`, `torso_pitch`, `torso_comfort`, `torso_turn_rate`).
+All of it was on console sliders (`torso_limit`, `torso_response`, `torso_pitch`, `torso_comfort`, `torso_turn_rate`), and should be again — every one of those numbers was arrived at by moving a slider, not by reasoning.
 
 Not built yet
 

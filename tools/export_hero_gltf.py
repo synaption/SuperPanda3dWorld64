@@ -23,7 +23,7 @@ animation under a name the rig also uses. It is unassigned for the duration of
 the export and put back afterwards.
 
 The clips come out at Blender's scale (he is 1.18 units tall); the game scales
-him on the Panda3D side, where one constant is easier to tune than a re-export.
+him at runtime, where one constant is easier to tune than a re-export.
 
 Usage, from the MCP connection or Blender's text editor:
 

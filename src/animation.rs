@@ -652,7 +652,7 @@ mod tests {
     /// T-pose.
     #[test]
     fn every_named_clip_exists_in_its_glb() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
         let hero = clip_names(&root.join("hero/hero.glb"));
         let mario = clip_names(&root.join("mario/mario.glb"));
         let motions = [

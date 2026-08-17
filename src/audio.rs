@@ -73,9 +73,10 @@ const HERO_HURT: Layers = &[&[
     "vc_zelda/vc_zelda_damage02.wav",
 ]];
 
-// Mario's samples are the placeholders `sm64py.audio` synthesises, because the
-// decomp ships a sound taxonomy and no waveforms. Grass is the castle
-// grounds' terrain, so these are the grass takes.
+// Mario's samples come out of an extracted asset tree via
+// `tools/import_sounds.py`, because the decomp ships a sound taxonomy and no
+// waveforms of its own. Grass is the castle grounds' terrain, so these are the
+// grass takes.
 const MARIO_JUMP: Layers = &[
     &["mario64/jump_grass.wav"],
     &[
@@ -379,7 +380,7 @@ mod tests {
     /// sample that was renamed out from under them.
     #[test]
     fn every_named_sample_exists_in_the_repository() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/sounds");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/sounds");
         for path in all_paths() {
             assert!(root.join(path).is_file(), "missing sample: sounds/{path}");
         }

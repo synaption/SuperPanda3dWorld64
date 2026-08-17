@@ -33,7 +33,7 @@ ELEMENT_ARRAY_BUFFER = 34963
 class GLB:
     def __init__(self):
         self.json = {
-            "asset": {"version": "2.0", "generator": "sm64py actor exporter"},
+            "asset": {"version": "2.0", "generator": "sm64 actor exporter"},
             "scene": 0,
             "scenes": [{"nodes": []}],
             "nodes": [],
