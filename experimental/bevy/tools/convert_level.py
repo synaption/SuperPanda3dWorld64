@@ -91,6 +91,36 @@ def write_water_texture():
     print(f"wrote {WATER_OUT} ({WATER_OUT.stat().st_size:,} bytes)")
 
 
+def n64_shade_colors(raw_colors, group):
+    """Evaluate the original RSP's one-light vertex-lighting equation.
+
+    With G_LIGHTING enabled, the vertex colour bytes are signed normals. SM64
+    adds the material's ambient colour to the positive normal/light dot product
+    times its diffuse colour, clamps to a byte, then interpolates that result
+    across the triangle. Baking those bytes into COLOR_0 and drawing unlit is
+    materially closer than asking Bevy's fragment PBR pipeline to reinterpret
+    the same data.
+    """
+    ambient = np.asarray(group.get("light_ambient") or (255, 255, 255),
+                         dtype=np.float32)
+    diffuse = np.asarray(group.get("light_diffuse") or (0, 0, 0),
+                         dtype=np.float32)
+    direction = np.asarray(group.get("light_direction") or (40, 40, 40),
+                           dtype=np.float32)
+    direction_length = np.linalg.norm(direction)
+    if direction_length:
+        direction /= direction_length
+
+    normals = raw_colors[:, :3].astype(np.int16)
+    normals[normals > 127] -= 256
+    intensity = np.maximum((normals.astype(np.float32) @ direction) / 127.0, 0.0)
+    rgb = np.clip(ambient + intensity[:, None] * diffuse, 0.0, 255.0)
+    colors = np.empty((len(raw_colors), 4), dtype=np.float32)
+    colors[:, :3] = rgb / 255.0
+    colors[:, 3] = raw_colors[:, 3] / 255.0
+    return colors
+
+
 def write_render_glb(mesh):
     GLB_OUT.parent.mkdir(parents=True, exist_ok=True)
     groups = json.loads((ROOT / "assets/castle_grounds/mesh_materials.json").read_text())
@@ -123,8 +153,7 @@ def write_render_glb(mesh):
 
         raw_colors = mesh["colors"][used]
         if group.get("lighting"):
-            colors = np.ones((len(used), 4), dtype=np.float32)
-            colors[:, 3] = raw_colors[:, 3] / 255.0
+            colors = n64_shade_colors(raw_colors, group)
         else:
             colors = raw_colors.astype(np.float32) / 255.0
 
@@ -160,8 +189,9 @@ def write_render_glb(mesh):
             material["pbrMetallicRoughness"]["baseColorTexture"] = {
                 "index": image_cache[key]
             }
-        if not group.get("lighting"):
-            material["extensions"] = {"KHR_materials_unlit": {}}
+        # Both paths already contain their final N64 shade colour: either the
+        # source vertex colour, or the RSP lighting result baked above.
+        material["extensions"] = {"KHR_materials_unlit": {}}
         # SM64's ALPHA layer is alpha *tested*, not blended: the fence and the
         # castle doorway are cutouts with binary alpha. Blending them puts
         # them in the renderer's transparent queue, where they are sorted

@@ -277,6 +277,12 @@ class Level:
                 self.lights[name] = {
                     "ambient": tuple(values[0:3]),
                     "diffuse": tuple(values[3:6]),
+                    # Signed direction bytes. The RSP normalizes this vector
+                    # before taking its per-vertex dot product.
+                    "direction": tuple(
+                        value - 256 if value > 127 else value
+                        for value in values[6:9]
+                    ) if len(values) >= 9 else (0, 0, 127),
                 }
 
         for kind, name, body in ARRAY_RE.findall(source):
@@ -361,6 +367,7 @@ class MeshBuilder:
                 "light": light,
                 "light_diffuse": entry["diffuse"] if entry else None,
                 "light_ambient": entry["ambient"] if entry else None,
+                "light_direction": entry["direction"] if entry else None,
                 "combiner": combiner,
                 "combiner_kind": combiner_kind(combiner),
                 "first": self._group_start,

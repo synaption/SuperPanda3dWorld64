@@ -14,6 +14,7 @@ mod squad;
 mod water;
 
 use bevy::{
+    core_pipeline::tonemapping::Tonemapping,
     diagnostic::FrameTimeDiagnosticsPlugin,
     ecs::{schedule::ScheduleConfigs, system::ScheduleSystem},
     prelude::*,
@@ -310,19 +311,14 @@ fn setup(
             Transform::from_translation(position).with_scale(Vec3::splat(0.01)),
         ));
     }
-    commands.spawn((
-        DirectionalLight {
-            illuminance: 18_000.0,
-            shadow_maps_enabled: false,
-            ..default()
-        },
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, -0.5, 0.0)),
-    ));
     // `AmbientLight` is a per-camera component now as well as a resource, and
     // the resource that lights the whole world is the one under this name.
+    // The converted SM64 level is unlit because its original RSP lighting is
+    // already baked per vertex. This neutral fill is only for native PBR
+    // assets such as the Hero; it cannot alter the castle or its dark areas.
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.75, 0.82, 1.0),
-        brightness: 0.65,
+        color: Color::WHITE,
+        brightness: 80.0,
         ..default()
     });
     commands.spawn((
@@ -340,6 +336,9 @@ fn setup(
             pitch: -0.2,
             distance: 9.5,
         },
+        // N64 colours are already display-referred bytes. Filmic HDR grading
+        // would alter their contrast, saturation, and hue a second time.
+        Tonemapping::None,
         // Bevy fogs per camera rather than per scene, so the medium the camera
         // is in rides along with it.
         water::air_fog(),
