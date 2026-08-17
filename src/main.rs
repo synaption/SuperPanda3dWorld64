@@ -15,8 +15,10 @@ mod console;
 mod enemy;
 mod input;
 mod level;
+mod n64;
 mod pipe;
 mod player;
+mod shadow;
 mod squad;
 mod water;
 
@@ -106,6 +108,9 @@ fn main() {
                     ..default()
                 }),
         )
+        // The whole world is drawn by this one material, so it goes on directly
+        // after the plugins it is built out of.
+        .add_plugins(n64::N64Plugin)
         // Bevy's glTF loader puts these metadata components into each
         // WorldAsset, but GltfPlugin does not add them to the reflection
         // registry. WorldSerializationPlugin needs the registrations when it
@@ -145,7 +150,7 @@ fn main() {
         .add_systems(FixedUpdate, simulation())
         .add_systems(Update, presentation())
         .add_systems(Update, overlay())
-        .add_systems(PostUpdate, billboard::systems())
+        .add_systems(PostUpdate, (billboard::systems(), n64::systems()).chain())
         .run();
 }
 
@@ -188,6 +193,7 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
         squad::animate_allies,
         water::drift,
         water::camera_medium,
+        shadow::systems(),
         controls,
         update_hud,
     )
@@ -221,9 +227,11 @@ fn setup(
     assets: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
     let (collision, render) = level::load();
+    shadow::prepare(&mut commands, &mut meshes, &mut images);
     water::spawn(
         &mut commands,
         &assets,
@@ -255,6 +263,9 @@ fn setup(
     });
     commands.spawn((
         Player,
+        // The disc under him is as wide as the body the walls push around,
+        // which is the part of him actually standing on the ground.
+        shadow::ShadowCaster::new(player::PLAYER_RADIUS),
         PreviousPose::new(&spawn),
         Controller::default(),
         // What `SpatialBundle` used to carry. `Transform` now brings
@@ -318,16 +329,9 @@ fn setup(
             Transform::from_translation(position).with_scale(Vec3::splat(0.01)),
         ));
     }
-    // `AmbientLight` is a per-camera component now as well as a resource, and
-    // the resource that lights the whole world is the one under this name.
-    // The converted SM64 level is unlit because its original RSP lighting is
-    // already baked per vertex. This neutral fill is only for native PBR
-    // assets such as the Hero; it cannot alter the castle or its dark areas.
-    commands.insert_resource(GlobalAmbientLight {
-        color: Color::WHITE,
-        brightness: 80.0,
-        ..default()
-    });
+    // No light entity and no ambient resource: every surface in the world is
+    // drawn by `n64::N64Material`, which carries its own key and ambient terms
+    // and reads neither. `n64::N64Lighting` is where the sun lives now.
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(-13.0, 10.0, 56.0)
@@ -535,6 +539,13 @@ mod tests {
             .add_plugins(FrameTimeDiagnosticsPlugin::default())
             .init_asset::<Mesh>()
             .init_asset::<StandardMaterial>()
+            // The material swap and the light sync both run headlessly; what
+            // is missing without a renderer is the pipeline that draws them,
+            // which `MaterialPlugin` would bring along with a render world
+            // this app does not have.
+            .init_asset::<n64::N64Material>()
+            .init_resource::<n64::N64Lighting>()
+            .init_resource::<n64::Converted>()
             .init_asset::<WorldAsset>()
             .init_asset::<AnimationClip>()
             .init_asset::<AnimationGraph>()
@@ -567,7 +578,7 @@ mod tests {
             .add_systems(FixedUpdate, simulation())
             .add_systems(Update, presentation())
             .add_systems(Update, overlay())
-            .add_systems(PostUpdate, billboard::systems());
+            .add_systems(PostUpdate, (billboard::systems(), n64::systems()).chain());
         app
     }
 
@@ -804,6 +815,19 @@ mod tests {
     #[test]
     fn the_billboard_schedule_has_no_conflicting_queries() {
         initialise(billboard::systems());
+    }
+
+    #[test]
+    fn the_material_swap_schedule_has_no_conflicting_queries() {
+        initialise(n64::systems());
+    }
+
+    /// The shadow pass reaches `Transform` and `Visibility` through two queries
+    /// at once -- the casters and the discs -- and Bevy will not take on trust
+    /// that a disc is never its own caster.
+    #[test]
+    fn the_shadow_schedule_has_no_conflicting_queries() {
+        initialise(shadow::systems());
     }
 
     #[test]

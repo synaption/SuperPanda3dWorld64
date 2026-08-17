@@ -19,10 +19,12 @@ export PATH="$HOME/.cargo/bin:$PATH"
 cargo run
 ```
 
-`./run_bevy.sh` does the same from any working directory, preferring the
-packaged Windows executable where there is one. On Linux, sound and gamepad
-build against ALSA and udev and are opt-in: `cargo run --features
-sound,gamepad`. The Windows build always has both.
+`./run_bevy.sh` runs from any working directory, refreshes the packaged Windows
+build, and then launches its executable. Pass `--source` to build and run the
+native Rust source instead, or `--packaged` to launch the existing Windows
+package without rebuilding it. On Linux, sound and gamepad build against ALSA
+and udev and are opt-in: `cargo run --features sound,gamepad`. The Windows
+build always has both.
 
 Game assets required at runtime are included under `assets/`; the large
 reference sources are only needed when regenerating converted assets. The

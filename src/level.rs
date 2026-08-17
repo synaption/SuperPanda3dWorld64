@@ -231,11 +231,33 @@ impl LevelData {
             .map(|water| water.surface_y)
     }
     pub fn floor_height(&self, point: Vec3) -> Option<f32> {
-        let mut best = None;
+        self.floor_at(point).map(|(height, _)| height)
+    }
+
+    /// The same floor, with the direction it slopes as well as its height.
+    ///
+    /// [`crate::shadow`] wants both: a blob shadow lies *on* the ground, so it
+    /// has to be turned to face the way the ground faces, and a shadow that
+    /// stayed level would stand on its edge on every hill in the map.
+    ///
+    /// The normal is forced to point upwards. The converted castle mesh does
+    /// not have consistent winding -- which is why the floor is selected by
+    /// height and not by facing in the first place -- so a triangle's own
+    /// normal is as likely to be the underside as the top, and what a caller
+    /// wants from this is which way the ground slopes rather than which way the
+    /// polygon happened to be wound.
+    pub fn floor_at(&self, point: Vec3) -> Option<(f32, Vec3)> {
+        let mut best: Option<(f32, Vec3)> = None;
         for &index in &self.cell(point.x, point.z).floors {
-            if let Some(y) = surface_y(self.triangles[index], point.x, point.z) {
-                if y <= point.y + 0.5 && best.is_none_or(|old| y > old) {
-                    best = Some(y);
+            let tri = self.triangles[index];
+            if let Some(y) = surface_y(tri, point.x, point.z) {
+                if y <= point.y + 0.5 && best.is_none_or(|(height, _)| y > height) {
+                    let up = if tri.normal.y < 0.0 {
+                        -tri.normal
+                    } else {
+                        tri.normal
+                    };
+                    best = Some((y, up));
                 }
             }
         }

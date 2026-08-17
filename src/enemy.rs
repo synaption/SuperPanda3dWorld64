@@ -60,6 +60,15 @@ impl Kind {
             Self::Scuttlebug => (0.60, 0.80),
         }
     }
+
+    /// How wide a shadow it casts.
+    ///
+    /// Narrower than the collision cylinder, which is deliberately generous so
+    /// that walking near one of these counts as touching it. A shadow drawn at
+    /// that width would stick out well past the model and read as a puddle.
+    pub fn shadow_radius(self) -> f32 {
+        self.body().0 * 0.7
+    }
 }
 
 #[derive(Component)]
@@ -98,6 +107,7 @@ pub fn spawn(
             // Parts of both of these are flat quads the original turns to face
             // the camera every frame.
             crate::billboard::BillboardActor,
+            crate::shadow::ShadowCaster::new(kind.shadow_radius()),
         ))
         .id()
 }

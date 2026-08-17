@@ -42,10 +42,10 @@ export PATH="$HOME/.cargo/bin:$PATH"
 cargo run
 ```
 
-`./run_bevy.sh` from the repository root does the same from any working
-directory. It prefers the packaged Windows executable under Git Bash/MSYS or
-WSL and the current Rust source on a native Unix host; `--source` and
-`--packaged` select either explicitly.
+`./run_bevy.sh` from the repository root runs from any working directory. By
+default it refreshes the packaged Windows build and then launches it;
+`--source` builds and runs the native Rust source, while `--packaged` launches
+the existing Windows package without rebuilding it.
 
 Sound and gamepad support build against ALSA and udev on Linux, which the WSL
 environment here has no headers for, so on Linux they are opt-in and a plain

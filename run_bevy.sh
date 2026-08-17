@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Launch the game from any working directory. On Windows-compatible Bash
-# environments (including WSL), prefer the packaged executable and its bundled
-# assets. On a native Unix host, build and run the current source with Cargo.
+# Launch the game from any working directory. By default, refresh the packaged
+# Windows build and then run it. The source and existing-package paths remain
+# available as explicit options.
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 GAME_EXE="$REPO_ROOT/dist/windows/SuperBevyWorld64.exe"
@@ -12,7 +12,7 @@ usage() {
     cat <<'EOF'
 Usage: ./run_bevy.sh [--source|--packaged]
 
-  no option    Use the Windows package under Git Bash/WSL; otherwise Cargo.
+  no option    Build/package the Windows executable, then run it.
   --source     Build and run the current Rust source with Cargo.
   --packaged   Run the packaged Windows executable.
 EOF
@@ -38,12 +38,9 @@ run_packaged() {
     exec "$GAME_EXE"
 }
 
-prefer_packaged() {
-    if [[ -f "$GAME_EXE" ]]; then
-        run_packaged
-    fi
-    echo "Packaged Windows game not found; falling back to Cargo." >&2
-    run_source
+build_and_run_packaged() {
+    "$REPO_ROOT/build_windows.sh"
+    run_packaged
 }
 
 case "${1:-}" in
@@ -57,18 +54,7 @@ case "${1:-}" in
         usage
         ;;
     "")
-        case "$(uname -s)" in
-            MINGW*|MSYS*|CYGWIN*) prefer_packaged ;;
-            Linux*)
-                if [[ -r /proc/sys/kernel/osrelease ]] &&
-                    grep -qi microsoft /proc/sys/kernel/osrelease; then
-                    prefer_packaged
-                else
-                    run_source
-                fi
-                ;;
-            *) run_source ;;
-        esac
+        build_and_run_packaged
         ;;
     *)
         usage >&2
