@@ -356,6 +356,24 @@ impl LevelData {
     /// Returns the first collision point along a segment. Used to prevent the
     /// third-person camera from passing through castle geometry.
     pub fn segment_hit(&self, start: Vec3, end: Vec3) -> Option<Vec3> {
+        self.surface_hit(start, end).map(|(point, _)| point)
+    }
+
+    /// The first surface a segment meets, as the point it was met at and the
+    /// way that surface faces.
+    ///
+    /// Unlike the floor and ceiling queries this one asks about a direction
+    /// rather than about a column, which is what anything moving over the level
+    /// rather than falling through it needs: a wall and a ceiling are surfaces
+    /// here, not exceptions to be filtered out.
+    ///
+    /// The normal is turned to point back along the segment rather than taken
+    /// as the triangle has it. The castle mesh is not consistently wound --
+    /// which is why [`Self::highest_below`] picks by height and not by facing
+    /// -- so a polygon's own normal is as likely to be its back as its front,
+    /// and what a caller probing for a surface wants is the side it arrived
+    /// from.
+    pub fn surface_hit(&self, start: Vec3, end: Vec3) -> Option<(Vec3, Vec3)> {
         let direction = end - start;
         let mut nearest = 1.0_f32;
         let mut hit = None;
@@ -381,7 +399,7 @@ impl LevelData {
                     if let Some(t) = segment_triangle_time(start, direction, tri) {
                         if t < nearest {
                             nearest = t;
-                            hit = Some(start + direction * t);
+                            hit = Some((start + direction * t, facing_back(tri.normal, direction)));
                         }
                     }
                 }
@@ -390,7 +408,7 @@ impl LevelData {
         hit
     }
 
-    fn segment_hit_brute_force(&self, start: Vec3, end: Vec3) -> Option<Vec3> {
+    fn segment_hit_brute_force(&self, start: Vec3, end: Vec3) -> Option<(Vec3, Vec3)> {
         let direction = end - start;
         let mut nearest = 1.0_f32;
         let mut hit = None;
@@ -398,7 +416,7 @@ impl LevelData {
             if let Some(t) = segment_triangle_time(start, direction, tri) {
                 if t < nearest {
                     nearest = t;
-                    hit = Some(start + direction * t);
+                    hit = Some((start + direction * t, facing_back(tri.normal, direction)));
                 }
             }
         }
@@ -424,6 +442,17 @@ fn surface_y(tri: CollisionTriangle, x: f32, z: f32) -> Option<f32> {
         Some(a.y + u * (b.y - a.y) + v * (c.y - a.y))
     } else {
         None
+    }
+}
+
+/// A triangle's normal, flipped when needed so that it points back the way a
+/// probe came from. See [`LevelData::surface_hit`] for why it cannot be trusted
+/// as it is stored.
+fn facing_back(normal: Vec3, direction: Vec3) -> Vec3 {
+    if normal.dot(direction) > 0.0 {
+        -normal
+    } else {
+        normal
     }
 }
 
@@ -568,6 +597,16 @@ mod tests {
             .segment_hit(Vec3::new(0., 0., -2.), Vec3::new(0., 0., 2.))
             .unwrap();
         assert!(hit.z.abs() < 1e-5);
+        // And the surface it hit faces back at whatever asked, whichever way
+        // round the triangle happens to be wound.
+        let (_, normal) = data
+            .surface_hit(Vec3::new(0., 0., -2.), Vec3::new(0., 0., 2.))
+            .unwrap();
+        assert!(normal.z < -0.99, "{normal:?}");
+        let (_, normal) = data
+            .surface_hit(Vec3::new(0., 0., 2.), Vec3::new(0., 0., -2.))
+            .unwrap();
+        assert!(normal.z > 0.99, "{normal:?}");
     }
 
     #[test]
@@ -622,7 +661,7 @@ mod tests {
         ];
         for (start, end) in rays {
             assert_eq!(
-                data.segment_hit(start, end),
+                data.surface_hit(start, end),
                 data.segment_hit_brute_force(start, end)
             );
         }

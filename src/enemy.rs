@@ -36,6 +36,50 @@ const KNOCKBACK_RISE: f32 = 6.0;
 /// him, which is the entire point of it.
 const INVULNERABLE_SECONDS: f32 = 1.0;
 
+/// How close the player has to get before an enemy stops milling about where
+/// it was placed and comes for him.
+const CHASE_RANGE: f32 = 12.0;
+
+/// How fast a crawler mills about when nobody is worth chasing. The walking
+/// enemies drift towards their patrol point instead, but a crawler cannot: it
+/// is somewhere on a surface and can only get anywhere by walking there.
+const WANDER_SPEED: f32 = 1.2;
+
+/// Where a crawler's probes start and how far past its feet they reach.
+///
+/// `PROBE_EYE` is the height the forward probe is cast from -- low, because a
+/// bug that meets a wall is put down where its probe struck it, and a probe
+/// cast from its back would have it teleport half its own height up the wall.
+/// `PROBE_RISE` and `PROBE_DROP` bound the down probe, and between them decide
+/// the steepest step it can climb and the widest lip it can walk over before
+/// the surface is considered to have run out.
+const PROBE_EYE: f32 = 0.12;
+const PROBE_RISE: f32 = 0.4;
+const PROBE_DROP: f32 = 0.8;
+
+/// How far past its next step a crawler looks for something in its way.
+///
+/// Short on purpose. A bug that meets a wall is stood where its probe found it,
+/// so this is also the furthest it can be moved in a tick by finding one --
+/// and a slope counts as something in the way once it rises more than
+/// `PROBE_EYE` over this. Reaching a body's width ahead, as looks reasonable,
+/// has bugs jumping the better part of a metre up every hill on the lawn.
+const PROBE_REACH: f32 = 0.15;
+
+/// How fast a crawler can turn, in radians a second.
+///
+/// Not decoration. A bug that could turn instantly ping-pongs between the floor
+/// and the wall in front of it every single tick -- the wall is the way towards
+/// a player stood behind it, and the floor is the way towards him again the
+/// moment the bug is on the wall -- and it spends the whole fight spinning on
+/// the spot. Turning at a bug's pace, it commits to the climb.
+const TURN_RATE: f32 = 3.0;
+
+/// How far off its surface a crawler is held. Nothing to do with looks: the
+/// next tick's probes start here, and a probe starting exactly on a triangle is
+/// a probe that may or may not find it depending on the last bit of the float.
+const CRAWL_SKIN: f32 = 0.02;
+
 /// The enemies the port places. Each is resolved against the player as an
 /// upright cylinder, the way the original does: a radius in the horizontal
 /// plane and a height above its feet.
@@ -81,6 +125,37 @@ pub struct Enemy {
     pub animation: Handle<AnimationClip>,
 }
 
+/// An enemy that walks the level's surfaces rather than its floors.
+///
+/// A scuttlebug has eight legs and no opinion about which way is down, so it
+/// treats a wall and a ceiling as more floor: it keeps its own up vector, which
+/// is the normal of whatever it is stuck to at the time, and everything it does
+/// -- which way it steps, which way it faces, which way it probes -- is asked
+/// relative to that rather than to the world's Y.
+#[derive(Component)]
+pub struct Crawler {
+    /// Up for this bug: the normal of the surface under its feet.
+    pub up: Vec3,
+    /// The way it is walking: a unit vector lying in that surface, which is
+    /// also the way its model is turned.
+    ///
+    /// Kept rather than worked out afresh each tick from where it wants to be,
+    /// because where it wants to be can be behind a wall -- and a bug that
+    /// reconsiders that every tick never gets anywhere. See [`TURN_RATE`].
+    pub heading: Vec3,
+}
+
+impl Default for Crawler {
+    fn default() -> Self {
+        // Whatever it is eventually stuck to, it starts the right way up and
+        // finds out on its first step.
+        Self {
+            up: Vec3::Y,
+            heading: Vec3::Z,
+        }
+    }
+}
+
 /// Puts one enemy in the world.
 ///
 /// Shared by the level's own placements and by the warp pipes so the two
@@ -109,6 +184,7 @@ pub fn spawn(
             crate::billboard::BillboardActor,
             crate::shadow::ShadowCaster::new(kind.shadow_radius()),
         ))
+        .insert_if(Crawler::default(), || kind == Kind::Scuttlebug)
         .id()
 }
 
@@ -131,6 +207,7 @@ type WalkingEnemies<'w, 's> = Query<
         &'static Enemy,
         &'static mut Transform,
         &'static mut Visibility,
+        Option<&'static mut Crawler>,
     ),
     (Without<Player>, Without<crate::pipe::Launched>),
 >;
@@ -152,7 +229,7 @@ pub fn update(
     let tick = *fixed_tick;
     enemies
         .par_iter_mut()
-        .for_each(|(entity, enemy, mut transform, mut visibility)| {
+        .for_each(|(entity, enemy, mut transform, mut visibility, crawler)| {
             let to_player = player - transform.translation;
             let distance_squared = to_player.length_squared();
             *visibility = if distance_squared > tuning.enemy_draw * tuning.enemy_draw {
@@ -173,19 +250,199 @@ pub fn update(
             // A reduced-rate step covers the skipped fixed ticks, so far actors
             // retain the same average movement and animation-independent AI time.
             let dt = crate::player::FIXED_DT * stride as f32;
-            if distance_squared < 12.0 * 12.0 {
-                let dir = Vec3::new(to_player.x, 0.0, to_player.z).normalize_or_zero();
-                transform.translation += dir * dt * tuning.enemy_speed;
-                transform.rotation = Quat::from_rotation_y(dir.x.atan2(dir.z));
+            // Where it would rather be: the player once he is close enough to
+            // be worth the trouble, and otherwise a slow circle around where it
+            // was placed.
+            let chasing = distance_squared < CHASE_RANGE * CHASE_RANGE;
+            let goal = if chasing {
+                player
             } else {
                 let a = elapsed * 0.35 + enemy.phase;
-                let target = enemy.origin + Vec3::new(a.sin(), 0.0, a.cos()) * 2.0;
-                transform.translation = transform.translation.lerp(target, dt);
-            }
-            if let Some(floor) = level.floor_height(transform.translation + Vec3::Y * 2.0) {
-                transform.translation.y = floor;
-            }
+                enemy.origin + Vec3::new(a.sin(), 0.0, a.cos()) * 2.0
+            };
+            let Some(mut crawler) = crawler else {
+                // The plain walkers stay in the horizontal plane and are
+                // dropped onto whatever floor is under them.
+                if chasing {
+                    let dir = tangent(goal - transform.translation, Vec3::Y);
+                    transform.translation += dir * dt * tuning.enemy_speed;
+                    transform.rotation = Quat::from_rotation_y(dir.x.atan2(dir.z));
+                } else {
+                    transform.translation = transform.translation.lerp(goal, dt);
+                }
+                if let Some(floor) = level.floor_height(transform.translation + Vec3::Y * 2.0) {
+                    transform.translation.y = floor;
+                }
+                return;
+            };
+            // A crawler heads for the same goal, but only along the surface it
+            // is on, and only as fast as it can turn.
+            let speed = if chasing {
+                tuning.enemy_speed
+            } else {
+                WANDER_SPEED
+            };
+            transform.translation = crawl_towards(
+                &level,
+                transform.translation,
+                &mut crawler,
+                goal,
+                speed * dt,
+                TURN_RATE * dt,
+            );
+            transform.rotation =
+                orientation(crawler.up, crawler.heading).unwrap_or(transform.rotation);
         });
+}
+
+/// Walks a crawler one tick towards `goal`, turning it as it goes, and reports
+/// where it ended up.
+///
+/// This is the whole of what a scuttlebug does, kept out of [`update`] so that a
+/// bug can be walked across a level in a test without an app around it.
+fn crawl_towards(
+    level: &LevelData,
+    position: Vec3,
+    crawler: &mut Crawler,
+    goal: Vec3,
+    step: f32,
+    turn: f32,
+) -> Vec3 {
+    // The part of the way to the goal it could actually walk. Behind a wall,
+    // that is the wall -- and a bug that walks into a wall climbs it.
+    let wanted = tangent(goal - position, crawler.up);
+    crawler.heading = steer(crawler.heading, wanted, crawler.up, turn);
+    match crawl(level, position, crawler.up, crawler.heading * step) {
+        Some((moved, up)) => {
+            // The heading is carried round the corner rather than recomputed:
+            // a bug that walks over the lip of a table is still walking the
+            // way it was, it is just that the way it was has been bent by the
+            // edge it went round.
+            crawler.heading = tangent(
+                Quat::from_rotation_arc(crawler.up, up) * crawler.heading,
+                up,
+            );
+            crawler.up = up;
+            moved
+        }
+        // Nothing within reach in any direction, so there is no surface to walk
+        // and nothing to be the right way up for: it is over open space, or
+        // under the map at a spawn point placed below the hill it was meant to
+        // be on. It carries on the way the plain walkers do -- straight there,
+        // and dropped onto the first floor that appears under it -- which is
+        // also how it gets out from under that hill.
+        None => {
+            let drifted = position + crawler.heading * step;
+            match level.floor_height(drifted + Vec3::Y * 2.0) {
+                Some(floor) => {
+                    crawler.up = Vec3::Y;
+                    Vec3::new(drifted.x, floor, drifted.z)
+                }
+                None => drifted,
+            }
+        }
+    }
+}
+
+/// Turns `heading` towards `target` within the surface `up` names, by at most
+/// `most` radians.
+fn steer(heading: Vec3, target: Vec3, up: Vec3, most: f32) -> Vec3 {
+    let heading = tangent(heading, up);
+    if heading == Vec3::ZERO {
+        return target;
+    }
+    if target == Vec3::ZERO {
+        return heading;
+    }
+    let angle = heading.angle_between(target);
+    if angle <= most {
+        return target;
+    }
+    // Which way round the shorter turn is. Dead astern it is neither way, and
+    // the bug picks one rather than standing there unable to choose.
+    let sign = if heading.cross(target).dot(up) < 0.0 {
+        -1.0
+    } else {
+        1.0
+    };
+    Quat::from_axis_angle(up, sign * most) * heading
+}
+
+/// The part of `vector` that lies in the surface whose normal is `up`, as a
+/// direction. Zero when `vector` has nothing to say about where to go along the
+/// surface, which is the case a caller has to handle rather than normalise.
+fn tangent(vector: Vec3, up: Vec3) -> Vec3 {
+    (vector - up * vector.dot(up)).normalize_or_zero()
+}
+
+/// Stands a model on `up` and turns it to face `forward`, which is the thing
+/// `from_rotation_y` cannot express once up has stopped being up.
+///
+/// `None` when the two are the same direction and there is no facing to build
+/// out of them -- a bug walking exactly into the surface it is stuck to, which
+/// the caller answers by leaving it turned the way it already was.
+fn orientation(up: Vec3, forward: Vec3) -> Option<Quat> {
+    let forward = tangent(forward, up);
+    if forward == Vec3::ZERO {
+        return None;
+    }
+    // Right-handed, and orthonormal because up and forward are perpendicular
+    // unit vectors by construction: exactly what `from_mat3` requires.
+    let right = up.cross(forward);
+    Some(Quat::from_mat3(&Mat3::from_cols(right, up, forward)))
+}
+
+/// Walks a crawler one step of `step` along whatever it is stuck to, and
+/// reports where it ended up and which way is up there.
+///
+/// Three questions, and the order they are asked in is the whole of it:
+///
+/// * is something in the way? An inside corner -- the foot of a wall, or the
+///   top of one where it meets the ceiling. The surface it ran into becomes the
+///   surface it is standing on, which is how a bug gets off the floor and,
+///   eventually, onto the ceiling.
+/// * is there anything under the step? The ordinary case, and every slope with
+///   it, since the answer carries the new surface's normal.
+/// * is there anything under the *lip* it just walked over? An outside corner --
+///   the edge of a table -- where the far side of the edge becomes the floor and
+///   the bug carries on down it upside down relative to where it started.
+///
+/// `None` when all three miss, which means open space rather than a surface.
+fn crawl(level: &LevelData, position: Vec3, up: Vec3, step: Vec3) -> Option<(Vec3, Vec3)> {
+    let distance = step.length();
+    if distance < 1e-6 {
+        // Still worth asking what it is standing on -- the ground under a bug
+        // that has stopped is the ground it should be lying along.
+        let start = position + up * PROBE_RISE;
+        return level
+            .surface_hit(start, position - up * PROBE_DROP)
+            .map(|(hit, normal)| (hit + normal * CRAWL_SKIN, normal))
+            .or(Some((position, up)));
+    }
+    let direction = step / distance;
+    // Cast from just off the surface: a probe starting on the floor it is
+    // standing on finds that floor and nothing else.
+    let eye = position + up * PROBE_EYE;
+    if let Some((hit, normal)) = level.surface_hit(eye, eye + direction * (distance + PROBE_REACH))
+    {
+        return Some((hit + normal * CRAWL_SKIN, normal));
+    }
+    let ahead = position + step;
+    if let Some((hit, normal)) = level.surface_hit(ahead + up * PROBE_RISE, ahead - up * PROBE_DROP)
+    {
+        return Some((hit + normal * CRAWL_SKIN, normal));
+    }
+    // Under and past the edge, looking back the way it came: what it finds is
+    // the far face of the lip it just walked off. Reaching back exactly as far
+    // as the edge can be and no further, because whatever this finds the bug is
+    // put on, and a longer reach is a longer hop round the corner.
+    let under = ahead - up * PROBE_DROP;
+    if let Some((hit, normal)) =
+        level.surface_hit(under, under - direction * (distance + PROBE_REACH))
+    {
+        return Some((hit + normal * CRAWL_SKIN, normal));
+    }
+    None
 }
 
 /// Resolves the player against every enemy once a tick: a swing defeats what
@@ -237,12 +494,19 @@ pub fn combat(
         }
         // Vertical overlap: his feet below its head, his head above its feet.
         // Without this he is "touching" it from a storey up.
-        if here.y > transform.translation.y + height
-            || here.y + PLAYER_HEIGHT < transform.translation.y
-        {
+        //
+        // Which end of a crawler is its head depends on what it is stuck to --
+        // one hanging from a ceiling has its head *below* its feet -- so the
+        // band it occupies is measured from the direction its own model is
+        // stood on rather than assumed to run upwards. For everything that does
+        // stand upright that reads as it always did.
+        let head = transform.translation + (transform.rotation * Vec3::Y) * height;
+        let bottom = transform.translation.y.min(head.y);
+        let top = transform.translation.y.max(head.y);
+        if here.y > top || here.y + PLAYER_HEIGHT < bottom {
             continue;
         }
-        if controller.velocity.y < 0.0 && here.y > transform.translation.y + height * STOMP_MARGIN {
+        if controller.velocity.y < 0.0 && here.y > bottom + (top - bottom) * STOMP_MARGIN {
             commands.entity(entity).despawn();
             sounds.push(Sfx::Defeat);
             controller.velocity.y = BOUNCE_VELOCITY;
@@ -285,6 +549,196 @@ mod tests {
     use super::*;
     use bevy::ecs::system::RunSystemOnce;
 
+    /// A room with a floor, one wall across the far end of it and a ceiling:
+    /// the three surfaces a scuttlebug is supposed to treat as the same thing.
+    ///
+    /// The wall is at `x = 4` and the ceiling at `y = 4`, both spanning the
+    /// floor's footprint, so a bug that keeps walking in `+x` meets each of
+    /// them in turn.
+    fn room() -> LevelData {
+        let mut vertices = Vec::new();
+        let mut triangles = Vec::new();
+        let mut quad = |a: Vec3, b: Vec3, c: Vec3, d: Vec3| {
+            let base = vertices.len() as u32;
+            vertices.extend([a, b, c, d]);
+            triangles.push([base, base + 1, base + 2]);
+            triangles.push([base, base + 2, base + 3]);
+        };
+        quad(
+            Vec3::new(-4., 0., -4.),
+            Vec3::new(4., 0., -4.),
+            Vec3::new(4., 0., 4.),
+            Vec3::new(-4., 0., 4.),
+        );
+        quad(
+            Vec3::new(4., 0., -4.),
+            Vec3::new(4., 4., -4.),
+            Vec3::new(4., 4., 4.),
+            Vec3::new(4., 0., 4.),
+        );
+        quad(
+            Vec3::new(-4., 4., -4.),
+            Vec3::new(4., 4., -4.),
+            Vec3::new(4., 4., 4.),
+            Vec3::new(-4., 4., 4.),
+        );
+        LevelData::new(vertices, triangles, Vec::new())
+    }
+
+    /// Walks a bug towards `goal` the way [`update`] does, and reports every
+    /// place it stood on the way and which way was up there.
+    fn walk(level: &LevelData, start: (Vec3, Vec3), goal: Vec3, steps: usize) -> Vec<(Vec3, Vec3)> {
+        let (mut position, up) = start;
+        let mut crawler = Crawler {
+            up,
+            heading: tangent(goal - position, up),
+        };
+        (0..steps)
+            .map(|_| {
+                position = crawl_towards(level, position, &mut crawler, goal, 0.1, TURN_RATE / 30.);
+                (position, crawler.up)
+            })
+            .collect()
+    }
+
+    /// The whole point of the thing: a scuttlebug chasing something it cannot
+    /// reach along the floor climbs the wall in its way, carries on over the
+    /// top of it onto the ceiling, and walks that upside down.
+    #[test]
+    fn a_crawler_walks_up_a_wall_and_across_the_ceiling() {
+        let level = room();
+        // Beyond the wall, so that the way to it is through the wall rather
+        // than across the floor.
+        let trail = walk(
+            &level,
+            (Vec3::new(-3., 0., 0.), Vec3::Y),
+            Vec3::new(10., 4., 0.),
+            200,
+        );
+        let climbed = trail
+            .iter()
+            .find(|(position, up)| up.x < -0.99 && position.y > 0.5)
+            .unwrap_or_else(|| panic!("it never climbed the wall: {:?}", trail.last()));
+        assert!(
+            (climbed.0.x - 4.).abs() < 0.1,
+            "climbing thin air: {climbed:?}"
+        );
+        let hanging = trail
+            .iter()
+            .find(|(_, up)| up.y < -0.99)
+            .unwrap_or_else(|| panic!("it never made it onto the ceiling: {:?}", trail.last()));
+        assert!(
+            (hanging.0.y - 4.).abs() < 0.1,
+            "hanging off nothing: {hanging:?}"
+        );
+        // And once there it walks the ceiling like any other floor, which the
+        // corner it climbed in at would hide.
+        let across = walk(&level, *hanging, Vec3::new(-10., 4., 0.), 40);
+        let (position, up) = *across.last().unwrap();
+        assert!(
+            up.y < -0.99 && (position.y - 4.).abs() < 0.1 && position.x < hanging.0.x - 1.0,
+            "it did not cross the ceiling: at {position:?} with up {up:?}"
+        );
+    }
+
+    /// The other kind of corner. Walking off the end of a slab, the bug follows
+    /// the far side of it down rather than stepping into the air.
+    #[test]
+    fn a_crawler_follows_an_edge_round_onto_the_underside() {
+        let level = LevelData::new(
+            vec![
+                Vec3::new(-4., 0., -4.),
+                Vec3::new(4., 0., -4.),
+                Vec3::new(4., 0., 4.),
+                Vec3::new(-4., 0., 4.),
+                // The slab's outer face, hanging below its edge.
+                Vec3::new(4., 0., -4.),
+                Vec3::new(4., -4., -4.),
+                Vec3::new(4., -4., 4.),
+                Vec3::new(4., 0., 4.),
+            ],
+            vec![[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]],
+            Vec::new(),
+        );
+        let (position, up) = crawl(&level, Vec3::new(4.0, 0., 0.), Vec3::Y, Vec3::X * 0.3)
+            .expect("the bug stepped into the air rather than round the edge");
+        assert!(up.x > 0.99, "not clinging to the outer face: up {up:?}");
+        assert!(position.y < 0.0, "still on top of the slab: {position:?}");
+    }
+
+    /// Turned loose on the real castle, a bug chasing a player it cannot reach
+    /// walks the place rather than fighting it.
+    ///
+    /// The failure this pins is the one the turn rate is there for. Deciding
+    /// afresh every tick which way the player is, a bug at the foot of a wall
+    /// climbs it (the way to the player is up), immediately steps back down
+    /// (the way to the player is along the floor), and repeats: six hundred
+    /// changes of surface in half a minute, which on screen is a scuttlebug
+    /// spinning like a top in the corner.
+    #[test]
+    fn a_crawler_on_the_castle_does_not_spin_between_surfaces() {
+        let (level, _) = crate::level::load();
+        for start in [Vec3::new(-29., 3., 21.), Vec3::new(4., 3., 19.)] {
+            // Somewhere it has to cross the castle to get to, so the walk takes
+            // in walls, corners and the courtyard rather than open lawn.
+            let goal = Vec3::new(0., 8., -30.);
+            let mut position = start;
+            let mut crawler = Crawler::default();
+            let mut was = crawler.up;
+            let (mut flips, mut furthest) = (0, 0.0_f32);
+            for _ in 0..900 {
+                let before = position;
+                position = crawl_towards(
+                    &level,
+                    position,
+                    &mut crawler,
+                    goal,
+                    4.0 * FIXED_DT,
+                    TURN_RATE * FIXED_DT,
+                );
+                if crawler.up.distance(was) > 0.5 {
+                    flips += 1;
+                }
+                was = crawler.up;
+                // The floor snap is allowed its jump; a step along a surface is
+                // not, and going round an edge is the longest of them.
+                if crawler.up != Vec3::Y {
+                    furthest = furthest.max(position.distance(before));
+                }
+            }
+            assert!(
+                flips < 30,
+                "from {start:?} it changed surface {flips} times in 900 ticks"
+            );
+            assert!(
+                furthest < 1.0,
+                "from {start:?} it jumped {furthest:.2} in one tick"
+            );
+            assert!(
+                position.distance(start) > 5.0,
+                "from {start:?} it never got anywhere, ending at {position:?}"
+            );
+        }
+    }
+
+    /// Nothing within reach in any direction is not a surface, and the caller
+    /// puts a bug that finds itself there back on the world's floor.
+    #[test]
+    fn a_crawler_over_open_space_finds_nothing() {
+        assert!(crawl(&room(), Vec3::new(0., 20., 0.), Vec3::Y, Vec3::X * 0.1).is_none());
+    }
+
+    /// A bug on the ceiling is stood on its head, and its model has to be too.
+    #[test]
+    fn a_crawler_is_stood_on_the_surface_it_is_stuck_to() {
+        let rotation = orientation(Vec3::NEG_Y, Vec3::X).expect("no facing was built");
+        assert!((rotation * Vec3::Y).abs_diff_eq(Vec3::NEG_Y, 1e-5));
+        assert!((rotation * Vec3::Z).abs_diff_eq(Vec3::X, 1e-5));
+        // Walking straight into the surface it is stuck to says nothing about
+        // which way it is facing, and it keeps the facing it had.
+        assert!(orientation(Vec3::Y, Vec3::Y).is_none());
+    }
+
     /// A player, and one enemy standing on his toes.
     fn world(player_y: f32, velocity: Vec3) -> (World, Entity) {
         let mut world = World::new();
@@ -318,10 +772,7 @@ mod tests {
     fn touching_an_enemy_hurts_and_knocks_the_player_back() {
         let (mut world, enemy) = world(0.0, Vec3::ZERO);
         world.run_system_once(combat).expect("combat could not run");
-        assert!(
-            world.get_entity(enemy).is_ok(),
-            "the enemy died on contact"
-        );
+        assert!(world.get_entity(enemy).is_ok(), "the enemy died on contact");
         let (velocity, health, immune) = controller(&mut world);
         assert_eq!(health, 2);
         assert!(velocity.x < 0.0, "not thrown away from it: {velocity:?}");
@@ -364,6 +815,27 @@ mod tests {
         let (velocity, health, _) = controller(&mut world);
         assert_eq!(velocity.y, BOUNCE_VELOCITY);
         assert_eq!(health, 3, "a stomp is not supposed to hurt");
+    }
+
+    /// A scuttlebug hanging from a ceiling reaches down out of it, and the
+    /// player walking underneath is walking into the bug rather than under it.
+    /// Measured upright -- from its feet upwards -- it would be a storey away.
+    #[test]
+    fn an_enemy_hanging_upside_down_reaches_downwards() {
+        let (mut world, enemy) = world(0.0, Vec3::ZERO);
+        {
+            let mut query = world.query_filtered::<&mut Transform, Without<Player>>();
+            let mut transform = query.single_mut(&mut world).unwrap();
+            transform.translation = Vec3::new(0.5, 2.2, 0.0);
+            transform.rotation = orientation(Vec3::NEG_Y, Vec3::X).unwrap();
+        }
+        world.run_system_once(combat).expect("combat could not run");
+        assert!(world.get_entity(enemy).is_ok(), "it was somehow stomped");
+        assert_eq!(
+            controller(&mut world).1,
+            2,
+            "hung out of reach of the player"
+        );
     }
 
     /// Standing on a roof directly above one is not touching it.
