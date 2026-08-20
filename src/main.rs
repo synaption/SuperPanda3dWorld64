@@ -211,7 +211,11 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
         squad::update_goals,
         squad::move_allies,
         enemy::combat,
+        enemy::alert,
         enemy::update,
+        // After the step that moved them, so a crowd that walked into itself
+        // this tick is untangled before it is drawn rather than a tick later.
+        enemy::spread,
         // The arc first, so something thrown this tick starts flying on the
         // next one rather than being stepped on the tick it was created.
         pipe::fly,
@@ -1002,3 +1006,4 @@ mod tests {
     }
 
 }
+
