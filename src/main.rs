@@ -24,10 +24,14 @@ mod water;
 
 use bevy::{
     core_pipeline::tonemapping::Tonemapping,
-    diagnostic::FrameTimeDiagnosticsPlugin,
+    diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
     ecs::{schedule::ScheduleConfigs, system::ScheduleSystem},
+    input::InputSystems,
     prelude::*,
-    window::{CursorGrabMode, CursorOptions, PrimaryWindow, WindowResolution},
+    window::{
+        CursorGrabMode, CursorOptions, MonitorSelection, PrimaryWindow, WindowMode,
+        WindowResolution,
+    },
 };
 use camera::FollowCamera;
 use input::InputState;
@@ -50,6 +54,15 @@ enum ActiveCharacter {
 
 #[derive(Component)]
 struct Hud;
+
+/// The frame-rate readout in the corner.
+///
+/// Its own node rather than a line of the debug HUD, and always drawn, because
+/// what it is for is telling whether a change costs anything -- and a reading
+/// that goes away with the rest of the debug text is one you cannot check
+/// against a clean screen.
+#[derive(Component)]
+struct FpsText;
 
 /// Writes panics to a file beside the executable as well as to stderr.
 ///
@@ -97,6 +110,13 @@ fn main() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: "Super Bevy World 64".into(),
+                        // Borderless rather than exclusive fullscreen: it takes
+                        // the monitor's own resolution and refresh rate instead
+                        // of asking for a mode switch, so alt-tabbing away and
+                        // back does not black the screen while the display
+                        // renegotiates. F11 goes back to a window.
+                        mode: WindowMode::BorderlessFullscreen(MonitorSelection::Current),
+                        // The size the window takes when F11 leaves fullscreen.
                         resolution: WindowResolution::new(1280, 720),
                         present_mode: bevy::window::PresentMode::AutoVsync,
                         ..default()
@@ -144,14 +164,36 @@ fn main() {
         .register_type::<AnimationPlayer>()
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_systems(Startup, setup)
-        // The console claims the keyboard first, then every device is polled
-        // into one snapshot, before any schedule that reads player intent.
-        .add_systems(PreUpdate, (console::input, input::gather).chain())
+        .add_systems(PreUpdate, input_pipeline())
         .add_systems(FixedUpdate, simulation())
         .add_systems(Update, presentation())
         .add_systems(Update, overlay())
         .add_systems(PostUpdate, (billboard::systems(), n64::systems()).chain())
         .run();
+}
+
+/// Reading the keyboard, the mouse and the pad into one snapshot for the frame.
+///
+/// The console claims the keyboard first, then every device is polled into one
+/// snapshot, before any schedule that reads player intent.
+///
+/// The `after` is the part that is not obvious, and leaving it off is a real
+/// bug rather than untidiness. `ButtonInput` is not a fact that sits still: at
+/// the top of every `PreUpdate`, Bevy's own `keyboard_input_system` *clears*
+/// last frame's just-pressed set and refills it from this frame's events.
+/// Sharing a schedule with it is not enough, because these two systems only
+/// take turns -- they both touch `ButtonInput<KeyCode>`, so the executor will
+/// not run them at once, but nothing said which goes first, and which one wins
+/// is down to whichever thread is free.
+///
+/// Land on opposite sides of the clear on two consecutive frames and one
+/// physical key press is read as two. Every edge here is a toggle or latches
+/// with `|=`, so reading it twice is reading it zero times: the console opens
+/// and shuts inside a single frame, F1 turns the HUD off and back on, F11
+/// leaves and re-enters fullscreen, and Escape drops the cursor and grabs it
+/// again. The key looks dead. It was pressed exactly once and acted on twice.
+fn input_pipeline() -> ScheduleConfigs<ScheduleSystem> {
+    (console::input, input::gather).chain().after(InputSystems)
 }
 
 /// The fixed-step simulation, in the order one tick runs.
@@ -210,6 +252,12 @@ fn overlay() -> ScheduleConfigs<ScheduleSystem> {
         enemy::sync_animation_visibility,
         audio::play,
         console::draw,
+        // Both of these belong out here rather than in `presentation`: a frame
+        // drawn while the console is open is still a frame, and being stuck
+        // fullscreen because the console is up is exactly the trap F11 exists
+        // to avoid.
+        toggle_fullscreen,
+        update_fps,
     )
         .chain()
 }
@@ -231,7 +279,7 @@ fn setup(
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
     let (collision, render) = level::load();
-    shadow::prepare(&mut commands, &mut meshes, &mut images);
+    shadow::prepare(&mut commands, &mut meshes, &mut images, &mut materials);
     water::spawn(
         &mut commands,
         &assets,
@@ -263,9 +311,6 @@ fn setup(
     });
     commands.spawn((
         Player,
-        // The disc under him is as wide as the body the walls push around,
-        // which is the part of him actually standing on the ground.
-        shadow::ShadowCaster::new(player::PLAYER_RADIUS),
         PreviousPose::new(&spawn),
         Controller::default(),
         // What `SpatialBundle` used to carry. `Transform` now brings
@@ -274,15 +319,28 @@ fn setup(
         spawn,
         Visibility::default(),
     ));
+    // The disc goes under the *visual* rather than under the `Player` entity,
+    // and that is not an arbitrary choice of parent. `Player` carries the
+    // simulation's transform, rewritten thirty times a second; the visuals
+    // carry `RenderPose`, which `player::sync_visual` interpolates between two
+    // of those steps once per drawn frame. A shadow hung off the simulation
+    // transform snaps between fixed steps while the character it belongs to
+    // glides, which reads as the shadow juddering under his feet.
+    //
+    // It also settles which shadow: only one of the two visuals is ever shown,
+    // and `project` already hides the disc of a caster nobody is drawing.
+    let shadow = shadow::ShadowCaster::new(player::PLAYER_RADIUS);
     commands.spawn((
         PlayerVisual,
         ActiveCharacter::Hero,
+        shadow,
         WorldAssetRoot(assets.load("hero/hero.glb#Scene0")),
         Transform::from_scale(Vec3::splat(0.81)),
     ));
     commands.spawn((
         PlayerVisual,
         ActiveCharacter::Mario,
+        shadow,
         WorldAssetRoot(assets.load("mario/mario.glb#Scene0")),
         Visibility::Hidden,
         Transform::from_scale(Vec3::splat(0.00667)),
@@ -346,6 +404,9 @@ fn setup(
             yaw: 0.0,
             pitch: -0.2,
             distance: 9.5,
+            // Starts fully extended: the first frame eases in from wherever the
+            // level actually leaves room, rather than out from the player's head.
+            clearance: 1.0,
         },
         // N64 colours are already display-referred bytes. Filmic HDR grading
         // would alter their contrast, saturation, and hue a second time.
@@ -383,6 +444,21 @@ fn setup(
             position_type: PositionType::Absolute,
             left: Val::Percent(49.5),
             top: Val::Percent(47.0),
+            ..default()
+        },
+    ));
+    commands.spawn((
+        FpsText,
+        Text::new(""),
+        TextFont {
+            font_size: FontSize::Px(18.0),
+            ..default()
+        },
+        TextColor(Color::srgb(0.55, 1.0, 0.55)),
+        Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(16.0),
+            top: Val::Px(12.0),
             ..default()
         },
     ));
@@ -439,6 +515,55 @@ fn controls(
     }
 }
 
+/// Writes the corner frame-rate readout.
+///
+/// Smoothed rather than instantaneous: the raw per-frame number swings far too
+/// fast to read, and what anyone looking at it wants to know is what the frame
+/// rate *is*, not what one particular frame cost. The frame time comes along
+/// with it because it is the number that scales linearly with work -- twice the
+/// milliseconds is twice the cost, where a drop from 240 to 200 fps and one
+/// from 60 to 55 look alike and are not.
+fn update_fps(diagnostics: Res<DiagnosticsStore>, mut text: Query<&mut Text, With<FpsText>>) {
+    let Ok(mut readout) = text.single_mut() else {
+        return;
+    };
+    let fps = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(|fps| fps.smoothed());
+    let frame_time = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .and_then(|frame_time| frame_time.smoothed());
+    **readout = match (fps, frame_time) {
+        (Some(fps), Some(frame_time)) => format!("{fps:.0} fps · {frame_time:.1} ms"),
+        // The diagnostic needs a few frames before it has anything to average,
+        // and a blank corner says that better than a zero would.
+        _ => String::new(),
+    };
+}
+
+/// Puts the window back into a window, and back into fullscreen again.
+///
+/// Fullscreen is the default, and a game that starts fullscreen with no way out
+/// of it is a game you have to kill to get your desktop back.
+fn toggle_fullscreen(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut window: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    // Not gated on the console being shut, unlike everything else that reads a
+    // key. Being stuck fullscreen because the console is up is the exact trap
+    // this exists to get out of, and F11 types nothing into the prompt anyway.
+    if !keys.just_pressed(KeyCode::F11) {
+        return;
+    }
+    let Ok(mut window) = window.single_mut() else {
+        return;
+    };
+    window.mode = match window.mode {
+        WindowMode::Windowed => WindowMode::BorderlessFullscreen(MonitorSelection::Current),
+        _ => WindowMode::Windowed,
+    };
+}
+
 fn update_hud(
     state: Res<GameState>,
     input: Res<InputState>,
@@ -459,7 +584,7 @@ fn update_hud(
         let following = squad.members.len();
         let marching = squad.marching();
         let holding = squad.sent.len() - marching;
-        format!("Super Bevy World 64\n{:?}  ·  {:?}  ·  Health {}  ·  {device}\nSquad {following} following · {marching} marching · {holding} holding\nWASD move · mouse look · Space jump · V jetpack/skate\nShift attack · X squad (hold to whistle, tap to send)\nF/right mouse aim · ` console · F2 switch · Esc cursor", state.active, ctrl.motion, ctrl.health)
+        format!("Super Bevy World 64\n{:?}  ·  {:?}  ·  Health {}  ·  {device}\nSquad {following} following · {marching} marching · {holding} holding\nWASD move · mouse look · Space jump · V jetpack/skate\nShift attack · X squad (hold to whistle, tap to send)\nF/right mouse aim · ` console · F2 switch · Esc cursor · F11 window", state.active, ctrl.motion, ctrl.health)
     } else {
         String::new()
     };
@@ -839,4 +964,41 @@ mod tests {
     fn startup_has_no_conflicting_queries() {
         initialise(setup.into_configs());
     }
+
+    /// A key press must be read once, not twice.
+    ///
+    /// Bevy's `keyboard_input_system` clears and refills `ButtonInput` in
+    /// `PreUpdate`, the same schedule the game reads it in. Both touch the same
+    /// resource, so the executor serialises them -- but until
+    /// [`input_pipeline`] says `after`, *which order* is down to thread timing,
+    /// and an order that flips between frames reads one press on both sides of
+    /// the clear. Every edge the pipeline latches is a toggle, so a doubled
+    /// read cancels itself and the key appears dead.
+    ///
+    /// Bevy can prove the ordering exists rather than the test having to catch
+    /// a race in the act: ambiguity detection fails the schedule build when two
+    /// systems share access with no order between them.
+    #[test]
+    fn keys_are_read_after_bevy_refills_them() {
+        use bevy::ecs::schedule::{LogLevel, ScheduleBuildSettings};
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_plugins(bevy::input::InputPlugin)
+            .init_resource::<console::ConsoleState>()
+            .init_resource::<console::GameTuning>()
+            .init_resource::<input::InputState>()
+            .add_systems(PreUpdate, input_pipeline());
+        app.edit_schedule(PreUpdate, |schedule| {
+            schedule.set_build_settings(ScheduleBuildSettings {
+                ambiguity_detection: LogLevel::Error,
+                ..default()
+            });
+        });
+        app.finish();
+        app.cleanup();
+        // Panics with the ambiguity spelled out if the ordering is ever dropped.
+        app.update();
+    }
+
 }
