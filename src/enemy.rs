@@ -1,14 +1,21 @@
-//! The things that can be fought, and how they resolve against the player.
+//! The things that can be fought, and how they resolve against each other.
 //!
-//! The combat rules are ported from `Interactions.resolve` in
-//! `sm64py/objects.py`, and every distance is that build's, converted from
+//! Two sides: the enemies, and the player with his Marios. Both sides notice
+//! each other the same way, pass the alarm along the same way, and walk to
+//! whatever they have noticed the same way -- see [`Side`] and [`alert`] -- and
+//! then each resolves what it does on arrival in its own terms, because a
+//! sword, a punch and walking into a goomba are three different things.
+//!
+//! The player's half of the combat rules is ported from `Interactions.resolve`
+//! in `sm64py/objects.py`, and every distance is that build's, converted from
 //! SM64 units to the port's world scale of 1/100.
 
 use crate::{
     audio::{Sfx, SoundQueue},
     console::GameTuning,
     level::LevelData,
-    player::{Controller, Player, FIXED_DT, PLAYER_HEIGHT},
+    player::{Controller, Motion, Player, FIXED_DT, PLAYER_HEIGHT},
+    squad::Ally,
 };
 use bevy::{platform::collections::HashMap, prelude::*};
 
@@ -54,6 +61,27 @@ const WANDER_ARRIVE: f32 = 0.6;
 const WANDER_REST: f32 = 1.5;
 const WANDER_REST_SPREAD: f32 = 3.0;
 
+/// The tallest thing a walking enemy can get up.
+///
+/// Not a tuning knob so much as a statement of what a goomba is: a short thing
+/// on two feet. Anything taller than this is a wall to it however walkable the
+/// top happens to be, which is the difference between climbing a slope and
+/// appearing on top of a cliff.
+///
+/// It is half a unit because that is the tolerance [`LevelData::ground_at`]
+/// already answers with, and one step limit is better than two that disagree.
+const STEP_UP: f32 = 0.5;
+
+/// How fast an enemy's feet follow the ground under them, climbing and
+/// falling, in world units a second.
+///
+/// The floor query answers where its feet belong; putting them there in one
+/// step is what makes a walker crossing a lip or a step look like it changed
+/// elevation rather than walked up it. Climbing is the slower of the two on
+/// purpose: things fall faster than they clamber.
+const CLIMB_SPEED: f32 = 4.0;
+const FALL_SPEED: f32 = 14.0;
+
 /// How much room two enemies keep between their bodies, on top of the two
 /// bodies themselves.
 ///
@@ -63,12 +91,18 @@ const WANDER_REST_SPREAD: f32 = 3.0;
 /// several models in it.
 const PERSONAL_SPACE: f32 = 0.35;
 
-/// How much of the overlap between two enemies is taken out per tick.
+/// How much of the overlap between two enemies is taken out per tick, how much
+/// overlap is beneath noticing, and the furthest one may be shoved in a tick.
 ///
-/// Not all of it: both of them are pushed, so a pair closes half the gap
-/// between them each tick anyway, and shoving the whole overlap out at once
-/// makes a dense crowd pop rather than settle.
-const SPREAD_RATE: f32 = 0.5;
+/// All three exist to keep a crowd still. Both members of a pair are pushed, so
+/// even a quarter each closes the gap between them soon enough; the slack means
+/// two that are merely touching are left alone rather than shoved apart and
+/// pulled back every tick; and the cap stops one in the middle of a press, with
+/// neighbours leaning on it from every side, from being fired out of the crowd
+/// by the sum of them.
+const SPREAD_RATE: f32 = 0.25;
+const SPREAD_SLACK: f32 = 0.05;
+const SPREAD_LIMIT: f32 = 1.5;
 
 /// Where a crawler's probes start and how far past its feet they reach.
 ///
@@ -148,6 +182,19 @@ pub struct Enemy {
     pub animation: Handle<AnimationClip>,
 }
 
+/// Which side of the fight a creature is on.
+///
+/// On the enemies, on the Marios, and on the player -- the player carries one
+/// without being able to notice anything himself, because a side is what makes
+/// him worth noticing. Everything [`alert`] does is asked in terms of this
+/// rather than of what a creature is: a Mario looks for the nearest thing not
+/// on its side exactly as a goomba does.
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Side {
+    Hostile,
+    Friendly,
+}
+
 /// What an enemy has noticed, which is the whole of whether it is coming for
 /// you or ambling about.
 ///
@@ -165,6 +212,62 @@ pub struct Aggro {
     /// for the last place it knew of when the target is gone -- and so that
     /// the movement step needs nothing but the enemy's own components.
     pub at: Vec3,
+}
+
+/// How wide a berth an enemy gives what it is chasing, and how far that berth
+/// varies from one to the next.
+///
+/// Without it every enemy in a brood walks to the same point -- the target's
+/// feet -- and a crowd chasing one player is a crowd converging on one spot,
+/// which is a scrum that [`spread`] then spends the fight pushing apart. With
+/// it they arrive around him instead.
+const STAND_OFF: f32 = 1.0;
+const STAND_OFF_SPREAD: f32 = 1.6;
+
+/// How far off the straight line to its goal an enemy wanders, and how quickly
+/// that wander swings from one side to the other.
+const WEAVE_WIDTH: f32 = 0.9;
+const WEAVE_RATE: f32 = 1.3;
+
+/// How much faster or slower than the rest one enemy walks, as a fraction.
+const PACE_SPREAD: f32 = 0.25;
+
+/// The small differences between one enemy and the next.
+///
+/// All of it comes off a single number fixed when the enemy is placed, so a
+/// brood out of one pipe is a crowd of individuals rather than a marching band,
+/// and none of it needs a random number generator -- the field stays
+/// reproducible, which is what lets a test walk one of these across the castle
+/// and get the same answer twice.
+#[derive(Component)]
+pub struct Quirk {
+    seed: f32,
+}
+
+impl Quirk {
+    fn new(phase: f32) -> Self {
+        Self {
+            seed: phase * crate::squad::GOLDEN_ANGLE,
+        }
+    }
+
+    /// Its own walking pace, as a multiple of the speed for its kind.
+    fn pace(&self) -> f32 {
+        1.0 + PACE_SPREAD * (self.seed * 1.7).sin()
+    }
+
+    /// The spot around a target it makes for, rather than the target itself.
+    fn stand_off(&self) -> Vec3 {
+        let angle = self.seed * 2.3;
+        let reach = STAND_OFF + STAND_OFF_SPREAD * (self.seed * 0.9).sin().abs();
+        Vec3::new(angle.sin(), 0.0, angle.cos()) * reach
+    }
+
+    /// How far to one side of the straight line to its goal it is at `elapsed`,
+    /// which is what keeps a group from converging along one bearing.
+    fn weave(&self, elapsed: f32) -> f32 {
+        WEAVE_WIDTH * (elapsed * WEAVE_RATE + self.seed).sin()
+    }
 }
 
 /// Where an enemy mills about while [`Aggro`] is empty.
@@ -278,7 +381,9 @@ pub fn spawn(
                 kind,
                 animation: assets.load(format!("{}#Animation0", kind.model())),
             },
+            Side::Hostile,
             Aggro::default(),
+            Quirk::new(phase),
             Wander::new(position, phase),
             WorldAssetRoot(assets.load(format!("{}#Scene0", kind.model()))),
             Transform::from_translation(position).with_scale(Vec3::splat(0.01)),
@@ -291,9 +396,119 @@ pub fn spawn(
         .id()
 }
 
-/// Every enemy's whereabouts and what it has noticed.
-type Crowd<'w, 's> =
-    Query<'w, 's, (Entity, &'static Transform, &'static mut Aggro), (With<Enemy>, Without<Player>)>;
+/// Everything that can be noticed: where it is and whose side it is on.
+type Creatures<'w, 's> = Query<'w, 's, (Entity, &'static Transform, &'static Side)>;
+
+/// Everything that does the noticing, which is the same crowd less the player,
+/// who is told what to chase by whoever is holding the controller.
+type Hunters<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Transform,
+        &'static Side,
+        &'static mut Aggro,
+    ),
+>;
+
+/// Who has noticed whom, and who has been told about it.
+///
+/// One rule for both sides. A creature with nothing to chase looks for the
+/// nearest creature not on its side within `enemy_sight`; the moment it finds
+/// one, everything on *its* side within `enemy_alert` hears about it, and
+/// everything within `enemy_alert` of them hears it in turn, until the chain
+/// runs out of neighbours. A crowd with one lookout in it all turns round at
+/// once, which is what makes walking into the middle of one a mistake rather
+/// than a series of separate small ones.
+///
+/// Only creatures that took the alarm this tick pass it on. One already in a
+/// fight is not shouting about it forever, or the alarm would creep across the
+/// whole field through whatever incidental pairs drift within earshot.
+///
+/// Nothing is ever given up on except by dying: aggro is not a leash, and an
+/// enemy that has seen you comes until it or you are gone. What it does lose is
+/// a target that has been despawned, which is not giving up but having won.
+pub fn alert(tuning: Res<GameTuning>, everyone: Creatures, mut hunters: Hunters) {
+    let crowd: Vec<(Entity, Vec3, Side)> = everyone
+        .iter()
+        .map(|(entity, transform, side)| (entity, transform.translation, *side))
+        .collect();
+    let mut hunting: Vec<(Entity, Vec3, Side, Option<Entity>)> = hunters
+        .iter()
+        .map(|(entity, transform, side, aggro)| {
+            let target = aggro
+                .target
+                // A target that is no longer in the world is no target. This is
+                // how a Mario that has just flattened a goomba goes looking for
+                // the next one rather than standing over the spot.
+                .filter(|target| everyone.get(*target).is_ok());
+            (entity, transform.translation, *side, target)
+        })
+        .collect();
+    // Who can see something to go for. These are the seeds of the chain, and
+    // the only ones that shout.
+    let sight = tuning.enemy_sight;
+    let seen = Neighbourhood::new(crowd.iter().map(|(_, at, _)| *at), sight);
+    let mut nearby = Vec::new();
+    let seeds: Vec<(usize, Entity)> = hunting
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, _, target))| target.is_none())
+        .filter_map(|(index, &(_, at, side, _))| {
+            seen.near(at, &mut nearby);
+            nearby
+                .iter()
+                .map(|&other| crowd[other])
+                .filter(|(_, _, theirs)| *theirs != side)
+                .map(|(entity, theirs, _)| (entity, at.distance_squared(theirs)))
+                .filter(|(_, range)| *range < sight * sight)
+                .min_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(quarry, _)| (index, quarry))
+        })
+        .collect();
+    let mut shouting: Vec<usize> = Vec::new();
+    for (index, quarry) in seeds {
+        hunting[index].3 = Some(quarry);
+        shouting.push(index);
+    }
+    // And the chain: everything on the same side within earshot of a shout
+    // takes the same target and shouts in its turn.
+    let earshot = tuning.enemy_alert;
+    let earshot_grid = Neighbourhood::new(hunting.iter().map(|(_, at, _, _)| *at), earshot);
+    while let Some(index) = shouting.pop() {
+        let (_, from, side, target) = hunting[index];
+        earshot_grid.near(from, &mut nearby);
+        for &other in &nearby {
+            let (_, theirs, their_side, their_target) = hunting[other];
+            if their_target.is_some()
+                || their_side != side
+                || theirs.distance_squared(from) >= earshot * earshot
+            {
+                continue;
+            }
+            hunting[other].3 = target;
+            shouting.push(other);
+        }
+    }
+    // Written back by entity rather than by position in the iteration, which is
+    // not a thing to bet a fight on.
+    let decided: HashMap<Entity, Option<Entity>> = hunting
+        .iter()
+        .map(|(entity, _, _, target)| (*entity, *target))
+        .collect();
+    for (entity, transform, _, mut aggro) in &mut hunters {
+        let target = decided.get(&entity).copied().flatten();
+        if aggro.target != target {
+            aggro.target = target;
+        }
+        // Where that target is now, for the movement step to walk towards.
+        aggro.at = match target.and_then(|target| everyone.get(target).ok()) {
+            Some((_, seen, _)) => seen.translation,
+            None => transform.translation,
+        };
+    }
+}
 
 /// The enemies that are held out of each other. Anything still flying the arc a
 /// pipe threw it is left out, for the same reason the movement step leaves it
@@ -309,92 +524,6 @@ type Jostling<'w, 's> = Query<
     ),
     (Without<Player>, Without<crate::pipe::Launched>),
 >;
-
-/// Who has noticed the player, and who has been told about it.
-///
-/// Two things, because they are the same thing: an enemy notices the player by
-/// itself when he comes within `enemy_sight`, and the moment one does, every
-/// other enemy within `enemy_alert` of it hears the alarm -- and so does every
-/// enemy within `enemy_alert` of *them*, out and out until the chain runs out
-/// of neighbours. A crowd with one lookout in it is a crowd that all turns
-/// round at once, which is what makes walking into the middle of one a mistake
-/// rather than a series of separate small mistakes.
-///
-/// Only enemies that took the alarm this tick pass it on. An enemy already
-/// chasing you is not shouting about it forever, or the alarm would creep
-/// across the whole field through whatever incidental pairs happen to drift
-/// within earshot of each other.
-///
-/// "Aligned" is every other enemy: they are all one side here, and the day they
-/// are not is the day this grows a side to compare rather than another system.
-pub fn alert(
-    tuning: Res<GameTuning>,
-    player: Query<(Entity, &Transform), With<Player>>,
-    whereabouts: Query<&Transform>,
-    mut enemies: Crowd,
-) {
-    let Ok((hero, hero_transform)) = player.single() else {
-        return;
-    };
-    let hero_at = hero_transform.translation;
-    let crowd: Vec<(Entity, Vec3, Option<Entity>)> = enemies
-        .iter()
-        .map(|(entity, transform, aggro)| (entity, transform.translation, aggro.target))
-        .collect();
-    let mut targets: Vec<Option<Entity>> = crowd.iter().map(|(_, _, target)| *target).collect();
-    // Whoever can see him from where they are standing. These are the seeds of
-    // the chain, and the only enemies that shout.
-    let sight = tuning.enemy_sight;
-    let mut shouting: Vec<usize> = Vec::new();
-    for (index, (_, position, target)) in crowd.iter().enumerate() {
-        if target.is_none() && position.distance_squared(hero_at) < sight * sight {
-            targets[index] = Some(hero);
-            shouting.push(index);
-        }
-    }
-    // And the chain itself: everything within earshot of a shout takes the same
-    // target and shouts in its turn. Bucketed by earshot so that a field of
-    // five thousand does not cost every pair of them.
-    let earshot = tuning.enemy_alert;
-    let crowd_grid = Neighbourhood::new(crowd.iter().map(|(_, at, _)| *at), earshot);
-    let mut heard = Vec::new();
-    while let Some(index) = shouting.pop() {
-        let (_, from, _) = crowd[index];
-        crowd_grid.near(from, &mut heard);
-        for &other in &heard {
-            if targets[other].is_some()
-                || crowd[other].1.distance_squared(from) >= earshot * earshot
-            {
-                continue;
-            }
-            targets[other] = targets[index];
-            shouting.push(other);
-        }
-    }
-    // Written back by entity rather than by position in the iteration, which is
-    // not a thing to bet a chase on.
-    let decided: HashMap<Entity, Option<Entity>> = crowd
-        .iter()
-        .zip(&targets)
-        .filter(|((_, _, was), now)| was != *now)
-        .map(|((entity, _, _), now)| (*entity, *now))
-        .collect();
-    for (entity, transform, mut aggro) in &mut enemies {
-        if let Some(target) = decided.get(&entity) {
-            aggro.target = *target;
-        }
-        // Where the target is now, for the movement step to walk towards. An
-        // enemy whose target has been despawned keeps the last place it saw it
-        // and goes there, which is the closest thing to looking for it.
-        if let Some(target) = aggro.target {
-            if let Ok(seen) = whereabouts.get(target) {
-                aggro.at = seen.translation;
-            }
-        } else {
-            aggro.at = transform.translation;
-        }
-    }
-}
 
 /// Holds enemies out of one another, so that a crowd chasing one player stays a
 /// crowd rather than converging into a single stack of models.
@@ -434,7 +563,7 @@ pub fn spread(mut enemies: Jostling) {
             let (_, theirs, their_radius, _) = crowd[other];
             let room = radius + their_radius + PERSONAL_SPACE;
             let apart = position - theirs;
-            let overlap = room - apart.length();
+            let overlap = room - apart.length() - SPREAD_SLACK;
             if overlap <= 0.0 {
                 continue;
             }
@@ -453,7 +582,7 @@ pub fn spread(mut enemies: Jostling) {
         }
         if push != Vec3::ZERO {
             if let Ok((_, _, mut transform, _)) = enemies.get_mut(entity) {
-                transform.translation += push;
+                transform.translation += push.clamp_length_max(SPREAD_LIMIT * FIXED_DT);
             }
         }
     }
@@ -525,9 +654,11 @@ type WalkingEnemies<'w, 's> = Query<
     's,
     (
         Entity,
+        &'static Enemy,
         &'static mut Transform,
         &'static mut Visibility,
         &'static Aggro,
+        &'static Quirk,
         &'static mut Wander,
         Option<&'static mut Crawler>,
     ),
@@ -535,6 +666,7 @@ type WalkingEnemies<'w, 's> = Query<
 >;
 
 pub fn update(
+    fixed_time: Res<Time<Fixed>>,
     level: Res<LevelData>,
     player: Query<&Transform, With<Player>>,
     mut enemies: WalkingEnemies,
@@ -545,10 +677,11 @@ pub fn update(
         return;
     };
     let player = player.translation;
+    let elapsed = fixed_time.elapsed_secs();
     *fixed_tick = fixed_tick.wrapping_add(1);
     let tick = *fixed_tick;
     enemies.par_iter_mut().for_each(
-        |(entity, mut transform, mut visibility, aggro, mut wander, crawler)| {
+        |(entity, enemy, mut transform, mut visibility, aggro, quirk, mut wander, crawler)| {
             let distance_squared = player.distance_squared(transform.translation);
             *visibility = if distance_squared > tuning.enemy_draw * tuning.enemy_draw {
                 Visibility::Hidden
@@ -569,60 +702,153 @@ pub fn update(
             // retain the same average movement and animation-independent AI time.
             let dt = crate::player::FIXED_DT * stride as f32;
             // Where it is going, and how fast. Something it has noticed is
-            // chased at the chase speed and never given up on; the rest of the
-            // time it ambles around its own patch, and standing about between
-            // one spot and the next is a goal of `None`.
+            // chased at the chase speed and never given up on -- at its own
+            // spot around it rather than at it, so a brood arrives around what
+            // it is after instead of inside it. The rest of the time it ambles
+            // around its own patch, and standing about between one spot and the
+            // next is a goal of `None`.
             let (goal, speed) = match aggro.target {
-                Some(_) => (Some(aggro.at), tuning.enemy_speed),
+                Some(_) => (Some(aggro.at + quirk.stand_off()), tuning.enemy_speed),
                 None => (wander.goal(transform.translation, dt), WANDER_SPEED),
             };
+            let speed = speed * quirk.pace();
+            let up = crawler.as_ref().map_or(Vec3::Y, |crawler| crawler.up);
+            // A wander across the line it is walking, so that a group heading
+            // for one place does not converge on it along one bearing.
+            let goal = goal.map(|goal| {
+                let across = (goal - transform.translation).cross(up).normalize_or_zero();
+                goal + across * quirk.weave(elapsed)
+            });
             let Some(mut crawler) = crawler else {
-                // The plain walkers stay in the horizontal plane and are
-                // dropped onto whatever floor is under them.
+                // The plain walkers stay in the horizontal plane, are stopped by
+                // anything too steep to walk, and follow the ground under them.
                 if let Some(goal) = goal {
                     let dir = tangent(goal - transform.translation, Vec3::Y);
-                    transform.translation += dir * dt * speed;
+                    transform.translation = walk(
+                        &level,
+                        transform.translation,
+                        dir * dt * speed,
+                        enemy.kind.body().0,
+                    );
                     transform.rotation = Quat::from_rotation_y(dir.x.atan2(dir.z));
                 }
-                if let Some(floor) = ground_under(&level, transform.translation) {
-                    transform.translation.y = floor;
-                }
+                transform.translation = settle(&level, transform.translation, dt);
                 return;
             };
             // A crawler heads for the same goal, but only along the surface it
             // is on, and only as fast as it can turn. Standing about, it is
             // still asked to walk nowhere in the direction it already faces:
             // that re-seats it on ground that may have shifted under it.
-            let (goal, step) = match goal {
-                Some(goal) => (goal, speed * dt),
+            let (goal, speed) = match goal {
+                Some(goal) => (goal, speed),
                 None => (transform.translation + crawler.heading, 0.0),
             };
-            transform.translation = crawl_towards(
-                &level,
-                transform.translation,
-                &mut crawler,
-                goal,
-                step,
-                TURN_RATE * dt,
-            );
+            transform.translation =
+                crawl_towards(&level, transform.translation, &mut crawler, goal, speed, dt);
             transform.rotation =
                 orientation(crawler.up, crawler.heading).unwrap_or(transform.rotation);
         },
     );
 }
 
-/// The height an enemy stands at over `position`: the floor under it, or, when
-/// there is none, the top of whatever it is inside.
+/// Takes one step along the ground, if there is ground to take it onto.
 ///
-/// The second half is not a curiosity. Several of the level's own placements
-/// are authored below the lawn they are meant to be standing on, and an enemy
-/// that only ever looks *down* for ground never finds any -- it spends the
-/// session sliding about inside the hill. What is over its head there is the
-/// underside of that hill, so the thing to do with it is climb out.
-fn ground_under(level: &LevelData, position: Vec3) -> Option<f32> {
-    level
-        .floor_height(position + Vec3::Y * 2.0)
-        .or_else(|| level.ceiling_height(position, 0.0))
+/// Two questions, and between them they are the whole of what a walking enemy
+/// may do with a cliff:
+///
+///  * is there something too steep to walk in the way? Probed at [`STEP_UP`]
+///    above its feet, so that a kerb it could step up passes underneath the
+///    probe while a wall, a cliff face or a slope past
+///    [`crate::level::GROUND_NORMAL_Y`] does not. Steepness is measured with the
+///    same threshold the collision grid sorts walls by, because a walker's idea
+///    of too steep and the level's had better be one idea.
+///  * is there ground at the far end to put its feet on? Ground it can get up
+///    onto in a step, which is what [`LevelData::ground_at`] answers.
+///
+/// A refused step is retried one axis at a time, so a goomba that walks into a
+/// wall at an angle slides along it instead of standing there pushing.
+///
+/// This replaced snapping to whatever the floor query answered, which is how a
+/// goomba at the bottom of a cliff used to arrive at the top of it: the query
+/// was happy to hand back a surface two body-heights up, and being handed it was
+/// the same thing as standing on it.
+fn walk(level: &LevelData, position: Vec3, step: Vec3, radius: f32) -> Vec3 {
+    let knee = Vec3::Y * STEP_UP;
+    for candidate in [
+        step,
+        Vec3::new(step.x, 0.0, 0.0),
+        Vec3::new(0.0, 0.0, step.z),
+    ] {
+        if candidate.length_squared() < 1e-12 {
+            continue;
+        }
+        // A body's width past where it would end up, so it stops with its face
+        // at the wall rather than inside it.
+        let reach = candidate + candidate.normalize() * radius;
+        let blocked = level
+            .surface_hit(position + knee, position + knee + reach)
+            .is_some_and(|(_, normal)| normal.y.abs() <= crate::level::GROUND_NORMAL_Y);
+        if blocked {
+            continue;
+        }
+        let there = position + candidate;
+        if level.ground_at(there).is_some() {
+            return there;
+        }
+    }
+    position
+}
+
+/// Walks `position` towards whatever it should be standing on, at a pace rather
+/// than by teleport.
+///
+/// Three cases, and which one applies is the whole of how a walker treats a
+/// cliff:
+///
+///  * there is ground under it -- *ground*, meaning something it could walk up
+///    onto rather than merely something solid. [`LevelData::ground_at`] refuses
+///    both the too-steep and the too-high, so what comes back is a step and not
+///    a climb, and a goomba at the foot of a cliff is not offered the top of it.
+///  * there is something under it but nothing it can stand on: a cliff face, the
+///    slope it just walked off. It falls, and no further than the thing it fell
+///    onto.
+///  * there is nothing under it at all, which over this castle means it is
+///    *inside* something rather than above it -- several of the level's own
+///    placements are authored below the lawn they belong on. What is over its
+///    head is the underside of that lawn, so it climbs out onto it.
+///
+/// The pace matters as much as the choice. The floor query answers a column and
+/// a column's answer jumps; taking it whole is what made goombas appear to morph
+/// between elevations rather than walk between them.
+fn settle(level: &LevelData, position: Vec3, dt: f32) -> Vec3 {
+    let (rise, drop) = (CLIMB_SPEED * dt, FALL_SPEED * dt);
+    let towards = |height: f32, most: f32| {
+        Vec3::new(
+            position.x,
+            position.y + (height - position.y).clamp(-drop, most),
+            position.z,
+        )
+    };
+    if let Some((ground, _)) = level.ground_at(position) {
+        return towards(ground, rise);
+    }
+    match level.floor_height(position + Vec3::Y * STEP_UP) {
+        // Nothing to stand on, but something to land on.
+        Some(floor) => towards(floor, 0.0),
+        // Nothing either: it is in the hill rather than on it.
+        None => match level.ceiling_height(position, 0.0) {
+            Some(top) => towards(top, rise),
+            None => position,
+        },
+    }
+}
+
+/// Is there anything at all for an enemy to stand on here?
+///
+/// Asked of the crawlers' fallback, which needs to know whether the bug it is
+/// dropping has landed rather than what height that landing is at.
+fn ground_under(level: &LevelData, position: Vec3) -> bool {
+    level.ground_at(position).is_some()
 }
 
 /// Walks a crawler one tick towards `goal`, turning it as it goes, and reports
@@ -635,14 +861,14 @@ fn crawl_towards(
     position: Vec3,
     crawler: &mut Crawler,
     goal: Vec3,
-    step: f32,
-    turn: f32,
+    speed: f32,
+    dt: f32,
 ) -> Vec3 {
     // The part of the way to the goal it could actually walk. Behind a wall,
     // that is the wall -- and a bug that walks into a wall climbs it.
     let wanted = tangent(goal - position, crawler.up);
-    crawler.heading = steer(crawler.heading, wanted, crawler.up, turn);
-    match crawl(level, position, crawler.up, crawler.heading * step) {
+    crawler.heading = steer(crawler.heading, wanted, crawler.up, TURN_RATE * dt);
+    match crawl(level, position, crawler.up, crawler.heading * speed * dt) {
         Some((moved, up)) => {
             // The heading is carried round the corner rather than recomputed:
             // a bug that walks over the lip of a table is still walking the
@@ -662,14 +888,11 @@ fn crawl_towards(
         // and dropped onto the first floor that appears under it -- which is
         // also how it gets out from under that hill.
         None => {
-            let drifted = position + crawler.heading * step;
-            match ground_under(level, drifted) {
-                Some(floor) => {
-                    crawler.up = Vec3::Y;
-                    Vec3::new(drifted.x, floor, drifted.z)
-                }
-                None => drifted,
+            let drifted = position + crawler.heading * speed * dt;
+            if ground_under(level, drifted) {
+                crawler.up = Vec3::Y;
             }
+            settle(level, drifted, dt)
         }
     }
 }
@@ -854,6 +1077,59 @@ pub fn combat(
     }
 }
 
+/// How long a Mario's punch takes from the moment he starts it, and how far it
+/// lands. The reach is the player's sword's less the difference between a
+/// sword and a fist.
+const MARIO_SWING: f32 = 0.45;
+const MARIO_REACH: f32 = 1.6;
+
+/// The Marios' half of the fight: a Mario stood over what it has noticed hits
+/// it, and what it hits dies.
+///
+/// The blow lands at the *end* of the swing rather than the moment it starts,
+/// so what kills a goomba is the punch connecting rather than the decision to
+/// punch -- one that wanders out of reach mid-swing is missed, which is the
+/// only thing that makes standing next to one of these dangerous at all.
+///
+/// Runs after the allies have been walked, because the swing overrides what
+/// they were doing: a Mario in the middle of a punch is punching, whatever the
+/// walk step made of it.
+pub fn ally_combat(
+    mut commands: Commands,
+    mut sounds: ResMut<SoundQueue>,
+    mut allies: Query<(&mut Ally, &Transform, &Aggro)>,
+    enemies: Query<&Transform, (With<Enemy>, Without<Ally>)>,
+) {
+    for (mut ally, transform, aggro) in &mut allies {
+        let quarry = aggro
+            .target
+            .and_then(|target| enemies.get(target).ok().map(|at| (target, at.translation)));
+        let in_reach = quarry.is_some_and(|(_, at)| {
+            let apart = at - transform.translation;
+            Vec3::new(apart.x, 0.0, apart.z).length() < MARIO_REACH
+        });
+        if ally.swing_left > 0.0 {
+            ally.swing_left = (ally.swing_left - FIXED_DT).max(0.0);
+            ally.state.motion = Motion::Attack;
+            ally.state.still_for = 0.0;
+            if ally.swing_left == 0.0 && in_reach {
+                let (target, _) = quarry.expect("in reach of nothing");
+                commands.entity(target).despawn();
+                sounds.push(Sfx::Defeat);
+            }
+            continue;
+        }
+        if in_reach {
+            ally.swing_left = MARIO_SWING;
+            // Punches alternate, so a Mario stood over a crowd is throwing a
+            // combination rather than the same punch on a loop.
+            ally.state.combo ^= 1;
+            ally.state.motion = Motion::Attack;
+            ally.state.still_for = 0.0;
+        }
+    }
+}
+
 /// Hidden skinned actors do not need their bones evaluated. This runs after
 /// the console-wide animation pause so visible enemies resume while culled
 /// enemies remain stopped.
@@ -917,7 +1193,12 @@ mod tests {
 
     /// Walks a bug towards `goal` the way [`update`] does, and reports every
     /// place it stood on the way and which way was up there.
-    fn walk(level: &LevelData, start: (Vec3, Vec3), goal: Vec3, steps: usize) -> Vec<(Vec3, Vec3)> {
+    fn trail(
+        level: &LevelData,
+        start: (Vec3, Vec3),
+        goal: Vec3,
+        steps: usize,
+    ) -> Vec<(Vec3, Vec3)> {
         let (mut position, up) = start;
         let mut crawler = Crawler {
             up,
@@ -925,7 +1206,7 @@ mod tests {
         };
         (0..steps)
             .map(|_| {
-                position = crawl_towards(level, position, &mut crawler, goal, 0.1, TURN_RATE / 30.);
+                position = crawl_towards(level, position, &mut crawler, goal, 3.0, FIXED_DT);
                 (position, crawler.up)
             })
             .collect()
@@ -939,31 +1220,31 @@ mod tests {
         let level = room();
         // Beyond the wall, so that the way to it is through the wall rather
         // than across the floor.
-        let trail = walk(
+        let climb = trail(
             &level,
             (Vec3::new(-3., 0., 0.), Vec3::Y),
             Vec3::new(10., 4., 0.),
             200,
         );
-        let climbed = trail
+        let climbed = climb
             .iter()
             .find(|(position, up)| up.x < -0.99 && position.y > 0.5)
-            .unwrap_or_else(|| panic!("it never climbed the wall: {:?}", trail.last()));
+            .unwrap_or_else(|| panic!("it never climbed the wall: {:?}", climb.last()));
         assert!(
             (climbed.0.x - 4.).abs() < 0.1,
             "climbing thin air: {climbed:?}"
         );
-        let hanging = trail
+        let hanging = climb
             .iter()
             .find(|(_, up)| up.y < -0.99)
-            .unwrap_or_else(|| panic!("it never made it onto the ceiling: {:?}", trail.last()));
+            .unwrap_or_else(|| panic!("it never made it onto the ceiling: {:?}", climb.last()));
         assert!(
             (hanging.0.y - 4.).abs() < 0.1,
             "hanging off nothing: {hanging:?}"
         );
         // And once there it walks the ceiling like any other floor, which the
         // corner it climbed in at would hide.
-        let across = walk(&level, *hanging, Vec3::new(-10., 4., 0.), 40);
+        let across = trail(&level, *hanging, Vec3::new(-10., 4., 0.), 40);
         let (position, up) = *across.last().unwrap();
         assert!(
             up.y < -0.99 && (position.y - 4.).abs() < 0.1 && position.x < hanging.0.x - 1.0,
@@ -1018,14 +1299,7 @@ mod tests {
             let (mut flips, mut furthest) = (0, 0.0_f32);
             for _ in 0..900 {
                 let before = position;
-                position = crawl_towards(
-                    &level,
-                    position,
-                    &mut crawler,
-                    goal,
-                    4.0 * FIXED_DT,
-                    TURN_RATE * FIXED_DT,
-                );
+                position = crawl_towards(&level, position, &mut crawler, goal, 4.0, FIXED_DT);
                 if crawler.up.distance(was) > 0.5 {
                     flips += 1;
                 }
@@ -1073,7 +1347,9 @@ mod tests {
     fn field(placed: &[Vec3]) -> (World, Entity, Vec<Entity>) {
         let mut world = World::new();
         world.insert_resource(GameTuning::default());
-        let player = world.spawn((Player, Transform::default())).id();
+        let player = world
+            .spawn((Player, Side::Friendly, Transform::default()))
+            .id();
         let enemies = placed
             .iter()
             .map(|at| {
@@ -1083,6 +1359,7 @@ mod tests {
                             kind: Kind::Goomba,
                             animation: Handle::default(),
                         },
+                        Side::Hostile,
                         Aggro::default(),
                         Wander::new(*at, 0.0),
                         Transform::from_translation(*at),
@@ -1164,12 +1441,58 @@ mod tests {
         }
         let apart = world.get::<Transform>(enemies[0]).unwrap().translation
             - world.get::<Transform>(enemies[1]).unwrap().translation;
-        let room = Kind::Goomba.body().0 * 2.0 + PERSONAL_SPACE;
+        let room = Kind::Goomba.body().0 * 2.0 + PERSONAL_SPACE - SPREAD_SLACK;
         assert!(
             apart.length() > room - 0.01,
             "two enemies settled {} apart, inside the {room} they are owed",
             apart.length()
         );
+    }
+
+    /// A crowd untangles and then holds still. The one in the middle of a press
+    /// has neighbours leaning on it from every side, and if the shove takes out
+    /// the whole overlap every tick, what it does with that is vibrate.
+    #[test]
+    fn a_packed_crowd_settles_instead_of_jittering() {
+        let heap: Vec<Vec3> = (0..20)
+            .map(|index| {
+                let angle = index as f32 * crate::squad::GOLDEN_ANGLE;
+                Vec3::new(angle.sin(), 0., angle.cos()) * (index as f32 * 0.05)
+            })
+            .collect();
+        let (mut world, _, enemies) = field(&heap);
+        let places = |world: &mut World| -> Vec<Vec3> {
+            enemies
+                .iter()
+                .map(|enemy| world.get::<Transform>(*enemy).unwrap().translation)
+                .collect()
+        };
+        for _ in 0..600 {
+            world.run_system_once(spread).expect("spread could not run");
+        }
+        let settled = places(&mut world);
+        for _ in 0..30 {
+            world.run_system_once(spread).expect("spread could not run");
+        }
+        let after = places(&mut world);
+        let moved = settled
+            .iter()
+            .zip(&after)
+            .fold(0.0_f32, |most, (was, now)| most.max(was.distance(*now)));
+        assert!(
+            moved < 0.01,
+            "a settled crowd was still shuffling {moved} a tick"
+        );
+        let room = Kind::Goomba.body().0 * 2.0 + PERSONAL_SPACE - SPREAD_SLACK;
+        for (index, one) in after.iter().enumerate() {
+            for other in &after[index + 1..] {
+                assert!(
+                    one.distance(*other) > room - 0.05,
+                    "two of the crowd ended up {} apart",
+                    one.distance(*other)
+                );
+            }
+        }
     }
 
     /// And a crawler is shoved along its surface rather than off it: two bugs
@@ -1227,6 +1550,237 @@ mod tests {
         assert_eq!(wander.goal(first, FIXED_DT), None, "its rest was one tick");
         let next = goal_after(&mut wander, first).expect("it never set off again");
         assert!(next != first, "it went back to the spot it was already on");
+    }
+
+    /// A Mario and a goomba, stood within arm's reach of each other, with the
+    /// Mario having noticed it.
+    fn duel(apart: f32) -> (World, Entity, Entity) {
+        let mut world = World::new();
+        world.insert_resource(SoundQueue::default());
+        let mario = world
+            .spawn((
+                Ally::new(Vec3::ZERO, 0.0),
+                Side::Friendly,
+                Aggro::default(),
+                Transform::default(),
+            ))
+            .id();
+        let goomba = world
+            .spawn((
+                Enemy {
+                    kind: Kind::Goomba,
+                    animation: Handle::default(),
+                },
+                Side::Hostile,
+                Transform::from_xyz(apart, 0., 0.),
+            ))
+            .id();
+        world.get_mut::<Aggro>(mario).unwrap().target = Some(goomba);
+        (world, mario, goomba)
+    }
+
+    fn swing(world: &mut World, ticks: usize) {
+        for _ in 0..ticks {
+            world
+                .run_system_once(ally_combat)
+                .expect("ally_combat could not run");
+        }
+    }
+
+    /// A Mario stood over something on the other side hits it, and what it hits
+    /// dies. It takes the length of the punch to do it: the blow lands when the
+    /// swing finishes, not when it starts.
+    #[test]
+    fn a_mario_punches_what_it_has_noticed() {
+        let (mut world, mario, goomba) = duel(1.0);
+        swing(&mut world, 1);
+        assert!(
+            world.get_entity(goomba).is_ok(),
+            "the goomba died on the wind-up"
+        );
+        assert_eq!(
+            world.get::<Ally>(mario).unwrap().state.motion,
+            Motion::Attack
+        );
+        swing(&mut world, (MARIO_SWING / FIXED_DT).ceil() as usize + 1);
+        assert!(
+            world.get_entity(goomba).is_err(),
+            "the punch landed on nothing"
+        );
+    }
+
+    /// And one that wanders out of reach while the punch is in the air is
+    /// missed, which is the only thing that makes standing next to a Mario
+    /// survivable.
+    #[test]
+    fn a_mario_misses_what_walks_out_of_the_punch() {
+        let (mut world, _, goomba) = duel(1.0);
+        swing(&mut world, 1);
+        world.get_mut::<Transform>(goomba).unwrap().translation.x = MARIO_REACH + 3.0;
+        swing(&mut world, (MARIO_SWING / FIXED_DT).ceil() as usize + 1);
+        assert!(
+            world.get_entity(goomba).is_ok(),
+            "the punch followed it across the lawn"
+        );
+    }
+
+    /// Out of reach to begin with, a Mario does not swing at the air: walking
+    /// to it is the movement step's business.
+    #[test]
+    fn a_mario_does_not_punch_at_something_across_the_lawn() {
+        let (mut world, mario, goomba) = duel(MARIO_REACH + 2.0);
+        swing(&mut world, 30);
+        assert!(world.get_entity(goomba).is_ok());
+        assert_eq!(world.get::<Ally>(mario).unwrap().swing_left, 0.0);
+    }
+
+    /// Both sides notice each other, off the one rule. The Mario has a goomba
+    /// to hit and the goomba has a Mario to chase, out of a single pass.
+    #[test]
+    fn a_mario_and_a_goomba_notice_each_other() {
+        let mut world = World::new();
+        world.insert_resource(GameTuning::default());
+        let mario = world
+            .spawn((
+                Ally::new(Vec3::ZERO, 0.0),
+                Side::Friendly,
+                Aggro::default(),
+                Transform::default(),
+            ))
+            .id();
+        let goomba = world
+            .spawn((
+                Enemy {
+                    kind: Kind::Goomba,
+                    animation: Handle::default(),
+                },
+                Side::Hostile,
+                Aggro::default(),
+                Transform::from_xyz(4., 0., 0.),
+            ))
+            .id();
+        world.run_system_once(alert).expect("alert could not run");
+        assert_eq!(world.get::<Aggro>(mario).unwrap().target, Some(goomba));
+        assert_eq!(world.get::<Aggro>(goomba).unwrap().target, Some(mario));
+        // And what a Mario kills stops being a target, so it looks for the next
+        // one rather than standing over the spot.
+        world.despawn(goomba);
+        world.run_system_once(alert).expect("alert could not run");
+        assert_eq!(world.get::<Aggro>(mario).unwrap().target, None);
+    }
+
+    /// A step at `height`: ground to the west of the origin, a face rising at
+    /// x = 0, and more ground on top of it to the east. A kerb and a cliff are
+    /// the same shape at two heights, which is the point.
+    fn ledge(height: f32) -> LevelData {
+        let mut vertices = Vec::new();
+        let mut triangles = Vec::new();
+        let mut quad = |a: Vec3, b: Vec3, c: Vec3, d: Vec3| {
+            let base = vertices.len() as u32;
+            vertices.extend([a, b, c, d]);
+            triangles.push([base, base + 1, base + 2]);
+            triangles.push([base, base + 2, base + 3]);
+        };
+        quad(
+            Vec3::new(-9., 0., -9.),
+            Vec3::new(0., 0., -9.),
+            Vec3::new(0., 0., 9.),
+            Vec3::new(-9., 0., 9.),
+        );
+        quad(
+            Vec3::new(0., 0., -9.),
+            Vec3::new(0., height, -9.),
+            Vec3::new(0., height, 9.),
+            Vec3::new(0., 0., 9.),
+        );
+        quad(
+            Vec3::new(0., height, -9.),
+            Vec3::new(9., height, -9.),
+            Vec3::new(9., height, 9.),
+            Vec3::new(0., height, 9.),
+        );
+        LevelData::new(vertices, triangles, Vec::new())
+    }
+
+    /// Walks a goomba east for a while and reports where it got to.
+    fn trudge(level: &LevelData, from: Vec3, ticks: usize) -> Vec3 {
+        let mut at = from;
+        for _ in 0..ticks {
+            at = walk(level, at, Vec3::X * 0.06, Kind::Goomba.body().0);
+            at = settle(level, at, FIXED_DT);
+        }
+        at
+    }
+
+    /// The bug this was written for. A goomba at the bottom of a cliff stays at
+    /// the bottom of the cliff: the top is not a step, however near it is in a
+    /// straight line, and being handed it by the floor query is not the same as
+    /// having climbed it.
+    #[test]
+    fn a_walker_does_not_arrive_on_top_of_a_cliff() {
+        let cliff = ledge(2.5);
+        let at = trudge(&cliff, Vec3::new(-3., 0., 0.), 200);
+        assert!(
+            at.y < 0.01,
+            "it got up a two-and-a-half unit cliff, to {at:?}"
+        );
+        assert!(at.x < 0.01, "it walked into the cliff, to {at:?}");
+        // It did set off, rather than being stuck from the first tick.
+        assert!(at.x > -3.0 + 0.5, "it never walked anywhere: {at:?}");
+    }
+
+    /// And it is not stopped by everything: a kerb it could step onto it steps
+    /// onto, and a slope it could walk up it walks up.
+    #[test]
+    fn a_walker_steps_up_what_it_can() {
+        let kerb = ledge(0.35);
+        let at = trudge(&kerb, Vec3::new(-3., 0., 0.), 200);
+        assert!(
+            (at.y - 0.35).abs() < 0.01 && at.x > 1.0,
+            "it was stopped by a kerb, ending at {at:?}"
+        );
+    }
+
+    /// Ground is followed at a walking pace rather than assigned, which is the
+    /// other half of the same complaint: the floor query answers a column, a
+    /// column's answer jumps, and taking it whole is a walker that morphs
+    /// between elevations instead of walking between them.
+    #[test]
+    fn a_walker_climbs_and_falls_at_a_pace() {
+        let kerb = ledge(0.35);
+        // Stood at the foot of the step, in the column its top occupies.
+        let climbing = settle(&kerb, Vec3::new(0.5, 0., 0.), FIXED_DT);
+        assert!(
+            (climbing.y - CLIMB_SPEED * FIXED_DT).abs() < 1e-6,
+            "it climbed {} in one tick",
+            climbing.y
+        );
+        // Dropped from above it, it comes down faster than it goes up, and it
+        // settles exactly rather than shivering around the ground.
+        let mut at = Vec3::new(-3., 6., 0.);
+        let first = settle(&kerb, at, FIXED_DT);
+        assert!((first.y - (6.0 - FALL_SPEED * FIXED_DT)).abs() < 1e-6);
+        for _ in 0..300 {
+            at = settle(&kerb, at, FIXED_DT);
+        }
+        assert_eq!(at.y, 0.0);
+    }
+
+    /// No two enemies walk quite alike: they keep different paces, make for
+    /// different spots around what they are chasing, and weave differently on
+    /// the way. A brood that shares one number for all of it marches.
+    #[test]
+    fn no_two_enemies_walk_quite_alike() {
+        let (first, second) = (Quirk::new(1.0), Quirk::new(2.0));
+        assert!((first.pace() - second.pace()).abs() > 0.01);
+        assert!(first.stand_off().distance(second.stand_off()) > 0.1);
+        assert!((first.weave(3.0) - second.weave(3.0)).abs() > 0.01);
+        // Within bounds, both of them: a quirk is a difference, not a licence.
+        for quirk in [&first, &second] {
+            assert!((quirk.pace() - 1.0).abs() <= PACE_SPREAD + 1e-6);
+            assert!(quirk.stand_off().length() <= STAND_OFF + STAND_OFF_SPREAD + 1e-6);
+            assert!(quirk.weave(7.0).abs() <= WEAVE_WIDTH + 1e-6);
+        }
     }
 
     /// A player, and one enemy standing on his toes.

@@ -12,9 +12,11 @@ mod audio;
 mod billboard;
 mod camera;
 mod console;
+mod display;
 mod enemy;
 mod input;
 mod level;
+mod menu;
 mod n64;
 mod pipe;
 mod player;
@@ -34,6 +36,7 @@ use bevy::{
     },
 };
 use camera::FollowCamera;
+use display::SceneTarget;
 use input::InputState;
 use player::{Controller, Player, PlayerVisual, PreviousPose, RenderPose};
 use std::path::PathBuf;
@@ -104,6 +107,8 @@ fn main() {
         .init_resource::<animation::EnemyGraphs>()
         .init_resource::<squad::Squad>()
         .init_resource::<squad::Whistle>()
+        .init_resource::<menu::MenuState>()
+        .init_resource::<display::DisplaySettings>()
         .insert_resource(Time::<Fixed>::from_hz(30.0))
         .add_plugins(
             DefaultPlugins
@@ -193,7 +198,9 @@ fn main() {
 /// leaves and re-enters fullscreen, and Escape drops the cursor and grabs it
 /// again. The key looks dead. It was pressed exactly once and acted on twice.
 fn input_pipeline() -> ScheduleConfigs<ScheduleSystem> {
-    (console::input, input::gather).chain().after(InputSystems)
+    (console::input, menu::input, input::gather)
+        .chain()
+        .after(InputSystems)
 }
 
 /// The fixed-step simulation, in the order one tick runs.
@@ -211,6 +218,9 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
         squad::update_goals,
         squad::move_allies,
         enemy::combat,
+        // After the walk step: a Mario mid-punch is punching, whatever the walk
+        // made of it.
+        enemy::ally_combat,
         enemy::alert,
         enemy::update,
         // After the step that moved them, so a crowd that walked into itself
@@ -223,6 +233,7 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
     )
         .chain()
         .run_if(console::is_closed)
+        .run_if(menu::is_closed)
 }
 
 /// Everything that runs per rendered frame while the console is closed.
@@ -245,6 +256,7 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
     )
         .chain()
         .run_if(console::is_closed)
+        .run_if(menu::is_closed)
 }
 
 /// The overlay, which runs whether or not the console is open. Sound drains
@@ -253,9 +265,17 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
 fn overlay() -> ScheduleConfigs<ScheduleSystem> {
     (
         console::pause_animations,
+        // After the console's, which resumes everything the frame it closes:
+        // a menu open over a closed console still holds the world still.
+        menu::pause_animations,
         enemy::sync_animation_visibility,
         audio::play,
         console::draw,
+        // Before the menu is drawn rather than after, so the resolution the
+        // menu reads back out of the target is the one the row above it just
+        // asked for rather than last frame's.
+        display::resize,
+        menu::draw,
         // Both of these belong out here rather than in `presentation`: a frame
         // drawn while the console is open is still a frame, and being stuck
         // fullscreen because the console is up is exactly the trap F11 exists
@@ -282,6 +302,11 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
+    // Made before anything that refers to it: the world camera draws into it,
+    // the full-screen node below shows it, and `display::resize` sizes it to
+    // the window on the first frame.
+    let scene_target = display::create_target(&mut images);
+    commands.insert_resource(SceneTarget(scene_target.clone()));
     let (collision, render) = level::load();
     shadow::prepare(&mut commands, &mut meshes, &mut images, &mut materials);
     water::spawn(
@@ -317,6 +342,9 @@ fn setup(
         Player,
         PreviousPose::new(&spawn),
         Controller::default(),
+        // He does not notice anything -- that is what the player is for -- but
+        // he is very much noticeable, and a side is what makes him so.
+        enemy::Side::Friendly,
         // What `SpatialBundle` used to carry. `Transform` now brings
         // `GlobalTransform` with it as a required component, and `Visibility`
         // brings its own computed pair, so naming these two names all four.
@@ -396,6 +424,10 @@ fn setup(
     // and reads neither. `n64::N64Lighting` is where the sun lives now.
     commands.spawn((
         Camera3d::default(),
+        // The world is drawn at whatever internal resolution the display
+        // settings ask for rather than the window's, and `display` stretches
+        // the result over the window afterwards.
+        display::world_camera_target(&scene_target),
         Transform::from_xyz(-13.0, 10.0, 56.0)
             .looking_at(Vec3::new(-13.0, 4.0, 46.0), Vec3::Y),
         Projection::from(PerspectiveProjection {
@@ -419,6 +451,12 @@ fn setup(
         // is in rides along with it.
         water::air_fog(),
     ));
+    // The second camera: it draws nothing of its own, only the node holding
+    // the world's image and every other piece of UI on top of it. Being the
+    // one camera left whose target is the window is also what makes it the
+    // camera Bevy hands the UI to, with nothing marked.
+    commands.spawn(display::presentation_camera());
+    commands.spawn(display::scene_view_bundle(&scene_target));
     commands.spawn((
         Hud,
         // One text node is now four components rather than one bundle: the
@@ -468,6 +506,7 @@ fn setup(
     ));
     commands.spawn(console::panel_bundle());
     commands.spawn(console::tuning_tray_bundle());
+    menu::spawn(&mut commands);
     if let Ok(mut cursor) = cursor.single_mut() {
         cursor.grab_mode = CursorGrabMode::Locked;
         cursor.visible = false;
@@ -480,7 +519,6 @@ fn controls(
     mut state: ResMut<GameState>,
     mut squad: ResMut<squad::Squad>,
     mut visuals: Query<(&ActiveCharacter, &mut Visibility), With<PlayerVisual>>,
-    mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
     console: Res<console::ConsoleState>,
 ) {
     if console.open || console.closed_this_frame {
@@ -505,17 +543,6 @@ fn controls(
     }
     if InputState::take(&mut input.debug) {
         state.debug = !state.debug;
-    }
-    if InputState::take(&mut input.cursor) {
-        if let Ok(mut cursor) = cursor.single_mut() {
-            let locked = cursor.grab_mode != CursorGrabMode::None;
-            cursor.grab_mode = if locked {
-                CursorGrabMode::None
-            } else {
-                CursorGrabMode::Locked
-            };
-            cursor.visible = locked;
-        }
     }
 }
 
@@ -588,7 +615,7 @@ fn update_hud(
         let following = squad.members.len();
         let marching = squad.marching();
         let holding = squad.sent.len() - marching;
-        format!("Super Bevy World 64\n{:?}  ·  {:?}  ·  Health {}  ·  {device}\nSquad {following} following · {marching} marching · {holding} holding\nWASD move · mouse look · Space jump · V jetpack/skate\nShift attack · X squad (hold to whistle, tap to send)\nF/right mouse aim · ` console · F2 switch · Esc cursor · F11 window", state.active, ctrl.motion, ctrl.health)
+        format!("Super Bevy World 64\n{:?}  ·  {:?}  ·  Health {}  ·  {device}\nSquad {following} following · {marching} marching · {holding} holding\nWASD move · mouse look · Space jump · V jetpack/skate\nShift attack · X squad (hold to whistle, tap to send)\nF/right mouse aim · ` console · F2 switch · Esc menu · F11 window", state.active, ctrl.motion, ctrl.health)
     } else {
         String::new()
     };
@@ -695,6 +722,8 @@ mod tests {
             .init_resource::<animation::EnemyGraphs>()
             .init_resource::<squad::Squad>()
             .init_resource::<squad::Whistle>()
+            .init_resource::<menu::MenuState>()
+            .init_resource::<display::DisplaySettings>()
             .insert_resource(Time::<Fixed>::from_hz(30.0))
             // A test loop runs far faster than real time, so without this the
             // clock would barely advance and the fixed step would never tick:
@@ -941,6 +970,48 @@ mod tests {
         initialise(overlay());
     }
 
+    /// The world goes into the render target and the UI goes onto the window.
+    ///
+    /// Two things break silently if this ever stops holding, and neither one
+    /// is a compile error. Point the world camera back at the window and the
+    /// render-resolution setting quietly does nothing. Give the world camera
+    /// the higher order, or the window as a target, and Bevy hands the UI to
+    /// *it* instead -- so the HUD and the menu are drawn into the
+    /// low-resolution image and come out blurred.
+    #[test]
+    fn the_world_is_drawn_into_the_target_and_the_ui_onto_the_window() {
+        use bevy::camera::RenderTarget;
+
+        let mut app = headless();
+        app.update();
+
+        let target = app.world().resource::<SceneTarget>().0.clone();
+        let mut world = app.world_mut().query::<(&Camera, &RenderTarget, &Camera3d)>();
+        let (world_order, world_target) = world
+            .single(app.world())
+            .map(|(camera, target, _)| (camera.order, target.clone()))
+            .expect("there should be exactly one camera drawing the world");
+        assert_eq!(
+            world_target.as_image(),
+            Some(&target),
+            "the world camera draws into the render target"
+        );
+
+        let mut presentation = app.world_mut().query::<(&Camera, &RenderTarget, &Camera2d)>();
+        let (presentation_order, presentation_target) = presentation
+            .single(app.world())
+            .map(|(camera, target, _)| (camera.order, target.clone()))
+            .expect("there should be exactly one camera showing it");
+        assert!(
+            matches!(presentation_target, RenderTarget::Window(_)),
+            "the presentation camera is the one that draws to the window"
+        );
+        assert!(
+            presentation_order > world_order,
+            "the stretch has to happen after the frame it stretches"
+        );
+    }
+
     #[test]
     fn the_billboard_schedule_has_no_conflicting_queries() {
         initialise(billboard::systems());
@@ -961,7 +1032,7 @@ mod tests {
 
     #[test]
     fn the_input_schedule_has_no_conflicting_queries() {
-        initialise((console::input, input::gather).chain().into_configs());
+        initialise(input_pipeline());
     }
 
     #[test]
@@ -992,6 +1063,8 @@ mod tests {
             .init_resource::<console::ConsoleState>()
             .init_resource::<console::GameTuning>()
             .init_resource::<input::InputState>()
+            .init_resource::<menu::MenuState>()
+            .init_resource::<display::DisplaySettings>()
             .add_systems(PreUpdate, input_pipeline());
         app.edit_schedule(PreUpdate, |schedule| {
             schedule.set_build_settings(ScheduleBuildSettings {
@@ -1004,6 +1077,4 @@ mod tests {
         // Panics with the ambiguity spelled out if the ordering is ever dropped.
         app.update();
     }
-
 }
-

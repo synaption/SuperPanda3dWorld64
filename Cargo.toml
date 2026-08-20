@@ -19,6 +19,12 @@ bevy = { version = "0.19", default-features = false, features = [
     "multi_threaded", "bevy_asset", "bevy_scene", "bevy_winit",
     "bevy_core_pipeline", "bevy_pbr", "bevy_gltf", "bevy_render",
     "bevy_text", "bevy_ui", "png", "x11",
+    # `bevy_ui` is layout only: it measures and positions nodes and draws none
+    # of them. The pass that puts a UI node on the screen lives in
+    # `bevy_ui_render`, which `DefaultPlugins` adds behind this feature -- so
+    # without it the HUD, the frame-rate readout, the console and the pause
+    # menu are all laid out every frame and never seen.
+    "bevy_ui_render",
     # The tonemapping LUTs are KTX2 files compressed with zstd, and the
     # decompressor is no longer chosen for you -- naming neither is a hard
     # compile error rather than a silent fallback. The Rust implementation

@@ -88,6 +88,10 @@ pub(crate) const GOLDEN_ANGLE: f32 = 2.399_963_2;
 /// How near an ally has to be before it counts as standing on its slot.
 const ALLY_RADIUS: f32 = 0.4;
 
+/// How close a Mario walks to what it is going to hit. Inside its own punch's
+/// reach, so that arriving and connecting are not two separate strides.
+const STRIKE_RANGE: f32 = 1.2;
+
 /// The amble an ally falls back on with nobody to follow: how far from where
 /// it was left it will wander, how near it has to get before that counts as
 /// arriving, and how long it stands about afterwards before ambling somewhere
@@ -128,6 +132,12 @@ pub struct Ally {
     phase: f32,
     pub velocity: Vec3,
     pub state: AnimationState,
+    /// How long is left of the punch it is throwing, or zero.
+    ///
+    /// Thrown and resolved by [`crate::enemy::ally_combat`]; kept here because
+    /// a Mario in the middle of one stands still to throw it, which is this
+    /// module's business.
+    pub swing_left: f32,
 }
 
 impl Ally {
@@ -141,6 +151,7 @@ impl Ally {
             phase,
             velocity: Vec3::ZERO,
             state: AnimationState::default(),
+            swing_left: 0.0,
         };
         ally.amble_somewhere_else();
         ally
@@ -372,6 +383,10 @@ pub fn spawn_ally(commands: &mut Commands, assets: &AssetServer, home: Vec3, pha
     commands
         .spawn((
             Ally::new(home, phase),
+            // A Mario is on the player's side, and goes for what it notices on
+            // the other one exactly as an enemy goes for him.
+            crate::enemy::Side::Friendly,
+            crate::enemy::Aggro::default(),
             // Allies animate off the same tables the playable Mario does.
             ActiveCharacter::Mario,
             // And stand on the ground the same way, so they get the same disc
@@ -487,10 +502,18 @@ pub fn move_allies(
     squad: Res<Squad>,
     // One still in the air out of the Mario pipe is flown by `pipe::fly`, and
     // walking it toward a goal at the same time would drag it out of its arc.
-    mut allies: Query<(Entity, &mut Ally, &mut Transform), Without<crate::pipe::Launched>>,
+    mut allies: Query<
+        (
+            Entity,
+            &mut Ally,
+            &mut Transform,
+            Option<&crate::enemy::Aggro>,
+        ),
+        Without<crate::pipe::Launched>,
+    >,
 ) {
     let dt = crate::player::FIXED_DT;
-    for (entity, mut ally, mut transform) in &mut allies {
+    for (entity, mut ally, mut transform, aggro) in &mut allies {
         let ordered = squad.members.contains(&entity)
             || squad.sent.iter().any(|(sent, _, _)| *sent == entity);
         // A goal outlives the order it came from by exactly one tick, which is
@@ -501,20 +524,34 @@ pub fn move_allies(
             ally.home = transform.translation;
             ally.amble_somewhere_else();
         }
+        // Mid-punch it stands where it is and throws it. `ally_combat` owns
+        // the swing itself; what it means here is that a Mario is not walking.
+        if ally.swing_left > 0.0 {
+            ally.velocity = Vec3::ZERO;
+            continue;
+        }
+        // What it has noticed, if it is still there to be noticed. This beats
+        // both the order and the amble: a Mario that has seen a goomba deals
+        // with the goomba and picks its errand back up afterwards, which is
+        // what the order still sitting in `goal` is for.
+        let hunting = aggro
+            .and_then(|aggro| aggro.target.map(|_| aggro.at))
+            .map(|at| (Vec2::new(at.x, at.z), STRIKE_RANGE));
         // Standing about between ambles. An ally that has nowhere to be is
         // still for seconds at a time, which is what lets the idle actually
         // play.
-        if ally.rest_left > 0.0 && ally.goal.is_none() {
+        if ally.rest_left > 0.0 && ally.goal.is_none() && hunting.is_none() {
             ally.rest_left -= dt;
             ally.stand(dt);
             continue;
         }
         let here = Vec2::new(transform.translation.x, transform.translation.z);
-        let (target, arrive) = match ally.goal {
-            Some((target, arrive)) => (target, arrive),
+        let (target, arrive) = match (hunting, ally.goal) {
+            (Some(hunt), _) => hunt,
+            (None, Some((target, arrive))) => (target, arrive),
             // Nowhere to be: amble to the spot picked last time it arrived, so
             // an idle field of Marios is not a field of statues.
-            None => (ally.stroll, WANDER_ARRIVE),
+            (None, None) => (ally.stroll, WANDER_ARRIVE),
         };
         let to_target = target - here;
         let distance = to_target.length();
@@ -528,7 +565,7 @@ pub fn move_allies(
             continue;
         }
         // Ease off over the last stride so arriving is not a hard stop.
-        let pace = if ally.goal.is_some() {
+        let pace = if hunting.is_some() || ally.goal.is_some() {
             tuning.ally_speed
         } else {
             AMBLE_SPEED

@@ -7,7 +7,12 @@ against the ported SM64 physics on the same level.
 
 The current build includes the castle grounds, water, enemies, warp pipes, a
 Mario squad, sound effects, a third-person aiming camera, keyboard/mouse and
-gamepad input, and a debug console.
+gamepad input, a pause menu with display settings, and a debug console.
+
+Escape pauses the game and opens the menu; its display page changes the
+internal render resolution, which is the world's own resolution rather than the
+window's — the setting that buys frame rate, and the one that puts the
+console's pixels back.
 
 ## Run the project
 

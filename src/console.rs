@@ -5,6 +5,7 @@
 
 use crate::{
     enemy::Enemy,
+    menu::MenuState,
     player::{Controller, Player},
     GameState,
 };
@@ -183,14 +184,14 @@ pub const SPECS: &[TunableSpec] = &[
         low: 0.0,
         high: 200.0,
         step: 1.0,
-        doc: "how near the player has to be to be noticed",
+        doc: "how near a creature has to be to be noticed",
     },
     TunableSpec {
         name: "enemy_alert",
         low: 0.0,
         high: 200.0,
         step: 1.0,
-        doc: "how far one enemy's alarm carries to the rest",
+        doc: "how far one creature's alarm carries to its own side",
     },
     TunableSpec {
         name: "enemy_lod_near",
@@ -752,16 +753,25 @@ impl KeyRepeat {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn input(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     mut typed: MessageReader<KeyboardInput>,
     mut wheel: MessageReader<MouseWheel>,
+    menu: Res<MenuState>,
     mut console: ResMut<ConsoleState>,
     mut tuning: ResMut<GameTuning>,
     mut repeat: Local<KeyRepeat>,
 ) {
     console.closed_this_frame = false;
+    // The menu has the keyboard while it is up, and the two cannot share it:
+    // the grave key would open a console nobody can see behind the menu, and
+    // the bracket keys would tune the pinned control while the player is
+    // walking a list of settings.
+    if menu.open {
+        return;
+    }
     if keys.just_pressed(KeyCode::Backquote) {
         console.open = !console.open;
         if console.open {

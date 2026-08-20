@@ -101,6 +101,8 @@ src/
   water.rs       the water sheets and the underwater view
   audio.rs       gameplay sound events -> layered samples
   console.rs     the debug console: commands, live tuning, pinned controls
+  menu.rs        the pause menu: Escape, its pages, and what they change
+  display.rs     the internal render target and the stretch onto the window
 tools/           the asset pipeline -- see docs/pipeline.md
 assets/          everything the game loads -- see docs/pipeline.md
 ```
@@ -127,9 +129,10 @@ once and neither has to be selected.
 | Recenter camera | `R` | right shoulder |
 | Squad: hold to whistle, tap to send | `X` | west (X) |
 | Switch Hero/Mario in place | `F2` | Start |
+| Pause menu (pauses the simulation) | `Escape` | Select |
 | Tuning console (pauses the simulation) | `` ` `` | — |
 | Debug text | `F1` | — |
-| Release/capture the cursor | `Escape` | — |
+| Window/fullscreen | `F11` | — |
 
 Landing on an enemy defeats it whichever character is active. A pad plugged in
 mid-game is picked up without a restart, and the pad's sticks use circular
@@ -420,6 +423,38 @@ Movement, camera, water, enemy and spawning constants are backed by the tuning
 resource rather than copied at startup, so console changes apply on the next
 gameplay tick.
 
+## The pause menu and the internal render resolution
+
+Escape pauses the game and opens a menu — Resume, Options, Quit — with the
+display settings one page in. Escape goes back a page and closes it from the
+root, so the key that opened it is the key that gets out of it whatever page
+you wandered into. It is keyboard-driven (arrows or `WASD`, Enter, and
+left/right to change a value) and the pad drives the same rows with the d-pad,
+south and east; Select opens it, because Start already swaps character. Opening
+it hands the mouse cursor back and resuming captures it again.
+
+**The world is not drawn to the window.** It is drawn into an image, and a
+second camera stretches that image over the window with a nearest-neighbour
+filter — which is what makes the render-resolution row possible. The row is a
+percentage of the window rather than a fixed height like 240p, so the internal
+image always has the window's own aspect ratio and the stretch is uniform;
+`src/display.rs` shows what it works out to in pixels beside the percentage.
+25% of a 1080p screen is 480×270, which is close to what the console actually
+put out.
+
+Everything expensive in a frame here — the water's overdraw, the vertex-lit
+surfaces, the billboards — scales with the pixel count and nothing else, so the
+setting is the one dial that reliably buys frame rate. The UI is deliberately
+outside it: the HUD, the console and the menu are drawn by the second camera,
+*after* the stretch, so they stay at the window's own resolution however low
+the world is rendered.
+
+The two cameras have to stay the way they are, and the failure is silent both
+ways. If the world camera goes back to targeting the window the setting does
+nothing; if it ends up the highest-order camera on the window, Bevy hands it
+the UI as well and the HUD comes out blurred along with the world. A test in
+`main.rs` asserts both.
+
 ## Performance
 
 Static collision queries go through the 16×16 grid rather than the full
@@ -431,6 +466,9 @@ Distance-based crowd LOD lowers far AI to 15 or 7.5 Hz and culls distant
 skinned models and their skeletal animation work. All three thresholds are
 exposed through the console, which is the point — the right values depend on
 the machine, and guessing them from source is how the previous set got chosen.
+
+The other dial is the internal render resolution above, which is the one that
+scales the fragment side of the frame rather than the CPU side.
 
 ## Not done yet
 

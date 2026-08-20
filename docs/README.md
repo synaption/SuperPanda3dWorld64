@@ -11,6 +11,8 @@ with the page that matches what you want to do:
   toolchain, the optional sound and gamepad features, and the Windows
   cross-build.
 - [Controls](project-guide.md#controls) — keyboard, mouse, and gamepad input.
+- [Pause menu and render resolution](project-guide.md#the-pause-menu-and-the-internal-render-resolution)
+  — Escape, the display settings, and how the world is drawn.
 - [Debug console](project-guide.md#the-debug-console) — in-game inspection and
   live tuning.
 

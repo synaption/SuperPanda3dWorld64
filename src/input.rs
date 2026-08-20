@@ -12,7 +12,7 @@
 //! Nothing here requires a pad. With none attached every pad field reads
 //! neutral and the keyboard is untouched.
 
-use crate::console::ConsoleState;
+use crate::{console::ConsoleState, menu::MenuState};
 use bevy::{input::mouse::MouseMotion, prelude::*};
 
 /// How far a stick leaves centre before it counts. Sticks rest a little off
@@ -32,9 +32,9 @@ pub const THRUST_THRESHOLD: f32 = 0.3;
 ///
 /// The `bool` fields split into two kinds. Held controls (`boost`, `aim`) are
 /// rewritten every frame and read freely. Latched edges (`jump`, `attack`,
-/// `swap`, `debug`, `cursor`, `recenter`) stay set until the system that acts
-/// on them calls [`InputState::take`], so no press is lost or double-counted
-/// across the fixed-step boundary.
+/// `swap`, `debug`, `recenter`) stay set until the system that acts on them
+/// calls [`InputState::take`], so no press is lost or double-counted across the
+/// fixed-step boundary.
 #[derive(Resource, Default, Debug, Clone, Copy)]
 pub struct InputState {
     /// Camera-relative movement wish: x right, y forward, length at most 1.
@@ -55,7 +55,6 @@ pub struct InputState {
     pub squad_released: bool,
     pub swap: bool,
     pub debug: bool,
-    pub cursor: bool,
     /// Whether a pad was seen this frame, for the debug readout.
     pub pad: bool,
 }
@@ -68,10 +67,10 @@ impl InputState {
 
     /// Everything centred and released, keeping latched edges cleared.
     ///
-    /// Called while the console holds the input. A direction held at that
-    /// moment must not stay held forever: unlike a key, there is no release
-    /// event arriving later for a stick that was pushed when the console
-    /// opened.
+    /// Called while the console or the pause menu holds the input. A direction
+    /// held at that moment must not stay held forever: unlike a key, there is
+    /// no release event arriving later for a stick that was pushed when the
+    /// console opened.
     fn neutral(&mut self) {
         let pad = self.pad;
         *self = Self::default();
@@ -95,9 +94,9 @@ pub fn apply_deadzone(value: Vec2, deadzone: f32) -> Vec2 {
 
 /// Polls every device and publishes the frame's [`InputState`].
 ///
-/// Runs in `PreUpdate` after the console, so the console's own keys never
-/// reach gameplay and an open console holds the pad neutral without dropping
-/// the device.
+/// Runs in `PreUpdate` after the console and the menu, so neither one's keys
+/// reach gameplay and an overlay that is up holds the pad neutral without
+/// dropping the device.
 #[allow(clippy::too_many_arguments)]
 pub fn gather(
     keys: Res<ButtonInput<KeyCode>>,
@@ -109,6 +108,7 @@ pub fn gather(
     // arrived first, picked up mid-game without a restart.
     pads: Query<&Gamepad>,
     console: Res<ConsoleState>,
+    menu: Res<MenuState>,
     mut state: ResMut<InputState>,
 ) {
     // Accumulated mouse motion is per frame, never latched: a look that was
@@ -117,9 +117,10 @@ pub fn gather(
     let pad = pads.iter().next();
     state.pad = pad.is_some();
 
-    // The grave key toggles the console and must not also reach the game, so
-    // the whole snapshot goes neutral for the frame the console closes on too.
-    if console.open || console.closed_this_frame {
+    // The grave key toggles the console and Escape the menu, and neither must
+    // also reach the game, so the whole snapshot goes neutral for the frame
+    // either one closes on too.
+    if console.open || console.closed_this_frame || menu.open || menu.closed_this_frame {
         state.neutral();
         return;
     }
@@ -204,7 +205,6 @@ pub fn gather(
     state.squad_released |= squad_released;
     state.swap |= swap;
     state.debug |= keys.just_pressed(KeyCode::F1);
-    state.cursor |= keys.just_pressed(KeyCode::Escape);
 }
 
 #[cfg(test)]
