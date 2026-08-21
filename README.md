@@ -9,11 +9,13 @@ The current build includes the castle grounds, water, enemies, warp pipes, a
 Mario squad, sound effects, a third-person aiming camera, keyboard/mouse and
 gamepad input, a pause menu with display settings, and a debug console.
 
-Crowds are the thing it is built around: `crowd 2000 mix` in the console puts
-two thousand enemies on the lawn, and past `enemy_draw` each one is drawn as a
-baked sprite rather than a skeleton, so the whole distant field costs two draw
-calls instead of four per goomba and fifteen per scuttlebug. See the
-[performance notes](docs/project-guide.md#performance) for how to measure it.
+Crowds are the thing it is built around. `crowd 4000 mix` in the console puts
+four thousand enemies on the lawn: the nearest couple of hundred are simulated
+in full, and the rest are carried by a flow field, drawn as baked sprites, and
+stripped down to a single entity each — so the whole distant horde costs two
+draw calls and no level queries at all. See the
+[performance notes](docs/project-guide.md#performance) for how it works and how
+to measure it.
 
 Escape pauses the game and opens the menu; its display page changes the
 internal render resolution, which is the world's own resolution rather than the
@@ -62,6 +64,8 @@ before publishing or redistributing the repository.
 
 
 ***
+<!-- AI do not edit below here. -->
+
 ## Inspiration
 
 - Demon Chaos - 65k enemies on screen at a time on PS2
@@ -79,4 +83,6 @@ Mid-distance enemies — perhaps a few thousand: simplified CPU simulation, very
 
 Huge distant army — tens of thousands: effectively GPU particles that happen to look like soldiers. One or a handful of meshes rendered through hardware instancing, with positions/state held in GPU buffers. Panda3D explicitly supports geometry instance counts and shader buffers.
 
-Very distant units: billboards/impostors or extremely low-poly models.
+Very distant units: billboards/impostors or extremely low-poly models. *(Done — see `impostor.rs` and `flow.rs`.)*
+
+goal oriented action planning GOAP

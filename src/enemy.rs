@@ -17,7 +17,7 @@ use crate::{
     player::{Controller, Motion, Player, FIXED_DT, PLAYER_HEIGHT},
     squad::Ally,
 };
-use bevy::{platform::collections::HashMap, prelude::*};
+use bevy::{platform::collections::HashMap, prelude::*, world_serialization::WorldAssetRoot};
 
 /// How far above an enemy's own feet counts as landing on top of it, as a
 /// fraction of its height.
@@ -70,7 +70,7 @@ const WANDER_REST_SPREAD: f32 = 3.0;
 ///
 /// It is half a unit because that is the tolerance [`LevelData::ground_at`]
 /// already answers with, and one step limit is better than two that disagree.
-const STEP_UP: f32 = 0.5;
+pub(crate) const STEP_UP: f32 = 0.5;
 
 /// How fast an enemy's feet follow the ground under them, climbing and
 /// falling, in world units a second.
@@ -134,6 +134,21 @@ const PROBE_REACH: f32 = 0.15;
 /// the spot. Turning at a bug's pace, it commits to the climb.
 const TURN_RATE: f32 = 3.0;
 
+/// How fast a crawler may roll from one surface's angle onto another's, in
+/// radians a second.
+///
+/// A degree a millisecond, which is 1,000 degrees a second: quick enough that
+/// nothing looks hesitant, slow enough that a right-angle corner takes three
+/// ticks instead of none. Before it the surface normal was taken whole the tick
+/// it was found, so a bug meeting the foot of a wall was *instantly* lying at
+/// ninety degrees to the floor it had been on -- a flip with no frames in it,
+/// which reads as the model glitching rather than as an animal climbing.
+///
+/// This is separate from [`TURN_RATE`], which is how fast it may turn *within*
+/// a surface. Both exist for the same reason and neither substitutes for the
+/// other: one is which way it is walking, this is which way is up.
+const ROLL_RATE: f32 = 1000.0 * std::f32::consts::PI / 180.0;
+
 /// How far off its surface a crawler is held. Nothing to do with looks: the
 /// next tick's probes start here, and a probe starting exactly on a triangle is
 /// a probe that may or may not find it depending on the last bit of the float.
@@ -161,6 +176,36 @@ impl Kind {
         match self {
             Self::Goomba => (0.70, 1.00),
             Self::Scuttlebug => (0.60, 0.80),
+        }
+    }
+
+    /// How far the model's geometry hangs below its own transform origin.
+    ///
+    /// **This is a fact about the asset, not a tuning knob.** The placement code
+    /// treats an enemy's translation as the point its feet rest on, and for the
+    /// scuttlebug that is simply not where its origin is: the rig's root sits up
+    /// in the body, and the legs, the mandibles and the underside of the shell
+    /// all hang below it. Seat the origin on the floor -- which is exactly what
+    /// [`crawl`] does, two centimetres of skin above the surface it found -- and
+    /// a third of the bug is underground. That is the "scuttlebugs clipping
+    /// through the floor" report, and it happens on flat stone with nothing
+    /// steep anywhere near, which is why nothing about walls or ceilings or
+    /// stale surface normals ever fixed it.
+    ///
+    /// Measured off the baked impostor sheets rather than guessed, because those
+    /// are renders of the real posed actor through the game's own draw chain:
+    /// the sheet's metadata says where the origin sits in a cell, and the lowest
+    /// opaque pixel says where the model stops.
+    /// `the_lift_matches_what_the_baked_sheets_show` re-derives both from the
+    /// PNGs on every test run, so the constant cannot drift from the art.
+    ///
+    /// The goomba's is small enough to read as the soles of its feet. The real
+    /// fix for both is the exporter putting the origin on the floor, which would
+    /// also let this be zero -- see `tools/export_actor_gltf.py`.
+    pub fn lift(self) -> f32 {
+        match self {
+            Self::Goomba => 0.065,
+            Self::Scuttlebug => 0.312,
         }
     }
 
@@ -411,7 +456,12 @@ pub fn spawn(
             Aggro::default(),
             Quirk::new(phase),
             Wander::new(position, phase),
-            WorldAssetRoot(assets.load(format!("{}#Scene0", kind.model()))),
+            // No `WorldAssetRoot` and hidden to begin with: [`shed_scenes`]
+            // builds the model on the first frame the enemy is near enough to
+            // need one. Spawning it here instead would have a field of two
+            // thousand build two thousand actor scenes and destroy all but a
+            // couple of hundred of them again on the next frame.
+            Visibility::Hidden,
             Transform::from_translation(position).with_scale(Vec3::splat(0.01)),
             // Parts of both of these are flat quads the original turns to face
             // the camera every frame.
@@ -530,6 +580,28 @@ pub enum Detail {
     Crowd,
 }
 
+/// How much further than `enemy_draw` an enemy must get before its skinned
+/// model is thrown away, and how much nearer than it before one is built again.
+///
+/// A tenth. Small enough that the swap still happens where it was asked for,
+/// wide enough that an enemy ambling along the boundary does not spawn and
+/// despawn a whole actor scene on alternate frames.
+const SWAP_HYSTERESIS: f32 = 1.1;
+
+/// How far across its route a crowd enemy is allowed to wander, as a fraction
+/// of the route itself.
+///
+/// A flow field hands every enemy in a cell the *same* direction, so a crowd
+/// following it walks in single file down one line -- which is both unlike the
+/// near tier, whose enemies each pick their own spot around the target and
+/// weave across the line to it, and unlike anything alive. The conga lines are
+/// obvious from a distance and read as a thinner crowd than is actually there.
+///
+/// The same [`Quirk::weave`] the near tier uses, applied across the flow
+/// instead of across a straight line to a goal, costs one sine a tick and
+/// spreads the stream back out into a crowd.
+const CROWD_WEAVE: f32 = 0.8;
+
 /// How far along the flow field's route the cheap tier notices the player, as a
 /// multiple of `enemy_sight`.
 ///
@@ -559,6 +631,69 @@ pub enum Detail {
 /// way that corrects itself the moment an enemy is promoted -- which is the
 /// direction an error here should point.
 const CROWD_SIGHT: f32 = 1.0;
+
+/// Builds and throws away the skinned model as an enemy crosses `enemy_draw`.
+///
+/// Hiding a distant enemy stops it being *drawn*, which was the whole of the
+/// first version of this and bought the draw calls back. What it does not stop
+/// is the enemy existing: a goomba is not one entity but a scene of about
+/// fifteen, a scuttlebug about sixty-three, and every one of them is a
+/// transform to propagate, a visibility to compute and an archetype row to walk
+/// past. A mixed field of two thousand is some eighty-five thousand entities,
+/// and eight thousand is a third of a million -- at which point the entity
+/// count, rather than the draws or the AI, is what a frame is made of. It was
+/// measured: at eight thousand the simulation budget saved nothing at all,
+/// because the simulation was no longer the expensive part.
+///
+/// So an enemy past the swap distance keeps only itself. Its `WorldAssetRoot`
+/// is taken away and its children go with it, and it comes back the moment the
+/// enemy is near enough to be drawn as a model again. What stands in for it
+/// meanwhile is its impostor, which needs nothing but the root's own transform.
+///
+/// The handle is not stored anywhere: `AssetServer::load` hands back the same
+/// handle for the same path, so rebuilding it costs a lookup rather than a load.
+pub fn shed_scenes(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    enemies: Query<(Entity, &Enemy, &Visibility, Option<&WorldAssetRoot>), With<Enemy>>,
+) {
+    for (entity, enemy, visibility, root) in &enemies {
+        match (*visibility == Visibility::Hidden, root.is_some()) {
+            // Gone far enough away to stop being a model.
+            (true, true) => {
+                commands.entity(entity).remove::<WorldAssetRoot>();
+            }
+            // Come near enough to be one again.
+            (false, false) => {
+                commands.entity(entity).insert(WorldAssetRoot(
+                    assets.load(format!("{}#Scene0", enemy.kind.model())),
+                ));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Spreads the alarm outward through the flow field while anything is chasing
+/// the player.
+///
+/// This is the cheap tier's whole substitute for [`alert`]'s shouting chain,
+/// and it exists because leaving it out was visibly wrong: a fully simulated
+/// field of two thousand ends up converging on the player almost entirely, as
+/// the chain cascades through a dense crowd within a tick or two, while a
+/// tiered field left the far crowd ambling about. The difference read as the
+/// crowd having lost most of its enemies.
+///
+/// The query is the whole cost: a scan that stops at the first enemy with the
+/// player's scent.
+pub fn rouse_crowd(
+    time: Res<Time>,
+    mut field: ResMut<crate::flow::FlowField>,
+    hunters: Query<&Aggro, With<Enemy>>,
+) {
+    let roused = hunters.iter().any(|aggro| aggro.target.is_some());
+    field.rouse(roused, time.delta_secs());
+}
 
 /// Sorts the field by distance and hands the nearest `sim_budget` the full
 /// simulation.
@@ -755,6 +890,11 @@ pub fn alert(tuning: Res<GameTuning>, everyone: Creatures, mut hunters: Hunters)
 /// The enemies that are held out of each other. Anything still flying the arc a
 /// pipe threw it is left out, for the same reason the movement step leaves it
 /// out: a shove during the launch is a launch that lands somewhere else.
+///
+/// The `Without`s are not decoration. This runs beside [`Marios`] and the
+/// player's own query in one system, and Bevy refuses two `&mut Transform`
+/// queries whose rows it cannot *prove* disjoint -- at initialisation, which in
+/// a windowed build is a panic nobody sees the message for.
 type Jostling<'w, 's> = Query<
     'w,
     's,
@@ -765,51 +905,132 @@ type Jostling<'w, 's> = Query<
         Option<&'static Crawler>,
         &'static Detail,
     ),
-    (Without<Player>, Without<crate::pipe::Launched>),
+    (
+        Without<Player>,
+        Without<crate::squad::Ally>,
+        Without<crate::pipe::Launched>,
+    ),
 >;
 
-/// Holds enemies out of one another, so that a crowd chasing one player stays a
-/// crowd rather than converging into a single stack of models.
+/// The Marios, who are held out of each other and out of everything else by the
+/// same pass. They were held out of nothing at all before it.
+type Marios<'w, 's> = Query<
+    'w,
+    's,
+    (Entity, &'static mut Transform),
+    (
+        With<crate::squad::Ally>,
+        Without<Player>,
+        Without<Enemy>,
+        Without<crate::pipe::Launched>,
+    ),
+>;
+
+/// One body in the press, reduced to what a shove needs to know.
+struct Body {
+    at: Vec3,
+    /// The cylinder it is resolved as, which is the one it is already fought as.
+    radius: f32,
+    height: f32,
+    /// Which way is up *for this body*: a crawler is pushed within the surface
+    /// it is stuck to, because shoving a bug off its wall is the one thing this
+    /// must not do.
+    up: Vec3,
+}
+
+/// Which query a shoved body came out of, so the push can be written back to it.
 ///
-/// A positional shove rather than a force: they are already resolved against
-/// the player as cylinders, and this resolves them against each other the same
-/// way. Crawlers are pushed within the surface they are stuck to -- shoving a
-/// bug off its wall is the one thing this must not do -- and the walkers within
-/// the horizontal plane, where their own floor query will catch them.
-pub fn spread(mut enemies: Jostling) {
+/// The player is deliberately not in here. He is in the body list -- everything
+/// else is held out of him -- but he is never pushed: the shove would fight the
+/// controller for his position, and being nudged about by the crowd you are
+/// walking through is a worse bug than the one being fixed.
+enum Shoved {
+    Enemy(Entity),
+    Ally(Entity),
+}
+
+/// Holds every creature out of every other one, so that a crowd converging on a
+/// player stays a crowd rather than a single stack of models.
+///
+/// A positional shove rather than a force: they are already resolved against the
+/// player as cylinders, and this resolves them against each other the same way.
+/// Crawlers are pushed within the surface they are stuck to, and everything else
+/// within the horizontal plane, where its own floor query will catch it.
+///
+/// **The Marios are in this and were not.** [`crate::squad::move_allies`] walks
+/// each one to its slot and asks nothing about what else is standing there, so a
+/// squad following the player was a heap of Marios in the same place walking
+/// through each other and through him. That they are held apart by the enemies'
+/// pass rather than by one of their own is the point: a Mario, a goomba and a
+/// scuttlebug are all bodies of some radius standing on some ground, and two
+/// separate answers to how bodies avoid each other is two answers that disagree
+/// at the boundary between them.
+pub fn spread(
+    level: Res<LevelData>,
+    mut enemies: Jostling,
+    mut allies: Marios,
+    player: Query<&Transform, With<Player>>,
+) {
+    let mut bodies: Vec<Body> = Vec::new();
+    let mut shoved: Vec<Shoved> = Vec::new();
     // The near tier only. Two distant goombas standing in the same spot are two
     // pixels standing in the same spot, and untangling them costs a spatial
     // grid over the whole field to fix something nobody can see.
-    let crowd: Vec<(Entity, Vec3, f32, Vec3)> = enemies
+    for (entity, enemy, transform, crawler, detail) in &enemies {
+        if *detail != Detail::Full {
+            continue;
+        }
+        let (radius, height) = enemy.kind.body();
+        bodies.push(Body {
+            at: transform.translation,
+            radius,
+            height,
+            up: crawler.map_or(Vec3::Y, |crawler| crawler.up),
+        });
+        shoved.push(Shoved::Enemy(entity));
+    }
+    for (entity, transform) in &allies {
+        bodies.push(Body {
+            at: transform.translation,
+            // A Mario is a Mario: the same body the player is resolved against
+            // walls with, rather than a second number that would drift from it.
+            radius: crate::player::PLAYER_RADIUS,
+            height: crate::player::PLAYER_HEIGHT,
+            up: Vec3::Y,
+        });
+        shoved.push(Shoved::Ally(entity));
+    }
+    // Solid, and last, so that everything after `shoved.len()` is a body that
+    // pushes without being pushed.
+    let fixed = shoved.len();
+    for transform in &player {
+        bodies.push(Body {
+            at: transform.translation,
+            radius: crate::player::PLAYER_RADIUS,
+            height: crate::player::PLAYER_HEIGHT,
+            up: Vec3::Y,
+        });
+    }
+
+    let widest = bodies
         .iter()
-        .filter(|(_, _, _, _, detail)| **detail == Detail::Full)
-        .map(|(entity, enemy, transform, crawler, _)| {
-            (
-                entity,
-                transform.translation,
-                enemy.kind.body().0,
-                crawler.map_or(Vec3::Y, |crawler| crawler.up),
-            )
-        })
-        .collect();
-    let widest = crowd
-        .iter()
-        .fold(0.0_f32, |most, (_, _, radius, _)| most.max(*radius));
+        .fold(0.0_f32, |most, body| most.max(body.radius));
     let grid = Neighbourhood::new(
-        crowd.iter().map(|(_, at, _, _)| *at),
+        bodies.iter().map(|body| body.at),
         widest * 2.0 + PERSONAL_SPACE,
     );
+    let mut pushes = vec![Vec3::ZERO; fixed];
     let mut near = Vec::new();
-    for (index, &(entity, position, radius, up)) in crowd.iter().enumerate() {
+    for (index, body) in bodies.iter().enumerate().take(fixed) {
         let mut push = Vec3::ZERO;
-        grid.near(position, &mut near);
+        grid.near(body.at, &mut near);
         for &other in &near {
             if other == index {
                 continue;
             }
-            let (_, theirs, their_radius, _) = crowd[other];
-            let room = radius + their_radius + PERSONAL_SPACE;
-            let apart = position - theirs;
+            let theirs = &bodies[other];
+            let room = body.radius + theirs.radius + PERSONAL_SPACE;
+            let apart = body.at - theirs.at;
             let overlap = room - apart.length() - SPREAD_SLACK;
             if overlap <= 0.0 {
                 continue;
@@ -818,18 +1039,53 @@ pub fn spread(mut enemies: Jostling) {
             // pipe on the same tick genuinely are, there is no direction to be
             // pushed in and one has to be invented. The golden angle again, so
             // that a pile does not unfold along one line.
-            let away = tangent(apart, up);
+            let away = tangent(apart, body.up);
             let away = if away == Vec3::ZERO {
                 let angle = index as f32 * crate::squad::GOLDEN_ANGLE;
-                tangent(Vec3::new(angle.sin(), 0.0, angle.cos()), up)
+                tangent(Vec3::new(angle.sin(), 0.0, angle.cos()), body.up)
             } else {
                 away
             };
-            push += away * overlap * SPREAD_RATE;
+            // A pair normally closes its gap at twice the rate, because both
+            // ends are shoved. Against something that will not move -- the
+            // player -- there is only one end, so it takes the whole share or
+            // it is walked through.
+            let share = if other < fixed { 1.0 } else { 2.0 };
+            push += away * overlap * SPREAD_RATE * share;
         }
-        if push != Vec3::ZERO {
-            if let Ok((_, _, mut transform, _, _)) = enemies.get_mut(entity) {
-                transform.translation += push.clamp_length_max(SPREAD_LIMIT * FIXED_DT);
+        pushes[index] = push;
+    }
+
+    for (index, push) in pushes.into_iter().enumerate() {
+        if push == Vec3::ZERO {
+            continue;
+        }
+        let body = &bodies[index];
+        let push = push.clamp_length_max(SPREAD_LIMIT * FIXED_DT);
+        // A press of bodies leaning on the one at the front is enough to post it
+        // through a fence, and neither the walk step nor the crowd step gets a
+        // say in where the shove puts it. So the shove resolves its own result,
+        // as the cylinder it was just pushed as.
+        //
+        // Not for crawlers: a bug is held out of walls by being *on* one, and
+        // `resolve_walls` would push it off the surface it is standing on.
+        let shove = |at: Vec3| {
+            let moved = at + push;
+            match body.up == Vec3::Y {
+                true => level.resolve_walls(moved, body.radius, body.height),
+                false => moved,
+            }
+        };
+        match shoved[index] {
+            Shoved::Enemy(entity) => {
+                if let Ok((_, _, mut transform, _, _)) = enemies.get_mut(entity) {
+                    transform.translation = shove(transform.translation);
+                }
+            }
+            Shoved::Ally(entity) => {
+                if let Ok((_, mut transform)) = allies.get_mut(entity) {
+                    transform.translation = shove(transform.translation);
+                }
             }
         }
     }
@@ -952,11 +1208,26 @@ pub fn update(
             detail,
         )| {
             let distance_squared = player.distance_squared(transform.translation);
-            *visibility = if distance_squared > tuning.enemy_draw * tuning.enemy_draw {
+            // Hysteresis, and it is load-bearing rather than tidy. Crossing
+            // this boundary now costs a whole glTF scene being spawned or
+            // thrown away -- see [`shed_scenes`] -- so an enemy stood exactly
+            // on it with a hard threshold would build and destroy forty
+            // entities every frame it jittered. The band means a boundary can
+            // only be crossed by walking a tenth of the draw distance past it.
+            let near = tuning.enemy_draw * tuning.enemy_draw;
+            let far = near * SWAP_HYSTERESIS * SWAP_HYSTERESIS;
+            let wanted = if distance_squared > far {
                 Visibility::Hidden
-            } else {
+            } else if distance_squared < near {
                 Visibility::Visible
+            } else {
+                *visibility
             };
+            // Written only on a change, so the far crowd is not put through
+            // visibility propagation every frame for standing still.
+            if *visibility != wanted {
+                *visibility = wanted;
+            }
             let stride = if distance_squared > tuning.enemy_lod_far * tuning.enemy_lod_far {
                 4
             } else if distance_squared > tuning.enemy_lod_near * tuning.enemy_lod_near {
@@ -987,8 +1258,11 @@ pub fn update(
                     quirk,
                     hero,
                     &tuning,
+                    elapsed,
                     dt,
+                    enemy.kind.lift(),
                 );
+                stand_upright(crawler, dt);
                 return;
             }
             let (goal, speed) = match aggro.target {
@@ -1003,20 +1277,22 @@ pub fn update(
                 let across = (goal - transform.translation).cross(up).normalize_or_zero();
                 goal + across * quirk.weave(elapsed)
             });
+            // `walk` and `settle` answer in contact points -- where the feet go
+            // -- and the transform is the model's origin, which for these
+            // actors is not the same place. Converted here rather than inside
+            // them, so both stay pure functions of the level that a test can
+            // walk an enemy across without knowing what it looks like.
+            let lift = Vec3::Y * enemy.kind.lift();
             let Some(mut crawler) = crawler else {
                 // The plain walkers stay in the horizontal plane, are stopped by
                 // anything too steep to walk, and follow the ground under them.
+                let mut at = transform.translation - lift;
                 if let Some(goal) = goal {
-                    let dir = tangent(goal - transform.translation, Vec3::Y);
-                    transform.translation = walk(
-                        &level,
-                        transform.translation,
-                        dir * dt * speed,
-                        enemy.kind.body().0,
-                    );
+                    let dir = tangent(goal - at, Vec3::Y);
+                    at = walk(&level, at, dir * dt * speed, enemy.kind.body().0);
                     transform.rotation = Quat::from_rotation_y(dir.x.atan2(dir.z));
                 }
-                transform.translation = settle(&level, transform.translation, dt);
+                transform.translation = settle(&level, at, dt) + lift;
                 return;
             };
             // A crawler heads for the same goal, but only along the surface it
@@ -1027,8 +1303,15 @@ pub fn update(
                 Some(goal) => (goal, speed),
                 None => (transform.translation + crawler.heading, 0.0),
             };
-            transform.translation =
-                crawl_towards(&level, transform.translation, &mut crawler, goal, speed, dt);
+            transform.translation = crawl_towards(
+                &level,
+                transform.translation,
+                &mut crawler,
+                goal,
+                speed,
+                dt,
+                enemy.kind.lift(),
+            );
             transform.rotation =
                 orientation(crawler.up, crawler.heading).unwrap_or(transform.rotation);
         },
@@ -1039,11 +1322,12 @@ pub fn update(
 ///
 /// No ray casts, no floor queries, no neighbours -- one lookup into
 /// [`crate::flow::FlowField`], which answered all of those questions once for
-/// everybody. What it gives up against [`walk`] and [`settle`] is collision:
-/// this will walk through a fence and clip the corner of a wall. What it keeps
-/// is everything that reads at a distance -- enemies that stream toward the
-/// player round the moat rather than into it, that mill about when nothing has
-/// their attention, and that stand on the ground rather than in it.
+/// everybody -- walls and cliffs included, so a crowd enemy is stopped by a
+/// fence and refused a cliff exactly as [`walk`] would stop and refuse it, just
+/// out of a table rather than a ray cast. What it gives up is resolution: the
+/// grid cannot hold anything thinner than itself, so a wall that does not
+/// separate two cell centres is a wall this does not know about, and a body is
+/// held out of one by the cell it is in rather than by its own width.
 ///
 /// The two behaviours it picks between are the same two the near tier has, so
 /// an enemy crossing the boundary carries on doing what it was doing rather
@@ -1057,7 +1341,9 @@ fn crowd_step(
     quirk: &Quirk,
     player: Entity,
     tuning: &GameTuning,
+    elapsed: f32,
     dt: f32,
+    lift: f32,
 ) {
     let guide = field.at(transform.translation);
     // Noticing the player, without [`alert`]. The field already knows how far
@@ -1066,12 +1352,14 @@ fn crowd_step(
     // moat is not as close as it looks. Once noticed he is never given up on,
     // exactly as in the near tier.
     let earshot = tuning.enemy_sight * CROWD_SIGHT;
-    if aggro.target.is_none()
-        && guide
-            .steps
-            .is_some_and(|steps| steps as f32 * field.cell_size() < earshot)
-    {
-        aggro.target = Some(player);
+    if aggro.target.is_none() {
+        let noticed = guide.steps.is_some_and(|steps| {
+            // Either it can see him for itself, or word has reached it.
+            steps as f32 * field.cell_size() < earshot || field.alarmed(steps)
+        });
+        if noticed {
+            aggro.target = Some(player);
+        }
     }
     let speed = quirk.pace()
         * if aggro.target.is_some() {
@@ -1082,7 +1370,10 @@ fn crowd_step(
     // Chasing follows the field; ambling heads for its own patch, which is
     // ground it was placed on and so ground it can stand on.
     let towards = if aggro.target.is_some() {
-        guide.towards
+        // Across the route rather than along it, so a thousand enemies handed
+        // the same direction spread into a crowd instead of a queue.
+        let across = Vec2::new(-guide.towards.y, guide.towards.x);
+        (guide.towards + across * quirk.weave(elapsed) * CROWD_WEAVE).normalize_or_zero()
     } else {
         let goal = wander.goal(transform.translation, dt);
         goal.map_or(Vec2::ZERO, |goal| {
@@ -1092,12 +1383,20 @@ fn crowd_step(
     };
     if towards != Vec2::ZERO {
         let step = towards * speed * dt;
-        let ahead = transform.translation + Vec3::new(step.x, 0.0, step.y);
-        // The one check that survives from the near tier, and the cheapest
-        // possible version of it: the survey already recorded which cells have
-        // ground, so walking off the map is a lookup rather than a ray cast.
-        if field.at(ahead).walkable {
-            transform.translation = ahead;
+        // The same three candidates [`walk`] tries, against the same idea of
+        // what a wall is, read out of the survey instead of ray-cast: a goomba
+        // that meets a fence at an angle slides along it rather than standing
+        // there pushing at it, and one offered the top of a wall as its next
+        // step is refused it.
+        for candidate in [step, Vec2::new(step.x, 0.0), Vec2::new(0.0, step.y)] {
+            if candidate == Vec2::ZERO {
+                continue;
+            }
+            let ahead = transform.translation + Vec3::new(candidate.x, 0.0, candidate.y);
+            if field.clear(transform.translation, ahead) {
+                transform.translation = ahead;
+                break;
+            }
         }
         transform.rotation = Quat::from_rotation_y(step.x.atan2(step.y));
     }
@@ -1108,7 +1407,48 @@ fn crowd_step(
     let guide = field.at(transform.translation);
     if guide.walkable {
         let (rise, drop) = (CLIMB_SPEED * dt, FALL_SPEED * dt);
-        transform.translation.y += (guide.ground - transform.translation.y).clamp(-drop, rise);
+        // The field answers where the ground is; the model's origin belongs
+        // `lift` above that, the same as in the near tier. Getting this wrong in
+        // one tier and right in the other is an enemy that sinks into the floor
+        // as you walk away from it.
+        let wanted = guide.ground + lift;
+        transform.translation.y += (wanted - transform.translation.y).clamp(-drop, rise);
+    }
+}
+
+/// Puts a crawler the right way up, and is the only thing that ever rescues one
+/// from under the floor.
+///
+/// A scuttlebug carries its own idea of which way is up, and walking onto a
+/// ceiling turns that idea upside down -- which is the feature. The trouble is
+/// that hanging under a ceiling and being buried under a floor are *the same
+/// state*: a surface overhead, the body against its underside, `up` pointing
+/// down. Nothing local can tell them apart, so nothing local can undo the
+/// second, and [`crawl`]'s probes are perfectly happy to keep a bug there
+/// forever -- it finds the floor's underside every tick and clings to it. On
+/// screen that is a scuttlebug swimming about inside the lawn.
+///
+/// What puts one there is any move it did not make itself: the crowd tier
+/// planting it on the ground at [`crowd_step`], a knockback, a shove from
+/// [`spread`]. It was moved without being told which way was up, and it kept the
+/// answer it had.
+///
+/// So the fix belongs at the transition rather than in the crawl, and the crowd
+/// tier is a good place to put it: everything past the simulation budget is
+/// walking the flow field on level ground, where up is up by definition. It also
+/// makes the game self-healing -- a bug that has got itself stuck under the
+/// world is stood back up the moment you walk far enough away for it to become
+/// crowd, which is the opposite of how these usually go.
+///
+/// Written only when it is wrong, so the far crowd is not marked changed every
+/// tick for already being upright.
+fn stand_upright(crawler: Option<Mut<Crawler>>, dt: f32) {
+    if let Some(mut crawler) = crawler {
+        if crawler.up != Vec3::Y {
+            // Rolled rather than snapped, at the same rate as any other change
+            // of surface: a bug righting itself is a bug going round a corner.
+            crawler.up = lean(crawler.up, Vec3::Y, crawler.heading, ROLL_RATE * dt);
+        }
     }
 }
 
@@ -1217,6 +1557,11 @@ fn ground_under(level: &LevelData, position: Vec3) -> bool {
 ///
 /// This is the whole of what a scuttlebug does, kept out of [`update`] so that a
 /// bug can be walked across a level in a test without an app around it.
+/// `position` and the result are the model's *origin*; `lift` is how far its
+/// geometry hangs below that ([`Kind::lift`]). Everything in between works in
+/// contact points -- the spot the body is actually resting on -- because that is
+/// what the probes have to be cast from and what the surface arithmetic means.
+/// Mixing the two is how the bug ended up underground in the first place.
 fn crawl_towards(
     level: &LevelData,
     position: Vec3,
@@ -1224,23 +1569,38 @@ fn crawl_towards(
     goal: Vec3,
     speed: f32,
     dt: f32,
+    lift: f32,
 ) -> Vec3 {
+    let contact = position - crawler.up * lift;
     // The part of the way to the goal it could actually walk. Behind a wall,
     // that is the wall -- and a bug that walks into a wall climbs it.
-    let wanted = tangent(goal - position, crawler.up);
+    let wanted = tangent(goal - contact, crawler.up);
     crawler.heading = steer(crawler.heading, wanted, crawler.up, TURN_RATE * dt);
-    match crawl(level, position, crawler.up, crawler.heading * speed * dt) {
-        Some((moved, up)) => {
+    match crawl(level, contact, crawler.up, crawler.heading * speed * dt) {
+        Some((moved, found)) => {
+            // Rolled towards the surface it found rather than snapped onto it,
+            // so a corner is something it goes round over a few ticks.
+            let up = lean(crawler.up, found, crawler.heading, ROLL_RATE * dt);
             // The heading is carried round the corner rather than recomputed:
             // a bug that walks over the lip of a table is still walking the
             // way it was, it is just that the way it was has been bent by the
-            // edge it went round.
+            // edge it went round. By however much of the edge it has got round
+            // so far, which is what the roll rate has just decided.
             crawler.heading = tangent(
                 Quat::from_rotation_arc(crawler.up, up) * crawler.heading,
                 up,
             );
             crawler.up = up;
-            moved
+            // Lifted along the *same* axis it was lowered along at the top --
+            // the bug's own up, not the surface's. Mid-roll those differ, and
+            // taking one for the other leaves a residue every tick that the
+            // next tick then walks on: measured, a bug going round the castle's
+            // corners drifted 1.2 m in a single step that way.
+            //
+            // The origin does still move as the body rolls, because a body
+            // pivoting on its feet moves its middle. That is the thing itself,
+            // not an error in it.
+            moved + up * lift
         }
         // Nothing within reach in any direction, so there is no surface to walk
         // and nothing to be the right way up for: it is over open space, or
@@ -1249,13 +1609,41 @@ fn crawl_towards(
         // and dropped onto the first floor that appears under it -- which is
         // also how it gets out from under that hill.
         None => {
-            let drifted = position + crawler.heading * speed * dt;
+            let drifted = contact + crawler.heading * speed * dt;
             if ground_under(level, drifted) {
-                crawler.up = Vec3::Y;
+                crawler.up = lean(crawler.up, Vec3::Y, crawler.heading, ROLL_RATE * dt);
             }
-            settle(level, drifted, dt)
+            settle(level, drifted, dt) + crawler.up * lift
         }
     }
+}
+
+/// Rolls `up` towards `wanted` by at most `most` radians, and is the whole of
+/// why a scuttlebug going round a corner has frames in it.
+///
+/// `heading` is only the fallback axis, for the one case that has no other
+/// answer: a surface exactly opposite the one it is on -- walking off a lip onto
+/// the underside of the very slab it was standing on -- where every axis is a
+/// shortest path and the cross product is zero. Tipping over its own nose is the
+/// way an animal does that, so the axis is the one across its travel.
+fn lean(up: Vec3, wanted: Vec3, heading: Vec3, most: f32) -> Vec3 {
+    let angle = up.angle_between(wanted);
+    if angle <= most || !angle.is_finite() {
+        return wanted;
+    }
+    let across = up.cross(wanted);
+    let axis = if across.length_squared() > 1e-9 {
+        across.normalize()
+    } else {
+        match up.cross(heading).try_normalize() {
+            Some(axis) => axis,
+            // Facing exactly the way it is standing, which `orientation` also
+            // has no answer for. Leave it be for a tick; the walk step will
+            // have moved it by the next one.
+            None => return up,
+        }
+    };
+    Quat::from_axis_angle(axis, most) * up
 }
 
 /// Turns `heading` towards `target` within the surface `up` names, by at most
@@ -1629,7 +2017,9 @@ mod tests {
         };
         (0..steps)
             .map(|_| {
-                position = crawl_towards(level, position, &mut crawler, goal, 3.0, FIXED_DT);
+                // No lift: this walks the abstract [`room`] and asserts where
+                // the contact point lands, which is what `crawl` answers in.
+                position = crawl_towards(level, position, &mut crawler, goal, 3.0, FIXED_DT, 0.0);
                 (position, crawler.up)
             })
             .collect()
@@ -1672,6 +2062,188 @@ mod tests {
         assert!(
             up.y < -0.99 && (position.y - 4.).abs() < 0.1 && position.x < hanging.0.x - 1.0,
             "it did not cross the ceiling: at {position:?} with up {up:?}"
+        );
+    }
+
+    /// A bug meeting a new surface rolls onto it over several ticks.
+    ///
+    /// Asked for directly: "they should not snap so immediately to the angle of
+    /// the surface they are walking on". Before [`ROLL_RATE`] the normal the
+    /// probe returned became the bug's `up` the same tick, so the floor-to-wall
+    /// corner was a ninety-degree flip with no frames in it.
+    #[test]
+    fn a_crawler_rolls_onto_a_new_surface_rather_than_snapping() {
+        let level = room();
+        let most = ROLL_RATE * FIXED_DT;
+        let mut position = Vec3::new(-3., 0., 0.);
+        let mut crawler = Crawler::default();
+        let (mut steepest, mut rolling) = (0.0_f32, 0);
+        for _ in 0..200 {
+            let was = crawler.up;
+            position = crawl_towards(
+                &level,
+                position,
+                &mut crawler,
+                Vec3::new(10., 4., 0.),
+                3.0,
+                FIXED_DT,
+                0.0,
+            );
+            let turned = was.angle_between(crawler.up);
+            steepest = steepest.max(turned);
+            if turned > 1e-4 {
+                rolling += 1;
+            }
+        }
+        assert!(
+            steepest <= most + 1e-3,
+            "up swung {:.1} degrees in one tick, past the {:.1} it is allowed",
+            steepest.to_degrees(),
+            most.to_degrees()
+        );
+        // Floor to wall is a right angle and wall to ceiling another, so the
+        // climb cannot be done in fewer than six ticks of turning at this rate.
+        assert!(
+            rolling >= 6,
+            "the whole climb was done in {rolling} ticks of turning"
+        );
+        // And it still got there, which is the point of a limit rather than a ban.
+        assert!(
+            crawler.up.y < -0.99,
+            "it never reached the ceiling: up {:?}",
+            crawler.up
+        );
+    }
+
+    /// A scuttlebug walking the castle keeps its body out of the floor.
+    ///
+    /// This is the report, and it took three passes to find because every guess
+    /// was about *behaviour* -- stale surface normals, walls, ceilings, the tier
+    /// boundary -- when the cause was arithmetic and constant. The scuttlebug's
+    /// rig root sits up inside its body, so the model hangs 31 cm below its own
+    /// transform origin, and every placement in the game seated that origin on
+    /// the ground. The bug was buried to its belly on flat stone with nothing
+    /// steep within twenty metres.
+    ///
+    /// What finally found it was looking at one: a screenshot of a single
+    /// scuttlebug on the castle courtyard, where the floor cuts a flat line
+    /// across the bottom of its shell.
+    ///
+    /// The test drives [`update`] rather than [`crawl_towards`] on purpose. A
+    /// test that passes a lift in and then subtracts the same lift back out
+    /// proves nothing -- it passes just as happily with the lift set to zero,
+    /// which is exactly what the first version of this did. What has to be
+    /// checked is that the *game's own placement* seats the model clear of the
+    /// ground, so the number comes from [`Kind::lift`] here and from whatever
+    /// `update` chooses to do there. Between this and
+    /// `impostor::tests::the_lift_matches_what_the_baked_sheets_show` -- which
+    /// pins `Kind::lift` to the pixels of the baked art -- neither half can
+    /// drift without a failure.
+    ///
+    /// Both tiers are in the field at once, because a model correctly seated by
+    /// one tier and buried by the other is an enemy that sinks into the ground
+    /// as you walk away from it.
+    #[test]
+    fn a_scuttlebug_keeps_its_body_out_of_the_floor() {
+        bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let (level, _) = crate::level::load();
+        let mut world = World::new();
+        let spots = crowd_spots(64, &level);
+        world.insert_resource(GameTuning {
+            // Half the field near, half crowd.
+            sim_budget: 32.0,
+            ..GameTuning::default()
+        });
+        world.insert_resource(crate::flow::FlowField::new(&level));
+        world.insert_resource(level);
+        world.insert_resource(Time::<Fixed>::default());
+        world.insert_resource(Time::<()>::default());
+        world.spawn((Player, Transform::from_xyz(-13.28, 3.0, 46.64)));
+        let bugs: Vec<Entity> = spots
+            .iter()
+            .enumerate()
+            .map(|(index, at)| {
+                world
+                    .spawn((
+                        Enemy {
+                            kind: Kind::Scuttlebug,
+                            animation: Handle::default(),
+                        },
+                        Transform::from_translation(*at),
+                        Visibility::Visible,
+                        Side::Hostile,
+                        Aggro::default(),
+                        Quirk::new(index as f32 * crate::squad::GOLDEN_ANGLE),
+                        Wander::new(*at, index as f32),
+                        Crawler::default(),
+                        Detail::Full,
+                    ))
+                    .id()
+            })
+            .collect();
+        let sweep = world.register_system(crate::flow::rebuild);
+        let rank = world.register_system(assign_detail);
+        let step = world.register_system(update);
+
+        // How far the art hangs below the origin, which is the thing the
+        // placement has to hold clear of the ground. Read off the baked sheet
+        // rather than taken from `Kind::lift`: a test that subtracts back out
+        // the very number the placement put in passes with the lift set to
+        // zero, which is how the first two versions of this quietly proved
+        // nothing.
+        let hang = crate::impostor::tests::hang_in_sheet(Kind::Scuttlebug);
+        // Counted per tier, because they fail differently and only one of them
+        // is under test here.
+        let (mut standing, mut sunk) = ([0; 2], [0; 2]);
+        let mut deepest = 0.0_f32;
+        for _ in 0..600 {
+            world.run_system(sweep).expect("no sweep");
+            world.run_system(rank).expect("no rank");
+            world.run_system(step).expect("no step");
+            for bug in &bugs {
+                // Only while it is the right way up. Clinging to a wall or a
+                // ceiling, the ground below is not what it is resting on.
+                if world.get::<Crawler>(*bug).expect("gone").up.y < 0.99 {
+                    continue;
+                }
+                let at = world.get::<Transform>(*bug).expect("gone").translation;
+                let tier = usize::from(*world.get::<Detail>(*bug).expect("gone") == Detail::Crowd);
+                let level = world.resource::<LevelData>();
+                let Some((ground, _)) = level.ground_at(at) else {
+                    continue;
+                };
+                standing[tier] += 1;
+                let depth = ground - (at.y - hang);
+                if depth > 0.05 {
+                    sunk[tier] += 1;
+                    deepest = deepest.max(depth);
+                }
+            }
+        }
+        assert!(
+            standing[0] > 2_000 && standing[1] > 2_000,
+            "not enough upright ticks in both tiers: {standing:?}"
+        );
+        // The near tier is the one under test, and it has to be clean: with the
+        // lift taken out, 98% of these ticks have the model underground.
+        assert!(
+            sunk[0] * 200 < standing[0],
+            "{} of {} near-tier ticks had the model in the ground, the worst by \
+             {deepest:.2} m",
+            sunk[0],
+            standing[0]
+        );
+        // The crowd tier is allowed a little, and it is not this bug. It stands
+        // on the flow field's bilinear height rather than on the collision mesh,
+        // and bilinear interpolation between cell centres cuts the corner off a
+        // convex ridge -- so a bug on a crest reads as sunk by a few tenths.
+        // Pre-existing, documented on `FlowField::at`, and invisible at the
+        // range that tier is drawn at. Bounded here so it cannot grow.
+        assert!(
+            sunk[1] * 20 < standing[1],
+            "{} of {} crowd ticks had the model in the ground",
+            sunk[1],
+            standing[1]
         );
     }
 
@@ -1718,13 +2290,28 @@ mod tests {
             let goal = Vec3::new(0., 8., -30.);
             let mut position = start;
             let mut crawler = Crawler::default();
+            // A change of surface is counted where the roll *finishes*, not per
+            // tick. Since [`ROLL_RATE`] a corner takes several ticks to go
+            // round, and each of those ticks moves `up` further than the old
+            // per-tick threshold -- so the old counter would have called one
+            // corner three surfaces.
             let mut was = crawler.up;
+            let mut resting = crawler.up;
             let (mut flips, mut furthest) = (0, 0.0_f32);
             for _ in 0..900 {
                 let before = position;
-                position = crawl_towards(&level, position, &mut crawler, goal, 4.0, FIXED_DT);
-                if crawler.up.distance(was) > 0.5 {
+                position = crawl_towards(
+                    &level,
+                    position,
+                    &mut crawler,
+                    goal,
+                    4.0,
+                    FIXED_DT,
+                    Kind::Scuttlebug.lift(),
+                );
+                if crawler.up.distance(was) < 1e-4 && crawler.up.distance(resting) > 0.5 {
                     flips += 1;
+                    resting = crawler.up;
                 }
                 was = crawler.up;
                 // The floor snap is allowed its jump; a step along a surface is
@@ -1814,10 +2401,122 @@ mod tests {
         assert!(apart > 0.01, "two benchmark enemies are {apart} apart");
     }
 
+    /// The budget is a count, and it is the *nearest* that count which is kept.
+    ///
+    /// The whole promise of the crowd work is that the expensive tier has a
+    /// fixed size, so a field of five thousand costs what a field of five
+    /// hundred does. A budget that leaked with the field size would be no
+    /// budget at all.
+    #[test]
+    fn the_nearest_enemies_are_the_ones_simulated_in_full() {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut world = World::new();
+        world.insert_resource(GameTuning {
+            sim_budget: 10.0,
+            ..GameTuning::default()
+        });
+        world.spawn((Player, Transform::default()));
+        // Placed at 1, 2, 3 ... metres out, shuffled by the golden angle so the
+        // spawn order is nothing like the distance order.
+        let mut placed: Vec<(f32, Entity)> = (1..=50)
+            .map(|step| {
+                let away = step as f32;
+                let angle = step as f32 * crate::squad::GOLDEN_ANGLE;
+                let at = Vec3::new(angle.sin(), 0.0, angle.cos()) * away;
+                (
+                    away,
+                    world
+                        .spawn((
+                            Enemy {
+                                kind: Kind::Goomba,
+                                animation: Handle::default(),
+                            },
+                            Transform::from_translation(at),
+                        ))
+                        .id(),
+                )
+            })
+            .collect();
+        world.run_system_once(assign_detail).expect("no run");
+        placed.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (rank, (away, entity)) in placed.iter().enumerate() {
+            let detail = *world.get::<Detail>(*entity).expect("no tier");
+            let wanted = if rank < 10 {
+                Detail::Full
+            } else {
+                Detail::Crowd
+            };
+            assert_eq!(
+                detail, wanted,
+                "the enemy {away} metres out, ranked {rank}, got {detail:?}"
+            );
+        }
+    }
+
+    /// A budget nobody exceeds demotes nobody: a small field is simulated in
+    /// full, exactly as it was before any of this existed.
+    #[test]
+    fn a_field_inside_the_budget_is_all_simulated_in_full() {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut world = World::new();
+        world.insert_resource(GameTuning::default());
+        world.spawn((Player, Transform::default()));
+        let enemies: Vec<Entity> = (0..20)
+            .map(|step| {
+                world
+                    .spawn((
+                        Enemy {
+                            kind: Kind::Goomba,
+                            animation: Handle::default(),
+                        },
+                        Transform::from_xyz(step as f32 * 3.0, 0.0, 0.0),
+                    ))
+                    .id()
+            })
+            .collect();
+        world.run_system_once(assign_detail).expect("no run");
+        for entity in enemies {
+            assert_eq!(*world.get::<Detail>(entity).unwrap(), Detail::Full);
+        }
+    }
+
+    /// An enemy is born with a tier whether or not anybody remembered to give
+    /// it one. `Detail` is a required component of `Enemy` precisely so that a
+    /// spawn site that forgets is impossible rather than merely unlikely.
+    #[test]
+    fn every_enemy_has_a_tier_without_being_given_one() {
+        let mut world = World::new();
+        let enemy = world
+            .spawn(Enemy {
+                kind: Kind::Goomba,
+                animation: Handle::default(),
+            })
+            .id();
+        assert_eq!(world.get::<Detail>(enemy).copied(), Some(Detail::Full));
+    }
+
     /// A player at the origin and enemies stood where they are asked for.
+    /// Open ground and nothing else, for the tests that are about bodies rather
+    /// than about the level: [`spread`] resolves what it shoves against the
+    /// walls, and a world with no [`LevelData`] in it has no walls to resolve
+    /// against and no resource for the system to take.
+    fn lawn() -> LevelData {
+        LevelData::new(
+            vec![
+                Vec3::new(-200., 0., -200.),
+                Vec3::new(200., 0., -200.),
+                Vec3::new(200., 0., 200.),
+                Vec3::new(-200., 0., 200.),
+            ],
+            vec![[0, 1, 2], [0, 2, 3]],
+            Vec::new(),
+        )
+    }
+
     fn field(placed: &[Vec3]) -> (World, Entity, Vec<Entity>) {
         let mut world = World::new();
         world.insert_resource(GameTuning::default());
+        world.insert_resource(lawn());
         let player = world
             .spawn((Player, Side::Friendly, Transform::default()))
             .id();
@@ -1971,6 +2670,7 @@ mod tests {
     #[test]
     fn crawlers_are_shoved_along_the_surface_they_are_stuck_to() {
         let mut world = World::new();
+        world.insert_resource(lawn());
         let wall = Vec3::new(4., 3., 0.);
         let pair: Vec<Entity> = [wall, wall + Vec3::new(0., 0.2, 0.)]
             .iter()
@@ -2358,5 +3058,273 @@ mod tests {
         world.run_system_once(combat).expect("combat could not run");
         assert!(world.get_entity(enemy).is_ok());
         assert_eq!(controller(&mut world).1, 3, "hurt from a storey up");
+    }
+
+    /// A scuttlebug that has been under the world is stood back up by the
+    /// crowd tier, and that is the only thing in the game that will do it.
+    ///
+    /// The state being fixed is a real one and reachable in a couple of
+    /// seconds' play: walk a bug up a wall and onto a ceiling and its `up` is
+    /// now pointing down, which is correct while it is hanging there. Move it
+    /// without telling it -- the crowd tier planting it on the ground is the
+    /// easy way, a knockback is another -- and it is under a floor rather than
+    /// on a ceiling, with no way to tell the difference and no way back. It
+    /// clings to the underside of the lawn from then on.
+    #[test]
+    fn a_bug_left_upside_down_is_stood_back_up_by_the_crowd() {
+        let level = room();
+        // Walk it up the wall and onto the ceiling, so the upside-down `up`
+        // is one the game itself produced rather than one written by hand.
+        let mut position = Vec3::new(-3., 0., 0.);
+        let mut crawler = Crawler::default();
+        for _ in 0..200 {
+            position = crawl_towards(
+                &level,
+                position,
+                &mut crawler,
+                Vec3::new(10., 4., 0.),
+                3.0,
+                FIXED_DT,
+                0.0,
+            );
+        }
+        assert!(
+            crawler.up.y < -0.99,
+            "it never made it onto the ceiling: up {:?}",
+            crawler.up
+        );
+
+        // Now put it where the crowd tier would: on the floor, upside down.
+        // `update` walks the field in parallel, so it wants a pool to walk it in.
+        bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let mut world = World::new();
+        let (level, _) = crate::level::load();
+        world.insert_resource(GameTuning::default());
+        world.insert_resource(crate::flow::FlowField::new(&level));
+        world.insert_resource(level);
+        world.insert_resource(Time::<Fixed>::default());
+        let ground = Vec3::new(-13.28, 3.0, 46.64);
+        world.spawn((Player, Transform::from_translation(ground)));
+        let bug = world
+            .spawn((
+                Enemy {
+                    kind: Kind::Scuttlebug,
+                    animation: Handle::default(),
+                },
+                Transform::from_translation(ground + Vec3::X * 2.0),
+                Visibility::Visible,
+                Side::Hostile,
+                Aggro::default(),
+                Quirk::new(0.0),
+                Wander::new(ground, 0.0),
+                crawler,
+                Detail::Crowd,
+            ))
+            .id();
+        // Several ticks, because righting itself is a roll like any other and
+        // [`ROLL_RATE`] gives it about six of them to turn all the way over.
+        let step = world.register_system(update);
+        let mut ticks = 0;
+        while world.get::<Crawler>(bug).expect("no crawler").up != Vec3::Y {
+            world.run_system(step).expect("no run");
+            ticks += 1;
+            assert!(ticks < 30, "it is still upside down after {ticks} ticks");
+        }
+        // And it did roll rather than snap: a flip that took one tick would be
+        // the instant swap this is here to prevent.
+        assert!(ticks > 2, "it snapped upright in {ticks} tick(s)");
+    }
+
+    /// A field of crowd-tier goombas turned loose on the castle never walks
+    /// through anything.
+    ///
+    /// The unit tests in [`crate::flow`] check the rule; this checks that the
+    /// tier actually asks it, over the real collision mesh, with the weave and
+    /// the wander and the promotions and everything else that moves an enemy
+    /// somewhere the flow field did not send it. Every step of every enemy is
+    /// cast against the level at knee height -- the near tier's own test for
+    /// what it may walk through -- and none of them may hit a wall.
+    ///
+    /// Before the survey learned about walls this reported hundreds of
+    /// crossings over a thirty-second walk.
+    #[test]
+    fn a_crowd_walks_the_castle_without_walking_through_it() {
+        bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let (level, _) = crate::level::load();
+        let mut world = World::new();
+        world.insert_resource(GameTuning {
+            // Everything is crowd, which is the tier under test.
+            sim_budget: 0.0,
+            ..GameTuning::default()
+        });
+        world.insert_resource(crate::flow::FlowField::new(&level));
+        let spots = crowd_spots(96, &level);
+        world.insert_resource(level);
+        world.insert_resource(Time::<Fixed>::default());
+        world.spawn((Player, Transform::from_xyz(-13.28, 3.0, 46.64)));
+        let enemies: Vec<Entity> = spots
+            .iter()
+            .enumerate()
+            .map(|(index, at)| {
+                world
+                    .spawn((
+                        Enemy {
+                            kind: Kind::Goomba,
+                            animation: Handle::default(),
+                        },
+                        Transform::from_translation(*at),
+                        Visibility::Visible,
+                        Side::Hostile,
+                        Aggro::default(),
+                        Quirk::new(index as f32 * crate::squad::GOLDEN_ANGLE),
+                        Wander::new(*at, index as f32),
+                        Detail::Crowd,
+                    ))
+                    .id()
+            })
+            .collect();
+        // Registered rather than run one-shot, so the tick counter the strides
+        // are taken off actually counts.
+        let sweep = world.register_system(crate::flow::rebuild);
+        let step = world.register_system(update);
+        world.insert_resource(Time::<()>::default());
+
+        let mut was: Vec<Vec3> = spots.clone();
+        let knee = Vec3::Y * STEP_UP;
+        let mut through = Vec::new();
+        for _ in 0..900 {
+            world.run_system(sweep).expect("no sweep");
+            world.run_system(step).expect("no step");
+            for (index, enemy) in enemies.iter().enumerate() {
+                let now = world.get::<Transform>(*enemy).expect("gone").translation;
+                let level = world.resource::<LevelData>();
+                // The horizontal part only, cast from knee height: exactly the
+                // probe [`walk`] makes, so the two tiers are held to one
+                // standard. The vertical part is [`settle`] falling, and a
+                // segment drawn down a cliff face hits the cliff whether or not
+                // anything walked through it.
+                let moved = Vec3::new(now.x - was[index].x, 0.0, now.z - was[index].z);
+                if moved.length_squared() > 1e-8 {
+                    let from = was[index] + knee;
+                    let crossed = level
+                        .surface_hit(from, from + moved)
+                        .is_some_and(|(_, normal)| {
+                            normal.y.abs() <= crate::level::GROUND_NORMAL_Y
+                        });
+                    if crossed {
+                        let field = world.resource::<crate::flow::FlowField>();
+                        through.push((was[index], now, field.same_cell(was[index], now)));
+                    }
+                }
+                was[index] = now;
+            }
+        }
+        // It has to have gone somewhere, or a field that never moves passes.
+        let travelled: f32 = enemies
+            .iter()
+            .zip(&spots)
+            .map(|(enemy, from)| {
+                world
+                    .get::<Transform>(*enemy)
+                    .expect("gone")
+                    .translation
+                    .distance(*from)
+            })
+            .sum();
+        assert!(
+            travelled > 96.0 * 5.0,
+            "the crowd barely moved: {travelled:.0} m between all of them"
+        );
+        // Nothing crossed a wall on its way out of a cell, which is the whole of
+        // what a grid of this size can promise. What is left is enemies moving
+        // *within* one cell that has a fence running through it: the survey
+        // records what stands between two cell centres and has no way to record
+        // anything finer, so an enemy can clip a fence corner by less than the
+        // 1.7 m the grid is drawn at. It is also the tier that is never within
+        // twenty-five metres of the camera -- anything nearer is walking on
+        // [`walk`], which casts for itself.
+        let escaped: Vec<_> = through
+            .iter()
+            .filter(|(_, _, same_cell)| !same_cell)
+            .collect();
+        assert!(
+            escaped.is_empty(),
+            "{} steps crossed a wall into another cell, e.g. {:?}",
+            escaped.len(),
+            &escaped[..escaped.len().min(3)]
+        );
+
+        // And nobody walked up the castle. The measure is bluntly physical --
+        // how much height an enemy gained in thirty seconds -- because that is
+        // what the report was: goombas going up and down elevations that are
+        // impossibly steep. With only `walkable` checked, the worst of a field
+        // of ninety-six climbed **30.3 m**, straight up the castle wall at
+        // [`CLIMB_SPEED`], with four more past 9 m. Refusing the cliff edges
+        // leaves 8 m, over ramps and lawn that genuinely rise that far.
+        let worst = enemies
+            .iter()
+            .zip(&spots)
+            .map(|(enemy, from)| {
+                world.get::<Transform>(*enemy).expect("gone").translation.y - from.y
+            })
+            .fold(f32::MIN, f32::max);
+        assert!(worst < 10.0, "something climbed {worst:.1} m in thirty seconds");
+    }
+
+    /// The Marios were held out of nothing at all: `move_allies` walks each one
+    /// to its slot and asks nothing about what is standing there. A squad
+    /// following the player was a heap of Marios in one place.
+    #[test]
+    fn the_marios_are_held_out_of_each_other_and_out_of_the_player() {
+        let mut world = World::new();
+        world.insert_resource(lawn());
+        let at = Vec3::new(0.0, 0.0, 0.0);
+        world.spawn((Player, Transform::from_translation(at)));
+        // All four in the same spot, on top of him.
+        let marios: Vec<Entity> = (0..4)
+            .map(|_| {
+                world
+                    .spawn((
+                        crate::squad::Ally::new(at, 0.0),
+                        Transform::from_translation(at),
+                    ))
+                    .id()
+            })
+            .collect();
+        for _ in 0..120 {
+            world.run_system_once(spread).expect("no run");
+        }
+        let room = crate::player::PLAYER_RADIUS * 2.0 + PERSONAL_SPACE - SPREAD_SLACK;
+        let places: Vec<Vec3> = marios
+            .iter()
+            .map(|mario| world.get::<Transform>(*mario).expect("gone").translation)
+            .collect();
+        for (index, mine) in places.iter().enumerate() {
+            assert!(
+                mine.distance(at) >= room * 0.99,
+                "a Mario is standing inside the player, {:.2} m away",
+                mine.distance(at)
+            );
+            for theirs in &places[index + 1..] {
+                assert!(
+                    mine.distance(*theirs) >= room * 0.99,
+                    "two Marios {:.2} m apart, which is inside each other",
+                    mine.distance(*theirs)
+                );
+            }
+        }
+        // And the player was not shoved out of the way by the crowd he is
+        // standing in: he is driven by the controller, not by the press.
+        let mut players = world.query_filtered::<&Transform, With<Player>>();
+        assert_eq!(players.single(&world).expect("no player").translation, at);
+    }
+
+    #[test]
+    #[ignore]
+    fn diagnose_spots() {
+        let (level, _) = crate::level::load();
+        for (i, at) in crowd_spots(6, &level).iter().enumerate() {
+            println!("{i}: {at:?}");
+        }
     }
 }

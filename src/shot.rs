@@ -83,8 +83,6 @@ fn keep(
     images: Res<Assets<Image>>,
     target: Option<Res<SceneTarget>>,
     shot_stats: Res<crate::impostor::ImpostorStats>,
-    heights: Query<(&Transform, &crate::enemy::Detail), With<crate::enemy::Enemy>>,
-    level: Res<crate::level::LevelData>,
     mut exit: MessageWriter<AppExit>,
 ) {
     let Some(target) = target else {
@@ -104,57 +102,13 @@ fn keep(
         exit.write(AppExit::error());
         return;
     }
-    {
-        let mut sunk = [0usize; 2];
-        let mut total = [0usize; 2];
-        let mut worst = [0.0f32; 2];
-        let mut mean = [0.0f64; 2];
-        let mut spread = [0.0f64; 2];
-        let mut buried = [0usize; 2];
-        let mut counted = [0usize; 2];
-        for (t, detail) in &heights {
-            let i = usize::from(*detail == crate::enemy::Detail::Crowd);
-            total[i] += 1;
-            if let Some(real) = level.ground_at(t.translation + Vec3::Y * 60.0) {
-                let below = real.0 - t.translation.y;
-                if below > 0.5 { sunk[i] += 1; }
-                worst[i] = worst[i].max(below);
-                mean[i] += below as f64;
-                spread[i] += below.abs() as f64;
-                if below > 0.25 { buried[i] += 1; }
-                counted[i] += 1;
-            }
-        }
-        println!(
-            "screenshot: full tier {} ({} sunk, worst {:.2}m) | crowd tier {} ({} sunk, worst {:.2}m)",
-            total[0], sunk[0], worst[0], total[1], sunk[1], worst[1]
-        );
-        for i in 0..2 {
-            if counted[i] > 0 {
-                println!(
-                    "screenshot: tier {i}: mean {:+.3}m, mean |offset| {:.3}m, {} of {} buried >0.25m",
-                    mean[i] / counted[i] as f64,
-                    spread[i] / counted[i] as f64,
-                    buried[i],
-                    counted[i]
-                );
-            }
-        }
-        // Where they are, in bands out from the shot's aim point.
-        let mut bands = [0usize; 8];
-        for (t, _) in &heights {
-            let d = t.translation.distance(shot.at);
-            let b = ((d / 15.0) as usize).min(7);
-            bands[b] += 1;
-        }
-        println!("screenshot: distance bands from aim (15m each): {bands:?}");
-    }
     let crowd = *shot_stats;
     println!(
-        "screenshot: {} sprites + {} skinned = {} enemies drawn",
+        "screenshot: {} sprites + {} skinned = {} drawn, {} MISSING",
         crowd.sprites,
         crowd.skinned,
-        crowd.sprites + crowd.skinned
+        crowd.sprites + crowd.skinned,
+        crowd.missing
     );
     match image::RgbaImage::from_raw(size.width, size.height, pixels[..wanted].to_vec()) {
         Some(picture) => match picture.save_with_format(&shot.path, image::ImageFormat::Png) {
@@ -197,7 +151,10 @@ pub fn run(path: &std::path::Path, crowd: usize, eye: Vec3, at: Vec3) {
         path: path.to_path_buf(),
         eye,
         at,
-        left: SETTLE,
+        left: std::env::var("SHOT_SETTLE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(SETTLE),
         asked: false,
     })
     // In `PostUpdate` and before the transforms are propagated, so this is the

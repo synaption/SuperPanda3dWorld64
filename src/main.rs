@@ -275,10 +275,26 @@ pub fn game_systems(app: &mut App) {
         .add_systems(FixedUpdate, simulation())
         .add_systems(Update, presentation())
         .add_systems(Update, overlay())
-        .add_systems(
-            PostUpdate,
-            (billboard::systems(), impostor::systems(), n64::systems()).chain(),
-        );
+        .add_systems(PostUpdate, drawing());
+}
+
+/// Everything that happens to geometry after the world has moved: billboards
+/// aimed at the camera, the far crowd's sprites rebuilt, and every surface
+/// swapped onto the N64 material.
+///
+/// A named chain rather than three calls at each site, because **the impostor
+/// baker has to run exactly this and getting it wrong is invisible.** It did:
+/// the baker was drawing actors without the billboard half, so the goomba's
+/// face and the scuttlebug's three billboard joints came out at a quarter of
+/// their size -- `billboard::aim` is what puts back the 0.25 the exporter bakes
+/// onto the skeleton -- and single-sided, so they were culled from half the
+/// angles. The sheets that came out covered 52% of the pixels the real models
+/// did, which is what a swap distance looks like when enemies visibly shrink
+/// as they cross it. Sharing the chain is what stops that happening again.
+///
+/// The order inside it is load-bearing and documented at each of the three.
+pub fn drawing() -> ScheduleConfigs<ScheduleSystem> {
+    (billboard::systems(), impostor::systems(), n64::systems()).chain()
 }
 
 /// Reading the keyboard, the mouse and the pad into one snapshot for the frame.
@@ -325,6 +341,8 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
         // And before every system that asks how much simulation an enemy is
         // getting this tick.
         enemy::assign_detail,
+        // After the sweep, whose step counts it spreads along.
+        enemy::rouse_crowd,
         squad::maintain_population,
         squad::update_goals,
         squad::move_allies,
@@ -334,6 +352,9 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
         enemy::ally_combat,
         enemy::alert,
         enemy::update,
+        // Straight after the step that decided what is near enough to be drawn
+        // as a model, so the scene is built or shed against this tick's answer.
+        enemy::shed_scenes,
         // After the step that moved them, so a crowd that walked into itself
         // this tick is untangled before it is drawn rather than a tick later.
         enemy::spread,
@@ -409,6 +430,7 @@ fn asset_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup(
     mut commands: Commands,
     assets: Res<AssetServer>,
@@ -416,6 +438,7 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut sprites: ResMut<Assets<n64::N64Material>>,
     mut images: ResMut<Assets<Image>>,
+    mut console: ResMut<console::ConsoleState>,
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
     // Made before anything that refers to it: the world camera draws into it,
@@ -438,6 +461,7 @@ fn setup(
         // same disc material every other shadow in the game uses -- at full
         // strength, since everything it draws is stood on the ground.
         shadow_art.fade(shadow::SOLID),
+        &mut console,
         &asset_path(),
     );
     commands.insert_resource(shadow_art);
@@ -726,10 +750,17 @@ fn update_fps(
             let mut line = format!("{fps:.0} fps · {frame_time:.1} ms");
             if let Some(entities) = entities {
                 line.push_str(&format!(
-                    " · {} enemies ({} sprite / {} skinned) · {entities:.0} entities",
+                    " · {} enemies ({} sprite / {} skinned{}) · {entities:.0} entities",
                     enemies.iter().count(),
                     crowd.sprites,
                     crowd.skinned,
+                    // Silent otherwise, and this is the number that says the
+                    // far crowd is not being drawn at all.
+                    if crowd.missing > 0 {
+                        format!(" / {} UNDRAWN", crowd.missing)
+                    } else {
+                        String::new()
+                    },
                 ));
             }
             line
@@ -982,34 +1013,14 @@ mod tests {
                         file_path: asset_path().to_string_lossy().into_owned(),
                         ..default()
                     }),
-            )
-            .add_plugins(n64::N64Plugin)
-            .init_resource::<console::GameTuning>()
-            .init_resource::<console::ConsoleState>()
-            .init_resource::<input::InputState>()
-            .init_resource::<audio::SoundQueue>()
-            .init_resource::<water::CameraMedium>()
-            .init_resource::<animation::PlayerAnimation>()
-            .init_resource::<animation::EnemyGraphs>()
-            .init_resource::<squad::Squad>()
-            .init_resource::<squad::Whistle>()
-            .init_resource::<menu::MenuState>()
-            .init_resource::<display::DisplaySettings>()
-            .init_resource::<GameState>()
-            .insert_resource(ClearColor(water::SKY_COLOUR))
-            .insert_resource(Time::<Fixed>::from_hz(30.0))
+            );
+            add_game(&mut app);
             // A real clock would let the loop outrun the fixed step and leave
             // the simulation half-exercised. Sixteen milliseconds a frame is
             // the 60 Hz session this is trying to hold.
-            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
                 Duration::from_millis(16),
-            ))
-            .add_systems(Startup, setup)
-            .add_systems(FixedUpdate, simulation())
-            .add_systems(Update, presentation())
-            .add_systems(Update, overlay())
-            .add_systems(PostUpdate, (billboard::systems(), impostor::systems(), n64::systems()).chain());
-            register_world_asset_types(&mut app);
+            ));
 
             app.finish();
             app.cleanup();
@@ -1020,6 +1031,9 @@ mod tests {
             // of the box the cull never fires at all and everything downstream
             // of it, including stopping a culled enemy's animation, is dead
             // code on this map.
+            if let Ok(budget) = std::env::var("CROWD_SIM").ok().map_or(Err(()), |v| v.parse::<f32>().map_err(|_| ())) {
+                app.world_mut().resource_mut::<console::GameTuning>().sim_budget = budget;
+            }
             let draw = std::env::var("CROWD_DRAW")
                 .ok()
                 .and_then(|value| value.parse::<f32>().ok());

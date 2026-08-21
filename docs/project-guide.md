@@ -463,13 +463,26 @@ scuttlebug, which is fifteen draw calls to put seventy-six triangles on screen.
 Two thousand enemies drawn that way is around nineteen thousand draw calls a
 frame. The castle, for comparison, is 785 triangles and 45 draws.
 
-So the crowd work is all about drawing fewer things rather than about
-simulating faster:
+So the crowd work is all about doing less per enemy, in three ways: drawing
+fewer things, keeping fewer entities, and properly simulating fewer of them.
+
+### Drawing fewer things
 
 - **Impostors.** Past `enemy_draw` an enemy is drawn as a camera-facing sprite
   from a baked atlas rather than as a skeleton, and the whole distant crowd of
   one kind is rebuilt every frame into a *single* mesh — one draw call for a
   thousand goombas. See `impostor.rs`, and `impostor/bake.rs` for the baker.
+
+  The baker runs `drawing()` — the game's own post-update chain — rather than a
+  copy of it, and that is not tidiness. It was a copy once, missing the
+  billboard half, so the goomba's face and the scuttlebug's three billboard
+  joints baked at the quarter scale the exporter puts on the skeleton instead of
+  having it put back by `billboard::aim`, and single-sided, so they were culled
+  from half the angles too. Sprites covered **52% of the pixels the models did**
+  and enemies visibly shrank as they crossed the swap distance. Sharing the
+  chain took that to 95%. Nothing about it moves the silhouette — the face sits
+  inside the head, and the survey extents are identical to four decimals — so no
+  test on the sheets can catch it; only running the same code can.
 - **MSAA is off** on the world camera. It is not off by default: Bevy registers
   `Msaa` as a required component of every `Camera` and the default is
   `Sample4`, so a camera that says nothing runs four-times multisampling. On
@@ -481,10 +494,151 @@ simulating faster:
   every joint every frame — which also keeps the transform propagator's
   dirty-tree optimisation permanently defeated.
 
-Behind those, the ordinary things: collision queries go through a 64×64 grid
-rather than the full triangle list, enemy AI and floor placement run at the
-30 Hz simulation rate rather than the render rate, distance LOD drops far AI to
-15 or 7.5 Hz, and Bevy spreads the enemy step across its compute pool.
+### Keeping fewer entities
+
+An enemy is not one entity. It is a glTF scene — about 15 for a goomba, 63 for
+a scuttlebug — and every one of those is a transform to propagate and an
+archetype row to walk past. A mixed field of two thousand used to be 85,000
+entities and eight thousand was a third of a million, at which point the entity
+count, not the draws and not the AI, is what a frame is made of. That was
+measured: at eight thousand the simulation budget below saved nothing at all,
+because simulation was no longer the expensive part.
+
+So past `enemy_draw` an enemy sheds its `WorldAssetRoot` and the whole scene
+goes with it, leaving one entity holding a transform — which is all its
+impostor needs. Eight thousand enemies is now 51,000 entities rather than
+336,000, and 39 ms a frame rather than 58. Crossing back rebuilds the model;
+the boundary has hysteresis so something ambling along it cannot build and
+destroy an actor on alternate frames.
+
+### Simulating fewer of them
+
+`sim_budget` (default 200) is how many enemies are simulated properly, and it
+is a **count rather than a distance** — a fixed amount of CPU whether the field
+holds fifty or five thousand. The nearest that many get level collision, the
+jostling in `enemy::spread`, the aggro chain in `enemy::alert` and the ability
+to be hit. Everything else is a *crowd* tier moved by `flow.rs`.
+
+The flow field is where the cheap tier's believability comes from. The castle
+is surveyed once into a 96×96 grid — each cell asked what the ground under it
+is, whether anything can stand there, and which of its eight neighbours have a
+wall between them — and a few times a second a breadth-first sweep runs out
+from the player's cell recording how far every cell is from him and which way
+to walk to get closer. A crowd enemy then costs
+four array lookups and no level queries at all, and gets *better* behaviour for
+it: a route swept over connected ground flows round the moat and up the ramps
+instead of marching into the water.
+
+Four things about that tier are worth knowing, because all four were got wrong
+first and none of the failures looked like what it was:
+
+- **Ground on both sides of a step is not the same question as a step being
+  takeable.** The first version checked only that the far side had ground —
+  which is true on both sides of a fence, and true at the top of a wall as well
+  as the foot of it. On the castle that is 2,261 cliff edges out of 23,223, and
+  134 more with a wall across them: nearly a tenth of the map was somewhere a
+  crowd enemy could walk up at `CLIMB_SPEED`. The worst of a field of ninety-six
+  climbed **30 metres in thirty seconds**, straight up the castle. The survey
+  now casts between neighbouring cell centres at knee height, with the same
+  probe and the same steepness threshold `enemy::walk` uses, so the two tiers
+  share one idea of what a wall is. 3.7 ms once at startup.
+- **The rule lives in one place.** The sweep, the pass that turns step counts
+  into directions, and the enemy taking an actual step all go through one
+  `passable`. Three copies of it is a field that routes a crowd somewhere its
+  own members then refuse to walk, and a stream that jams against an invisible
+  line.
+- **Height is interpolated between cells, not taken from the cell.** Taking the
+  cell's own height stands every enemy in it at the height of that cell's
+  centre, so on a slope half are buried and half float — 0.46 m of average
+  error against a goomba 0.9 m tall, which reads as the crowd flickering in and
+  out of the hillsides.
+- **The alarm spreads as a wave.** `enemy::alert`'s shouting chain cascades
+  through a dense field within a tick or two, which is why a fully simulated
+  crowd ends up converging on the player almost entirely. The cheap tier cannot
+  afford the chain, so the flow field carries a single expanding radius
+  instead. Without it the far crowd ambles about while the near crowd charges,
+  and the field looks like it has lost most of its enemies.
+
+The rule underneath all of them: **a cheaper tier may look worse, but it must
+not behave differently.** An enemy must not change its mind about chasing you
+because it crossed a boundary it cannot see.
+
+### One answer to how bodies avoid each other
+
+`enemy::spread` holds every creature out of every other one: the near-tier
+enemies, the Marios and the player, in one pass over one list. It did not
+always — the Marios were held out of *nothing*, because `squad::move_allies`
+walks each one to its slot and asks nothing about what is standing there, so a
+squad following the player was a heap of Marios in the same place walking
+through each other and through him.
+
+They share a pass rather than having one each because a Mario, a goomba and a
+scuttlebug are all bodies of some radius standing on some ground, and two
+answers to how bodies avoid each other is two answers that disagree at the
+boundary between them.
+
+Three things it does that are not obvious:
+
+- **The player is in the list and is never pushed.** Everything else is held
+  out of him; he is driven by the controller. Being nudged about by the crowd
+  you are walking through is a worse bug than the one being fixed. A pair
+  against something immovable takes the whole share of the overlap rather than
+  half, or it is walked through.
+- **The shove resolves its own result against walls.** A press leaning on the
+  one at the front is enough to post it through a fence, and neither the walk
+  step nor the crowd step gets a say in where a shove puts it. Not for
+  crawlers: a scuttlebug is held out of walls by being *on* one.
+- **Crawlers are pushed within the surface they are stuck to.** Shoving a bug
+  off its wall is the one thing this must not do.
+
+### Where an enemy's feet are
+
+**A transform is not where the model is.** The scuttlebug's rig root sits up
+inside its body, so its geometry hangs 31 cm below its own origin; the goomba's
+hangs 6.5 cm. Seat that origin on the ground — which is what every placement in
+the game does — and a third of the scuttlebug is underground on flat stone.
+
+`Kind::lift` carries the offset, measured off the baked impostor sheets rather
+than guessed: those are renders of the real posed actor through the game's own
+draw chain, so the sheet metadata says where the origin sits in a cell and the
+lowest opaque pixel says where the model stops.
+`impostor::tests::the_lift_matches_what_the_baked_sheets_show` re-derives it from
+the PNGs on every run, so re-baking a sheet or re-rigging an actor fails a test
+instead of quietly sinking an enemy.
+
+`walk`, `settle` and `crawl` all keep answering in **contact points** — where the
+feet go — and `enemy::update` converts at the boundary. Keeping them pure means
+a test can walk an enemy across a level without knowing what it looks like.
+
+The real fix for both numbers is the exporter putting the origin on the floor,
+which would let the lift be zero. See `tools/export_actor_gltf.py`.
+
+Two related things are worth knowing about a scuttlebug's `up`. Hanging under a
+ceiling and being buried under a floor are the *same state* — surface overhead,
+body against its underside, `up` pointing down — so nothing local can tell them
+apart and nothing local can undo the second. A bug that has been moved without
+being told which way is up clings to the underside of the lawn forever. The
+crowd tier stands crawlers upright, which is the only thing in the game that
+rescues one, and makes it self-healing: walk far enough away and the bug is put
+back on its feet.
+
+And `up` is **rolled, not snapped**: `ROLL_RATE` caps it at a degree a
+millisecond, so a right-angle corner takes three ticks rather than none. The
+probe's normal used to become the bug's `up` the same tick it was found, which
+reads as the model glitching rather than as an animal climbing. Note that the
+lift has to be applied and removed along the same axis — the bug's own `up`, not
+the surface's — or the mismatch leaves a residue every tick: a bug going round
+the castle's corners drifted 1.2 m in one step that way.
+
+`squad::move_allies` still has no wall collision of its own, so a Mario walks
+through the castle unless the shove happens to catch it.
+
+### The rest
+
+Collision queries go through a 64×64 grid rather than the full triangle list,
+enemy AI and floor placement run at the 30 Hz simulation rate rather than the
+render rate, distance LOD drops far AI to 15 or 7.5 Hz, and Bevy spreads the
+enemy step across its compute pool.
 
 Every threshold is a console tunable, which is the point — the right values
 depend on the machine, and guessing them from source is how the previous set
@@ -493,6 +647,29 @@ got chosen.
 The remaining dial is the internal render resolution above, which scales the
 fragment side of the frame rather than the draw-call side, so it is the one
 that helps when the crowd is small and the window is large.
+
+### The packaging trap
+
+`build_windows.sh` copies a **named list** of assets rather than the whole tree,
+deliberately — the sound directories hold thousands of files and the game plays
+a couple of dozen. The cost of that is a failure mode with no symptoms at the
+point it happens: an asset the game loads but the script does not copy produces
+a packaged build that starts, runs, and is quietly missing something, saying so
+only on a stderr that a `windows_subsystem = "windows"` build has nobody
+attached to.
+
+It has now happened twice. `display.rs` guards the UI render plugin against it
+with a compile-time trick, and the impostor sheets were caught only after they
+had shipped: the packaged game drew *no distant enemies at all*, so enemies
+appeared out of nothing as you walked towards them, while every test passed
+because tests read the source tree.
+
+Two guards came out of that, and anything new under `assets/` wants both:
+
+- a test that reads `build_windows.sh` and asserts the path is in it
+  (`impostor::tests::the_windows_package_ships_the_sheets`)
+- a count on the corner readout of enemies drawn by *neither* path, so a missing
+  atlas shows up in the game as `… / 704 UNDRAWN` rather than as a mystery
 
 ### Measuring it
 
@@ -510,17 +687,26 @@ cargo test --release -- --ignored --nocapture crowd_benchmark
 ```
 
 which runs the real game headless against a real GPU and prints a row per field
-size. `CROWD_BENCH=2000` runs one size instead of the sweep, and `CROWD_DRAW=60`
-overrides the impostor swap distance — between them that is enough to A/B a
-single change. `--features perf` turns on Bevy's own per-system tracing and
+size. `CROWD_BENCH=2000` runs one size instead of the sweep, `CROWD_DRAW=60`
+overrides the impostor swap distance and `CROWD_SIM=2000` the simulation
+budget — between them that is enough to A/B a single change. `--features perf` turns on Bevy's own per-system tracing and
 writes a Chrome trace; the systems that matter are mostly Bevy's own
 (`animate_targets`, `propagate_parent_transforms`, the render-phase queues) and
 cannot be timed from this crate at all.
 
+Comparing a sprite against the model it replaces is a two-shot job, because
+`enemy_draw` changes only what is drawn and never what is simulated: render the
+same field at `enemy_draw 5` and `enemy_draw 900` with the same `SHOT_SETTLE`
+and the enemy positions are identical, so the frames can be differenced
+directly. Counting enemy-coloured pixels in each is what turned "the pop-in is
+bad" into "sprites cover 52% of what models do", and then into a fix.
+
 `cargo run --release -- screenshot out.png [crowd] [x,y,z] [look x,y,z]` draws
 the real game into a PNG without a window, which is the only way to see it at
-all on a machine with no display. `SHOT_SETUP="enemy_draw 12"` runs console
-commands before the shutter.
+all on a machine with no display. `SHOT_SETUP="enemy_draw 12; sim_budget 50"`
+runs console commands before the shutter and `SHOT_SETTLE=300` chooses how many
+frames the world runs first — which is what catches behaviour that only
+diverges over time, as the crowd tier's did.
 
 ## Not done yet
 
@@ -537,6 +723,12 @@ Still to port:
 - the complete SM64 move set — dives, slides, ledge grabs, wall bonks and the
   rest of the action machine
 - the thrown-arc preview the squad aim used to draw
+- the crowd tier's remaining behaviour gap. A tiered field converges on the
+  player less hard than a fully simulated one does — measured at roughly 60% of
+  the on-screen crowd after five seconds — because a spreading alarm radius is
+  an approximation of a chain whose reach depends on how densely packed the
+  crowd happens to be. `SHOT_SETTLE` and the pixel-counting comparison in the
+  performance notes are how that was measured and how a fix would be judged.
 - atlasing the actor exports. A scuttlebug is fifteen mesh primitives and nine
   materials for seventy-six triangles, and every one of them is its own draw
   call. Impostors take care of the far crowd, but the near crowd still pays it:

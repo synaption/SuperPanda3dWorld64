@@ -48,6 +48,7 @@ mkdir -p \
     "$DIST_DIR/assets/actors" \
     "$DIST_DIR/assets/bevy" \
     "$DIST_DIR/assets/hero" \
+    "$DIST_DIR/assets/impostors" \
     "$DIST_DIR/assets/mario"
 
 cp "$REPO_ROOT/target/$WINDOWS_TARGET/release/super-bevy-world-64.exe" \
@@ -62,6 +63,14 @@ cp \
     "$DIST_DIR/assets/actors/"
 cp "$REPO_ROOT/assets/hero/hero.glb" "$DIST_DIR/assets/hero/"
 cp "$REPO_ROOT/assets/mario/mario.glb" "$DIST_DIR/assets/mario/"
+# The impostor sheets. Leaving these out does not fail and does not crash: the
+# game starts, and every enemy past `enemy_draw` is drawn as nothing at all,
+# because the sprite that should stand in for it needs an atlas that is not
+# there. What that looks like from the outside is enemies popping into existence
+# as you walk towards them, and the only word about it goes to a stderr that a
+# `windows_subsystem = "windows"` build has nobody attached to.
+cp "$REPO_ROOT/assets/impostors/"*.png "$REPO_ROOT/assets/impostors/"*.json \
+    "$DIST_DIR/assets/impostors/"
 
 # Only the samples the sound tables actually name, read out of the tables
 # themselves so the two cannot drift: the sound directories hold thousands of

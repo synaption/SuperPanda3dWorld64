@@ -229,6 +229,10 @@ fn setup(
     ));
     commands.spawn((
         Subject,
+        // The same marker the game spawns these actors with. Without it
+        // `billboard::two_sided` never makes the quads double-sided, and a
+        // billboard seen from its back face is culled away entirely.
+        crate::billboard::BillboardActor,
         crate::WorldAssetRoot(assets.load(format!("{}#Scene0", model(bake.kind)))),
         // The same scale the game spawns these at, so the world units the
         // camera measures are the game's world units.
@@ -564,7 +568,11 @@ pub fn run(kinds: &[Kind]) {
         })
         .add_systems(Startup, setup)
         .add_systems(Update, (claim, step, done).chain())
-        .add_systems(PostUpdate, n64::systems())
+        // Literally the game's own draw chain, not a copy of it. A sheet baked
+        // through anything less is a sheet of something the game never draws --
+        // see [`crate::drawing`] for what that cost the first time.
+        .init_resource::<crate::impostor::ImpostorStats>()
+        .add_systems(PostUpdate, crate::drawing())
         .add_observer(collect);
         crate::register_world_asset_types(&mut app);
 

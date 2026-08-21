@@ -191,6 +191,12 @@ pub struct ImpostorStats {
     pub sprites: usize,
     /// Enemies drawn as skinned models, near enough to matter.
     pub skinned: usize,
+    /// Enemies drawn by **neither** path this frame.
+    ///
+    /// Should always be zero. Anything else is an enemy that is in the world,
+    /// is not far enough away to be a sprite, and has no model yet -- which is
+    /// to say an enemy nobody can see. See [`drawn_as_model`].
+    pub missing: usize,
 }
 
 /// The one entity per kind that a whole distant crowd is drawn by.
@@ -244,6 +250,7 @@ pub fn prepare(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<N64Material>,
     shadow: Handle<StandardMaterial>,
+    console: &mut crate::console::ConsoleState,
     root: &std::path::Path,
 ) {
     let mut impostors = Impostors::default();
@@ -265,7 +272,16 @@ pub fn prepare(
         let meta = match read_meta(root, kind) {
             Ok(meta) => meta,
             Err(error) => {
-                eprintln!("impostors: {kind:?} will not be drawn at distance -- {error}");
+                // Both, and the console one is the one that matters. A packaged
+                // Windows build has nobody reading stderr, and this failure is
+                // otherwise silent for ever: the game runs, and every enemy past
+                // `enemy_draw` is drawn as nothing at all.
+                let note = format!(
+                    "impostors: no sheet for {kind:?}, so nothing past enemy_draw \
+                     will be drawn -- {error}"
+                );
+                eprintln!("{note}");
+                console.report(note);
                 continue;
             }
         };
@@ -446,14 +462,14 @@ pub fn build_shadows(crowd: &[(Vec3, f32)], mesh: &mut Mesh) {
 /// Runs once per rendered frame rather than per fixed step, because what it
 /// depends on is where the camera is -- and a sprite that picked its angle on
 /// the last simulation tick visibly lags the view as you turn.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn draw(
     time: Res<Time>,
     impostors: Option<Res<Impostors>>,
     mut stats: ResMut<ImpostorStats>,
     mut meshes: ResMut<Assets<Mesh>>,
     camera: Query<&GlobalTransform, With<Camera3d>>,
-    crowd: Query<(&Enemy, &Transform, &Visibility, &Quirk)>,
+    crowd: Query<(&Enemy, &Transform, &Visibility, &Quirk, Option<&Children>)>,
     mut buffers: Local<Vec<(Kind, Vec<Member>)>>,
     mut shadows: Local<Vec<(Vec3, f32)>>,
 ) {
@@ -461,6 +477,8 @@ pub fn draw(
         return;
     };
     stats.skinned = 0;
+    stats.sprites = 0;
+    stats.missing = 0;
     let eye = view.translation();
     let elapsed = time.elapsed_secs();
     // The buffers are kept between frames: this refills them every frame for
@@ -474,13 +492,17 @@ pub fn draw(
         members.clear();
     }
     shadows.clear();
-    for (enemy, transform, visibility, quirk) in &crowd {
+    for (enemy, transform, visibility, quirk, children) in &crowd {
         // Exactly the ones the skinned pass is not drawing.
         // `crate::enemy::update` hides an enemy past `enemy_draw`, and this
         // picks up every one it hid -- so the two distances are one distance
         // and there is no band where an enemy is drawn twice or not at all.
         if *visibility != Visibility::Hidden {
-            stats.skinned += 1;
+            if children.is_some_and(|kids| !kids.is_empty()) {
+                stats.skinned += 1;
+            } else {
+                stats.missing += 1;
+            }
             continue;
         }
         let Some((_, members)) = buffers.iter_mut().find(|(kind, _)| *kind == enemy.kind) else {
@@ -498,7 +520,18 @@ pub fn draw(
             phase: elapsed + quirk.seed(),
         });
     }
-    stats.sprites = buffers.iter().map(|(_, members)| members.len()).sum();
+    // Counted per kind against whether that kind actually has a sheet, rather
+    // than as "everything we gathered". A kind whose atlas is missing gathers a
+    // full crowd and draws none of it, and reporting those as sprites is what
+    // let a packaged build with no sheets at all still claim to be drawing
+    // thousands of them.
+    for (kind, members) in buffers.iter() {
+        if impostors.get(*kind).is_some() {
+            stats.sprites += members.len();
+        } else {
+            stats.missing += members.len();
+        }
+    }
     if let Some(mesh) = impostors
         .shadows
         .as_ref()
@@ -525,7 +558,7 @@ pub fn systems() -> ScheduleConfigs<ScheduleSystem> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A PNG's dimensions, straight out of its IHDR chunk.
@@ -542,6 +575,13 @@ mod tests {
             u32::from_be_bytes(bytes[16..20].try_into().unwrap()),
             u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
         )
+    }
+
+    /// A PNG's size and its alpha channel, decoded with Bevy's own `image`.
+    fn png_alpha(path: &std::path::Path) -> (UVec2, Vec<u8>) {
+        let picture = image::open(path).expect("missing atlas").to_rgba8();
+        let size = UVec2::new(picture.width(), picture.height());
+        (size, picture.pixels().map(|pixel| pixel.0[3]).collect())
     }
 
     fn meta() -> SheetMeta {
@@ -737,6 +777,179 @@ mod tests {
             mesh.indices().map(|indices| indices.len()),
             Some(crowd.len() * 6)
         );
+    }
+
+    /// Every cell holds a whole actor, fitted to the cell and not clipped by it.
+    ///
+    /// What this guards is the geometry the runtime trusts: `world_size` is the
+    /// cell's extent in world units, so an actor that overflows its cell is an
+    /// actor drawn cropped, and one that rattles around inside a cell far too
+    /// big for it is drawn at the wrong size.
+    ///
+    /// What it deliberately does **not** claim to catch is the worst bug these
+    /// sheets have had. The baker was running without `billboard::systems()`,
+    /// so the goomba's face and the scuttlebug's three billboard joints came out
+    /// at the quarter scale the exporter bakes onto the skeleton rather than
+    /// having it put back -- and single-sided, so they were culled from half the
+    /// angles too. The sprites covered 52% of the pixels the models did and
+    /// enemies visibly shrank as they crossed the swap distance. None of that
+    /// moves the silhouette: the face sits inside the head. The survey extents
+    /// before and after the fix are identical to four decimal places.
+    ///
+    /// That one is guarded structurally instead, by the baker running
+    /// [`crate::drawing`] itself rather than a copy of it.
+    #[test]
+    fn every_baked_cell_holds_a_whole_actor() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        for kind in [Kind::Goomba, Kind::Scuttlebug] {
+            let meta = read_meta(&root, kind).expect("a committed sheet failed to load");
+            let path = root.join(SHEETS).join(format!("{}.png", stem(kind)));
+            let (size, alpha) = png_alpha(&path);
+            let cell = meta.cell_px;
+            let mut biggest = 0.0_f32;
+            for row in 0..meta.angles as u32 {
+                for column in 0..meta.frames as u32 {
+                    let (mut low, mut high) = (UVec2::splat(cell), UVec2::ZERO);
+                    for y in 0..cell {
+                        for x in 0..cell {
+                            let at = ((row * cell + y) * size.x + column * cell + x) as usize;
+                            if alpha[at] > 8 {
+                                low = low.min(UVec2::new(x, y));
+                                high = high.max(UVec2::new(x + 1, y + 1));
+                            }
+                        }
+                    }
+                    assert!(
+                        high.x > low.x && high.y > low.y,
+                        "{kind:?} cell {column},{row} is empty"
+                    );
+                    // Nothing may touch the edge, or the actor is cropped and
+                    // `world_size` is a lie about what the cell contains.
+                    assert!(
+                        low.x > 0 && low.y > 0 && high.x < cell && high.y < cell,
+                        "{kind:?} cell {column},{row} is clipped by its own edge"
+                    );
+                    let span = (high - low).as_vec2() / cell as f32;
+                    biggest = biggest.max(span.max_element());
+                }
+            }
+            // The baker fits the content to the cell, so the fullest cell of a
+            // sheet should very nearly fill it in its larger axis. Well under
+            // this means the camera was sized against something other than what
+            // was drawn.
+            assert!(
+                biggest > 0.7,
+                "{kind:?}'s fullest cell reaches only {:.0}% of the cell, so the \
+                 sheet was sized against something other than the actor in it",
+                biggest * 100.0
+            );
+        }
+    }
+
+    /// [`Kind::lift`] is a measurement of the art, so it is checked against the
+    /// art rather than trusted.
+    ///
+    /// The sheets are renders of the real posed actor through the game's own
+    /// draw chain, and their metadata says exactly where the model's origin sits
+    /// inside a cell -- `foot` of a cell-height up from the bottom edge. So the
+    /// lowest opaque pixel of any cell, measured down from there, is how far the
+    /// actor's geometry hangs below its own transform origin. For the
+    /// scuttlebug that is a third of a metre, and seating that origin on the
+    /// floor is what buried the bug to its belly in solid stone.
+    ///
+    /// Checking it here rather than writing the number down twice means
+    /// re-baking a sheet, re-rigging an actor or changing the exporter's root
+    /// offset fails this test instead of silently sinking an enemy into the
+    /// ground.
+    /// How far `kind`'s art hangs below its own transform origin, read off the
+    /// baked sheet.
+    ///
+    /// The sheets are renders of the real posed actor through the game's own
+    /// draw chain, and their metadata says exactly where the origin sits inside
+    /// a cell -- `foot` of a cell-height up from the bottom edge. So the lowest
+    /// opaque pixel of any cell, measured down from there, is the hang.
+    ///
+    /// Shared with `enemy`'s placement test rather than measured twice. That
+    /// test needs a number that does **not** come from [`Kind::lift`], or it
+    /// merely subtracts back out whatever the placement put in and passes with
+    /// the lift set to zero -- which two earlier versions of it duly did.
+    pub(crate) fn hang_in_sheet(kind: Kind) -> f32 {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let meta = read_meta(&root, kind).expect("a committed sheet failed to load");
+        let path = root.join(SHEETS).join(format!("{}.png", stem(kind)));
+        let (size, alpha) = png_alpha(&path);
+        let cell = meta.cell_px;
+        let metres = meta.world_size / cell as f32;
+        // Where the origin is, counted up from the bottom edge of a cell.
+        let origin = meta.foot * cell as f32;
+        let mut hangs = f32::MIN;
+        for row in 0..meta.angles as u32 {
+            for column in 0..meta.frames as u32 {
+                for y in (0..cell).rev() {
+                    let line = (row * cell + y) * size.x + column * cell;
+                    if (0..cell).any(|x| alpha[(line + x) as usize] > 8) {
+                        let above_bottom = (cell - 1 - y) as f32;
+                        hangs = hangs.max((origin - above_bottom) * metres);
+                        break;
+                    }
+                }
+            }
+        }
+        hangs
+    }
+
+    #[test]
+    fn the_lift_matches_what_the_baked_sheets_show() {
+        for kind in [Kind::Goomba, Kind::Scuttlebug] {
+            let measured = hang_in_sheet(kind);
+            let claimed = kind.lift();
+            assert!(
+                (measured - claimed).abs() < 0.02,
+                "{kind:?} hangs {measured:.3} m below its origin in the sheets \
+                 but `Kind::lift` claims {claimed:.3} m -- an enemy seated on \
+                 the ground will be that far into it"
+            );
+        }
+    }
+
+    /// The Windows package has to actually contain the sheets.
+    ///
+    /// This is the test for the bug that made all of the above pointless in the
+    /// build people actually play. `build_windows.sh` copies a *named list* of
+    /// assets rather than the whole tree -- deliberately, because the sound
+    /// directories hold thousands of files -- and the impostor sheets were
+    /// simply never added to it. The packaged game therefore started normally,
+    /// found no atlas, drew no sprites at all, and every enemy past
+    /// `enemy_draw` was nothing whatsoever until you walked close enough for it
+    /// to become a model.
+    ///
+    /// Nothing catches that at runtime: the failure is a line on a stderr that a
+    /// `windows_subsystem = "windows"` build has nobody attached to, and every
+    /// test in this file passes because they all read the *source* tree. The
+    /// same trap the shader is guarded against in `display.rs`, sprung on a
+    /// different asset.
+    ///
+    /// So the guard is here, on the packaging script itself: whatever this
+    /// module loads at runtime, the script must be seen to copy.
+    #[test]
+    fn the_windows_package_ships_the_sheets() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let script = std::fs::read_to_string(root.join("build_windows.sh"))
+            .expect("build_windows.sh has gone missing");
+        assert!(
+            script.contains(&format!("assets/{SHEETS}")),
+            "build_windows.sh does not copy assets/{SHEETS}, so the packaged \
+             game will draw no distant enemies at all"
+        );
+        for kind in [Kind::Goomba, Kind::Scuttlebug] {
+            for suffix in ["png", "json"] {
+                let file = format!("{}.{suffix}", stem(kind));
+                assert!(
+                    root.join("assets").join(SHEETS).join(&file).is_file(),
+                    "{SHEETS}/{file} is loaded at runtime but is not in the tree"
+                );
+            }
+        }
     }
 
     /// The sheets on disk have to be the ones this code thinks it is reading.

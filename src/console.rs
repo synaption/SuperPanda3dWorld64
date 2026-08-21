@@ -555,6 +555,17 @@ impl ConsoleState {
         self.cursor = self.input.len();
     }
 
+    /// Puts a line in the console's log from outside it.
+    ///
+    /// For the things that go wrong at startup and then stay wrong quietly. A
+    /// packaged Windows build has no stderr attached to anything, so `eprintln`
+    /// there is the same as saying nothing -- and "the impostor sheets are
+    /// missing so no distant enemy will be drawn" is exactly the kind of fact
+    /// that otherwise reaches the player as a mystery rather than a message.
+    pub fn report(&mut self, message: impl Into<String>) {
+        self.echo(message);
+    }
+
     fn echo(&mut self, message: impl Into<String>) {
         for line in message.into().lines() {
             if self.log.len() == LOG_LIMIT {

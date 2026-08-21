@@ -193,6 +193,11 @@ pub struct Squad {
     /// again, which is what makes sending them an order rather than a
     /// suggestion.
     pub sent: Vec<(Entity, Vec2, bool)>,
+    /// Where the followers are gathering, kept between ticks so it can trail the
+    /// leader rather than be recomputed from where he happens to be facing.
+    ///
+    /// See [`update_goals`] for what goes wrong without it.
+    anchor: Option<Vec2>,
 }
 
 /// The live whistle: how long the button has been down and how big the circle
@@ -468,12 +473,39 @@ pub fn update_goals(
     squad.sent.retain(|(ally, _, _)| allies.contains(*ally));
 
     // Behind the leader, so walking forward drags the group along rather than
-    // through him, and so the slots stay put while he turns.
-    let behind = leader.rotation * Vec3::Z;
-    let anchor = Vec2::new(
-        leader.translation.x - behind.x * FOLLOW_DISTANCE,
-        leader.translation.z - behind.z * FOLLOW_DISTANCE,
-    );
+    // through him -- but *behind* meaning the side they are already on, not the
+    // side his shoulders happen to be pointing away from.
+    //
+    // Taking it from his facing is what made the formation jitter, and it is
+    // worth being precise about why, because the fix looks like a nicety and is
+    // not. The anchor sat on a three-metre arm off his back. Turning on the spot
+    // -- which a mouse does several times a second and which moves the player
+    // nowhere at all -- swept that arm around him at a speed no Mario can walk,
+    // and the whole squad spent its time chasing a target orbiting them. On
+    // screen: eight Marios shuffling on the spot, never arriving, their walk
+    // clips restarting.
+    //
+    // [`slot`] already says this in its own doc -- "the leader turning on the
+    // spot should not send everyone shuffling around him" -- and takes care not
+    // to rotate the cluster. The anchor it was placed at then rotated it anyway.
+    //
+    // A trailing anchor has no facing in it. It stays wherever it is relative to
+    // him and is simply held at arm's length, so turning moves it not at all and
+    // walking pulls it round behind him on its own.
+    let here = Vec2::new(leader.translation.x, leader.translation.z);
+    let trail = squad
+        .anchor
+        .map(|anchor| anchor - here)
+        .filter(|arm| arm.length_squared() > 1e-6)
+        .unwrap_or_else(|| {
+            // Nothing to trail yet -- the first tick, or the leader standing
+            // exactly on it. His back is as good a guess as any, and it is only
+            // ever a seed.
+            let behind = leader.rotation * Vec3::Z;
+            -Vec2::new(behind.x, behind.z)
+        });
+    let anchor = here + trail.normalize_or_zero() * FOLLOW_DISTANCE;
+    squad.anchor = Some(anchor);
     for (index, entity) in squad.members.iter().enumerate() {
         if let Ok((mut ally, _)) = allies.get_mut(*entity) {
             ally.goal = Some((anchor + slot(index, FOLLOW_SPACING), FOLLOW_ARRIVE));
@@ -847,6 +879,64 @@ mod tests {
                 "two allies were sent to the same place"
             );
             seen.push(*spot);
+        }
+    }
+
+    /// Turning the camera does not send the squad running round the player.
+    ///
+    /// This is the formation jitter, and the numbers are the point: the anchor
+    /// sat on a 3.3 m arm off the leader's back, so a half-turn on the spot --
+    /// one flick of a mouse, moving the player nowhere -- threw it 6.6 m across
+    /// and every Mario chased it. Walking, on the other hand, must still drag
+    /// the group along behind.
+    #[test]
+    fn turning_on_the_spot_does_not_move_the_formation() {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut world = World::new();
+        let mut squad = Squad::default();
+        let allies: Vec<Entity> = (0..4)
+            .map(|index| {
+                world
+                    .spawn((
+                        Ally::new(Vec3::ZERO, index as f32),
+                        Transform::default(),
+                    ))
+                    .id()
+            })
+            .collect();
+        squad.members.extend(allies.iter().copied());
+        world.insert_resource(squad);
+        let leader = world.spawn((Player, Transform::default())).id();
+
+        let goals = |world: &mut World| -> Vec<Vec2> {
+            world.run_system_once(update_goals).expect("no run");
+            allies
+                .iter()
+                .map(|ally| world.get::<Ally>(*ally).expect("gone").goal.expect("no goal").0)
+                .collect()
+        };
+        let facing_one_way = goals(&mut world);
+        // A half turn, standing still.
+        world.get_mut::<Transform>(leader).unwrap().rotation =
+            Quat::from_rotation_y(std::f32::consts::PI);
+        let facing_the_other = goals(&mut world);
+        for (before, after) in facing_one_way.iter().zip(&facing_the_other) {
+            assert!(
+                before.distance(*after) < 1e-3,
+                "turning on the spot moved a slot {:.2} m",
+                before.distance(*after)
+            );
+        }
+
+        // But walking does bring them along: ten metres forward and the group
+        // is gathering ten metres further on, still trailing at arm's length.
+        world.get_mut::<Transform>(leader).unwrap().translation = Vec3::new(0.0, 0.0, 10.0);
+        let walked = goals(&mut world);
+        for (before, after) in facing_one_way.iter().zip(&walked) {
+            assert!(
+                (after.y - before.y - 10.0).abs() < 1e-3,
+                "the formation did not follow him: {before:?} -> {after:?}"
+            );
         }
     }
 

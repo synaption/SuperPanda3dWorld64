@@ -9,8 +9,11 @@
 //! A flow field answers all of them once, for everybody, in advance.
 //!
 //! The castle is divided into square cells. Each cell is asked *once*, at
-//! startup, what the ground under it is and whether anything can stand there.
-//! Then a few times a second a breadth-first sweep runs out from whichever cell
+//! startup, what the ground under it is, whether anything can stand there, and
+//! which of its neighbours have a wall or a fence in the way -- that last one
+//! being the difference between a crowd that streams round the castle and a
+//! crowd that walks through it. Then a few times a second a breadth-first sweep
+//! runs out from whichever cell
 //! the player is standing in, and every cell records how many steps it is from
 //! him and which way its neighbour with the shorter walk lies.
 //!
@@ -46,6 +49,14 @@ const WIDTH: usize = 96;
 /// goombas at a wall.
 const CLIMB: f32 = 1.2;
 
+/// How high off the ground the survey looks for something in the way.
+///
+/// The same height [`crate::enemy::walk`] probes at, and for the same reason: a
+/// kerb the enemy could step up passes under the probe, a fence does not. One
+/// idea of what a wall is, shared between the tier that ray-casts for them and
+/// the tier that reads them out of a table.
+const KNEE: f32 = crate::enemy::STEP_UP;
+
 /// How often the sweep is rerun, in seconds.
 ///
 /// The field only changes when the player moves, and a crowd walking a
@@ -60,6 +71,18 @@ const SKY: f32 = 90.0;
 /// Unreachable, or not yet reached by the sweep.
 const FAR: u32 = u32::MAX;
 
+/// How fast word gets around, in cells a second.
+///
+/// At the castle's cell size this is roughly thirty metres a second, so an
+/// alarm raised at one end of the grounds has the far end coming for you in
+/// about five seconds. Fast enough to feel like a horde reacting, slow enough
+/// that you can watch it happen and run.
+const ALARM_SPREAD: f32 = 18.0;
+
+/// Where the alarm stops growing: comfortably past the far corner of any grid,
+/// so it saturates rather than counting up forever.
+const MAX_ALARM: f32 = (WIDTH * 2) as f32;
+
 /// The navigation grid, and the last sweep run over it.
 #[derive(Resource)]
 pub struct FlowField {
@@ -70,11 +93,41 @@ pub struct FlowField {
     /// Ground height per cell, and whether there is any.
     ground: Vec<f32>,
     walkable: Vec<bool>,
+    /// Which of a cell's eight neighbours have something solid in the way, one
+    /// bit each in [`STEPS`] order.
+    ///
+    /// Ground under both ends of a step is not the same question as a step
+    /// being takeable, and leaving out the difference is what let a crowd walk
+    /// through the castle's fences. A fence is a thin thing standing *between*
+    /// two patches of perfectly good lawn: both cells survey as walkable, both
+    /// are at the same height, so every test the field had to offer said yes.
+    /// Measured on the castle, 134 of the 23,223 walkable edges have a wall
+    /// across them -- few, but they are exactly the edges a player is standing
+    /// next to and watching.
+    ///
+    /// Surveyed once, with the same knee-height cast and the same steepness
+    /// threshold the near tier uses, so the two tiers disagree about a fence
+    /// only where the grid is too coarse to hold one.
+    blocked: Vec<u8>,
     /// Steps from the player's cell, [`FAR`] where the sweep never arrived.
     steps: Vec<u32>,
     /// Which way to walk to get one step closer. Zero where there is nowhere to
     /// go, which is both the player's own cell and every unreachable one.
     flow: Vec<Vec2>,
+    /// How far out the alarm has spread, in cells of walking.
+    ///
+    /// The cheap tier's stand-in for [`crate::enemy::alert`]'s shouting chain.
+    /// The chain itself is a spatial grid and a flood fill over the crowd, and
+    /// in a field of two thousand packed enemies it reaches essentially all of
+    /// them within a single tick -- which is why a fully simulated field ends up
+    /// converging on the player entirely. Something has to reproduce that, or
+    /// the far crowd stands about while the near crowd charges, and the field
+    /// looks like it has lost most of its enemies.
+    ///
+    /// A radius that grows with time reproduces it for the price of one number.
+    /// It is also better to watch: the horde turns and comes for you in a wave
+    /// spreading outward rather than all at once.
+    alarm: f32,
     /// Seconds until the next sweep.
     due: f32,
     /// Where the player was when the last sweep ran, so a stationary player
@@ -118,16 +171,67 @@ impl FlowField {
                 }
             }
         }
-        Self {
+        let mut field = Self {
             origin: low,
             cell,
             ground,
             walkable,
+            blocked: vec![0; WIDTH * WIDTH],
             steps: vec![FAR; WIDTH * WIDTH],
             flow: vec![Vec2::ZERO; WIDTH * WIDTH],
+            alarm: 0.0,
             due: 0.0,
             swept_from: None,
+        };
+        field.survey_walls(level);
+        field
+    }
+
+    /// Records what has something solid standing across it, once the ground is
+    /// known.
+    ///
+    /// Only the second half of [`STEPS`] is walked, and what it finds is written
+    /// to both ends. Every undirected edge is therefore surveyed exactly once --
+    /// half the casts, and no chance of the two directions across one fence
+    /// disagreeing because a ray happened to catch an edge from one side and
+    /// miss it from the other.
+    fn survey_walls(&mut self, level: &LevelData) {
+        for here in 0..WIDTH * WIDTH {
+            if !self.walkable[here] {
+                continue;
+            }
+            for step in STEPS.len() / 2..STEPS.len() {
+                let Some(there) = neighbour(here, step) else {
+                    continue;
+                };
+                if !self.walkable[there] || !self.wall_between(level, here, there) {
+                    continue;
+                }
+                self.blocked[here] |= 1 << step;
+                self.blocked[there] |= 1 << opposite(step);
+            }
         }
+    }
+
+    /// Is there something between these two cell centres that a walker could not
+    /// step over?
+    ///
+    /// The cast runs between the two cells' own *ground* heights rather than at
+    /// a fixed altitude, so it follows a slope up instead of ploughing into it,
+    /// and it is raised by [`KNEE`] at both ends so a kerb passes underneath.
+    /// The steepness test is [`crate::level::GROUND_NORMAL_Y`] -- the same
+    /// threshold the collision grid sorts walls by and the same one
+    /// [`crate::enemy::walk`] refuses a step on, because a walker's idea of a
+    /// wall and the level's had better be one idea.
+    fn wall_between(&self, level: &LevelData, here: usize, there: usize) -> bool {
+        let at = |index: usize| {
+            let (x, z) = ((index % WIDTH) as f32, (index / WIDTH) as f32);
+            let flat = self.origin + Vec2::new(x + 0.5, z + 0.5) * self.cell;
+            Vec3::new(flat.x, self.ground[index] + KNEE, flat.y)
+        };
+        level
+            .surface_hit(at(here), at(there))
+            .is_some_and(|(_, normal)| normal.y.abs() <= crate::level::GROUND_NORMAL_Y)
     }
 
     /// The cell a world position falls in, clamped to the grid.
@@ -213,6 +317,81 @@ impl FlowField {
         self.cell
     }
 
+    /// Whether a body standing in `here` may move into the cell `step` away
+    /// from it.
+    ///
+    /// The one rule, in one place. It is asked three times over -- by the sweep
+    /// deciding where the crowd *can* go, by the pass that turns step counts
+    /// into directions, and by each enemy as it takes an actual step -- and the
+    /// three must agree, or the field routes a crowd somewhere its own members
+    /// then refuse to walk and the whole stream jams against an invisible line.
+    fn passable(&self, here: usize, step: usize, there: usize) -> bool {
+        self.walkable[there]
+            && (self.ground[there] - self.ground[here]).abs() <= CLIMB
+            && self.blocked[here] & (1 << step) == 0
+    }
+
+    /// Whether two points fall in the same cell, and so whether the grid has
+    /// any opinion at all about the step between them.
+    ///
+    /// Only [`crate::enemy`]'s end-to-end walk asks, and only so that it can
+    /// separate what the field got wrong from what it cannot see.
+    #[cfg(test)]
+    pub fn same_cell(&self, from: Vec3, to: Vec3) -> bool {
+        self.index(from) == self.index(to)
+    }
+
+    /// Whether something at `from` may walk to `to`.
+    ///
+    /// The crowd's whole substitute for collision, and it costs three array
+    /// reads. Within one cell there is nothing to decide -- the grid has no
+    /// opinion finer than itself -- and across a boundary it is the same
+    /// question the sweep asked when it built the route.
+    ///
+    /// Without this the tier checked only that the far side had *ground*, which
+    /// is true on top of the castle wall as well as at the foot of it: an
+    /// enemy ambling toward a wander goal would step from the lawn onto the
+    /// parapet and then rise to meet it at [`crate::enemy::CLIMB_SPEED`],
+    /// which is the "impossibly steep" climb. Nearly a tenth of the castle's
+    /// walkable edges -- 2,261 of 23,223 -- are cliffs of that kind.
+    pub fn clear(&self, from: Vec3, to: Vec3) -> bool {
+        let here = self.index(from);
+        let there = self.index(to);
+        if here == there {
+            return true;
+        }
+        let (hx, hz) = ((here % WIDTH) as isize, (here / WIDTH) as isize);
+        let (tx, tz) = ((there % WIDTH) as isize, (there / WIDTH) as isize);
+        match STEPS.iter().position(|&d| d == (tx - hx, tz - hz)) {
+            Some(step) => self.passable(here, step, there),
+            // Further than a neighbour, which a step at a walking pace across a
+            // cell this size is not. Answered on what can be answered rather
+            // than waved through.
+            None => {
+                self.walkable[there]
+                    && (self.ground[there] - self.ground[here]).abs() <= CLIMB
+            }
+        }
+    }
+
+    /// Advances the alarm.
+    ///
+    /// `roused` is whether anything in the world has the player's scent at all.
+    /// While it does the alarm spreads outward; when the last thing chasing him
+    /// is gone it collapses, so that clearing the field and spawning a fresh one
+    /// starts the crowd off calm rather than already at your throat.
+    pub fn rouse(&mut self, roused: bool, dt: f32) {
+        self.alarm = if roused {
+            (self.alarm + ALARM_SPREAD * dt).min(MAX_ALARM)
+        } else {
+            0.0
+        };
+    }
+
+    /// Whether the alarm has reached a cell this many steps out.
+    pub fn alarmed(&self, steps: u32) -> bool {
+        steps as f32 <= self.alarm
+    }
 }
 
 /// Reruns the sweep when it is due and the player has moved to a new cell.
@@ -241,43 +420,33 @@ pub fn rebuild(
     }
     field.swept_from = Some(from);
 
-    let FlowField {
-        ground,
-        walkable,
-        steps,
-        flow,
-        ..
-    } = &mut *field;
-    steps.fill(FAR);
+    field.steps.fill(FAR);
 
     // A plain queue rather than a priority queue: every step costs one, which
     // makes diagonals slightly cheap and is invisible on a crowd. A real metric
     // would buy nothing here and cost a heap.
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
-    if walkable[from] {
-        steps[from] = 0;
+    if field.walkable[from] {
+        field.steps[from] = 0;
         queue.push_back(from);
     } else {
         // The player is somewhere the survey called unwalkable -- in the air,
         // in the water, on a ledge between cells. Seed from whatever walkable
         // cells touch his, so the crowd still comes for him.
-        for neighbour in neighbours(from) {
-            if walkable[neighbour] {
-                steps[neighbour] = 0;
+        for (_, neighbour) in neighbours(from) {
+            if field.walkable[neighbour] {
+                field.steps[neighbour] = 0;
                 queue.push_back(neighbour);
             }
         }
     }
     while let Some(here) = queue.pop_front() {
-        let next = steps[here] + 1;
-        for neighbour in neighbours(here) {
-            if !walkable[neighbour] || steps[neighbour] != FAR {
+        let next = field.steps[here] + 1;
+        for (step, neighbour) in neighbours(here) {
+            if field.steps[neighbour] != FAR || !field.passable(here, step, neighbour) {
                 continue;
             }
-            if (ground[neighbour] - ground[here]).abs() > CLIMB {
-                continue;
-            }
-            steps[neighbour] = next;
+            field.steps[neighbour] = next;
             queue.push_back(neighbour);
         }
     }
@@ -285,63 +454,77 @@ pub fn rebuild(
     // And the directions, from the finished distances: point at whichever
     // neighbour is nearest the player.
     for here in 0..WIDTH * WIDTH {
-        flow[here] = Vec2::ZERO;
-        if steps[here] == FAR || steps[here] == 0 {
+        field.flow[here] = Vec2::ZERO;
+        if field.steps[here] == FAR || field.steps[here] == 0 {
             continue;
         }
-        let mut best = steps[here];
+        let mut best = field.steps[here];
         let mut towards = Vec2::ZERO;
-        for neighbour in neighbours(here) {
-            if steps[neighbour] >= best {
+        for (step, neighbour) in neighbours(here) {
+            if field.steps[neighbour] >= best {
                 continue;
             }
             // The same refusal the sweep made, applied again here. Without it a
-            // cell at the foot of a wall will happily point at the top of that
-            // wall, because the top is genuinely fewer steps from the player --
-            // it was simply reached the long way round. The sweep never crossed
-            // that edge and neither may the flow.
+            // cell on one side of a fence will happily point at the cell on the
+            // other side of it, because that cell is genuinely fewer steps from
+            // the player -- it was simply reached the long way round. The sweep
+            // never crossed that edge and neither may the flow.
             //
             // There is always something left after this filter: a cell got its
             // step count *from* a neighbour one closer, across an edge that
             // passed the test, and the test is symmetric.
-            if (ground[neighbour] - ground[here]).abs() > CLIMB {
+            if !field.passable(here, step, neighbour) {
                 continue;
             }
-            best = steps[neighbour];
+            best = field.steps[neighbour];
             let (hx, hz) = ((here % WIDTH) as f32, (here / WIDTH) as f32);
             let (nx, nz) = ((neighbour % WIDTH) as f32, (neighbour / WIDTH) as f32);
             towards = Vec2::new(nx - hx, nz - hz);
         }
-        flow[here] = towards.normalize_or_zero();
+        field.flow[here] = towards.normalize_or_zero();
     }
 }
 
-/// The up-to-eight cells touching this one, without wrapping round the edge of
-/// the grid -- which would send the west of the map walking off the east.
-fn neighbours(here: usize) -> impl Iterator<Item = usize> {
-    let (x, z) = ((here % WIDTH) as isize, (here / WIDTH) as isize);
-    [
-        (-1, -1),
-        (0, -1),
-        (1, -1),
-        (-1, 0),
-        (1, 0),
-        (-1, 1),
-        (0, 1),
-        (1, 1),
-    ]
-    .into_iter()
-    .filter_map(move |(dx, dz)| {
-        let (nx, nz) = (x + dx, z + dz);
-        // `then` rather than `then_some`: the latter evaluates its argument
-        // whatever the condition says, and off the edge of the grid `nz` is -1,
-        // so the index is computed before it is rejected. In a debug build that
-        // is an overflow panic. In a release build it is worse -- the
-        // arithmetic wraps to some other perfectly valid cell, and the sweep
-        // quietly treats the far edge of the map as next door.
-        (nx >= 0 && nx < WIDTH as isize && nz >= 0 && nz < WIDTH as isize)
-            .then(|| nz as usize * WIDTH + nx as usize)
-    })
+/// The eight directions a body may step, and the order the bits of
+/// [`FlowField::blocked`] are in.
+///
+/// Arranged so that a direction and its opposite are mirrored about the middle
+/// of the list, which is what makes [`opposite`] arithmetic rather than a table
+/// -- and what lets the wall survey visit each edge once and write both ends.
+const STEPS: [(isize, isize); 8] = [
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+    (-1, 0),
+    (1, 0),
+    (-1, 1),
+    (0, 1),
+    (1, 1),
+];
+
+/// The way back along a step.
+fn opposite(step: usize) -> usize {
+    STEPS.len() - 1 - step
+}
+
+/// The cell `step` away from `here`, or `None` off the edge of the grid --
+/// which if left to wrap would send the west of the map walking off the east.
+fn neighbour(here: usize, step: usize) -> Option<usize> {
+    let (dx, dz) = STEPS[step];
+    let (nx, nz) = ((here % WIDTH) as isize + dx, (here / WIDTH) as isize + dz);
+    // `then` rather than `then_some`: the latter evaluates its argument whatever
+    // the condition says, and off the edge of the grid `nz` is -1, so the index
+    // is computed before it is rejected. In a debug build that is an overflow
+    // panic. In a release build it is worse -- the arithmetic wraps to some
+    // other perfectly valid cell, and the sweep quietly treats the far edge of
+    // the map as next door.
+    (nx >= 0 && nx < WIDTH as isize && nz >= 0 && nz < WIDTH as isize)
+        .then(|| nz as usize * WIDTH + nx as usize)
+}
+
+/// The up-to-eight cells touching this one, each with the step that reaches it.
+fn neighbours(here: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..STEPS.len()).filter_map(move |step| neighbour(here, step).map(|to| (step, to)))
 }
 
 #[cfg(test)]
@@ -422,7 +605,8 @@ mod tests {
         }
         assert!(tested > 500, "only {tested} cells were reachable at all");
         assert_eq!(
-            arrived, tested,
+            arrived,
+            tested,
             "{} of {tested} cells lead somewhere other than the player",
             tested - arrived
         );
@@ -482,5 +666,110 @@ mod tests {
             differing > WIDTH * WIDTH / 20,
             "moving the player across the map changed only {differing} cells"
         );
+    }
+
+    /// The castle has fences, and a crowd walking through one is the whole of
+    /// what the wall survey is for.
+    ///
+    /// Before it, 35 of the field's 4,390 routes crossed something the near
+    /// tier would have been stopped by -- few in the count, but each one is a
+    /// stream of goombas walking through a fence somebody is standing next to.
+    #[test]
+    fn the_flow_never_routes_through_a_wall() {
+        let (level, _) = crate::level::load();
+        let field = swept(Vec3::new(-13.28, 3.0, 46.64));
+        let mut routes = 0;
+        let mut through = Vec::new();
+        for index in 0..WIDTH * WIDTH {
+            let towards = field.flow[index];
+            if towards == Vec2::ZERO {
+                continue;
+            }
+            routes += 1;
+            let (x, z) = ((index % WIDTH) as isize, (index / WIDTH) as isize);
+            let next = ((z + towards.y.round() as isize) * WIDTH as isize
+                + (x + towards.x.round() as isize)) as usize;
+            if field.wall_between(&level, index, next) {
+                through.push((index, next));
+            }
+        }
+        // Still a field: refusing those edges must not have cut the map in two.
+        assert!(routes > 4_000, "only {routes} cells lead anywhere at all");
+        assert!(
+            through.is_empty(),
+            "{} of {routes} routes cross a wall, e.g. {:?}",
+            through.len(),
+            &through[..through.len().min(4)]
+        );
+    }
+
+    /// And what an enemy is refused when it takes the step itself, which is a
+    /// separate question from what the sweep routed it along: an enemy weaving
+    /// across its route, or ambling to a wander goal with no route at all, walks
+    /// over edges the flow never chose.
+    ///
+    /// Both directions are asserted. A rule that refuses everything would pass
+    /// the half of this that matters and strand the crowd where it stood.
+    #[test]
+    fn a_step_over_a_cliff_or_through_a_fence_is_refused() {
+        let (level, _) = crate::level::load();
+        let field = FlowField::new(&level);
+        let centre = |index: usize| {
+            let (x, z) = ((index % WIDTH) as f32, (index / WIDTH) as f32);
+            let flat = field.origin + Vec2::new(x + 0.5, z + 0.5) * field.cell;
+            Vec3::new(flat.x, field.ground[index], flat.y)
+        };
+        let (mut refused, mut allowed) = (0, 0);
+        for here in 0..WIDTH * WIDTH {
+            if !field.walkable[here] {
+                continue;
+            }
+            for (_, there) in neighbours(here) {
+                if !field.walkable[there] || there < here {
+                    continue;
+                }
+                let cliff = (field.ground[there] - field.ground[here]).abs() > CLIMB;
+                let wall = field.wall_between(&level, here, there);
+                let clear = field.clear(centre(here), centre(there));
+                if cliff || wall {
+                    refused += 1;
+                    assert!(
+                        !clear,
+                        "cell {here} may step to {there} across a {} of {:.2} m",
+                        if wall { "fence" } else { "cliff" },
+                        (field.ground[there] - field.ground[here]).abs()
+                    );
+                } else {
+                    allowed += 1;
+                    assert!(clear, "cell {here} may not step to open ground at {there}");
+                }
+            }
+        }
+        assert!(refused > 1_000, "only {refused} edges were refused");
+        assert!(allowed > 10_000, "only {allowed} edges were walkable");
+    }
+
+    /// Stepping about inside one cell is nobody's business: the grid has no
+    /// opinion finer than itself, and pretending otherwise would have the crowd
+    /// stopped by rounding.
+    #[test]
+    fn a_step_that_stays_in_its_cell_is_always_clear() {
+        let (level, _) = crate::level::load();
+        let field = FlowField::new(&level);
+        let at = Vec3::new(-13.28, 3.0, 46.64);
+        assert!(field.clear(at, at + Vec3::new(0.01, 0.0, 0.01)));
+    }
+
+    /// How long the one-off survey takes, since it now casts as well as probes.
+    #[test]
+    #[ignore]
+    fn bench_survey() {
+        let (level, _) = crate::level::load();
+        let start = std::time::Instant::now();
+        let field = FlowField::new(&level);
+        let took = start.elapsed();
+        let barred: usize = field.blocked.iter().map(|bits| bits.count_ones() as usize).sum();
+        println!("survey took {took:?}; {barred} blocked edge-ends, {} cells touch one",
+            field.blocked.iter().filter(|bits| **bits != 0).count());
     }
 }
