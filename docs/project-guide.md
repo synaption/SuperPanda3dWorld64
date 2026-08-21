@@ -436,11 +436,9 @@ it hands the mouse cursor back and resuming captures it again.
 **The world is not drawn to the window.** It is drawn into an image, and a
 second camera stretches that image over the window with a nearest-neighbour
 filter — which is what makes the render-resolution row possible. The row is a
-percentage of the window rather than a fixed height like 240p, so the internal
-image always has the window's own aspect ratio and the stretch is uniform;
-`src/display.rs` shows what it works out to in pixels beside the percentage.
-25% of a 1080p screen is 480×270, which is close to what the console actually
-put out.
+pixel multiplier from 1×1 through 8×8. At 2×2 the world target is half the
+window width and height; at 3×3 it is one third of each, and so on. Both axes
+always use the same divisor, so this works at any aspect ratio.
 
 Everything expensive in a frame here — the water's overdraw, the vertex-lit
 surfaces, the billboards — scales with the pixel count and nothing else, so the
@@ -457,18 +455,72 @@ the UI as well and the HUD comes out blurred along with the world. A test in
 
 ## Performance
 
-Static collision queries go through the 16×16 grid rather than the full
-triangle list. Enemy AI and floor placement run at the 30 Hz simulation rate
-rather than the render rate, and Bevy distributes enemy transforms across its
-compute pool.
+The thing that costs a frame here is **draw calls, not pixels and not
+triangles**. Bevy marks every skinned mesh `NoAutomaticBatching`, because each
+one needs its own joint matrices, so a skinned actor costs one draw call per
+mesh primitive and no two of them ever merge — four for a goomba, fifteen for a
+scuttlebug, which is fifteen draw calls to put seventy-six triangles on screen.
+Two thousand enemies drawn that way is around nineteen thousand draw calls a
+frame. The castle, for comparison, is 785 triangles and 45 draws.
 
-Distance-based crowd LOD lowers far AI to 15 or 7.5 Hz and culls distant
-skinned models and their skeletal animation work. All three thresholds are
-exposed through the console, which is the point — the right values depend on
-the machine, and guessing them from source is how the previous set got chosen.
+So the crowd work is all about drawing fewer things rather than about
+simulating faster:
 
-The other dial is the internal render resolution above, which is the one that
-scales the fragment side of the frame rather than the CPU side.
+- **Impostors.** Past `enemy_draw` an enemy is drawn as a camera-facing sprite
+  from a baked atlas rather than as a skeleton, and the whole distant crowd of
+  one kind is rebuilt every frame into a *single* mesh — one draw call for a
+  thousand goombas. See `impostor.rs`, and `impostor/bake.rs` for the baker.
+- **MSAA is off** on the world camera. It is not off by default: Bevy registers
+  `Msaa` as a required component of every `Camera` and the default is
+  `Sample4`, so a camera that says nothing runs four-times multisampling. On
+  this renderer that measured 18% of the frame, and it buys nothing on vertex-lit
+  geometry that is then resampled nearest-neighbour onto the window.
+- **Culled enemies have their animation stopped, not paused.** Pausing saves
+  nothing at all: `bevy_animation` checks the paused flag only to skip the
+  clock and the event triggering, and still samples every curve and writes
+  every joint every frame — which also keeps the transform propagator's
+  dirty-tree optimisation permanently defeated.
+
+Behind those, the ordinary things: collision queries go through a 64×64 grid
+rather than the full triangle list, enemy AI and floor placement run at the
+30 Hz simulation rate rather than the render rate, distance LOD drops far AI to
+15 or 7.5 Hz, and Bevy spreads the enemy step across its compute pool.
+
+Every threshold is a console tunable, which is the point — the right values
+depend on the machine, and guessing them from source is how the previous set
+got chosen.
+
+The remaining dial is the internal render resolution above, which scales the
+fragment side of the frame rather than the draw-call side, so it is the one
+that helps when the crowd is small and the window is large.
+
+### Measuring it
+
+`crowd 2000 mix` in the console puts a whole reproducible field down at once
+rather than waiting for the pipes to fill it; `crowd clear` takes it away. The
+corner readout carries the enemy and entity counts beside the frame time,
+because an enemy is not one entity but a whole scene of them — a mixed field of
+two thousand is about 85,000 entities, and that multiplier is most of what the
+crowd work is fighting.
+
+For a repeatable number with no window in the way:
+
+```bash
+cargo test --release -- --ignored --nocapture crowd_benchmark
+```
+
+which runs the real game headless against a real GPU and prints a row per field
+size. `CROWD_BENCH=2000` runs one size instead of the sweep, and `CROWD_DRAW=60`
+overrides the impostor swap distance — between them that is enough to A/B a
+single change. `--features perf` turns on Bevy's own per-system tracing and
+writes a Chrome trace; the systems that matter are mostly Bevy's own
+(`animate_targets`, `propagate_parent_transforms`, the render-phase queues) and
+cannot be timed from this crate at all.
+
+`cargo run --release -- screenshot out.png [crowd] [x,y,z] [look x,y,z]` draws
+the real game into a PNG without a window, which is the only way to see it at
+all on a machine with no display. `SHOT_SETUP="enemy_draw 12"` runs console
+commands before the shutter.
 
 ## Not done yet
 
@@ -485,8 +537,11 @@ Still to port:
 - the complete SM64 move set — dives, slides, ledge grabs, wall bonks and the
   rest of the action machine
 - the thrown-arc preview the squad aim used to draw
-- impostor crowds. `assets/impostors/` still holds baked sheets for the goomba
-  and the scuttlebug; the tool that baked them was Panda3D-based and went with
-  it, so reviving these means a Bevy baker.
+- atlasing the actor exports. A scuttlebug is fifteen mesh primitives and nine
+  materials for seventy-six triangles, and every one of them is its own draw
+  call. Impostors take care of the far crowd, but the near crowd still pays it:
+  packing each actor's textures into one atlas and merging its primitives in
+  `tools/export_actor_gltf.py` would be roughly a seven-fold cut in draw calls
+  for everything inside `enemy_draw`.
 
 See `next.md` for what is wanted next.

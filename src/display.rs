@@ -23,7 +23,7 @@ use bevy::{
     image::ImageSampler,
     prelude::*,
     render::{
-        render_resource::{Extent3d, TextureFormat},
+        render_resource::{Extent3d, TextureFormat, TextureUsages},
         view::Msaa,
     },
     window::{MonitorSelection, PrimaryWindow, WindowMode},
@@ -42,20 +42,15 @@ const _: fn() = || {
     let _ = core::mem::size_of::<bevy::ui_render::UiRenderPlugin>();
 };
 
-/// The resolutions on offer, as a percentage of the window's own.
-///
-/// Percentages rather than fixed heights like 240p, because the window can be
-/// any shape and a fixed height would decide the aspect ratio for it. The
-/// menu shows what each one works out to in pixels, which is the number
-/// anybody actually wants to read.
-pub const SCALES: [u32; 7] = [25, 33, 50, 66, 75, 85, 100];
+/// How many physical pixels each world pixel occupies in each axis.
+pub const SCALES: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
 /// The scale a fresh game starts at: none at all.
 ///
 /// Full resolution is what the game did before this module existed, so it is
 /// what it still does until somebody chooses otherwise. There is no settings
 /// file yet, so this is also what it goes back to on every launch.
-const DEFAULT_SCALE: usize = SCALES.len() - 1;
+const DEFAULT_SCALE: usize = 0;
 
 /// The player's display choices.
 #[derive(Resource)]
@@ -74,7 +69,7 @@ impl Default for DisplaySettings {
 }
 
 impl DisplaySettings {
-    pub fn percent(&self) -> u32 {
+    pub fn pixel_scale(&self) -> u32 {
         SCALES[self.scale]
     }
 
@@ -117,6 +112,13 @@ pub fn create_target(images: &mut Assets<Image>) -> Handle<Image> {
     // low-resolution pixels back into a smear, which looks like a game running
     // out of focus rather than a game running at 320x240.
     image.sampler = ImageSampler::nearest();
+    // `new_target_texture` asks for the three usages a render target needs and
+    // no more, and copying *out* of one is not among them. Without this the
+    // world can be drawn but never read back, which is what the screenshot tool
+    // does -- and the failure is not a black picture but a render-world error
+    // that takes the whole app down with it. Free otherwise: a usage flag costs
+    // nothing that is not used.
+    image.texture_descriptor.usage |= TextureUsages::COPY_SRC;
     images.add(image)
 }
 
@@ -185,12 +187,12 @@ pub fn scene_view_bundle(target: &Handle<Image>) -> (SceneView, ImageNode, Node,
 
 /// The internal resolution a window of this size renders at.
 ///
-/// Rounded rather than truncated, and floored at one pixel: a scale that works
-/// out to zero on a minimised window is a texture the GPU refuses to make.
-pub fn internal_size(window: UVec2, percent: u32) -> UVec2 {
+/// Both dimensions use the same integer divisor, preserving the window's
+/// aspect ratio. Ceiling division keeps tiny windows at least one pixel wide.
+pub fn internal_size(window: UVec2, pixel_scale: u32) -> UVec2 {
     UVec2::new(
-        (window.x * percent).div_ceil(100).max(1),
-        (window.y * percent).div_ceil(100).max(1),
+        window.x.div_ceil(pixel_scale).max(1),
+        window.y.div_ceil(pixel_scale).max(1),
     )
 }
 
@@ -219,7 +221,7 @@ pub fn resize(
     let Some(mut image) = images.get_mut(&target.0) else {
         return;
     };
-    let wanted = internal_size(physical, settings.percent());
+    let wanted = internal_size(physical, settings.pixel_scale());
     let current = image.texture_descriptor.size;
     if current.width == wanted.x && current.height == wanted.y {
         return;
@@ -253,27 +255,28 @@ mod tests {
     #[test]
     fn scale_steps_wrap_in_both_directions() {
         let mut settings = DisplaySettings::default();
-        assert_eq!(settings.percent(), 100);
+        assert_eq!(settings.pixel_scale(), 1);
         settings.step_scale(1);
-        assert_eq!(settings.percent(), SCALES[0], "past the end comes the start");
+        assert_eq!(settings.pixel_scale(), 2);
         settings.step_scale(-1);
-        assert_eq!(settings.percent(), 100, "and back again");
+        assert_eq!(settings.pixel_scale(), 1, "and back again");
+        settings.step_scale(-1);
+        assert_eq!(settings.pixel_scale(), 8, "past the start comes the end");
     }
 
     #[test]
-    fn internal_size_scales_and_never_reaches_zero() {
+    fn internal_size_uses_square_pixel_multipliers() {
         assert_eq!(
-            internal_size(UVec2::new(1920, 1080), 50),
-            UVec2::new(960, 540)
+            internal_size(UVec2::new(1920, 1080), 3),
+            UVec2::new(640, 360)
         );
         // Full scale is the window itself, exactly, whatever the arithmetic
         // does in between.
         assert_eq!(
-            internal_size(UVec2::new(1366, 768), 100),
+            internal_size(UVec2::new(1366, 768), 1),
             UVec2::new(1366, 768)
         );
-        // A quarter of a very small window is still a texture.
-        assert_eq!(internal_size(UVec2::new(2, 2), 25), UVec2::new(1, 1));
+        assert_eq!(internal_size(UVec2::new(2, 2), 8), UVec2::new(1, 1));
     }
 
     /// The system that keeps the target in step with the window, run against a
@@ -287,7 +290,7 @@ mod tests {
         world.init_resource::<Assets<Image>>();
         let handle = create_target(&mut world.resource_mut::<Assets<Image>>());
         world.insert_resource(SceneTarget(handle.clone()));
-        world.insert_resource(DisplaySettings { scale: 0 });
+        world.insert_resource(DisplaySettings { scale: 1 });
         world.spawn((
             Window {
                 resolution: WindowResolution::new(1600, 900),
@@ -305,11 +308,11 @@ mod tests {
         world.run_system_once(resize).unwrap();
         assert_eq!(
             size(&world),
-            internal_size(UVec2::new(1600, 900), SCALES[0]),
+            internal_size(UVec2::new(1600, 900), SCALES[1]),
             "the first frame corrects whatever size the target was made at"
         );
 
-        world.resource_mut::<DisplaySettings>().scale = SCALES.len() - 1;
+        world.resource_mut::<DisplaySettings>().scale = DEFAULT_SCALE;
         world.run_system_once(resize).unwrap();
         assert_eq!(
             size(&world),

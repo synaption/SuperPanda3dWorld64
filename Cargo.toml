@@ -45,17 +45,26 @@ bevy = { version = "0.19", default-features = false, features = [
     "default_font",
 ] }
 
+# The impostor sheets carry a small JSON sidecar describing how the atlas is
+# laid out -- how many angles, how many frames, how big a quad it draws onto.
+# The baker writes it and the game reads it, so it is a real dependency rather
+# than a test one; the clip-name test, which reads a glTF's JSON chunk directly,
+# uses the same crate.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Writing the impostor atlases. Bevy already builds this to *read* PNGs, so
+# naming it costs no compile time; what it buys is a real deflate encoder. A
+# hand-rolled one storing its scanlines uncompressed turned a one-megabyte
+# atlas into sixteen, which is a runtime asset and a committed file.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 # Windows is where the game is played, and there both device backends build
 # against the OS with no extra packages, so both are always on.
 [target.'cfg(windows)'.dependencies]
 bevy = { version = "0.19", default-features = false, features = [
     "bevy_audio", "wav", "bevy_gilrs", "gamepad",
 ] }
-
-[dev-dependencies]
-# Only the clip-name test reads a glTF's JSON chunk directly, which is how it
-# checks the animation tables against the exports without a renderer.
-serde_json = "1"
 
 [features]
 default = []
@@ -76,6 +85,17 @@ default = []
 # by having 3D or UI switched on.
 sound = ["bevy/bevy_audio", "bevy/wav"]
 gamepad = ["bevy/bevy_gilrs", "bevy/gamepad"]
+
+# Per-system timing, for working out which half of a frame the crowd is in.
+#
+#   cargo run --features perf
+#
+# writes a `trace-*.json` beside the executable; open it in `chrome://tracing`
+# or at https://ui.perfetto.dev and every system in the schedule is a span.
+# Bevy's own instrumentation rather than timers added by hand: the systems that
+# matter here are Bevy's -- `animate_targets`, `propagate_parent_transforms`,
+# the render-phase queues -- and those cannot be timed from this crate at all.
+perf = ["bevy/trace", "bevy/trace_chrome"]
 
 [profile.dev]
 opt-level = 1

@@ -83,6 +83,26 @@ pub struct N64Uniform {
     alpha_cutoff: f32,
 }
 
+impl N64Uniform {
+    /// A surface whose colour is already finished: the texture is shown as it
+    /// is, with no light of any kind added to it.
+    ///
+    /// `light.a` of zero is the flag the shader reads, and with it set the
+    /// ambient, key and light direction are never looked at. Used by the
+    /// impostor sheets, which are pictures of lit models and would be lit twice
+    /// over otherwise -- the same reason the castle's own vertex colours are
+    /// left alone.
+    pub fn unlit(alpha_cutoff: f32) -> Self {
+        Self {
+            base_color: Vec4::ONE,
+            light: Vec4::ZERO,
+            ambient: Vec4::ZERO,
+            to_light: Vec4::Y,
+            alpha_cutoff,
+        }
+    }
+}
+
 /// A surface lit the way the console lit it.
 #[derive(Asset, AsBindGroup, TypePath, Clone)]
 #[bind_group_data(N64MaterialKey)]

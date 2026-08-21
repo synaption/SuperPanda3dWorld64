@@ -9,9 +9,22 @@ pub struct LevelData {
     grid_cell: Vec2,
 }
 
-const GRID_WIDTH: usize = 16;
+/// Cells across the collision grid, in each of the two horizontal axes.
+///
+/// 64 puts the castle's cells at about 2.5 m on a side. It was 16 -- cells of
+/// ten metres, holding an average of nine floor triangles each and up to
+/// forty-one -- which was fine when the only things asking were the player and a
+/// handful of goombas, and is not when a field of two thousand is asking several
+/// times each per tick.
+///
+/// Measured against the real castle rather than guessed: 16 -> 64 takes the
+/// average floor list from 9.1 triangles to 3.8 and the worst cell from 41 to
+/// 28, for 17,569 index entries in place of 2,929 -- some seventy kilobytes,
+/// which is nothing. 128 was also measured and is not worth it: it only reaches
+/// 3.1 average, because this collision mesh is 879 large triangles and past a
+/// point the finer cells simply hold the same big ones over again.
+const GRID_WIDTH: usize = 64;
 const WALL_GRID_MARGIN: f32 = 1.0;
-const MAX_MARKED_TRIANGLES: usize = 2048;
 
 /// How far off horizontal a triangle may lean and still be ground rather than
 /// wall. Anything at or below this is something you are pushed out of instead
@@ -229,6 +242,18 @@ impl LevelData {
         &self.cells[z * GRID_WIDTH + x]
     }
 
+    /// The horizontal extent of the collision, as `(min, max)`.
+    ///
+    /// Read by [`crate::flow`] so the crowd's navigation grid covers exactly
+    /// the ground that exists, rather than a rectangle picked by hand that
+    /// would have to be corrected every time the level changed.
+    pub fn bounds(&self) -> (Vec2, Vec2) {
+        (
+            self.grid_min,
+            self.grid_min + self.grid_cell * GRID_WIDTH as f32,
+        )
+    }
+
     pub fn water_level(&self, x: f32, z: f32) -> Option<f32> {
         self.water_boxes
             .iter()
@@ -377,24 +402,30 @@ impl LevelData {
         let direction = end - start;
         let mut nearest = 1.0_f32;
         let mut hit = None;
-        if self.triangles.len() > MAX_MARKED_TRIANGLES {
-            return self.segment_hit_brute_force(start, end);
-        }
         let min = Vec2::new(start.x.min(end.x), start.z.min(end.z));
         let max = Vec2::new(start.x.max(end.x), start.z.max(end.z));
         let cell_min = self.cell_coords(min);
         let cell_max = self.cell_coords(max);
-        // The fixed-size mark table avoids allocating a HashSet on every
-        // rendered camera frame while still deduplicating triangles spanning
-        // multiple cells.
-        let mut visited = [false; MAX_MARKED_TRIANGLES];
+        // A triangle spanning several of the cells this walks is tested once per
+        // cell, and that is deliberate. There used to be a `[bool; 2048]` mark
+        // table here to stop it -- two kilobytes of stack, zeroed on entry, to
+        // save re-running an intersection test costing a few dozen flops
+        // against a candidate list that on this castle averages eleven
+        // triangles. The bookkeeping cost more than the work it saved, and it
+        // was paid on every call: several per enemy per tick, times a field of
+        // two thousand.
+        //
+        // Dropping it also drops the reason for a fallback. The table was
+        // fixed-size, so a mesh with more triangles than it had slots had to go
+        // through a brute-force scan of every triangle in the level instead;
+        // with nothing to overflow, the grid path is now simply the path.
+        //
+        // Correctness never depended on it either way: the nearest hit is a
+        // minimum over the candidates, and testing one of them twice returns
+        // the same answer twice.
         for z in cell_min.1..=cell_max.1 {
             for x in cell_min.0..=cell_max.0 {
                 for &index in &self.cells[z * GRID_WIDTH + x].all {
-                    if visited[index] {
-                        continue;
-                    }
-                    visited[index] = true;
                     let tri = self.triangles[index];
                     if let Some(t) = segment_triangle_time(start, direction, tri) {
                         if t < nearest {
@@ -408,6 +439,11 @@ impl LevelData {
         hit
     }
 
+    /// Every triangle in the level, tested in order. Kept as what
+    /// [`Self::surface_hit`] is checked *against* rather than as a path the game
+    /// takes: `castle_grid_matches_brute_force_queries` is the test that says
+    /// the grid has not quietly started missing surfaces.
+    #[cfg(test)]
     fn segment_hit_brute_force(&self, start: Vec3, end: Vec3) -> Option<(Vec3, Vec3)> {
         let direction = end - start;
         let mut nearest = 1.0_f32;

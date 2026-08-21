@@ -194,6 +194,13 @@ pub const SPECS: &[TunableSpec] = &[
         doc: "how far one creature's alarm carries to its own side",
     },
     TunableSpec {
+        name: "sim_budget",
+        low: 0.0,
+        high: 2_000.0,
+        step: 25.0,
+        doc: "how many of the nearest enemies get the full simulation",
+    },
+    TunableSpec {
         name: "enemy_lod_near",
         low: 5.0,
         high: 150.0,
@@ -209,10 +216,12 @@ pub const SPECS: &[TunableSpec] = &[
     },
     TunableSpec {
         name: "enemy_draw",
-        low: 20.0,
+        // Down from 20, because this is now a quality dial rather than a
+        // visibility one and the interesting end of it is the near end.
+        low: 5.0,
         high: 500.0,
-        step: 10.0,
-        doc: "distance where skinned enemies are hidden",
+        step: 5.0,
+        doc: "distance where enemies become impostor sprites",
     },
     TunableSpec {
         name: "enemy_rate",
@@ -265,6 +274,9 @@ pub struct GameTuning {
     pub enemy_speed: f32,
     pub enemy_sight: f32,
     pub enemy_alert: f32,
+    /// How many of the nearest enemies are simulated in full. The rest are
+    /// moved by the flow field -- see [`crate::enemy::Detail`].
+    pub sim_budget: f32,
     pub enemy_lod_near: f32,
     pub enemy_lod_far: f32,
     pub enemy_draw: f32,
@@ -301,9 +313,26 @@ impl Default for GameTuning {
             enemy_speed: 1.8,
             enemy_sight: 14.0,
             enemy_alert: 9.0,
+            // The budget the crowd work is built around: a couple of hundred
+            // enemies get collision, jostling and the aggro chain, and
+            // everything past that is carried by the flow field. Chosen as a
+            // *count* rather than a distance on purpose -- it is a fixed amount
+            // of CPU whether the field holds fifty enemies or five thousand.
+            sim_budget: 200.0,
             enemy_lod_near: 35.0,
             enemy_lod_far: 70.0,
-            enemy_draw: 140.0,
+            // Where a skinned enemy becomes a sprite. It used to be 140, which
+            // is wider than the castle is across -- so nothing was ever culled
+            // and the cull may as well not have existed.
+            //
+            // 25 is chosen against `enemy_sight` rather than against a frame
+            // budget: an enemy only notices the player within 14 units, so
+            // everything that could conceivably be fighting you is comfortably
+            // inside this and drawn as a real skeleton. What is beyond it is
+            // scenery, and scenery a dozen pixels tall is exactly what an
+            // impostor is for. Past here the whole far crowd is two draw calls
+            // instead of four per goomba and fifteen per scuttlebug.
+            enemy_draw: 25.0,
             enemy_rate: 7.0,
             enemy_limit: 20.0,
             pipe_brood: 5.0,
@@ -337,6 +366,7 @@ impl GameTuning {
             "enemy_speed" => self.enemy_speed,
             "enemy_sight" => self.enemy_sight,
             "enemy_alert" => self.enemy_alert,
+            "sim_budget" => self.sim_budget,
             "enemy_lod_near" => self.enemy_lod_near,
             "enemy_lod_far" => self.enemy_lod_far,
             "enemy_draw" => self.enemy_draw,
@@ -377,6 +407,7 @@ impl GameTuning {
             "enemy_speed" => self.enemy_speed = value,
             "enemy_sight" => self.enemy_sight = value,
             "enemy_alert" => self.enemy_alert = value,
+            "sim_budget" => self.sim_budget = value,
             "enemy_lod_near" => self.enemy_lod_near = value,
             "enemy_lod_far" => self.enemy_lod_far = value,
             "enemy_draw" => self.enemy_draw = value,
@@ -389,10 +420,45 @@ impl GameTuning {
     }
 }
 
+/// The largest crowd `crowd` will place, however big a number it is handed.
+///
+/// A typo in a benchmark command should cost a second, not the session. Five
+/// thousand is `enemy_limit`'s own ceiling, and this is four times that.
+const CROWD_LIMIT: usize = 20_000;
+
+/// Which enemies a `crowd` command asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrowdKind {
+    Goomba,
+    Scuttlebug,
+    /// Half of each, alternating, which is the case the draw-call cost of a
+    /// mixed field is actually measured on.
+    Mix,
+}
+
+/// A side effect a command asked for, queued for a system with the access to
+/// carry it out.
+///
+/// [`ConsoleState::execute`] is deliberately Bevy-free: it takes a line and a
+/// [`GameTuning`] and touches nothing else, which is what lets the whole
+/// command table be tested without a renderer. Putting a crowd on the map needs
+/// `Commands`, the asset server and the level's collision, so the command
+/// records what it wants here and [`crate::enemy::crowd`] does it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Request {
+    /// Put this many enemies on the map, of this mix.
+    Crowd(usize, CrowdKind),
+    /// Take every enemy off it again.
+    ClearCrowd,
+}
+
 #[derive(Resource)]
 pub struct ConsoleState {
     pub open: bool,
     pub closed_this_frame: bool,
+    /// What the commands run so far have asked the world to do, in the order
+    /// they asked. Drained by whoever can do it.
+    pending: Vec<Request>,
     input: String,
     /// Where the caret sits in `input`, as a byte offset. Always on a character
     /// boundary: every move steps by whole characters, so a multi-byte one
@@ -414,6 +480,7 @@ impl Default for ConsoleState {
         Self {
             open: false,
             closed_this_frame: false,
+            pending: Vec::new(),
             input: String::new(),
             cursor: 0,
             log,
@@ -504,13 +571,14 @@ impl ConsoleState {
         }
         self.echo(format!("> {line}"));
         match words[0].to_ascii_lowercase().as_str() {
-            "help" | "?" => self.echo("commands: <name> [value], vars, reset <name|all>, close <name|all>, clear\nLeft/Right/Home/End move the caret; Up/Down recall; Tab completes.\nSelect a variable then use [ and ] (Shift = 10x) to tune it. Wheel/PageUp/PageDown scroll the log."),
+            "help" | "?" => self.echo("commands: <name> [value], vars, reset <name|all>, close <name|all>, clear\ncrowd <n> [goomba|scuttlebug|mix] puts a whole field down at once; crowd clear takes it away.\nLeft/Right/Home/End move the caret; Up/Down recall; Tab completes.\nSelect a variable then use [ and ] (Shift = 10x) to tune it. Wheel/PageUp/PageDown scroll the log."),
             "vars" | "list" => {
                 for spec in SPECS {
                     self.echo(format!("  {:<18} {:>7.3}  [{:.3} .. {:.3}]  {}", spec.name, tuning.get(spec.name).unwrap(), spec.low, spec.high, spec.doc));
                 }
             }
             "clear" => self.log.clear(),
+            "crowd" => self.crowd(&words[1..]),
             "reset" => self.reset(&words[1..], tuning),
             "close" | "hide" => self.close(&words[1..]),
             "set" | "slider" | "var" if words.len() > 1 => self.tunable(words[1], &words[2..], tuning),
@@ -521,6 +589,46 @@ impl ConsoleState {
                 self.echo(format!("unknown: {}{}  (try `help`)", words[0], hint));
             }
         }
+    }
+
+    /// Everything the commands have asked the world for, taken away as it is
+    /// read: a request carried out twice is a crowd placed twice.
+    pub fn take_requests(&mut self) -> Vec<Request> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// `crowd <n> [goomba|scuttlebug|mix]`, or `crowd clear`.
+    ///
+    /// The benchmark command. `enemy_limit` and `enemy_rate` can already fill
+    /// the field, but they do it a brood at a time over a minute or more, and a
+    /// field that arrives gradually is no way to compare two builds. This puts
+    /// the whole crowd down at once, in the same places every time, so what
+    /// changes between two runs is the build rather than the layout.
+    fn crowd(&mut self, args: &[&str]) {
+        if matches!(args.first(), Some(&"clear") | Some(&"none")) {
+            self.pending.push(Request::ClearCrowd);
+            self.echo("crowd: clearing the field");
+            return;
+        }
+        let Some(count) = args.first().and_then(|raw| raw.parse::<usize>().ok()) else {
+            self.echo("crowd: needs a count -- `crowd 2000 mix`, or `crowd clear`");
+            return;
+        };
+        // Prefixes, so `crowd 2000 g` works: this is a command typed between
+        // two readings of a frame-rate counter, not a configuration file.
+        let kind = match args.get(1).map(|word| word.to_ascii_lowercase()) {
+            None => CrowdKind::Mix,
+            Some(word) if "goomba".starts_with(&word) => CrowdKind::Goomba,
+            Some(word) if "scuttlebug".starts_with(&word) => CrowdKind::Scuttlebug,
+            Some(word) if "mix".starts_with(&word) => CrowdKind::Mix,
+            Some(word) => {
+                self.echo(format!("crowd: {word:?} is not goomba, scuttlebug or mix"));
+                return;
+            }
+        };
+        let count = count.min(CROWD_LIMIT);
+        self.pending.push(Request::Crowd(count, kind));
+        self.echo(format!("crowd: placing {count}, {kind:?}"));
     }
 
     fn tunable(&mut self, name: &str, args: &[&str], tuning: &mut GameTuning) {
@@ -912,8 +1020,24 @@ fn adjust_selected(
 
 /// Bevy's animation clock continues independently of fixed gameplay ticks, so
 /// explicitly pause clips while the console owns the simulation.
-pub fn pause_animations(console: Res<ConsoleState>, mut players: Query<&mut AnimationPlayer>) {
+/// The enemies are left out and handled by [`crate::enemy::sync_animation_visibility`]
+/// instead, which has to tell a culled enemy from a merely paused one -- a
+/// distinction this cannot make and would undo every frame.
+///
+/// Guarded on what each player is already doing, and read through the shared
+/// reference so that asking costs nothing. `pause_all` and `resume_all` mark
+/// the component changed whether or not they changed anything, and this runs
+/// over every animation player in the world on every frame: unguarded, a field
+/// of two thousand puts two thousand components through change detection every
+/// frame to tell them to carry on doing what they were doing.
+pub fn pause_animations(
+    console: Res<ConsoleState>,
+    mut players: Query<&mut AnimationPlayer, Without<crate::enemy::EnemyAnimationRoot>>,
+) {
     for mut player in &mut players {
+        if player.playing_animations().next().is_none() || player.all_paused() == console.open {
+            continue;
+        }
         if console.open {
             player.pause_all();
         } else {
@@ -1016,6 +1140,50 @@ mod tests {
         assert_eq!(console.selected.as_deref(), Some("cam_distance"));
         console.execute("close all", &mut tuning);
         assert!(console.pinned.is_empty());
+    }
+
+    /// The benchmark command, including the prefix forms, since the whole point
+    /// of it is being typed quickly between two readings of a frame counter.
+    #[test]
+    fn crowd_queues_a_field_of_the_asked_for_size_and_mix() {
+        let mut console = ConsoleState::default();
+        let mut tuning = GameTuning::default();
+        console.execute("crowd 2000 mix", &mut tuning);
+        console.execute("crowd 40 g", &mut tuning);
+        console.execute("crowd 40 scuttle", &mut tuning);
+        // No kind named is the mixed field, which is the one worth measuring.
+        console.execute("crowd 7", &mut tuning);
+        console.execute("crowd clear", &mut tuning);
+        assert_eq!(
+            console.take_requests(),
+            vec![
+                Request::Crowd(2000, CrowdKind::Mix),
+                Request::Crowd(40, CrowdKind::Goomba),
+                Request::Crowd(40, CrowdKind::Scuttlebug),
+                Request::Crowd(7, CrowdKind::Mix),
+                Request::ClearCrowd,
+            ]
+        );
+        // And taking them empties the queue: a request carried out on two
+        // consecutive frames is a field placed twice.
+        assert!(console.take_requests().is_empty());
+    }
+
+    /// A mistyped count must not queue anything, and a fat-fingered one must
+    /// not take the machine down with it.
+    #[test]
+    fn a_bad_crowd_command_is_refused_and_a_huge_one_is_capped() {
+        let mut console = ConsoleState::default();
+        let mut tuning = GameTuning::default();
+        console.execute("crowd", &mut tuning);
+        console.execute("crowd lots", &mut tuning);
+        console.execute("crowd 10 elephants", &mut tuning);
+        assert!(console.take_requests().is_empty());
+        console.execute("crowd 999999999", &mut tuning);
+        assert_eq!(
+            console.take_requests(),
+            vec![Request::Crowd(CROWD_LIMIT, CrowdKind::Mix)]
+        );
     }
 
     /// Types a line the way the character events do.

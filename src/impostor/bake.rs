@@ -1,0 +1,597 @@
+//! Baking the impostor sheets: rendering an actor from every angle, once.
+//!
+//! Run it with
+//!
+//! ```text
+//! cargo run --release -- bake-impostors [goomba|scuttlebug]
+//! ```
+//!
+//! and it writes `assets/impostors/<kind>.png` and `<kind>.json`.
+//!
+//! This is a rewrite of a tool that no longer exists. The sheets in the
+//! repository were baked by a Panda3D script that went with the Panda3D build,
+//! which left two atlases nobody could regenerate and a sidecar in a format
+//! whose meaning had to be guessed at. So the format here is defined by this
+//! file rather than reverse-engineered from those, and the numbers in it are
+//! ones the baker knows rather than ones it measured.
+//!
+//! It runs inside the game rather than beside it, and that is the point: the
+//! actor is loaded by the same glTF loader, converted onto the same
+//! [`crate::n64::N64Material`], and lit by the same [`crate::n64::N64Lighting`]
+//! as the skinned model it stands in for. A sprite baked by a separate tool
+//! with its own idea of lighting is a sprite that visibly changes colour at the
+//! swap distance.
+//!
+//! # How the geometry is pinned down
+//!
+//! The hard part of an impostor sheet is not drawing it, it is knowing what a
+//! cell *means* afterwards -- how big a quad it belongs on, and where in it the
+//! ground is. Measuring that from the pixels is guesswork. Instead the camera is
+//! orthographic, so a cell covers an exactly known number of world units:
+//!
+//!   * `world_size` is the camera's vertical extent. That is the quad's size.
+//!   * the camera is aimed at `focus` above the model's origin, so the origin
+//!     sits `0.5 - focus / world_size` of the way up the cell. That is `foot`.
+//!
+//! Both fall out of the camera rather than out of the image, which is why the
+//! runtime can trust them.
+//!
+//! The one thing that *is* measured is how big the camera has to be. A first
+//! pass renders the whole sheet at a deliberately generous extent and records
+//! the alpha bounding box; a second pass re-renders it at an extent tightened
+//! onto what the first pass found. That costs twice the time -- a few seconds --
+//! and spends the cell's pixels on the actor instead of on empty margin.
+
+use crate::{
+    enemy::Kind,
+    impostor::SheetMeta,
+    n64::{self, N64Lighting},
+};
+use bevy::{
+    asset::RenderAssetUsages,
+    camera::{visibility::RenderLayers, ImageRenderTarget, RenderTarget, ScalingMode},
+    core_pipeline::tonemapping::Tonemapping,
+    prelude::*,
+    render::{
+        gpu_readback::{Readback, ReadbackComplete},
+        render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages},
+    },
+    window::ExitCondition,
+};
+
+/// Pixels along one side of a cell.
+///
+/// 128 is what the retired tool used and is kept. It is about four times the
+/// height an impostor is ever drawn at -- past the swap distance an enemy is a
+/// dozen pixels tall -- and the headroom is what keeps the sprite from turning
+/// to mush when somebody raises the swap distance.
+const CELL_PX: u32 = 128;
+
+/// Viewing angles round the model, and frames of its walk.
+const ANGLES: usize = 16;
+const FRAMES: usize = 16;
+
+/// How far the camera is tilted down towards the model, in degrees.
+///
+/// The playing camera sits above the player and looks slightly down, so a sheet
+/// baked dead level would show a goomba's face where the game shows the top of
+/// its head. Fifteen degrees is roughly where the follow camera sits at the
+/// distance the swap happens.
+const ELEVATION: f32 = 15.0;
+
+/// How much room the first pass leaves around the model, as a multiple of its
+/// bind-pose height, and how much the second pass leaves around what the first
+/// one measured.
+///
+/// The first is generous because a walk cycle swings limbs well outside the
+/// bind pose and anything clipped in pass one is measured wrong for pass two.
+/// The second is the margin that survives into the sheet.
+const SURVEY_MARGIN: f32 = 2.6;
+const FINAL_MARGIN: f32 = 1.06;
+
+/// Frames rendered and thrown away after moving the model before the pixels are
+/// asked for.
+///
+/// Not superstition. A pose set this frame is written to the joints by
+/// `animate_targets`, propagated by the transform systems, and only then
+/// extracted into the render world -- and the readback returns whatever the GPU
+/// last finished, which is a frame or two behind the main world. Reading too
+/// early gives the *previous* cell's picture, and the failure looks like a
+/// sheet that is correct but rotated by one cell, which is a miserable thing to
+/// debug. Four is comfortably more than the pipeline is deep.
+const SETTLE: usize = 4;
+
+/// Which pass the bake is on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Pass {
+    /// Rendering at [`SURVEY_MARGIN`] to find out how big the actor really gets.
+    Survey,
+    /// Rendering the sheet that gets written.
+    Final,
+}
+
+/// Everything one bake needs to remember between frames.
+#[derive(Resource)]
+struct Bake {
+    kind: Kind,
+    pass: Pass,
+    /// Which cell is being rendered: an index into `angles * frames`.
+    cell: usize,
+    /// Frames left to settle before the pixels are worth asking for.
+    settle: usize,
+    /// True once the readback for this cell has been asked for, so it is not
+    /// asked for again on the next frame while the first is still in flight.
+    reading: bool,
+    /// The camera's vertical extent in world units, this pass.
+    extent: f32,
+    /// How far above the model's origin the camera is aimed.
+    focus: f32,
+    /// The tightest box, in cell fractions, that held content in the survey.
+    /// `(low, high)`, y measured downward like the image.
+    seen: Option<(Vec2, Vec2)>,
+    /// The finished sheet, `cols * cell_px` by `rows * cell_px`, RGBA8.
+    atlas: Vec<u8>,
+    /// The clip being sampled, and how long it is.
+    clip: Option<(AnimationNodeIndex, f32)>,
+    started: std::time::Instant,
+}
+
+impl Bake {
+    fn cells(&self) -> usize {
+        ANGLES * FRAMES
+    }
+
+    /// The angle and frame indices of the cell being rendered. Frames advance
+    /// fastest, so a row of the atlas is one angle's whole walk cycle -- which
+    /// is the layout [`SheetMeta::grid`] promises.
+    fn indices(&self) -> (usize, usize) {
+        (self.cell / FRAMES, self.cell % FRAMES)
+    }
+}
+
+/// The offscreen target one cell is drawn into.
+fn cell_target(images: &mut Assets<Image>) -> Handle<Image> {
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: CELL_PX,
+            height: CELL_PX,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 0],
+        // Not sRGB: the readback is written straight into a PNG, and the
+        // game reads that PNG back as sRGB. Asking the GPU to linearise on the
+        // way out and then treating the result as sRGB on the way in is how a
+        // sheet comes out visibly paler than the model it was baked from.
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+        | TextureUsages::COPY_DST
+        | TextureUsages::COPY_SRC
+        | TextureUsages::RENDER_ATTACHMENT;
+    images.add(image)
+}
+
+/// The actor being baked, so the systems below can find and pose it.
+#[derive(Component)]
+struct Subject;
+
+/// The camera, so its projection can be retuned between passes.
+#[derive(Component)]
+struct BakeCamera;
+
+fn model(kind: Kind) -> &'static str {
+    kind.model()
+}
+
+/// Sets the bake up: the target, the camera, and the actor.
+fn setup(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    mut images: ResMut<Assets<Image>>,
+    bake: Res<Bake>,
+) {
+    let target = cell_target(&mut images);
+    commands.insert_resource(CellImage(target.clone()));
+    commands.spawn((
+        BakeCamera,
+        Camera3d::default(),
+        Camera {
+            // Transparent, so the alpha channel that reaches the PNG is the
+            // actor's silhouette rather than a box of sky.
+            clear_color: ClearColorConfig::Custom(Color::NONE),
+            ..default()
+        },
+        // The target is its own component in this version rather than a field
+        // on the camera, the same way `display::world_camera_target` gives it.
+        RenderTarget::Image(ImageRenderTarget {
+            handle: target.clone(),
+            scale_factor: 1.0,
+        }),
+        // Orthographic on purpose: a cell then covers an exactly known number of
+        // world units, which is what lets `world_size` and `foot` be known
+        // rather than measured. A perspective camera would make both a function
+        // of the distance the model happened to be at.
+        Projection::from(OrthographicProjection {
+            scaling_mode: ScalingMode::Fixed {
+                width: bake.extent,
+                height: bake.extent,
+            },
+            ..OrthographicProjection::default_3d()
+        }),
+        // MSAA would feather the silhouette into the transparent background and
+        // leave a halo of half-alpha pixels round every sprite in the game.
+        Msaa::Off,
+        Tonemapping::None,
+        camera_pose(bake.extent, bake.focus, 0.0),
+        RenderLayers::layer(0),
+    ));
+    commands.spawn((
+        Subject,
+        crate::WorldAssetRoot(assets.load(format!("{}#Scene0", model(bake.kind)))),
+        // The same scale the game spawns these at, so the world units the
+        // camera measures are the game's world units.
+        Transform::from_scale(Vec3::splat(0.01)),
+    ));
+}
+
+/// The render target, kept so the readback can be asked for on it.
+#[derive(Resource)]
+struct CellImage(Handle<Image>);
+
+/// Where the camera sits to see a model of `extent` turned to `yaw`.
+///
+/// The camera orbits the model rather than the model turning under a fixed
+/// camera. Both would do, and this way round the actor's own transform stays
+/// the identity, so nothing has to reason about whether a rotation applied
+/// before or after the animation.
+fn camera_pose(extent: f32, focus: f32, yaw: f32) -> Transform {
+    let tilt = ELEVATION.to_radians();
+    // Far enough back that the near plane is never inside the model. With an
+    // orthographic projection the distance changes nothing about the picture,
+    // so it can simply be generous.
+    let away = extent * 4.0;
+    let at = Vec3::new(0.0, focus, 0.0);
+    let eye = at + Quat::from_rotation_y(yaw) * (Vec3::new(0.0, tilt.sin(), tilt.cos()) * away);
+    Transform::from_translation(eye).looking_at(at, Vec3::Y)
+}
+
+/// Gives the actor's animation player the clip, once its scene has arrived.
+fn claim(
+    mut bake: ResMut<Bake>,
+    clips: Res<Assets<AnimationClip>>,
+    assets: Res<AssetServer>,
+    mut graphs: ResMut<Assets<AnimationGraph>>,
+    mut commands: Commands,
+    players: Query<Entity, (With<AnimationPlayer>, Without<AnimationGraphHandle>)>,
+) {
+    if bake.clip.is_some() {
+        return;
+    }
+    let Ok(player) = players.single() else {
+        return;
+    };
+    let handle: Handle<AnimationClip> = assets.load(format!("{}#Animation0", model(bake.kind)));
+    let Some(clip) = clips.get(&handle) else {
+        return;
+    };
+    let duration = clip.duration();
+    let (graph, node) = AnimationGraph::from_clip(handle);
+    commands
+        .entity(player)
+        .insert(AnimationGraphHandle(graphs.add(graph)));
+    bake.clip = Some((node, duration));
+}
+
+/// Poses the actor for the current cell and asks for its pixels when it has
+/// settled.
+#[allow(clippy::too_many_arguments)]
+fn step(
+    mut commands: Commands,
+    mut bake: ResMut<Bake>,
+    cell: Res<CellImage>,
+    mut players: Query<&mut AnimationPlayer>,
+    mut camera: Query<(Entity, &mut Transform), With<BakeCamera>>,
+    subject: Query<Entity, With<Subject>>,
+) {
+    let Some((node, duration)) = bake.clip else {
+        return;
+    };
+    // Nothing to pose until the scene has actually spawned something.
+    if subject.iter().next().is_none() {
+        return;
+    }
+    let Ok((camera_entity, mut view)) = camera.single_mut() else {
+        return;
+    };
+    if bake.reading {
+        return;
+    }
+    let (angle, frame) = bake.indices();
+    let yaw = angle as f32 / ANGLES as f32 * std::f32::consts::TAU;
+    *view = camera_pose(bake.extent, bake.focus, yaw);
+    // Sampled at the middle of each frame's slice rather than at its start, so
+    // a sixteen-frame sheet of a looping clip does not show the first pose
+    // twice -- once at the beginning and once at the end.
+    let at = duration * (frame as f32 + 0.5) / FRAMES as f32;
+    for mut player in &mut players {
+        // Paused and seeked rather than played: the clock here is the cell
+        // index, and a clip advancing on its own would put a different pose in
+        // the picture than the one that was asked for.
+        player.play(node).seek_to(at).pause();
+    }
+    if bake.settle > 0 {
+        bake.settle -= 1;
+        return;
+    }
+    commands
+        .entity(camera_entity)
+        .insert(Readback::texture(cell.0.clone()));
+    bake.reading = true;
+}
+
+/// Takes one cell's pixels and moves on.
+fn collect(
+    trigger: On<ReadbackComplete>,
+    mut commands: Commands,
+    mut bake: ResMut<Bake>,
+    mut images: ResMut<Assets<Image>>,
+    mut projection: Query<&mut Projection, With<BakeCamera>>,
+) {
+    if !bake.reading {
+        return;
+    }
+    let pixels = trigger.event().data.clone();
+    commands.entity(trigger.event().entity).remove::<Readback>();
+    bake.reading = false;
+    let expected = (CELL_PX * CELL_PX * 4) as usize;
+    if pixels.len() < expected {
+        eprintln!(
+            "impostor bake: short readback ({} of {expected} bytes), retrying",
+            pixels.len()
+        );
+        bake.settle = SETTLE;
+        return;
+    }
+    match bake.pass {
+        Pass::Survey => note_bounds(&mut bake, &pixels),
+        Pass::Final => blit(&mut bake, &pixels),
+    }
+    bake.cell += 1;
+    bake.settle = SETTLE;
+    if bake.cell < bake.cells() {
+        return;
+    }
+    // End of a pass.
+    match bake.pass {
+        Pass::Survey => {
+            tighten(&mut bake);
+            bake.pass = Pass::Final;
+            bake.cell = 0;
+            if let Ok(mut projection) = projection.single_mut() {
+                *projection = Projection::from(OrthographicProjection {
+                    scaling_mode: ScalingMode::Fixed {
+                        width: bake.extent,
+                        height: bake.extent,
+                    },
+                    ..OrthographicProjection::default_3d()
+                });
+            }
+            let _ = &mut images;
+        }
+        Pass::Final => finish(&bake),
+    }
+}
+
+/// Widens the survey's running bounding box by whatever this cell contained.
+fn note_bounds(bake: &mut Bake, pixels: &[u8]) {
+    let mut low = Vec2::splat(f32::MAX);
+    let mut high = Vec2::splat(f32::MIN);
+    for y in 0..CELL_PX {
+        for x in 0..CELL_PX {
+            // Anything more than barely transparent counts. A threshold of zero
+            // would let a single stray dithered pixel decide the sheet's size.
+            if pixels[((y * CELL_PX + x) * 4 + 3) as usize] > 8 {
+                low = low.min(Vec2::new(x as f32, y as f32));
+                high = high.max(Vec2::new(x as f32 + 1.0, y as f32 + 1.0));
+            }
+        }
+    }
+    if low.x > high.x {
+        return;
+    }
+    let scale = 1.0 / CELL_PX as f32;
+    let (low, high) = (low * scale, high * scale);
+    bake.seen = Some(match bake.seen {
+        Some((old_low, old_high)) => (old_low.min(low), old_high.max(high)),
+        None => (low, high),
+    });
+}
+
+/// Chooses the extent and focus the final pass renders at, from what the survey
+/// saw.
+///
+/// Square, because a cell is square and the quad drawn from it is square: the
+/// extent has to cover the wider of the two axes or the sheet clips the actor
+/// in the other one.
+fn tighten(bake: &mut Bake) {
+    let Some((low, high)) = bake.seen else {
+        eprintln!("impostor bake: the survey saw nothing at all; keeping the wide camera");
+        return;
+    };
+    let span = high - low;
+    let survey = bake.extent;
+    // Back into world units: the survey cell covered `survey` units across.
+    let wanted = span.max_element() * survey * FINAL_MARGIN;
+    // Where the content's middle sat, relative to the camera's aim point. The
+    // image's y runs downward and the world's runs up, hence the negation.
+    let middle = (low + high) * 0.5 - Vec2::splat(0.5);
+    let shift = -middle.y * survey;
+    bake.focus += shift;
+    bake.extent = wanted;
+    println!(
+        "impostor bake: survey found {:.3} x {:.3} world units; \
+         drawing at {:.3} with the camera aimed {:.3} up",
+        span.x * survey,
+        span.y * survey,
+        bake.extent,
+        bake.focus,
+    );
+}
+
+/// Copies one cell's pixels into the atlas at its place.
+fn blit(bake: &mut Bake, pixels: &[u8]) {
+    let (angle, frame) = bake.indices();
+    let stride = FRAMES as u32 * CELL_PX * 4;
+    for y in 0..CELL_PX {
+        let from = (y * CELL_PX * 4) as usize;
+        let to = ((angle as u32 * CELL_PX + y) * stride + frame as u32 * CELL_PX * 4) as usize;
+        let width = (CELL_PX * 4) as usize;
+        bake.atlas[to..to + width].copy_from_slice(&pixels[from..from + width]);
+    }
+}
+
+/// Writes the atlas and its sidecar, and stops the app.
+fn finish(bake: &Bake) {
+    let root = crate::asset_path().join(super::SHEETS);
+    let stem = super::stem(bake.kind);
+    let width = FRAMES as u32 * CELL_PX;
+    let height = ANGLES as u32 * CELL_PX;
+    let png = root.join(format!("{stem}.png"));
+    if let Err(error) = write_png(&png, width, height, &bake.atlas) {
+        eprintln!("impostor bake: could not write {}: {error}", png.display());
+        return;
+    }
+    let meta = SheetMeta {
+        model: stem.to_string(),
+        cell_px: CELL_PX,
+        angles: ANGLES,
+        frames: FRAMES,
+        world_size: bake.extent,
+        // The origin's height in the cell, from the bottom. The camera is aimed
+        // `focus` above it and covers `extent`, so it sits exactly this far up.
+        foot: 0.5 - bake.focus / bake.extent,
+        // One walk cycle across the columns, at the clip's own length.
+        fps: bake.clip.map_or(FRAMES as f32, |(_, duration)| {
+            FRAMES as f32 / duration.max(0.001)
+        }),
+        elevation: ELEVATION,
+    };
+    let json = root.join(format!("{stem}.json"));
+    match serde_json::to_string_pretty(&meta) {
+        Ok(text) => {
+            if let Err(error) = std::fs::write(&json, text + "\n") {
+                eprintln!("impostor bake: could not write {}: {error}", json.display());
+                return;
+            }
+        }
+        Err(error) => {
+            eprintln!("impostor bake: could not encode the sidecar: {error}");
+            return;
+        }
+    }
+    println!(
+        "impostor bake: wrote {} ({width}x{height}) and {} in {:.1}s\n  {meta:#?}",
+        png.display(),
+        json.display(),
+        bake.started.elapsed().as_secs_f32(),
+    );
+}
+
+/// Writes an RGBA8 buffer as a PNG.
+fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> std::io::Result<()> {
+    std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")))?;
+    image::RgbaImage::from_raw(width, height, rgba.to_vec())
+        .ok_or_else(|| {
+            std::io::Error::other(format!(
+                "{} bytes is not a {width}x{height} RGBA image",
+                rgba.len()
+            ))
+        })?
+        .save_with_format(path, image::ImageFormat::Png)
+        .map_err(std::io::Error::other)
+}
+
+/// Ends the app once the final pass has been written.
+fn done(bake: Res<Bake>, mut exit: MessageWriter<AppExit>) {
+    if bake.pass == Pass::Final && bake.cell >= bake.cells() {
+        exit.write(AppExit::Success);
+    }
+}
+
+/// Runs a bake for each named kind and returns when they are written.
+pub fn run(kinds: &[Kind]) {
+    for &kind in kinds {
+        println!("impostor bake: {kind:?} -- surveying");
+        let extent = SURVEY_MARGIN;
+        let mut app = App::new();
+        app.add_plugins(
+            DefaultPlugins
+                .build()
+                .disable::<bevy::winit::WinitPlugin>()
+                .set(WindowPlugin {
+                    primary_window: None,
+                    exit_condition: ExitCondition::DontExit,
+                    close_when_requested: false,
+                    ..default()
+                })
+                .set(AssetPlugin {
+                    file_path: crate::asset_path().to_string_lossy().into_owned(),
+                    ..default()
+                }),
+        )
+        .add_plugins(n64::N64Plugin)
+        .init_resource::<N64Lighting>()
+        .insert_resource(Bake {
+            kind,
+            pass: Pass::Survey,
+            cell: 0,
+            settle: SETTLE,
+            reading: false,
+            extent,
+            // A quarter of the way up rather than half, so the survey sees well
+            // *below* the model's origin as well as above it. Aiming at the
+            // middle puts the cell's bottom edge exactly on y = 0, which clips
+            // whatever hangs under the origin -- and since the survey is what
+            // the final pass is sized from, a bottom edge measured wrong there
+            // is a sheet with its actor's feet cut off.
+            focus: extent * 0.25,
+            seen: None,
+            atlas: vec![0; (FRAMES as u32 * CELL_PX * ANGLES as u32 * CELL_PX * 4) as usize],
+            clip: None,
+            started: std::time::Instant::now(),
+        })
+        .add_systems(Startup, setup)
+        .add_systems(Update, (claim, step, done).chain())
+        .add_systems(PostUpdate, n64::systems())
+        .add_observer(collect);
+        crate::register_world_asset_types(&mut app);
+
+        // Driven by hand rather than by `App::run`. With `WinitPlugin` off
+        // there is no event loop to be the runner, and Bevy's fallback runner
+        // calls `update` exactly once and returns -- which looks precisely like
+        // a bake that did nothing and said nothing about why.
+        //
+        // The cap is a bug-stop, not a schedule: two passes of `angles * frames`
+        // cells at `SETTLE` frames each, and generous slack on top for the
+        // frames spent waiting on the glTF to load.
+        app.finish();
+        app.cleanup();
+        let cap = ANGLES * FRAMES * 2 * (SETTLE + 4) + 2_000;
+        let mut frames = 0;
+        while app.should_exit().is_none() {
+            app.update();
+            frames += 1;
+            if frames > cap {
+                eprintln!(
+                    "impostor bake: gave up after {frames} frames on cell {} of pass {:?} -- \
+                     something upstream is not producing pixels",
+                    app.world().resource::<Bake>().cell,
+                    app.world().resource::<Bake>().pass,
+                );
+                break;
+            }
+        }
+    }
+}

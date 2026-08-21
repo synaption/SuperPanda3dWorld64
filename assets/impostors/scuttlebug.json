@@ -1,31 +1,10 @@
 {
   "model": "scuttlebug",
-  "clip": "scuttlebug_seg6_anim_0601504C",
   "cell_px": 128,
   "angles": 16,
-  "frames": 24,
-  "cols": 24,
-  "rows": 16,
-  "angle_list": [
-    0.0,
-    22.5,
-    45.0,
-    67.5,
-    90.0,
-    112.5,
-    135.0,
-    157.5,
-    180.0,
-    202.5,
-    225.0,
-    247.5,
-    270.0,
-    292.5,
-    315.0,
-    337.5
-  ],
-  "elevation": 15.0,
-  "film": 324.857,
-  "foot_v": 0.37678,
-  "atlas": "scuttlebug.png"
+  "frames": 16,
+  "world_size": 2.712937,
+  "foot": 0.37271637,
+  "fps": 9.795918,
+  "elevation": 15.0
 }

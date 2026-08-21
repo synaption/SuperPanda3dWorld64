@@ -466,7 +466,10 @@ pub fn claim_players(
                 commands
                     .entity(entity)
                     .insert((
-                        crate::enemy::EnemyAnimationRoot(ancestor),
+                        crate::enemy::EnemyAnimationRoot {
+                            owner: ancestor,
+                            clip: node,
+                        },
                         AnimationGraphHandle(graph),
                     ));
                 break;

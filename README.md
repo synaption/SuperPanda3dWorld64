@@ -9,6 +9,12 @@ The current build includes the castle grounds, water, enemies, warp pipes, a
 Mario squad, sound effects, a third-person aiming camera, keyboard/mouse and
 gamepad input, a pause menu with display settings, and a debug console.
 
+Crowds are the thing it is built around: `crowd 2000 mix` in the console puts
+two thousand enemies on the lawn, and past `enemy_draw` each one is drawn as a
+baked sprite rather than a skeleton, so the whole distant field costs two draw
+calls instead of four per goomba and fifteen per scuttlebug. See the
+[performance notes](docs/project-guide.md#performance) for how to measure it.
+
 Escape pauses the game and opens the menu; its display page changes the
 internal render resolution, which is the world's own resolution rather than the
 window's — the setting that buys frame rate, and the one that puts the

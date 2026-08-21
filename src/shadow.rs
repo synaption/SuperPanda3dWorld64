@@ -61,7 +61,7 @@ const FADE_STEPS: usize = 12;
 /// How far the disc floats off the floor, along the floor's own normal. Small
 /// enough not to be seen from a playing camera and large enough that the disc
 /// and the ground it sits on never argue about which is in front.
-const LIFT: f32 = 0.03;
+pub const LIFT: f32 = 0.03;
 
 /// Segments around the disc. The original's circle shadow is nine vertices --
 /// eight triangles in a fan -- and the reason a low number is fine here is the
@@ -161,12 +161,15 @@ impl ShadowArt {
 
 /// Builds the shared disc and the ladder of materials. Called once, from
 /// startup.
+/// Returns the art rather than inserting it, so that `setup` can hand the solid
+/// rung to [`crate::impostor`] -- which draws the far crowd's shadows itself,
+/// as part of the one mesh that whole crowd is drawn by, and would otherwise
+/// have to wait a frame for a resource that is still a queued command.
 pub fn prepare(
-    commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     images: &mut Assets<Image>,
     materials: &mut Assets<StandardMaterial>,
-) {
+) -> ShadowArt {
     let texture = images.add(disc());
     let fades = ShadowArt::ladder()
         .map(|alpha| {
@@ -185,12 +188,12 @@ pub fn prepare(
             })
         })
         .collect();
-    commands.insert_resource(ShadowArt {
+    ShadowArt {
         // A unit circle in the XY plane facing +Z, which is why [`project`]
         // turns it by the rotation that takes +Z onto the floor's normal.
         mesh: meshes.add(Circle::new(1.0).mesh().resolution(SEGMENTS).build()),
         fades,
-    });
+    }
 }
 
 /// The shadow texture: black, with the alpha falling from solid at the middle

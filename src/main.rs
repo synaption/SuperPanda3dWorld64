@@ -14,6 +14,8 @@ mod camera;
 mod console;
 mod display;
 mod enemy;
+mod flow;
+mod impostor;
 mod input;
 mod level;
 mod menu;
@@ -21,15 +23,17 @@ mod n64;
 mod pipe;
 mod player;
 mod shadow;
+mod shot;
 mod squad;
 mod water;
 
 use bevy::{
     core_pipeline::tonemapping::Tonemapping,
-    diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin},
+    diagnostic::{DiagnosticsStore, EntityCountDiagnosticsPlugin, FrameTimeDiagnosticsPlugin},
     ecs::{schedule::ScheduleConfigs, system::ScheduleSystem},
     input::InputSystems,
     prelude::*,
+    render::view::Msaa,
     window::{
         CursorGrabMode, CursorOptions, MonitorSelection, PrimaryWindow, WindowMode,
         WindowResolution,
@@ -89,58 +93,21 @@ fn log_panics_to_a_file() {
     }));
 }
 
-fn main() {
-    log_panics_to_a_file();
-    App::new()
-        .insert_resource(ClearColor(water::SKY_COLOUR))
-        .insert_resource(GameState {
-            active: ActiveCharacter::Hero,
-            aiming: false,
-            debug: true,
-        })
-        .init_resource::<console::GameTuning>()
-        .init_resource::<console::ConsoleState>()
-        .init_resource::<input::InputState>()
-        .init_resource::<audio::SoundQueue>()
-        .init_resource::<water::CameraMedium>()
-        .init_resource::<animation::PlayerAnimation>()
-        .init_resource::<animation::EnemyGraphs>()
-        .init_resource::<squad::Squad>()
-        .init_resource::<squad::Whistle>()
-        .init_resource::<menu::MenuState>()
-        .init_resource::<display::DisplaySettings>()
-        .insert_resource(Time::<Fixed>::from_hz(30.0))
-        .add_plugins(
-            DefaultPlugins
-                .set(WindowPlugin {
-                    primary_window: Some(Window {
-                        title: "Super Bevy World 64".into(),
-                        // Borderless rather than exclusive fullscreen: it takes
-                        // the monitor's own resolution and refresh rate instead
-                        // of asking for a mode switch, so alt-tabbing away and
-                        // back does not black the screen while the display
-                        // renegotiates. F11 goes back to a window.
-                        mode: WindowMode::BorderlessFullscreen(MonitorSelection::Current),
-                        // The size the window takes when F11 leaves fullscreen.
-                        resolution: WindowResolution::new(1280, 720),
-                        present_mode: bevy::window::PresentMode::AutoVsync,
-                        ..default()
-                    }),
-                    ..default()
-                })
-                .set(AssetPlugin {
-                    file_path: asset_path().to_string_lossy().into_owned(),
-                    ..default()
-                }),
-        )
-        // The whole world is drawn by this one material, so it goes on directly
-        // after the plugins it is built out of.
-        .add_plugins(n64::N64Plugin)
-        // Bevy's glTF loader puts these metadata components into each
-        // WorldAsset, but GltfPlugin does not add them to the reflection
-        // registry. WorldSerializationPlugin needs the registrations when it
-        // clones the loaded world into the game world.
-        .register_type::<bevy::gltf::GltfExtras>()
+/// Reflection registrations every world in this game needs before a glTF can
+/// be spawned into it.
+///
+/// Bevy's glTF loader puts these metadata components into each `WorldAsset`,
+/// but `GltfPlugin` does not add them to the reflection registry, and
+/// `WorldSerializationPlugin` needs them when it clones a loaded world into the
+/// game world. A missing one is not a compile error and not a warning: it is a
+/// panic inside the spawner the first time an actor is loaded.
+///
+/// Shared by `main`, the headless test harness and the crowd benchmark, because
+/// it is a property of the assets rather than of any one of those -- and because
+/// keeping three copies of it in step is exactly the sort of thing that is
+/// discovered by a benchmark falling over.
+fn register_world_asset_types(app: &mut App) {
+    app.register_type::<bevy::gltf::GltfExtras>()
         .register_type::<bevy::gltf::GltfSceneExtras>()
         .register_type::<bevy::gltf::GltfSceneName>()
         .register_type::<bevy::gltf::GltfMeshExtras>()
@@ -166,15 +133,152 @@ fn main() {
         .register_type::<bevy::mesh::morph::MorphWeights>()
         .register_type::<bevy::animation::AnimationTargetId>()
         .register_type::<bevy::animation::AnimatedBy>()
-        .register_type::<AnimationPlayer>()
+        .register_type::<AnimationPlayer>();
+}
+
+fn main() {
+    log_panics_to_a_file();
+    // The impostor baker runs inside the game rather than beside it, so that
+    // the sprites it draws are lit by the same material the skinned models are.
+    // `cargo run --release -- bake-impostors [goomba|scuttlebug]`.
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.first().map(String::as_str) == Some("bake-impostors") {
+        let named: Vec<enemy::Kind> = arguments[1..]
+            .iter()
+            .filter_map(|word| match word.to_ascii_lowercase().as_str() {
+                "goomba" => Some(enemy::Kind::Goomba),
+                "scuttlebug" => Some(enemy::Kind::Scuttlebug),
+                other => {
+                    eprintln!("bake-impostors: {other:?} is not an actor with a sheet");
+                    None
+                }
+            })
+            .collect();
+        let all = [enemy::Kind::Goomba, enemy::Kind::Scuttlebug];
+        impostor::bake::run(if named.is_empty() { &all } else { &named });
+        return;
+    }
+    // `cargo run --release -- screenshot out.png [crowd] [x,y,z] [look x,y,z]`,
+    // which is the only way to see this game on a machine with no display.
+    if arguments.first().map(String::as_str) == Some("screenshot") {
+        let triple = |word: Option<&String>, fallback: Vec3| -> Vec3 {
+            let Some(word) = word else { return fallback };
+            let parts: Vec<f32> = word
+                .split(',')
+                .filter_map(|part| part.trim().parse().ok())
+                .collect();
+            match parts[..] {
+                [x, y, z] => Vec3::new(x, y, z),
+                _ => fallback,
+            }
+        };
+        let path = arguments
+            .get(1)
+            .cloned()
+            .unwrap_or_else(|| "screenshot.png".into());
+        let crowd = arguments.get(2).and_then(|n| n.parse().ok()).unwrap_or(0);
+        let eye = triple(arguments.get(3), Vec3::new(-13.0, 8.0, 60.0));
+        let at = triple(arguments.get(4), Vec3::new(-13.0, 3.0, 46.0));
+        shot::run(std::path::Path::new(&path), crowd, eye, at);
+        return;
+    }
+    let mut app = App::new();
+    app.add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "Super Bevy World 64".into(),
+                        // Borderless rather than exclusive fullscreen: it takes
+                        // the monitor's own resolution and refresh rate instead
+                        // of asking for a mode switch, so alt-tabbing away and
+                        // back does not black the screen while the display
+                        // renegotiates. F11 goes back to a window.
+                        mode: WindowMode::BorderlessFullscreen(MonitorSelection::Current),
+                        // The size the window takes when F11 leaves fullscreen.
+                        resolution: WindowResolution::new(1280, 720),
+                        present_mode: bevy::window::PresentMode::AutoVsync,
+                        ..default()
+                    }),
+                    ..default()
+                })
+                .set(AssetPlugin {
+                    file_path: asset_path().to_string_lossy().into_owned(),
+                    ..default()
+                }),
+    );
+    add_game(&mut app);
+    app.add_systems(PreUpdate, input_pipeline()).run();
+}
+
+/// Everything that makes an `App` this game, short of the plugins and the
+/// window.
+///
+/// Shared by `main`, the crowd benchmark and the screenshot tool, so that all
+/// three run the same game. Keeping three hand-written copies of this list in
+/// step is not a thing anyone succeeds at: the benchmark was already a
+/// half-copy that fell over on a missing reflection registration the first time
+/// it was run, which is what prompted pulling it out.
+///
+/// The input pipeline is *not* here. It reads real devices, and the two
+/// headless callers have none; `main` adds it separately.
+pub fn add_game(app: &mut App) {
+    game_resources(app);
+    // The whole world is drawn by this one material, so it goes on directly
+    // after the plugins it is built out of.
+    app.add_plugins(n64::N64Plugin)
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
-        .add_systems(Startup, setup)
-        .add_systems(PreUpdate, input_pipeline())
+        // The other half of the benchmark readout: an enemy is a whole scene of
+        // entities rather than one, and that multiplier is what the crowd work
+        // is trying to bring down.
+        .add_plugins(EntityCountDiagnosticsPlugin::default());
+    register_world_asset_types(app);
+    game_systems(app);
+}
+
+/// Every resource the game's systems expect to find.
+///
+/// Its own function because the headless test harness cannot use
+/// [`add_game`] -- it runs on `MinimalPlugins` with the render plugins stubbed
+/// out -- but must have exactly this list, and a resource added to one copy and
+/// not the other is not a compile error. It is every schedule test failing at
+/// once with "Resource does not exist" and no name attached, which is precisely
+/// how this function came to exist.
+pub fn game_resources(app: &mut App) {
+    app.insert_resource(ClearColor(water::SKY_COLOUR))
+        .insert_resource(GameState {
+            active: ActiveCharacter::Hero,
+            aiming: false,
+            debug: true,
+        })
+        .init_resource::<console::GameTuning>()
+        .init_resource::<console::ConsoleState>()
+        .init_resource::<input::InputState>()
+        .init_resource::<audio::SoundQueue>()
+        .init_resource::<water::CameraMedium>()
+        .init_resource::<animation::PlayerAnimation>()
+        .init_resource::<animation::EnemyGraphs>()
+        .init_resource::<squad::Squad>()
+        .init_resource::<squad::Whistle>()
+        .init_resource::<menu::MenuState>()
+        .init_resource::<display::DisplaySettings>()
+        .init_resource::<impostor::ImpostorStats>()
+        .insert_resource(Time::<Fixed>::from_hz(30.0));
+}
+
+/// The schedules, in the order a frame runs them. Shared for the same reason
+/// [`game_resources`] is.
+///
+/// The input pipeline is not here: it reads real devices, and the headless
+/// callers have none.
+pub fn game_systems(app: &mut App) {
+    app.add_systems(Startup, setup)
         .add_systems(FixedUpdate, simulation())
         .add_systems(Update, presentation())
         .add_systems(Update, overlay())
-        .add_systems(PostUpdate, (billboard::systems(), n64::systems()).chain())
-        .run();
+        .add_systems(
+            PostUpdate,
+            (billboard::systems(), impostor::systems(), n64::systems()).chain(),
+        );
 }
 
 /// Reading the keyboard, the mouse and the pad into one snapshot for the frame.
@@ -214,6 +318,13 @@ fn input_pipeline() -> ScheduleConfigs<ScheduleSystem> {
 fn simulation() -> ScheduleConfigs<ScheduleSystem> {
     (
         player::movement,
+        // Before anything that reads it. The field is what the crowd tier
+        // navigates by, and one built from last tick's player position would
+        // send two thousand enemies a step behind him.
+        flow::rebuild,
+        // And before every system that asks how much simulation an enemy is
+        // getting this tick.
+        enemy::assign_detail,
         squad::maintain_population,
         squad::update_goals,
         squad::move_allies,
@@ -268,6 +379,10 @@ fn overlay() -> ScheduleConfigs<ScheduleSystem> {
         // After the console's, which resumes everything the frame it closes:
         // a menu open over a closed console still holds the world still.
         menu::pause_animations,
+        // Out here rather than in `simulation` because the console is open at
+        // the moment a `crowd` command is typed, and a field that only arrived
+        // once you shut the console is a field you never saw arrive.
+        enemy::crowd,
         enemy::sync_animation_visibility,
         audio::play,
         console::draw,
@@ -299,6 +414,7 @@ fn setup(
     assets: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut sprites: ResMut<Assets<n64::N64Material>>,
     mut images: ResMut<Assets<Image>>,
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
@@ -308,7 +424,23 @@ fn setup(
     let scene_target = display::create_target(&mut images);
     commands.insert_resource(SceneTarget(scene_target.clone()));
     let (collision, render) = level::load();
-    shadow::prepare(&mut commands, &mut meshes, &mut images, &mut materials);
+    // Surveyed here, once, off the collision that was just loaded: every floor
+    // query the distant crowd will ever ask is answered in this call and never
+    // again.
+    commands.insert_resource(flow::FlowField::new(&collision));
+    let shadow_art = shadow::prepare(&mut meshes, &mut images, &mut materials);
+    impostor::prepare(
+        &mut commands,
+        &assets,
+        &mut meshes,
+        &mut sprites,
+        // The far crowd draws its own shadows into its own mesh, so it needs the
+        // same disc material every other shadow in the game uses -- at full
+        // strength, since everything it draws is stood on the ground.
+        shadow_art.fade(shadow::SOLID),
+        &asset_path(),
+    );
+    commands.insert_resource(shadow_art);
     water::spawn(
         &mut commands,
         &assets,
@@ -447,6 +579,18 @@ fn setup(
         // N64 colours are already display-referred bytes. Filmic HDR grading
         // would alter their contrast, saturation, and hue a second time.
         Tonemapping::None,
+        // Named rather than left to the default, which is *not* off:
+        // `bevy_render` registers `Msaa` as a required component of every
+        // `Camera` and `Msaa::default()` is `Sample4`, so a camera that says
+        // nothing is a camera running four-times multisampling. That is four
+        // times the fragment work and four times the render-target bandwidth --
+        // the cost that hurts most on exactly the weak integrated GPU this is
+        // meant to run on -- and it buys nothing here. The world is vertex-lit
+        // with hard-edged N64 texture work and is then resampled onto the
+        // window nearest-neighbour by `display`, which throws away smoothed
+        // edges anyway. `display::presentation_camera` has always said this;
+        // the camera that draws the expensive pass had not.
+        Msaa::Off,
         // Bevy fogs per camera rather than per scene, so the medium the camera
         // is in rides along with it.
         water::air_fog(),
@@ -554,7 +698,17 @@ fn controls(
 /// with it because it is the number that scales linearly with work -- twice the
 /// milliseconds is twice the cost, where a drop from 240 to 200 fps and one
 /// from 60 to 55 look alike and are not.
-fn update_fps(diagnostics: Res<DiagnosticsStore>, mut text: Query<&mut Text, With<FpsText>>) {
+/// The entity and enemy counts ride along with it because this readout is what
+/// a `crowd` benchmark is read off, and a frame time means nothing without the
+/// size of the field that produced it. The entity count is the one that catches
+/// the cost that is not obvious: an enemy is not one entity but a whole scene of
+/// them, and the difference between those two numbers is most of the frame.
+fn update_fps(
+    diagnostics: Res<DiagnosticsStore>,
+    enemies: Query<(), With<enemy::Enemy>>,
+    crowd: Res<impostor::ImpostorStats>,
+    mut text: Query<&mut Text, With<FpsText>>,
+) {
     let Ok(mut readout) = text.single_mut() else {
         return;
     };
@@ -564,8 +718,22 @@ fn update_fps(diagnostics: Res<DiagnosticsStore>, mut text: Query<&mut Text, Wit
     let frame_time = diagnostics
         .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
         .and_then(|frame_time| frame_time.smoothed());
+    let entities = diagnostics
+        .get(&EntityCountDiagnosticsPlugin::ENTITY_COUNT)
+        .and_then(|count| count.value());
     **readout = match (fps, frame_time) {
-        (Some(fps), Some(frame_time)) => format!("{fps:.0} fps · {frame_time:.1} ms"),
+        (Some(fps), Some(frame_time)) => {
+            let mut line = format!("{fps:.0} fps · {frame_time:.1} ms");
+            if let Some(entities) = entities {
+                line.push_str(&format!(
+                    " · {} enemies ({} sprite / {} skinned) · {entities:.0} entities",
+                    enemies.iter().count(),
+                    crowd.sprites,
+                    crowd.skinned,
+                ));
+            }
+            line
+        }
         // The diagnostic needs a few frames before it has anything to average,
         // and a blank corner says that better than a zero would.
         _ => String::new(),
@@ -665,34 +833,8 @@ mod tests {
                 file_path: asset_path().to_string_lossy().into_owned(),
                 ..default()
             })
-            .register_type::<bevy::gltf::GltfExtras>()
-            .register_type::<bevy::gltf::GltfSceneExtras>()
-            .register_type::<bevy::gltf::GltfSceneName>()
-            .register_type::<bevy::gltf::GltfMeshExtras>()
-            .register_type::<bevy::gltf::GltfMeshName>()
-            .register_type::<bevy::gltf::GltfMaterialExtras>()
-            .register_type::<bevy::gltf::GltfMaterialName>()
-            .register_type::<Transform>()
-            .register_type::<GlobalTransform>()
-            .register_type::<TransformTreeChanged>()
-            .register_type::<Visibility>()
-            .register_type::<InheritedVisibility>()
-            .register_type::<ViewVisibility>()
-            .register_type::<Name>()
-            .register_type::<ChildOf>()
-            .register_type::<Children>()
-            .register_type::<Mesh3d>()
-            .register_type::<MeshMaterial3d<StandardMaterial>>()
-            .register_type::<bevy::camera::primitives::Aabb>()
-            .register_type::<bevy::camera::visibility::DynamicSkinnedMeshBounds>()
-            .register_type::<bevy::camera::visibility::NoFrustumCulling>()
-            .register_type::<bevy::mesh::skinning::SkinnedMesh>()
-            .register_type::<bevy::mesh::morph::MeshMorphWeights>()
-            .register_type::<bevy::mesh::morph::MorphWeights>()
-            .register_type::<bevy::animation::AnimationTargetId>()
-            .register_type::<bevy::animation::AnimatedBy>()
-            .register_type::<AnimationPlayer>()
             .add_plugins(FrameTimeDiagnosticsPlugin::default())
+            .add_plugins(EntityCountDiagnosticsPlugin::default())
             .init_asset::<Mesh>()
             .init_asset::<StandardMaterial>()
             // The material swap and the light sync both run headlessly; what
@@ -707,24 +849,6 @@ mod tests {
             .init_asset::<AnimationGraph>()
             .init_asset::<Image>()
             .init_asset::<bevy::gltf::Gltf>()
-            .insert_resource(ClearColor(water::SKY_COLOUR))
-            .insert_resource(GameState {
-                active: ActiveCharacter::Hero,
-                aiming: false,
-                debug: true,
-            })
-            .init_resource::<console::GameTuning>()
-            .init_resource::<console::ConsoleState>()
-            .init_resource::<input::InputState>()
-            .init_resource::<audio::SoundQueue>()
-            .init_resource::<water::CameraMedium>()
-            .init_resource::<animation::PlayerAnimation>()
-            .init_resource::<animation::EnemyGraphs>()
-            .init_resource::<squad::Squad>()
-            .init_resource::<squad::Whistle>()
-            .init_resource::<menu::MenuState>()
-            .init_resource::<display::DisplaySettings>()
-            .insert_resource(Time::<Fixed>::from_hz(30.0))
             // A test loop runs far faster than real time, so without this the
             // clock would barely advance and the fixed step would never tick:
             // the simulation would go unexercised while the test still passed.
@@ -732,11 +856,13 @@ mod tests {
             .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
                 std::time::Duration::from_millis(16),
             ))
-            .add_systems(Startup, setup)
-            .add_systems(FixedUpdate, simulation())
-            .add_systems(Update, presentation())
-            .add_systems(Update, overlay())
-            .add_systems(PostUpdate, (billboard::systems(), n64::systems()).chain());
+            ;
+        // The same resources and the same schedules the real game gets. Listed
+        // in one place rather than two, because the copy that used to live here
+        // fell behind the real one and every schedule test failed at once.
+        game_resources(&mut app);
+        game_systems(&mut app);
+        register_world_asset_types(&mut app);
         app
     }
 
@@ -789,6 +915,140 @@ mod tests {
             count, wanted,
             "the field holds {count} Marios, not {wanted}"
         );
+    }
+
+    /// The crowd benchmark: the real game, a real GPU, no window, and a field
+    /// of a given size.
+    ///
+    /// Ignored by default because it opens a device and takes tens of seconds;
+    /// it is a measuring instrument rather than a thing that can fail. Run it
+    /// with
+    ///
+    /// ```text
+    /// cargo test --release -- --ignored --nocapture crowd_benchmark
+    /// ```
+    ///
+    /// and it prints a row per field size. `--release` is not optional: this
+    /// crate builds at `opt-level = 1` in dev, and a debug-speed simulation
+    /// tells you about `rustc` rather than about the game.
+    ///
+    /// Everything the game does is here except presenting to a surface: the
+    /// full plugin set, the real `setup`, the real schedules, and the world
+    /// camera drawing into the same offscreen target `display` gives it. What
+    /// that leaves out is the swap chain and vsync, which is exactly what a
+    /// benchmark wants left out.
+    #[test]
+    #[ignore = "measuring instrument: needs a GPU and tens of seconds"]
+    fn crowd_benchmark() {
+        use bevy::window::ExitCondition;
+        use std::time::{Duration, Instant};
+
+        /// Frames run before timing starts, to get the assets loaded, the
+        /// scenes spawned and the pipelines compiled. A first frame that
+        /// includes compiling every shader in the game is not a frame.
+        const WARMUP: usize = 90;
+        const TIMED: usize = 120;
+
+        // `CROWD_BENCH=2000` runs one size instead of the sweep, which is what
+        // makes it usable for A/B-ing a single change: toggle the thing, run
+        // one row, compare. The default is the whole sweep.
+        let sweep: Vec<(usize, &str)> = match std::env::var("CROWD_BENCH") {
+            Ok(sizes) => sizes
+                .split(',')
+                .filter_map(|size| size.trim().parse().ok())
+                .map(|count| (count, "mix"))
+                .collect(),
+            Err(_) => vec![
+                (0, "empty"),
+                (500, "mix"),
+                (1000, "mix"),
+                (2000, "mix"),
+                (2000, "scuttlebug"),
+            ],
+        };
+        for (count, kind) in sweep {
+            let mut app = App::new();
+            app.add_plugins(
+                DefaultPlugins
+                    .build()
+                    .disable::<bevy::winit::WinitPlugin>()
+                    .set(WindowPlugin {
+                        primary_window: None,
+                        exit_condition: ExitCondition::DontExit,
+                        close_when_requested: false,
+                        ..default()
+                    })
+                    .set(AssetPlugin {
+                        file_path: asset_path().to_string_lossy().into_owned(),
+                        ..default()
+                    }),
+            )
+            .add_plugins(n64::N64Plugin)
+            .init_resource::<console::GameTuning>()
+            .init_resource::<console::ConsoleState>()
+            .init_resource::<input::InputState>()
+            .init_resource::<audio::SoundQueue>()
+            .init_resource::<water::CameraMedium>()
+            .init_resource::<animation::PlayerAnimation>()
+            .init_resource::<animation::EnemyGraphs>()
+            .init_resource::<squad::Squad>()
+            .init_resource::<squad::Whistle>()
+            .init_resource::<menu::MenuState>()
+            .init_resource::<display::DisplaySettings>()
+            .init_resource::<GameState>()
+            .insert_resource(ClearColor(water::SKY_COLOUR))
+            .insert_resource(Time::<Fixed>::from_hz(30.0))
+            // A real clock would let the loop outrun the fixed step and leave
+            // the simulation half-exercised. Sixteen milliseconds a frame is
+            // the 60 Hz session this is trying to hold.
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                Duration::from_millis(16),
+            ))
+            .add_systems(Startup, setup)
+            .add_systems(FixedUpdate, simulation())
+            .add_systems(Update, presentation())
+            .add_systems(Update, overlay())
+            .add_systems(PostUpdate, (billboard::systems(), impostor::systems(), n64::systems()).chain());
+            register_world_asset_types(&mut app);
+
+            app.finish();
+            app.cleanup();
+            app.update();
+            // `CROWD_DRAW=60` runs the sweep with the skinned-model cull pulled
+            // in to sixty metres. Worth having as a knob because the shipped
+            // default is 140, which is wider than the castle is across -- so out
+            // of the box the cull never fires at all and everything downstream
+            // of it, including stopping a culled enemy's animation, is dead
+            // code on this map.
+            let draw = std::env::var("CROWD_DRAW")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok());
+            if let Some(draw) = draw {
+                app.world_mut().resource_mut::<console::GameTuning>().enemy_draw = draw;
+            }
+            {
+                let mut tuning = app.world_mut().resource::<console::GameTuning>().clone();
+                let mut console = app.world_mut().resource_mut::<console::ConsoleState>();
+                console.execute(&format!("crowd {count} {kind}"), &mut tuning);
+            }
+            for _ in 0..WARMUP {
+                app.update();
+            }
+
+            // `count_spawned` rather than `len`, which reports the entity
+            // meta-list's capacity and so always comes out a power of two.
+            let entities = app.world().entities().count_spawned();
+            let started = Instant::now();
+            for _ in 0..TIMED {
+                app.update();
+            }
+            let each = started.elapsed().as_secs_f64() / TIMED as f64;
+            println!(
+                "crowd {count:>5} {kind:<11} {:>7.2} ms/frame  {:>6.1} fps  {entities:>7} entities",
+                each * 1000.0,
+                1.0 / each,
+            );
+        }
     }
 
     /// Every `TextFont` here leaves `font` unset and so draws with

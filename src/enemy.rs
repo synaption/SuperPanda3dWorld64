@@ -12,7 +12,7 @@
 
 use crate::{
     audio::{Sfx, SoundQueue},
-    console::GameTuning,
+    console::{ConsoleState, CrowdKind, GameTuning, Request},
     level::LevelData,
     player::{Controller, Motion, Player, FIXED_DT, PLAYER_HEIGHT},
     squad::Ally,
@@ -174,7 +174,12 @@ impl Kind {
     }
 }
 
+/// Required rather than added at the spawn site, so that no enemy can exist
+/// without a tier -- including the ones tests build by hand. A missing
+/// `Detail` would not be a compile error, it would be an enemy silently left
+/// out of every query that decides how much simulation it gets.
 #[derive(Component)]
+#[require(Detail)]
 pub struct Enemy {
     /// What it is, which is also its collision cylinder and its model: kept as
     /// the one fact rather than as a copy of each thing derived from it.
@@ -251,6 +256,15 @@ impl Quirk {
         }
     }
 
+    /// The single number everything else here is derived from.
+    ///
+    /// Read by [`crate::impostor`] to offset one enemy's walk cycle from the
+    /// next's, which is the same job it does for the pace and the weave: a
+    /// crowd of sprites all on the same frame is a marching band.
+    pub fn seed(&self) -> f32 {
+        self.seed
+    }
+
     /// Its own walking pace, as a multiple of the speed for its kind.
     fn pace(&self) -> f32 {
         1.0 + PACE_SPREAD * (self.seed * 1.7).sin()
@@ -267,6 +281,18 @@ impl Quirk {
     /// which is what keeps a group from converging along one bearing.
     fn weave(&self, elapsed: f32) -> f32 {
         WEAVE_WIDTH * (elapsed * WEAVE_RATE + self.seed).sin()
+    }
+
+    /// Where in its walk cycle it starts, in seconds.
+    ///
+    /// Read when a culled enemy's animation is started again on coming back
+    /// into view. Starting every one of them at zero would put a crowd that
+    /// crossed the draw distance together into perfect step, which is the one
+    /// thing this whole component exists to prevent. A second is longer than
+    /// either actor's clip, so the whole cycle is covered whatever its length --
+    /// a seek past the end of a looping clip wraps.
+    fn animation_phase(&self) -> f32 {
+        (self.seed * 0.7).sin().abs()
     }
 }
 
@@ -396,8 +422,203 @@ pub fn spawn(
         .id()
 }
 
+/// Where a benchmark crowd is centred, how far out it spreads, and the height
+/// its floor query is asked from.
+///
+/// The centre and reach cover the castle grounds -- the collision spans roughly
+/// x -82..82 and z -81..68 -- and the sky is above everything in it, so the
+/// query finds the highest surface under each spot rather than starting inside
+/// a hill.
+const CROWD_CENTRE: Vec2 = Vec2::new(0.0, -6.0);
+const CROWD_REACH: f32 = 70.0;
+const CROWD_SKY: f32 = 90.0;
+
+/// How many spots a crowd will try before giving up on reaching its count.
+///
+/// A spiral spot can land off the edge of the collision, where there is no
+/// floor to stand something on, so the walk takes more spots than it places.
+/// Four to one is far more slack than the castle needs and still terminates.
+const CROWD_TRIES: usize = 4;
+
+/// The spots a crowd of `count` is placed on: a sunflower spiral over the
+/// castle, each one dropped onto whatever is under it.
+///
+/// A spiral by the golden angle with the radius going as the square root, which
+/// is what spreads the field evenly instead of leaving it in rings -- the same
+/// reason [`crate::squad::GOLDEN_ANGLE`] is used everywhere else here. No random
+/// number generator, so `crowd 2000` puts the same field down every time and
+/// two runs of the benchmark differ by the build rather than by the layout.
+fn crowd_spots(count: usize, level: &LevelData) -> Vec<Vec3> {
+    let mut spots = Vec::with_capacity(count);
+    for step in 0..count * CROWD_TRIES {
+        if spots.len() == count {
+            break;
+        }
+        let angle = step as f32 * crate::squad::GOLDEN_ANGLE;
+        // Against the count rather than the step, so the field covers the same
+        // ground whether it holds two hundred or two thousand.
+        let reach = CROWD_REACH * (step as f32 / count as f32).sqrt();
+        let at = CROWD_CENTRE + Vec2::new(angle.sin(), angle.cos()) * reach;
+        let sky = Vec3::new(at.x, CROWD_SKY, at.y);
+        if let Some(floor) = level.floor_height(sky) {
+            spots.push(Vec3::new(at.x, floor, at.y));
+        }
+    }
+    spots
+}
+
+/// Carries out the console's `crowd` command.
+///
+/// Runs whether or not the console is open, because the console is open at the
+/// moment the command is typed and a crowd that only appeared once you shut it
+/// would be a crowd you never saw arrive.
+pub fn crowd(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    level: Res<LevelData>,
+    mut console: ResMut<ConsoleState>,
+    existing: Query<Entity, With<Enemy>>,
+) {
+    // Taken before the loop and unconditionally: leaving a request in the queue
+    // because this frame had nothing to do with it is a crowd placed again on
+    // the next one.
+    for request in console.take_requests() {
+        let (count, kind) = match request {
+            Request::ClearCrowd => (0, CrowdKind::Mix),
+            Request::Crowd(count, kind) => (count, kind),
+        };
+        // Both cases clear first. `crowd 2000` twice is a field of two
+        // thousand, not of four -- which is the whole point of a command whose
+        // job is to make one number reproducible.
+        for enemy in &existing {
+            commands.entity(enemy).despawn();
+        }
+        for (index, spot) in crowd_spots(count, &level).into_iter().enumerate() {
+            let kind = match kind {
+                CrowdKind::Goomba => Kind::Goomba,
+                CrowdKind::Scuttlebug => Kind::Scuttlebug,
+                CrowdKind::Mix if index % 2 == 0 => Kind::Goomba,
+                CrowdKind::Mix => Kind::Scuttlebug,
+            };
+            spawn(&mut commands, &assets, kind, spot, index as f32);
+        }
+    }
+}
+
+/// How much of the simulation an enemy is getting this tick.
+///
+/// The crowd budget is a *count*, not a distance: the nearest
+/// `sim_budget` enemies are simulated in full and everything else is carried by
+/// the flow field, however many of them there are. That is what makes a field of
+/// five thousand cost the same as a field of five hundred -- the expensive tier
+/// has a fixed size, and the cheap tier is O(1) an enemy.
+///
+/// What [`Full`](Detail::Full) buys, and what a [`Crowd`](Detail::Crowd) enemy
+/// therefore does without:
+///
+/// * collision against the level -- walls, ledges, the step-up rule
+/// * being held out of its neighbours by [`spread`]
+/// * the aggro chain in [`alert`], and being a thing the player can hit
+/// * a crawler's ability to walk up a wall
+///
+/// None of that is visible on something the size of a thumbnail, which is the
+/// only kind of enemy that is ever in the cheap tier.
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Detail {
+    #[default]
+    Full,
+    Crowd,
+}
+
+/// How far along the flow field's route the cheap tier notices the player, as a
+/// multiple of `enemy_sight`.
+///
+/// **One, deliberately: the cheap tier notices at exactly the range the
+/// expensive one does, and no further.**
+///
+/// The temptation is to be generous here, because the cheap tier has no
+/// [`alert`] chain -- a near enemy also hears about the player from a neighbour
+/// who saw him, and comes from further than it can see, so an approximation
+/// with no chain looks under-alert on paper. Both attempts at compensating for
+/// that were wrong, and instructively so:
+///
+/// * four times sight, or about fifty metres, had the whole map charging the
+///   player the instant it spawned. The lawn emptied and the field appeared to
+///   have lost most of its enemies. It had not; they were all behind the camera.
+/// * sight plus one hop of earshot, about twenty-three metres, was subtler and
+///   still wrong. Every crowd enemy tests the range *independently*, so the
+///   whole band inside it acquires at once -- where the real chain only spreads
+///   between enemies that are near each other and only from one that has just
+///   taken the alarm. The result was a visible front, with emptied lawn behind
+///   it, at whatever radius was chosen.
+///
+/// The lesson is that an approximation of a chain is not a bigger radius, and
+/// that the failure looks like missing enemies rather than like over-eager
+/// ones. **A cheaper tier may look worse; it must not behave differently.**
+/// Matching the near tier's own acquisition range under-alerts a little, in a
+/// way that corrects itself the moment an enemy is promoted -- which is the
+/// direction an error here should point.
+const CROWD_SIGHT: f32 = 1.0;
+
+/// Sorts the field by distance and hands the nearest `sim_budget` the full
+/// simulation.
+///
+/// The cutoff is found with `select_nth_unstable`, which partitions in linear
+/// time rather than sorting -- the exact order of two thousand enemies is not
+/// wanted, only the boundary between the nearest two hundred and the rest.
+pub fn assign_detail(
+    tuning: Res<GameTuning>,
+    player: Query<&Transform, With<Player>>,
+    mut enemies: Query<(&Transform, &mut Detail), With<Enemy>>,
+    mut ranked: Local<Vec<f32>>,
+) {
+    let Ok(player) = player.single() else {
+        return;
+    };
+    let here = player.translation;
+    let budget = tuning.sim_budget.max(0.0) as usize;
+    ranked.clear();
+    ranked.extend(
+        enemies
+            .iter()
+            .map(|(transform, _)| here.distance_squared(transform.translation)),
+    );
+    // Everything fits in the budget, so nothing is demoted. The common case
+    // while the field is small, and worth not partitioning for.
+    let cutoff = if ranked.len() <= budget {
+        f32::INFINITY
+    } else {
+        *ranked.select_nth_unstable_by(budget, f32::total_cmp).1
+    };
+    for (transform, mut detail) in &mut enemies {
+        let wanted = if here.distance_squared(transform.translation) < cutoff {
+            Detail::Full
+        } else {
+            Detail::Crowd
+        };
+        // Assigned only on a change. Writing the same value back would mark the
+        // component changed for every enemy in the field every tick, which is
+        // the sort of thing that costs more than the system it belongs to.
+        if *detail != wanted {
+            *detail = wanted;
+        }
+    }
+}
+
 /// Everything that can be noticed: where it is and whose side it is on.
-type Creatures<'w, 's> = Query<'w, 's, (Entity, &'static Transform, &'static Side)>;
+///
+/// `Detail` is optional because the player and the Marios are creatures too and
+/// carry no tier of their own -- they are always simulated in full.
+type Creatures<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Transform,
+        &'static Side,
+        Option<&'static Detail>,
+    ),
+>;
 
 /// Everything that does the noticing, which is the same crowd less the player,
 /// who is told what to chase by whoever is holding the controller.
@@ -409,8 +630,16 @@ type Hunters<'w, 's> = Query<
         &'static Transform,
         &'static Side,
         &'static mut Aggro,
+        Option<&'static Detail>,
     ),
 >;
+
+/// Whether a creature is in the tier that gets the expensive treatment.
+///
+/// Anything without a tier -- the player, the Marios -- always is.
+fn detailed(detail: Option<&Detail>) -> bool {
+    detail != Some(&Detail::Crowd)
+}
 
 /// Who has noticed whom, and who has been told about it.
 ///
@@ -430,13 +659,20 @@ type Hunters<'w, 's> = Query<
 /// enemy that has seen you comes until it or you are gone. What it does lose is
 /// a target that has been despawned, which is not giving up but having won.
 pub fn alert(tuning: Res<GameTuning>, everyone: Creatures, mut hunters: Hunters) {
+    // Only the tier being simulated in full takes part. Everything this system
+    // does is quadratic-ish in the crowd it is handed -- two spatial grids and a
+    // flood fill -- so handing it two hundred rather than two thousand is most
+    // of what the budget buys. The rest of the field notices the player through
+    // the flow field instead, in [`update`], at no cost at all.
     let crowd: Vec<(Entity, Vec3, Side)> = everyone
         .iter()
-        .map(|(entity, transform, side)| (entity, transform.translation, *side))
+        .filter(|(_, _, _, detail)| detailed(*detail))
+        .map(|(entity, transform, side, _)| (entity, transform.translation, *side))
         .collect();
     let mut hunting: Vec<(Entity, Vec3, Side, Option<Entity>)> = hunters
         .iter()
-        .map(|(entity, transform, side, aggro)| {
+        .filter(|(_, _, _, _, detail)| detailed(*detail))
+        .map(|(entity, transform, side, aggro, _)| {
             let target = aggro
                 .target
                 // A target that is no longer in the world is no target. This is
@@ -497,14 +733,20 @@ pub fn alert(tuning: Res<GameTuning>, everyone: Creatures, mut hunters: Hunters)
         .iter()
         .map(|(entity, _, _, target)| (*entity, *target))
         .collect();
-    for (entity, transform, _, mut aggro) in &mut hunters {
+    for (entity, transform, _, mut aggro, detail) in &mut hunters {
+        // A crowd-tier enemy keeps whatever it was chasing when it was last in
+        // the near tier, and is not given a new target here. Losing one by
+        // walking away would break the rule that aggro is never given up.
+        if !detailed(detail) {
+            continue;
+        }
         let target = decided.get(&entity).copied().flatten();
         if aggro.target != target {
             aggro.target = target;
         }
         // Where that target is now, for the movement step to walk towards.
         aggro.at = match target.and_then(|target| everyone.get(target).ok()) {
-            Some((_, seen, _)) => seen.translation,
+            Some((_, seen, _, _)) => seen.translation,
             None => transform.translation,
         };
     }
@@ -521,6 +763,7 @@ type Jostling<'w, 's> = Query<
         &'static Enemy,
         &'static mut Transform,
         Option<&'static Crawler>,
+        &'static Detail,
     ),
     (Without<Player>, Without<crate::pipe::Launched>),
 >;
@@ -534,9 +777,13 @@ type Jostling<'w, 's> = Query<
 /// bug off its wall is the one thing this must not do -- and the walkers within
 /// the horizontal plane, where their own floor query will catch them.
 pub fn spread(mut enemies: Jostling) {
+    // The near tier only. Two distant goombas standing in the same spot are two
+    // pixels standing in the same spot, and untangling them costs a spatial
+    // grid over the whole field to fix something nobody can see.
     let crowd: Vec<(Entity, Vec3, f32, Vec3)> = enemies
         .iter()
-        .map(|(entity, enemy, transform, crawler)| {
+        .filter(|(_, _, _, _, detail)| **detail == Detail::Full)
+        .map(|(entity, enemy, transform, crawler, _)| {
             (
                 entity,
                 transform.translation,
@@ -581,7 +828,7 @@ pub fn spread(mut enemies: Jostling) {
             push += away * overlap * SPREAD_RATE;
         }
         if push != Vec3::ZERO {
-            if let Ok((_, _, mut transform, _)) = enemies.get_mut(entity) {
+            if let Ok((_, _, mut transform, _, _)) = enemies.get_mut(entity) {
                 transform.translation += push.clamp_length_max(SPREAD_LIMIT * FIXED_DT);
             }
         }
@@ -639,8 +886,16 @@ impl Neighbourhood {
 }
 
 /// Connects the AnimationPlayer created inside a GLB scene to its enemy root.
+///
+/// The clip node comes along with the owner because [`sync_animation_visibility`]
+/// *stops* a culled enemy's animation rather than pausing it, and something
+/// stopped has to be started again by name when it comes back into view. An
+/// enemy has exactly one clip, so one node is the whole of what that takes.
 #[derive(Component)]
-pub struct EnemyAnimationRoot(pub Entity);
+pub struct EnemyAnimationRoot {
+    pub owner: Entity,
+    pub clip: AnimationNodeIndex,
+}
 
 /// The enemies the AI step is allowed to move.
 ///
@@ -657,10 +912,13 @@ type WalkingEnemies<'w, 's> = Query<
         &'static Enemy,
         &'static mut Transform,
         &'static mut Visibility,
-        &'static Aggro,
+        // Mutable, because the cheap tier acquires its own target from the flow
+        // field rather than being told about one by `alert`.
+        &'static mut Aggro,
         &'static Quirk,
         &'static mut Wander,
         Option<&'static mut Crawler>,
+        &'static Detail,
     ),
     (With<Enemy>, Without<Player>, Without<crate::pipe::Launched>),
 >;
@@ -668,12 +926,13 @@ type WalkingEnemies<'w, 's> = Query<
 pub fn update(
     fixed_time: Res<Time<Fixed>>,
     level: Res<LevelData>,
-    player: Query<&Transform, With<Player>>,
+    field: Res<crate::flow::FlowField>,
+    player: Query<(Entity, &Transform), With<Player>>,
     mut enemies: WalkingEnemies,
     tuning: Res<GameTuning>,
     mut fixed_tick: Local<u32>,
 ) {
-    let Ok(player) = player.single() else {
+    let Ok((hero, player)) = player.single() else {
         return;
     };
     let player = player.translation;
@@ -681,7 +940,17 @@ pub fn update(
     *fixed_tick = fixed_tick.wrapping_add(1);
     let tick = *fixed_tick;
     enemies.par_iter_mut().for_each(
-        |(entity, enemy, mut transform, mut visibility, aggro, quirk, mut wander, crawler)| {
+        |(
+            entity,
+            enemy,
+            mut transform,
+            mut visibility,
+            mut aggro,
+            quirk,
+            mut wander,
+            crawler,
+            detail,
+        )| {
             let distance_squared = player.distance_squared(transform.translation);
             *visibility = if distance_squared > tuning.enemy_draw * tuning.enemy_draw {
                 Visibility::Hidden
@@ -707,6 +976,21 @@ pub fn update(
             // it is after instead of inside it. The rest of the time it ambles
             // around its own patch, and standing about between one spot and the
             // next is a goal of `None`.
+            // The cheap tier: everything it needs is one array lookup, and it
+            // asks the level nothing at all.
+            if *detail == Detail::Crowd {
+                crowd_step(
+                    &field,
+                    &mut transform,
+                    &mut aggro,
+                    &mut wander,
+                    quirk,
+                    hero,
+                    &tuning,
+                    dt,
+                );
+                return;
+            }
             let (goal, speed) = match aggro.target {
                 Some(_) => (Some(aggro.at + quirk.stand_off()), tuning.enemy_speed),
                 None => (wander.goal(transform.translation, dt), WANDER_SPEED),
@@ -749,6 +1033,83 @@ pub fn update(
                 orientation(crawler.up, crawler.heading).unwrap_or(transform.rotation);
         },
     );
+}
+
+/// One tick of a crowd-tier enemy: the whole of what a distant enemy costs.
+///
+/// No ray casts, no floor queries, no neighbours -- one lookup into
+/// [`crate::flow::FlowField`], which answered all of those questions once for
+/// everybody. What it gives up against [`walk`] and [`settle`] is collision:
+/// this will walk through a fence and clip the corner of a wall. What it keeps
+/// is everything that reads at a distance -- enemies that stream toward the
+/// player round the moat rather than into it, that mill about when nothing has
+/// their attention, and that stand on the ground rather than in it.
+///
+/// The two behaviours it picks between are the same two the near tier has, so
+/// an enemy crossing the boundary carries on doing what it was doing rather
+/// than visibly changing its mind.
+#[allow(clippy::too_many_arguments)]
+fn crowd_step(
+    field: &crate::flow::FlowField,
+    transform: &mut Transform,
+    aggro: &mut Aggro,
+    wander: &mut Wander,
+    quirk: &Quirk,
+    player: Entity,
+    tuning: &GameTuning,
+    dt: f32,
+) {
+    let guide = field.at(transform.translation);
+    // Noticing the player, without [`alert`]. The field already knows how far
+    // away he is *along walkable ground*, which is a better question than the
+    // straight-line one the near tier asks -- something on the far side of the
+    // moat is not as close as it looks. Once noticed he is never given up on,
+    // exactly as in the near tier.
+    let earshot = tuning.enemy_sight * CROWD_SIGHT;
+    if aggro.target.is_none()
+        && guide
+            .steps
+            .is_some_and(|steps| steps as f32 * field.cell_size() < earshot)
+    {
+        aggro.target = Some(player);
+    }
+    let speed = quirk.pace()
+        * if aggro.target.is_some() {
+            tuning.enemy_speed
+        } else {
+            WANDER_SPEED
+        };
+    // Chasing follows the field; ambling heads for its own patch, which is
+    // ground it was placed on and so ground it can stand on.
+    let towards = if aggro.target.is_some() {
+        guide.towards
+    } else {
+        let goal = wander.goal(transform.translation, dt);
+        goal.map_or(Vec2::ZERO, |goal| {
+            Vec2::new(goal.x - transform.translation.x, goal.z - transform.translation.z)
+                .normalize_or_zero()
+        })
+    };
+    if towards != Vec2::ZERO {
+        let step = towards * speed * dt;
+        let ahead = transform.translation + Vec3::new(step.x, 0.0, step.y);
+        // The one check that survives from the near tier, and the cheapest
+        // possible version of it: the survey already recorded which cells have
+        // ground, so walking off the map is a lookup rather than a ray cast.
+        if field.at(ahead).walkable {
+            transform.translation = ahead;
+        }
+        transform.rotation = Quat::from_rotation_y(step.x.atan2(step.y));
+    }
+    // Settled onto the cell's ground at a pace rather than snapped to it, for
+    // the same reason [`settle`] does: a column's answer jumps at a cell
+    // boundary, and taking it whole makes an enemy climbing a slope appear to
+    // teleport up it a step at a time.
+    let guide = field.at(transform.translation);
+    if guide.walkable {
+        let (rise, drop) = (CLIMB_SPEED * dt, FALL_SPEED * dt);
+        transform.translation.y += (guide.ground - transform.translation.y).clamp(-drop, rise);
+    }
 }
 
 /// Takes one step along the ground, if there is ground to take it onto.
@@ -1009,7 +1370,7 @@ pub fn combat(
     mut commands: Commands,
     mut sounds: ResMut<SoundQueue>,
     mut player: Query<(&Transform, &mut Controller), With<Player>>,
-    enemies: Query<(Entity, &Enemy, &Transform), Without<Player>>,
+    enemies: Query<(Entity, &Enemy, &Transform, &Detail), Without<Player>>,
 ) {
     let Ok((player_transform, mut controller)) = player.single_mut() else {
         return;
@@ -1027,7 +1388,13 @@ pub fn combat(
     }
     let here = player_transform.translation;
     let facing = player_transform.rotation * Vec3::Z;
-    for (entity, enemy, transform) in &enemies {
+    for (entity, enemy, transform, detail) in &enemies {
+        // The crowd tier is by definition further away than the nearest two
+        // hundred, and the player's reach is two metres. Nothing out there can
+        // be touched, hit or stomped, so nothing out there is tested.
+        if *detail == Detail::Crowd {
+            continue;
+        }
         let offset = transform.translation - here;
         let horizontal = Vec3::new(offset.x, 0.0, offset.z);
         let distance_squared = horizontal.length_squared();
@@ -1130,22 +1497,78 @@ pub fn ally_combat(
     }
 }
 
-/// Hidden skinned actors do not need their bones evaluated. This runs after
-/// the console-wide animation pause so visible enemies resume while culled
-/// enemies remain stopped.
+/// Hidden skinned actors do not need their bones evaluated.
+///
+/// **Stopped rather than paused, and the difference is the whole saving.**
+/// Pausing was what this did, and it saved nothing at all: in
+/// `bevy_animation`, `advance_animations` checks `paused` only to skip the
+/// clock, and `animate_targets` checks it only to skip firing animation
+/// events. A paused player still has its curves sampled and still writes a
+/// pose onto every joint it owns, every rendered frame -- for a field of two
+/// thousand that is tens of thousands of skeleton entities being posed to
+/// exactly the value they already held.
+///
+/// Worse than the wasted sampling is what the writes cost downstream.
+/// `bevy_transform` skips whole subtrees whose transforms have not changed,
+/// and a pose written every frame keeps every joint permanently dirty, so
+/// propagation walks the entire crowd as well.
+///
+/// Stopping empties the player's active animations, so the clip lookup finds
+/// nothing and returns immediately, no joint is written, and the dirty-tree
+/// skip finally engages. What it costs is that resuming has to start the clip
+/// again rather than unpause it -- which is what `restart` below does, from
+/// the graph node the player was given when its scene arrived.
 pub fn sync_animation_visibility(
     console: Res<crate::console::ConsoleState>,
-    roots: Query<&Visibility, With<Enemy>>,
+    roots: Query<(&Visibility, &Quirk), With<Enemy>>,
     mut players: Query<(&EnemyAnimationRoot, &mut AnimationPlayer)>,
 ) {
     for (root, mut player) in &mut players {
-        let hidden = roots
-            .get(root.0)
-            .map_or(true, |visibility| *visibility == Visibility::Hidden);
-        if console.open || hidden {
-            player.pause_all();
-        } else {
-            player.resume_all();
+        let Ok((visibility, quirk)) = roots.get(root.owner) else {
+            continue;
+        };
+        // Three states, and which one an enemy wants is worth naming because
+        // the console's case and the culled case are deliberately *not* the
+        // same. Culled means stopped, because nobody is looking and the whole
+        // point is to stop paying for the pose. The console open means merely
+        // paused, because you are looking straight at the crowd and stopping it
+        // would restart every clip from its first frame the moment you shut the
+        // console -- turning a field of individuals into a marching band.
+        let hidden = *visibility == Visibility::Hidden;
+        // Read through the shared reference: merely *asking* what a player is
+        // doing must not mark it changed. Every branch below is guarded on
+        // this, because taking `&mut` unconditionally would flag the component
+        // on every enemy on every frame, which is a change-detection storm in
+        // place of the one being removed.
+        let started = player.playing_animations().next().is_some();
+        let paused = player.all_paused();
+        match (hidden, console.open, started, paused) {
+            // Out of view and still costing something: stop it.
+            (true, _, true, _) => {
+                player.stop_all();
+            }
+            // Nothing to do -- already in the state it wants.
+            (true, _, false, _) => {}
+            (false, open, true, held) if open == held => {}
+            // In view, and the console has just opened or shut over it.
+            (false, true, true, _) => {
+                player.pause_all();
+            }
+            (false, false, true, _) => {
+                player.resume_all();
+            }
+            // Back into view after being culled. An enemy's whole animation is
+            // the single looping clip its kind loads, and `EnemyAnimationRoot`
+            // carries the node it sits at in the graph its scene was given.
+            //
+            // Seeded from the enemy's own quirk rather than started at zero, so
+            // a crowd that walks back into the draw distance together does not
+            // arrive in lockstep -- the same reason nothing else about these is
+            // shared either.
+            (false, _, false, _) => {
+                let phase = quirk.animation_phase();
+                player.play(root.clip).repeat().seek_to(phase);
+            }
         }
     }
 }
@@ -1341,6 +1764,54 @@ mod tests {
         // Walking straight into the surface it is stuck to says nothing about
         // which way it is facing, and it keeps the facing it had.
         assert!(orientation(Vec3::Y, Vec3::Y).is_none());
+    }
+
+    /// The benchmark field: the size that was asked for, on real ground, in the
+    /// same places every run.
+    ///
+    /// Reproducibility is the whole value of the command. A crowd scattered by
+    /// a random number generator would make two runs of the benchmark differ by
+    /// the layout as well as by the build, which is exactly the comparison it
+    /// exists to make.
+    #[test]
+    fn a_benchmark_crowd_is_the_size_asked_for_and_stands_on_the_castle() {
+        let (level, _) = crate::level::load();
+        for count in [200, 2000] {
+            let spots = crowd_spots(count, &level);
+            assert_eq!(spots.len(), count, "a crowd of {count} came up short");
+            for spot in &spots {
+                assert!(
+                    level.floor_height(*spot + Vec3::Y * 0.5).is_some(),
+                    "a benchmark enemy at {spot:?} is standing on nothing"
+                );
+            }
+        }
+        assert_eq!(
+            crowd_spots(500, &level),
+            crowd_spots(500, &level),
+            "two runs of the benchmark got two different fields"
+        );
+    }
+
+    /// It spreads rather than piling up: a crowd stacked on one spot measures
+    /// the cost of a stack, and `spread` would spend the whole run untangling it.
+    #[test]
+    fn a_benchmark_crowd_is_spread_over_the_grounds() {
+        let (level, _) = crate::level::load();
+        let spots = crowd_spots(1000, &level);
+        let far = spots
+            .iter()
+            .map(|spot| Vec2::new(spot.x, spot.z).distance(CROWD_CENTRE))
+            .fold(0.0_f32, f32::max);
+        assert!(far > CROWD_REACH * 0.5, "the crowd only reached {far}");
+        // And no two of them are placed in exactly the same spot.
+        let mut apart = f32::MAX;
+        for (index, spot) in spots.iter().enumerate().take(200) {
+            for other in &spots[index + 1..] {
+                apart = apart.min(spot.distance(*other));
+            }
+        }
+        assert!(apart > 0.01, "two benchmark enemies are {apart} apart");
     }
 
     /// A player at the origin and enemies stood where they are asked for.

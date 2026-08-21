@@ -440,8 +440,9 @@ pub fn draw(
             Item::Quit => "Quit".to_string(),
             Item::Display => "Display".to_string(),
             Item::RenderScale => format!(
-                "Render resolution      < {:>3}%  {} x {} >",
-                settings.percent(),
+                "World pixels           < {}x{}  {} x {} >",
+                settings.pixel_scale(),
+                settings.pixel_scale(),
                 rendered.x,
                 rendered.y
             ),
@@ -544,7 +545,7 @@ mod tests {
     #[test]
     fn the_display_page_changes_the_render_resolution() {
         let mut world = paused();
-        let full = world.resource::<DisplaySettings>().percent();
+        let full = world.resource::<DisplaySettings>().pixel_scale();
 
         press(&mut world, KeyCode::Escape);
         press(&mut world, KeyCode::ArrowDown);
@@ -556,7 +557,7 @@ mod tests {
 
         press(&mut world, KeyCode::ArrowRight);
         assert_ne!(
-            world.resource::<DisplaySettings>().percent(),
+            world.resource::<DisplaySettings>().pixel_scale(),
             full,
             "right on the render resolution row changes it"
         );

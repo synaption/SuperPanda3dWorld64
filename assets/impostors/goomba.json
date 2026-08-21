@@ -1,31 +1,10 @@
 {
   "model": "goomba",
-  "clip": "goomba_seg8_anim_0801DA34",
   "cell_px": 128,
   "angles": 16,
   "frames": 16,
-  "cols": 16,
-  "rows": 16,
-  "angle_list": [
-    0.0,
-    22.5,
-    45.0,
-    67.5,
-    90.0,
-    112.5,
-    135.0,
-    157.5,
-    180.0,
-    202.5,
-    225.0,
-    247.5,
-    270.0,
-    292.5,
-    315.0,
-    337.5
-  ],
-  "elevation": 15.0,
-  "film": 108.888,
-  "foot_v": 0.14394,
-  "atlas": "goomba.png"
+  "world_size": 0.90431243,
+  "foot": 0.0956873,
+  "fps": 16.551725,
+  "elevation": 15.0
 }
