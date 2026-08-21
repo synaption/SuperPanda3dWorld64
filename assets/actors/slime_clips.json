@@ -1,0 +1,62 @@
+{
+  "Emote_Anger": {
+    "frames": 21,
+    "loop_end": 21,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "Emote_Excite": {
+    "frames": 32,
+    "loop_end": 32,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "Emote_Sad": {
+    "frames": 46,
+    "loop_end": 46,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "Idle": {
+    "frames": 345,
+    "loop_end": 345,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "Idle_break": {
+    "frames": 113,
+    "loop_end": 113,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "Jump_Move": {
+    "frames": 31,
+    "loop_end": 31,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "Scoot_Move": {
+    "frames": 20,
+    "loop_end": 20,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "Squish_End": {
+    "frames": 47,
+    "loop_end": 47,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "Squish_Start": {
+    "frames": 37,
+    "loop_end": 37,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "Wiggle": {
+    "frames": 26,
+    "loop_end": 26,
+    "loop_start": 0,
+    "start_frame": 0
+  }
+}

@@ -3,9 +3,8 @@
     python3 tools/blend_to_glb.py assets/hero/TheHero.blend
     python3 tools/blend_to_glb.py assets/hero/TheHero.blend -o /tmp/hero.glb
 
-Unlike tools/export_hero_gltf.py, which is pasted into a running Blender on the
-Windows host and knows the Hero's rig, this drives the Blender installed in WSL
-(/usr/bin/blender, 4.0.2) and makes no assumptions about what is in the file.
+Unlike tools/export_hero_gltf.py, which knows the Hero's rig, this drives the
+project-local Blender 5.2 install and makes no assumptions about the file.
 It is the generic "just give me a glb" path.
 
 The script is run twice. The first run is a normal python3 process, where `import
@@ -34,6 +33,12 @@ except ImportError:  # Outside Blender -- we are the launcher half.
     bpy = None
 
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+PROJECT_BLENDER = os.path.join(
+    ROOT, "blender-5.2.0-linux-x64", "blender")
+
+
 # ---------------------------------------------------------------------------
 # Inside Blender
 # ---------------------------------------------------------------------------
@@ -57,7 +62,7 @@ def export_inside_blender(argv):
     if bpy.context.object and bpy.context.object.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
 
-    bpy.ops.export_scene.gltf(
+    options = dict(
         filepath=args.out,
         export_format="GLB",
         use_selection=args.selection_only,
@@ -67,6 +72,12 @@ def export_inside_blender(argv):
         export_apply=args.apply_modifiers,
         export_animations=not args.no_animations,
     )
+    properties = bpy.ops.export_scene.gltf.get_rna_type().properties
+    if "export_armature_object_remove" in properties:
+        # Blender 5.2 can omit its implementation-only Armature object node
+        # while retaining the actual skin joints and animation hierarchy.
+        options["export_armature_object_remove"] = True
+    bpy.ops.export_scene.gltf(**options)
 
     if not os.path.exists(args.out):
         raise SystemExit("exporter reported success but wrote no file")
@@ -103,7 +114,7 @@ def resolve_blender(explicit):
             sys.exit("blender not found: %s" % explicit)
         return found, blender_version(found)
 
-    candidates = ["/snap/bin/blender", shutil.which("blender"),
+    candidates = [PROJECT_BLENDER, "/snap/bin/blender", shutil.which("blender"),
                   "/usr/local/bin/blender"]
     candidates += sorted(glob.glob("/opt/blender*/blender"))
     seen, best = set(), []
@@ -131,8 +142,8 @@ def launch(argv):
     ap.add_argument("-o", "--out",
                     help="output .glb (default: alongside the .blend)")
     ap.add_argument("--blender", default=os.environ.get("BLENDER"),
-                    help="blender executable (default: $BLENDER, else the "
-                         "newest of /snap/bin, PATH, /usr/local/bin, /opt)")
+                    help="blender executable (default: $BLENDER, else newest "
+                         "candidate, preferring the project Blender 5.2)")
     ap.add_argument("--selection-only", action="store_true",
                     help="export only what was selected when the file was saved")
     ap.add_argument("--no-animations", action="store_true",
@@ -168,6 +179,7 @@ def launch(argv):
     cmd = [
         blender,
         "--background",
+        "-noaudio",
         # Addons and startup scripts from the user's profile can raise on load
         # and take the export down with them; nothing here needs them.
         "--factory-startup",

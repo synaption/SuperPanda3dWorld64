@@ -4,7 +4,7 @@
 //! each other the same way, pass the alarm along the same way, and walk to
 //! whatever they have noticed the same way -- see [`Side`] and [`alert`] -- and
 //! then each resolves what it does on arrival in its own terms, because a
-//! sword, a punch and walking into a goomba are three different things.
+//! sword, a punch and walking into a slime are three different things.
 //!
 //! The player's half of the combat rules is ported from `Interactions.resolve`
 //! in `sm64py/objects.py`, and every distance is that build's, converted from
@@ -63,8 +63,8 @@ const WANDER_REST_SPREAD: f32 = 3.0;
 
 /// The tallest thing a walking enemy can get up.
 ///
-/// Not a tuning knob so much as a statement of what a goomba is: a short thing
-/// on two feet. Anything taller than this is a wall to it however walkable the
+/// Not a tuning knob so much as a statement of what these are: short things
+/// close to the ground. Anything taller than this is a wall to it however walkable the
 /// top happens to be, which is the difference between climbing a slope and
 /// appearing on top of a cliff.
 ///
@@ -159,22 +159,73 @@ const CRAWL_SKIN: f32 = 0.02;
 /// plane and a height above its feet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
-    Goomba,
+    Slime,
     Scuttlebug,
 }
 
 impl Kind {
     pub fn model(self) -> &'static str {
         match self {
-            Self::Goomba => "actors/goomba.glb",
+            Self::Slime => "actors/slime.glb",
             Self::Scuttlebug => "actors/scuttlebug.glb",
         }
     }
 
-    /// Radius and height of its collision cylinder, from `sm64py/objects.py`.
+    /// Which of the model's glTF animations is the one it walks on.
+    ///
+    /// The decomp actors have exactly one clip each, so an index was never a
+    /// question: `#Animation0` was the only thing in the file. The slime is
+    /// authored art and carries ten -- three emotes, two idles, two ways of
+    /// moving, a squish and a wiggle -- of which the game wants the one it
+    /// crosses ground on. `Scoot_Move` is that one; `Jump_Move` hops, which
+    /// reads as a different creature at crowd distance and does not match the
+    /// flat speed [`update`] moves it at.
+    ///
+    /// Kept as an index rather than a name because that is all a glTF asset
+    /// label can carry. `the_clip_index_is_still_the_walk` pins each index to
+    /// the name it is supposed to be, so a re-export that reorders the file is
+    /// a failing test rather than a crowd of slimes standing still and pulling
+    /// faces.
+    pub fn clip(self) -> usize {
+        match self {
+            Self::Slime => 6,
+            Self::Scuttlebug => 0,
+        }
+    }
+
+    /// What the model is drawn at, world units per unit of its own file.
+    ///
+    /// **A fact about the asset, not a tuning knob**, and the two actors
+    /// disagree about it because they came from different places. The decomp
+    /// exports are in SM64 units, a hundred to the metre, so they are drawn at
+    /// 1/100. The slime is authored in Blender at metre scale and one unit
+    /// tall, so drawing it at 1/100 would put a centimetre-high blob on the
+    /// floor.
+    ///
+    /// The slime's 0.7 is the number that makes its footprint its collision
+    /// radius: the mesh is a unit-radius dome, so 0.7 of it is exactly the 0.70
+    /// in [`Kind::body`]. That matters more than its height does, because
+    /// crowd spacing is measured in body radii -- a model wider than the
+    /// cylinder that spaces it is a crowd that visibly interpenetrates.
+    pub fn draw_scale(self) -> f32 {
+        match self {
+            Self::Slime => 0.7,
+            Self::Scuttlebug => 0.01,
+        }
+    }
+
+    /// Radius and height of its collision cylinder.
+    ///
+    /// The scuttlebug's is the decomp's, from `sm64py/objects.py`. The slime
+    /// keeps the radius of the goomba it replaced, deliberately: the whole
+    /// crowd's spacing, its flow-field arithmetic and its shove resolution are
+    /// expressed in body radii, and every one of them was tuned against 0.70.
+    /// Its height is its own -- the model is a dome as tall as it is wide at
+    /// [`Kind::draw_scale`], and keeping the goomba's metre would let the
+    /// player punch a slime while stood a third of a body above it.
     pub fn body(self) -> (f32, f32) {
         match self {
-            Self::Goomba => (0.70, 1.00),
+            Self::Slime => (0.70, 0.70),
             Self::Scuttlebug => (0.60, 0.80),
         }
     }
@@ -199,12 +250,15 @@ impl Kind {
     /// `the_lift_matches_what_the_baked_sheets_show` re-derives both from the
     /// PNGs on every test run, so the constant cannot drift from the art.
     ///
-    /// The goomba's is small enough to read as the soles of its feet. The real
-    /// fix for both is the exporter putting the origin on the floor, which would
-    /// also let this be zero -- see `tools/export_actor_gltf.py`.
+    /// The slime is the case this wants: its mesh sits on `y = 0` in its own
+    /// file, so its origin already is its feet and nothing has to be lifted.
+    /// That is what authoring a model for the game buys over converting one --
+    /// the goomba it replaced hung 6.5 cm below its origin, and the scuttlebug
+    /// still hangs a third of a metre. The real fix for the bug is the exporter
+    /// putting the origin on the floor, which would let this be zero for both.
     pub fn lift(self) -> f32 {
         match self {
-            Self::Goomba => 0.065,
+            Self::Slime => 0.0,
             Self::Scuttlebug => 0.312,
         }
     }
@@ -238,7 +292,7 @@ pub struct Enemy {
 /// without being able to notice anything himself, because a side is what makes
 /// him worth noticing. Everything [`alert`] does is asked in terms of this
 /// rather than of what a creature is: a Mario looks for the nearest thing not
-/// on its side exactly as a goomba does.
+/// on its side exactly as a slime does.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Side {
     Hostile,
@@ -450,7 +504,7 @@ pub fn spawn(
         .spawn((
             Enemy {
                 kind,
-                animation: assets.load(format!("{}#Animation0", kind.model())),
+                animation: assets.load(format!("{}#Animation{}", kind.model(), kind.clip())),
             },
             Side::Hostile,
             Aggro::default(),
@@ -462,7 +516,7 @@ pub fn spawn(
             // thousand build two thousand actor scenes and destroy all but a
             // couple of hundred of them again on the next frame.
             Visibility::Hidden,
-            Transform::from_translation(position).with_scale(Vec3::splat(0.01)),
+            Transform::from_translation(position).with_scale(Vec3::splat(kind.draw_scale())),
             // Parts of both of these are flat quads the original turns to face
             // the camera every frame.
             crate::billboard::BillboardActor,
@@ -545,9 +599,9 @@ pub fn crowd(
         }
         for (index, spot) in crowd_spots(count, &level).into_iter().enumerate() {
             let kind = match kind {
-                CrowdKind::Goomba => Kind::Goomba,
+                CrowdKind::Slime => Kind::Slime,
                 CrowdKind::Scuttlebug => Kind::Scuttlebug,
-                CrowdKind::Mix if index % 2 == 0 => Kind::Goomba,
+                CrowdKind::Mix if index % 2 == 0 => Kind::Slime,
                 CrowdKind::Mix => Kind::Scuttlebug,
             };
             spawn(&mut commands, &assets, kind, spot, index as f32);
@@ -636,11 +690,11 @@ const CROWD_SIGHT: f32 = 1.0;
 ///
 /// Hiding a distant enemy stops it being *drawn*, which was the whole of the
 /// first version of this and bought the draw calls back. What it does not stop
-/// is the enemy existing: a goomba is not one entity but a scene of about
-/// fifteen, a scuttlebug about sixty-three, and every one of them is a
+/// is the enemy existing: a slime is not one entity but a scene of about
+/// nine, a scuttlebug about sixty-three, and every one of them is a
 /// transform to propagate, a visibility to compute and an archetype row to walk
-/// past. A mixed field of two thousand is some eighty-five thousand entities,
-/// and eight thousand is a third of a million -- at which point the entity
+/// past. A mixed field of two thousand is some seventy-five thousand entities,
+/// and eight thousand is close to three hundred thousand -- at which point the entity
 /// count, rather than the draws or the AI, is what a frame is made of. It was
 /// measured: at eight thousand the simulation budget saved nothing at all,
 /// because the simulation was no longer the expensive part.
@@ -811,7 +865,7 @@ pub fn alert(tuning: Res<GameTuning>, everyone: Creatures, mut hunters: Hunters)
             let target = aggro
                 .target
                 // A target that is no longer in the world is no target. This is
-                // how a Mario that has just flattened a goomba goes looking for
+                // how a Mario that has just flattened a slime goes looking for
                 // the next one rather than standing over the spot.
                 .filter(|target| everyone.get(*target).is_ok());
             (entity, transform.translation, *side, target)
@@ -961,7 +1015,7 @@ enum Shoved {
 /// each one to its slot and asks nothing about what else is standing there, so a
 /// squad following the player was a heap of Marios in the same place walking
 /// through each other and through him. That they are held apart by the enemies'
-/// pass rather than by one of their own is the point: a Mario, a goomba and a
+/// pass rather than by one of their own is the point: a Mario, a slime and a
 /// scuttlebug are all bodies of some radius standing on some ground, and two
 /// separate answers to how bodies avoid each other is two answers that disagree
 /// at the boundary between them.
@@ -973,7 +1027,7 @@ pub fn spread(
 ) {
     let mut bodies: Vec<Body> = Vec::new();
     let mut shoved: Vec<Shoved> = Vec::new();
-    // The near tier only. Two distant goombas standing in the same spot are two
+    // The near tier only. Two distant slimes standing in the same spot are two
     // pixels standing in the same spot, and untangling them costs a spatial
     // grid over the whole field to fix something nobody can see.
     for (entity, enemy, transform, crawler, detail) in &enemies {
@@ -1384,7 +1438,7 @@ fn crowd_step(
     if towards != Vec2::ZERO {
         let step = towards * speed * dt;
         // The same three candidates [`walk`] tries, against the same idea of
-        // what a wall is, read out of the survey instead of ray-cast: a goomba
+        // what a wall is, read out of the survey instead of ray-cast: a slime
         // that meets a fence at an angle slides along it rather than standing
         // there pushing at it, and one offered the top of a wall as its next
         // step is refused it.
@@ -1466,11 +1520,11 @@ fn stand_upright(crawler: Option<Mut<Crawler>>, dt: f32) {
 ///  * is there ground at the far end to put its feet on? Ground it can get up
 ///    onto in a step, which is what [`LevelData::ground_at`] answers.
 ///
-/// A refused step is retried one axis at a time, so a goomba that walks into a
+/// A refused step is retried one axis at a time, so a slime that walks into a
 /// wall at an angle slides along it instead of standing there pushing.
 ///
 /// This replaced snapping to whatever the floor query answered, which is how a
-/// goomba at the bottom of a cliff used to arrive at the top of it: the query
+/// slime at the bottom of a cliff used to arrive at the top of it: the query
 /// was happy to hand back a surface two body-heights up, and being handed it was
 /// the same thing as standing on it.
 fn walk(level: &LevelData, position: Vec3, step: Vec3, radius: f32) -> Vec3 {
@@ -1509,7 +1563,7 @@ fn walk(level: &LevelData, position: Vec3, step: Vec3, radius: f32) -> Vec3 {
 ///  * there is ground under it -- *ground*, meaning something it could walk up
 ///    onto rather than merely something solid. [`LevelData::ground_at`] refuses
 ///    both the too-steep and the too-high, so what comes back is a step and not
-///    a climb, and a goomba at the foot of a cliff is not offered the top of it.
+///    a climb, and a slime at the foot of a cliff is not offered the top of it.
 ///  * there is something under it but nothing it can stand on: a cliff face, the
 ///    slope it just walked off. It falls, and no further than the thing it fell
 ///    onto.
@@ -1519,7 +1573,7 @@ fn walk(level: &LevelData, position: Vec3, step: Vec3, radius: f32) -> Vec3 {
 ///    head is the underside of that lawn, so it climbs out onto it.
 ///
 /// The pace matters as much as the choice. The floor query answers a column and
-/// a column's answer jumps; taking it whole is what made goombas appear to morph
+/// a column's answer jumps; taking it whole is what made slimes appear to morph
 /// between elevations rather than walk between them.
 fn settle(level: &LevelData, position: Vec3, dt: f32) -> Vec3 {
     let (rise, drop) = (CLIMB_SPEED * dt, FALL_SPEED * dt);
@@ -1767,7 +1821,7 @@ pub fn combat(
     // That is not a detail: a knocked-back player is thrown up and off the
     // enemy that hit him and comes down on its head, so without this every
     // enemy that touches somebody standing perfectly still stomps *itself*
-    // within a couple of seconds. A warp pipe whose every goomba destroys
+    // within a couple of seconds. A warp pipe whose every slime destroys
     // itself before you turn round is a warp pipe that appears to spawn
     // nothing at all.
     if controller.invulnerable_left > 0.0 {
@@ -1842,7 +1896,7 @@ const MARIO_REACH: f32 = 1.6;
 /// it, and what it hits dies.
 ///
 /// The blow lands at the *end* of the swing rather than the moment it starts,
-/// so what kills a goomba is the punch connecting rather than the decision to
+/// so what kills a slime is the punch connecting rather than the decision to
 /// punch -- one that wanders out of reach mid-swing is missed, which is the
 /// only thing that makes standing next to one of these dangerous at all.
 ///
@@ -1965,6 +2019,75 @@ pub fn sync_animation_visibility(
 mod tests {
     use super::*;
     use bevy::ecs::system::RunSystemOnce;
+
+    /// The glTF JSON chunk of an asset, so a claim about a model can be checked
+    /// without a renderer. Same trick as `billboard.rs`, for the same reason.
+    fn gltf(path: &str) -> serde_json::Value {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let bytes = std::fs::read(root.join(path)).expect("missing glb");
+        let length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        serde_json::from_slice(&bytes[20..20 + length]).expect("bad glb json")
+    }
+
+    /// [`Kind::clip`] is an index into a file, and an index into a file is a
+    /// thing a re-export can silently move.
+    ///
+    /// This is the whole reason that method has a doc comment naming the clip:
+    /// the name is the intent and the number is only how glTF asset labels
+    /// happen to address it. Blender writes its actions out in alphabetical
+    /// order, so inserting one animation called `Attack` renumbers everything
+    /// after it -- and the failure that causes is a crowd of slimes playing
+    /// `Squish_Start` on a loop while sliding across the ground, which is a
+    /// thing somebody has to notice by eye. Here it is a failing test naming
+    /// both clips.
+    #[test]
+    fn the_clip_index_is_still_the_walk() {
+        for (kind, wanted) in [
+            (Kind::Slime, "Scoot_Move"),
+            (Kind::Scuttlebug, "scuttlebug_seg6_anim_0601504C"),
+        ] {
+            let doc = gltf(kind.model());
+            let clips = doc["animations"].as_array().expect("no animations");
+            let found = clips
+                .get(kind.clip())
+                .and_then(|clip| clip["name"].as_str())
+                .unwrap_or("<past the end of the file>");
+            assert_eq!(
+                found,
+                wanted,
+                "{kind:?} walks on animation {} of {}, which is now {found:?} \
+                 rather than {wanted:?}",
+                kind.clip(),
+                kind.model()
+            );
+        }
+    }
+
+    /// [`Kind::draw_scale`] against the size the model actually is.
+    ///
+    /// The slime's scale is not a look, it is the number that makes the mesh's
+    /// footprint the collision radius the crowd is spaced on. Read the dome's
+    /// own radius out of the file and multiply, and it has to come back as
+    /// [`Kind::body`]'s radius -- otherwise slimes overlap each other by
+    /// however far the two have drifted apart.
+    #[test]
+    fn the_slime_is_drawn_at_the_width_it_is_spaced_at() {
+        let doc = gltf(Kind::Slime.model());
+        let radius = doc["accessors"]
+            .as_array()
+            .expect("no accessors")
+            .iter()
+            .filter_map(|accessor| accessor["max"].as_array())
+            .filter(|bounds| bounds.len() == 3)
+            .filter_map(|bounds| bounds[0].as_f64())
+            .fold(0.0_f64, f64::max) as f32;
+        let drawn = radius * Kind::Slime.draw_scale();
+        assert!(
+            (drawn - Kind::Slime.body().0).abs() < 0.02,
+            "the slime is drawn {drawn:.3} m wide and spaced {:.3} m apart",
+            Kind::Slime.body().0
+        );
+    }
 
     /// A room with a floor, one wall across the far end of it and a ceiling:
     /// the three surfaces a scuttlebug is supposed to treat as the same thing.
@@ -2428,7 +2551,7 @@ mod tests {
                     world
                         .spawn((
                             Enemy {
-                                kind: Kind::Goomba,
+                                kind: Kind::Slime,
                                 animation: Handle::default(),
                             },
                             Transform::from_translation(at),
@@ -2466,7 +2589,7 @@ mod tests {
                 world
                     .spawn((
                         Enemy {
-                            kind: Kind::Goomba,
+                            kind: Kind::Slime,
                             animation: Handle::default(),
                         },
                         Transform::from_xyz(step as f32 * 3.0, 0.0, 0.0),
@@ -2488,7 +2611,7 @@ mod tests {
         let mut world = World::new();
         let enemy = world
             .spawn(Enemy {
-                kind: Kind::Goomba,
+                kind: Kind::Slime,
                 animation: Handle::default(),
             })
             .id();
@@ -2526,7 +2649,7 @@ mod tests {
                 world
                     .spawn((
                         Enemy {
-                            kind: Kind::Goomba,
+                            kind: Kind::Slime,
                             animation: Handle::default(),
                         },
                         Side::Hostile,
@@ -2611,7 +2734,7 @@ mod tests {
         }
         let apart = world.get::<Transform>(enemies[0]).unwrap().translation
             - world.get::<Transform>(enemies[1]).unwrap().translation;
-        let room = Kind::Goomba.body().0 * 2.0 + PERSONAL_SPACE - SPREAD_SLACK;
+        let room = Kind::Slime.body().0 * 2.0 + PERSONAL_SPACE - SPREAD_SLACK;
         assert!(
             apart.length() > room - 0.01,
             "two enemies settled {} apart, inside the {room} they are owed",
@@ -2653,7 +2776,7 @@ mod tests {
             moved < 0.01,
             "a settled crowd was still shuffling {moved} a tick"
         );
-        let room = Kind::Goomba.body().0 * 2.0 + PERSONAL_SPACE - SPREAD_SLACK;
+        let room = Kind::Slime.body().0 * 2.0 + PERSONAL_SPACE - SPREAD_SLACK;
         for (index, one) in after.iter().enumerate() {
             for other in &after[index + 1..] {
                 assert!(
@@ -2723,7 +2846,7 @@ mod tests {
         assert!(next != first, "it went back to the spot it was already on");
     }
 
-    /// A Mario and a goomba, stood within arm's reach of each other, with the
+    /// A Mario and a slime, stood within arm's reach of each other, with the
     /// Mario having noticed it.
     fn duel(apart: f32) -> (World, Entity, Entity) {
         let mut world = World::new();
@@ -2736,18 +2859,18 @@ mod tests {
                 Transform::default(),
             ))
             .id();
-        let goomba = world
+        let slime = world
             .spawn((
                 Enemy {
-                    kind: Kind::Goomba,
+                    kind: Kind::Slime,
                     animation: Handle::default(),
                 },
                 Side::Hostile,
                 Transform::from_xyz(apart, 0., 0.),
             ))
             .id();
-        world.get_mut::<Aggro>(mario).unwrap().target = Some(goomba);
-        (world, mario, goomba)
+        world.get_mut::<Aggro>(mario).unwrap().target = Some(slime);
+        (world, mario, slime)
     }
 
     fn swing(world: &mut World, ticks: usize) {
@@ -2763,11 +2886,11 @@ mod tests {
     /// swing finishes, not when it starts.
     #[test]
     fn a_mario_punches_what_it_has_noticed() {
-        let (mut world, mario, goomba) = duel(1.0);
+        let (mut world, mario, slime) = duel(1.0);
         swing(&mut world, 1);
         assert!(
-            world.get_entity(goomba).is_ok(),
-            "the goomba died on the wind-up"
+            world.get_entity(slime).is_ok(),
+            "the slime died on the wind-up"
         );
         assert_eq!(
             world.get::<Ally>(mario).unwrap().state.motion,
@@ -2775,7 +2898,7 @@ mod tests {
         );
         swing(&mut world, (MARIO_SWING / FIXED_DT).ceil() as usize + 1);
         assert!(
-            world.get_entity(goomba).is_err(),
+            world.get_entity(slime).is_err(),
             "the punch landed on nothing"
         );
     }
@@ -2785,12 +2908,12 @@ mod tests {
     /// survivable.
     #[test]
     fn a_mario_misses_what_walks_out_of_the_punch() {
-        let (mut world, _, goomba) = duel(1.0);
+        let (mut world, _, slime) = duel(1.0);
         swing(&mut world, 1);
-        world.get_mut::<Transform>(goomba).unwrap().translation.x = MARIO_REACH + 3.0;
+        world.get_mut::<Transform>(slime).unwrap().translation.x = MARIO_REACH + 3.0;
         swing(&mut world, (MARIO_SWING / FIXED_DT).ceil() as usize + 1);
         assert!(
-            world.get_entity(goomba).is_ok(),
+            world.get_entity(slime).is_ok(),
             "the punch followed it across the lawn"
         );
     }
@@ -2799,16 +2922,16 @@ mod tests {
     /// to it is the movement step's business.
     #[test]
     fn a_mario_does_not_punch_at_something_across_the_lawn() {
-        let (mut world, mario, goomba) = duel(MARIO_REACH + 2.0);
+        let (mut world, mario, slime) = duel(MARIO_REACH + 2.0);
         swing(&mut world, 30);
-        assert!(world.get_entity(goomba).is_ok());
+        assert!(world.get_entity(slime).is_ok());
         assert_eq!(world.get::<Ally>(mario).unwrap().swing_left, 0.0);
     }
 
-    /// Both sides notice each other, off the one rule. The Mario has a goomba
-    /// to hit and the goomba has a Mario to chase, out of a single pass.
+    /// Both sides notice each other, off the one rule. The Mario has a slime
+    /// to hit and the slime has a Mario to chase, out of a single pass.
     #[test]
-    fn a_mario_and_a_goomba_notice_each_other() {
+    fn a_mario_and_a_slime_notice_each_other() {
         let mut world = World::new();
         world.insert_resource(GameTuning::default());
         let mario = world
@@ -2819,10 +2942,10 @@ mod tests {
                 Transform::default(),
             ))
             .id();
-        let goomba = world
+        let slime = world
             .spawn((
                 Enemy {
-                    kind: Kind::Goomba,
+                    kind: Kind::Slime,
                     animation: Handle::default(),
                 },
                 Side::Hostile,
@@ -2831,11 +2954,11 @@ mod tests {
             ))
             .id();
         world.run_system_once(alert).expect("alert could not run");
-        assert_eq!(world.get::<Aggro>(mario).unwrap().target, Some(goomba));
-        assert_eq!(world.get::<Aggro>(goomba).unwrap().target, Some(mario));
+        assert_eq!(world.get::<Aggro>(mario).unwrap().target, Some(slime));
+        assert_eq!(world.get::<Aggro>(slime).unwrap().target, Some(mario));
         // And what a Mario kills stops being a target, so it looks for the next
         // one rather than standing over the spot.
-        world.despawn(goomba);
+        world.despawn(slime);
         world.run_system_once(alert).expect("alert could not run");
         assert_eq!(world.get::<Aggro>(mario).unwrap().target, None);
     }
@@ -2873,17 +2996,17 @@ mod tests {
         LevelData::new(vertices, triangles, Vec::new())
     }
 
-    /// Walks a goomba east for a while and reports where it got to.
+    /// Walks a slime east for a while and reports where it got to.
     fn trudge(level: &LevelData, from: Vec3, ticks: usize) -> Vec3 {
         let mut at = from;
         for _ in 0..ticks {
-            at = walk(level, at, Vec3::X * 0.06, Kind::Goomba.body().0);
+            at = walk(level, at, Vec3::X * 0.06, Kind::Slime.body().0);
             at = settle(level, at, FIXED_DT);
         }
         at
     }
 
-    /// The bug this was written for. A goomba at the bottom of a cliff stays at
+    /// The bug this was written for. A slime at the bottom of a cliff stays at
     /// the bottom of the cliff: the top is not a step, however near it is in a
     /// straight line, and being handed it by the floor query is not the same as
     /// having climbed it.
@@ -2954,6 +3077,17 @@ mod tests {
         }
     }
 
+    /// Where the player's feet are when he is coming down on top of one.
+    ///
+    /// A fraction of the enemy's own height rather than a number, because the
+    /// enemy these are measured against has changed once already: 0.8 sat
+    /// comfortably inside the goomba's metre and is a clean miss over the
+    /// slime's 0.70, so the stomp tests passed for a while and then quietly
+    /// stopped testing stomping.
+    fn on_its_head() -> f32 {
+        Kind::Slime.body().1 * 0.8
+    }
+
     /// A player, and one enemy standing on his toes.
     fn world(player_y: f32, velocity: Vec3) -> (World, Entity) {
         let mut world = World::new();
@@ -2964,7 +3098,7 @@ mod tests {
         let enemy = world
             .spawn((
                 Enemy {
-                    kind: Kind::Goomba,
+                    kind: Kind::Slime,
                     animation: Handle::default(),
                 },
                 Transform::from_xyz(0.5, 0.0, 0.0),
@@ -3004,7 +3138,7 @@ mod tests {
         // Now airborne from the knockback, coming down on its head.
         {
             let mut query = world.query_filtered::<&mut Transform, With<Player>>();
-            query.single_mut(&mut world).unwrap().translation.y = 0.8;
+            query.single_mut(&mut world).unwrap().translation.y = on_its_head();
             let mut query = world.query_filtered::<&mut Controller, With<Player>>();
             query.single_mut(&mut world).unwrap().velocity = Vec3::new(0.0, -6.0, 0.0);
         }
@@ -3022,7 +3156,7 @@ mod tests {
     /// test above would pass just as well if stomping had been removed.
     #[test]
     fn landing_on_an_enemy_defeats_it() {
-        let (mut world, enemy) = world(0.8, Vec3::new(0.0, -6.0, 0.0));
+        let (mut world, enemy) = world(on_its_head(), Vec3::new(0.0, -6.0, 0.0));
         world.run_system_once(combat).expect("combat could not run");
         assert!(world.get_entity(enemy).is_err(), "the stomp did nothing");
         let (velocity, health, _) = controller(&mut world);
@@ -3135,7 +3269,7 @@ mod tests {
         assert!(ticks > 2, "it snapped upright in {ticks} tick(s)");
     }
 
-    /// A field of crowd-tier goombas turned loose on the castle never walks
+    /// A field of crowd-tier slimes turned loose on the castle never walks
     /// through anything.
     ///
     /// The unit tests in [`crate::flow`] check the rule; this checks that the
@@ -3169,7 +3303,7 @@ mod tests {
                 world
                     .spawn((
                         Enemy {
-                            kind: Kind::Goomba,
+                            kind: Kind::Slime,
                             animation: Handle::default(),
                         },
                         Transform::from_translation(*at),
@@ -3256,7 +3390,7 @@ mod tests {
 
         // And nobody walked up the castle. The measure is bluntly physical --
         // how much height an enemy gained in thirty seconds -- because that is
-        // what the report was: goombas going up and down elevations that are
+        // what the report was: slimes going up and down elevations that are
         // impossibly steep. With only `walkable` checked, the worst of a field
         // of ninety-six climbed **30.3 m**, straight up the castle wall at
         // [`CLIMB_SPEED`], with four more past 9 m. Refusing the cliff edges

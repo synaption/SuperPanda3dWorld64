@@ -39,9 +39,9 @@ package without rebuilding it. On Linux, sound and gamepad build against ALSA
 and udev and are opt-in: `cargo run --features sound,gamepad`. The Windows
 build always has both.
 
-Game assets required at runtime are included under `assets/`; the large
-reference sources are only needed when regenerating converted assets. The
-asset pipeline is Python — it does not ship with the game.
+Game assets required at runtime and their Blender authoring sources are
+included under `assets/`. The old SM64 reference sources are no longer used by
+the active asset pipeline. Asset tools do not ship with the game.
 
 ## Documentation wiki
 

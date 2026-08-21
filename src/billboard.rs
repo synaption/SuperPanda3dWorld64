@@ -2,7 +2,7 @@
 //!
 //! SM64 draws some things as flat quads it rebuilds every frame to point at
 //! the camera: whole objects, like the trees, and single parts of an actor,
-//! like a goomba's face. glTF has no billboard concept, so all of it arrives
+//! like a scuttlebug's eyes. glTF has no billboard concept, so all of it arrives
 //! as ordinary geometry, drawn from whatever one side it was authored on. A
 //! flat quad seen from ninety degrees away is not merely wrong, it is nothing
 //! at all -- the tree meshes here measure exactly zero thick.
@@ -133,7 +133,7 @@ pub fn aim(
             continue;
         };
         // The joint chain above this quad leaves it with a rotation of its
-        // own -- on the goomba, about a quarter turn of roll -- and a local
+        // own -- on the scuttlebug, about a quarter turn of roll -- and a local
         // value is applied on top of that. So a heading set here comes out as
         // net *pitch*, and no value of it could ever have worked. Since
         // `net = parent * local`, the local wanted is `parent^-1 * world`.
@@ -198,7 +198,7 @@ mod tests {
     /// than relative to a bone that is itself rotated a quarter turn.
     #[test]
     fn a_joints_parent_rotation_is_cancelled() {
-        // A quarter turn of roll, which is what the goomba's face hangs off.
+        // A quarter turn of roll, which is what a billboard quad hangs off.
         let parent = Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
         let here = Vec3::new(1.0, 2.0, 3.0);
         let camera = Vec3::new(9.0, 2.5, -4.0);
@@ -214,21 +214,32 @@ mod tests {
 
     /// Claiming is by name, so the name is worth pinning: if the exporter ever
     /// stops marking these, nothing turns and nothing says why.
+    ///
+    /// The scuttlebug is the only actor left that carries them. The goomba it
+    /// used to share this with was a decomp export, and its face was one of the
+    /// flat quads SM64 rebuilds every frame; the slime that replaced it is
+    /// authored art with a real skinned mesh and nothing flat anywhere on it.
     #[test]
     fn the_actors_still_carry_the_joints_this_claims() {
-        for actor in ["goomba", "scuttlebug"] {
-            let nodes = node_names(&format!("actors/{actor}.glb"));
-            assert!(
-                nodes.iter().any(|name| name.starts_with(JOINT_PREFIX)),
-                "{actor} has no {JOINT_PREFIX}* joint for this to drive"
-            );
-        }
+        let nodes = node_names("actors/scuttlebug.glb");
+        assert!(
+            nodes.iter().any(|name| name.starts_with(JOINT_PREFIX)),
+            "the scuttlebug has no {JOINT_PREFIX}* joint for this to drive"
+        );
         // The tree is the other case: a whole object, with no joint of its own
         // to claim, turned bodily instead.
         let tree = node_names("actors/tree.glb");
         assert!(
             !tree.iter().any(|name| name.starts_with(JOINT_PREFIX)),
             "the tree grew a billboard joint, so it wants driving the other way"
+        );
+        // And the slime is a third case: an actor with no billboarded part at
+        // all. It still carries `BillboardActor`, which is what makes its
+        // surfaces double-sided, but there is nothing here for `aim` to turn.
+        let slime = node_names("actors/slime.glb");
+        assert!(
+            !slime.iter().any(|name| name.starts_with(JOINT_PREFIX)),
+            "the slime grew a billboard joint, so something has to drive it"
         );
     }
 
@@ -237,14 +248,13 @@ mod tests {
     /// times too big rather than the right size.
     #[test]
     fn the_scale_put_back_is_the_one_baked_in() {
-        for actor in ["goomba", "scuttlebug"] {
-            let baked = root_joint_scale(&format!("actors/{actor}.glb"))
-                .unwrap_or_else(|| panic!("{actor} has no scale on its skeleton"));
-            assert!(
-                (baked * JOINT_SCALE - 1.0).abs() < 1e-4,
-                "{actor} bakes {baked} and this puts back {JOINT_SCALE}"
-            );
-        }
+        let actor = "scuttlebug";
+        let baked = root_joint_scale(&format!("actors/{actor}.glb"))
+            .unwrap_or_else(|| panic!("{actor} has no scale on its skeleton"));
+        assert!(
+            (baked * JOINT_SCALE - 1.0).abs() < 1e-4,
+            "{actor} bakes {baked} and this puts back {JOINT_SCALE}"
+        );
     }
 
     /// A tree is a flat card in the XY plane, so its face is along Z -- which

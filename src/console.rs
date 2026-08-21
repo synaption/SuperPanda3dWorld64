@@ -331,7 +331,7 @@ impl Default for GameTuning {
             // inside this and drawn as a real skeleton. What is beyond it is
             // scenery, and scenery a dozen pixels tall is exactly what an
             // impostor is for. Past here the whole far crowd is two draw calls
-            // instead of four per goomba and fifteen per scuttlebug.
+            // instead of two per slime and fifteen per scuttlebug.
             enemy_draw: 25.0,
             enemy_rate: 7.0,
             enemy_limit: 20.0,
@@ -426,10 +426,21 @@ impl GameTuning {
 /// thousand is `enemy_limit`'s own ceiling, and this is four times that.
 const CROWD_LIMIT: usize = 20_000;
 
+/// What a `crowd` command's kind argument may be spelled, and what it means.
+///
+/// One table rather than a match arm each, so that the prefix matching in
+/// [`ConsoleState::crowd`] can see all of the names at once and tell an
+/// ambiguous abbreviation from an unknown one.
+const CROWD_NAMES: [(&str, CrowdKind); 3] = [
+    ("slime", CrowdKind::Slime),
+    ("scuttlebug", CrowdKind::Scuttlebug),
+    ("mix", CrowdKind::Mix),
+];
+
 /// Which enemies a `crowd` command asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CrowdKind {
-    Goomba,
+    Slime,
     Scuttlebug,
     /// Half of each, alternating, which is the case the draw-call cost of a
     /// mixed field is actually measured on.
@@ -582,7 +593,7 @@ impl ConsoleState {
         }
         self.echo(format!("> {line}"));
         match words[0].to_ascii_lowercase().as_str() {
-            "help" | "?" => self.echo("commands: <name> [value], vars, reset <name|all>, close <name|all>, clear\ncrowd <n> [goomba|scuttlebug|mix] puts a whole field down at once; crowd clear takes it away.\nLeft/Right/Home/End move the caret; Up/Down recall; Tab completes.\nSelect a variable then use [ and ] (Shift = 10x) to tune it. Wheel/PageUp/PageDown scroll the log."),
+            "help" | "?" => self.echo("commands: <name> [value], vars, reset <name|all>, close <name|all>, clear\ncrowd <n> [slime|scuttlebug|mix] puts a whole field down at once; crowd clear takes it away.\nLeft/Right/Home/End move the caret; Up/Down recall; Tab completes.\nSelect a variable then use [ and ] (Shift = 10x) to tune it. Wheel/PageUp/PageDown scroll the log."),
             "vars" | "list" => {
                 for spec in SPECS {
                     self.echo(format!("  {:<18} {:>7.3}  [{:.3} .. {:.3}]  {}", spec.name, tuning.get(spec.name).unwrap(), spec.low, spec.high, spec.doc));
@@ -608,7 +619,7 @@ impl ConsoleState {
         std::mem::take(&mut self.pending)
     }
 
-    /// `crowd <n> [goomba|scuttlebug|mix]`, or `crowd clear`.
+    /// `crowd <n> [slime|scuttlebug|mix]`, or `crowd clear`.
     ///
     /// The benchmark command. `enemy_limit` and `enemy_rate` can already fill
     /// the field, but they do it a brood at a time over a minute or more, and a
@@ -625,16 +636,35 @@ impl ConsoleState {
             self.echo("crowd: needs a count -- `crowd 2000 mix`, or `crowd clear`");
             return;
         };
-        // Prefixes, so `crowd 2000 g` works: this is a command typed between
+        // Prefixes, so `crowd 2000 m` works: this is a command typed between
         // two readings of a frame-rate counter, not a configuration file.
+        //
+        // Matched against all three rather than taken in order, because the
+        // slime and the scuttlebug now share a first letter and first match
+        // wins would quietly hand `crowd 2000 s` to whichever of them this
+        // happened to list first. An ambiguous prefix says so instead.
         let kind = match args.get(1).map(|word| word.to_ascii_lowercase()) {
             None => CrowdKind::Mix,
-            Some(word) if "goomba".starts_with(&word) => CrowdKind::Goomba,
-            Some(word) if "scuttlebug".starts_with(&word) => CrowdKind::Scuttlebug,
-            Some(word) if "mix".starts_with(&word) => CrowdKind::Mix,
             Some(word) => {
-                self.echo(format!("crowd: {word:?} is not goomba, scuttlebug or mix"));
-                return;
+                let matched: Vec<_> = CROWD_NAMES
+                    .iter()
+                    .filter(|(name, _)| name.starts_with(&word))
+                    .collect();
+                match matched.as_slice() {
+                    [(_, kind)] => *kind,
+                    [] => {
+                        self.echo(format!("crowd: {word:?} is not slime, scuttlebug or mix"));
+                        return;
+                    }
+                    several => {
+                        let names: Vec<_> = several.iter().map(|(name, _)| *name).collect();
+                        self.echo(format!(
+                            "crowd: {word:?} could be {} -- say more of it",
+                            names.join(" or ")
+                        ));
+                        return;
+                    }
+                }
             }
         };
         let count = count.min(CROWD_LIMIT);
@@ -1160,7 +1190,7 @@ mod tests {
         let mut console = ConsoleState::default();
         let mut tuning = GameTuning::default();
         console.execute("crowd 2000 mix", &mut tuning);
-        console.execute("crowd 40 g", &mut tuning);
+        console.execute("crowd 40 sl", &mut tuning);
         console.execute("crowd 40 scuttle", &mut tuning);
         // No kind named is the mixed field, which is the one worth measuring.
         console.execute("crowd 7", &mut tuning);
@@ -1169,7 +1199,7 @@ mod tests {
             console.take_requests(),
             vec![
                 Request::Crowd(2000, CrowdKind::Mix),
-                Request::Crowd(40, CrowdKind::Goomba),
+                Request::Crowd(40, CrowdKind::Slime),
                 Request::Crowd(40, CrowdKind::Scuttlebug),
                 Request::Crowd(7, CrowdKind::Mix),
                 Request::ClearCrowd,
@@ -1178,6 +1208,38 @@ mod tests {
         // And taking them empties the queue: a request carried out on two
         // consecutive frames is a field placed twice.
         assert!(console.take_requests().is_empty());
+    }
+
+    /// `s` is not an abbreviation any more.
+    ///
+    /// The slime and the scuttlebug share a first letter, and the version of
+    /// this that took the first name to match would have silently handed a
+    /// benchmark of one to a benchmark of the other -- two fields with quite
+    /// different draw costs, told apart only by squinting at them.
+    #[test]
+    fn an_ambiguous_kind_queues_nothing_and_says_why() {
+        let mut console = ConsoleState::default();
+        let mut tuning = GameTuning::default();
+        console.execute("crowd 40 s", &mut tuning);
+        assert!(
+            console.take_requests().is_empty(),
+            "an ambiguous prefix placed a field anyway"
+        );
+        let said = console.log.back().expect("nothing was echoed").clone();
+        assert!(
+            said.contains("slime") && said.contains("scuttlebug"),
+            "the ambiguity was not explained: {said:?}"
+        );
+        // Enough of it to tell them apart still works, both ways.
+        console.execute("crowd 40 sl", &mut tuning);
+        console.execute("crowd 40 sc", &mut tuning);
+        assert_eq!(
+            console.take_requests(),
+            vec![
+                Request::Crowd(40, CrowdKind::Slime),
+                Request::Crowd(40, CrowdKind::Scuttlebug),
+            ]
+        );
     }
 
     /// A mistyped count must not queue anything, and a fat-fingered one must

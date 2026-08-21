@@ -95,7 +95,7 @@ src/
   input.rs       keyboard, mouse and pad merged into one latched snapshot
   animation.rs   which clip each character plays, and how fast
   billboard.rs   turning billboarded objects and actor parts to face the camera
-  enemy.rs       goombas and scuttlebugs: behaviour, LOD, hit resolution
+  enemy.rs       slimes and scuttlebugs: behaviour, LOD, hit resolution
   pipe.rs        warp pipes, and the arc they throw their brood out on
   squad.rs       aiming at the ground, and the Marios whistled up and sent out
   water.rs       the water sheets and the underwater view
@@ -304,14 +304,14 @@ never tips over when the camera looks down at it. Note that nothing in the
 the decomp, not the geo layout — `bhvTree` is `BILLBOARD()`/`CYLBOARD()` even
 though the tree's geo has no `GEO_BILLBOARD` in it at all.
 
-**Part of an actor** — a goomba's face, most of a scuttlebug — is skinned to a
+**Part of an actor** — most of a scuttlebug — is skinned to a
 joint, where no transform on the object can reach it. The exporter makes each
 such quad a joint named `billboard_*`, and those are driven one at a time.
 
 Driving a joint takes two things that are easy to get wrong. The rotation is
 composed against the inverse of the parent joint's world rotation, because the
 skeleton leaves the quad rotated a quarter turn and a heading applied on top of
-that comes out as pitch — on the goomba the parent sits at `(98.4, 4.9, -90.7)`,
+that comes out as pitch — on the scuttlebug the parent sits at `(98.4, 4.9, -90.7)`,
 so no value of a plain heading could ever have worked. And the aiming runs
 after the animation player has posed the skeleton and before transforms are
 propagated: before the animation player, every joint written is overwritten a
@@ -336,7 +336,7 @@ isolated.
 
 ## Warp pipes
 
-Three pipes, and each produces one thing: goombas out of the one in the far
+Three pipes, and each produces one thing: slimes out of the one in the far
 west corner, scuttlebugs out of the one in the far east, and Marios out of the
 one by the spawn on the castle path. The two enemy pipes are where they are on
 purpose — they are somewhere to go rather than something to trip over on the
@@ -352,14 +352,14 @@ outwards throughout and landing about four pipe-widths away.
 
 For that second the thing's own behaviour is suspended and the arc alone moves
 it. That suspension is the trick: every behaviour writes its own speed each
-tick — a goomba bleeds whatever it has back toward a walk, a scuttlebug simply
+tick — a slime bleeds whatever it has back toward a walk, a scuttlebug simply
 overwrites it with its crawl — so a launch handed to the behaviour is gone
 within a tick or two and the thing lands back on the pipe it came out of.
 
 Where it is thrown is chosen rather than taken: headings a golden angle apart
 are tried until one has floor at the end of it that is not far below the pipe.
 The west pipe stands a few hundred units from where the ground falls into the
-moat, and without this a quarter of its goombas came down in the water. The
+moat, and without this a quarter of its slimes came down in the water. The
 golden angle rather than a random number means five throws spread around the
 pipe instead of stacking, with a whole run still reproducible in a test.
 
@@ -386,14 +386,17 @@ and a height — rather than a point, so standing on a roof above one is not
 touching it.
 
 Sizes come from the originals' hitboxes rather than from eye. Mario's is 160
-tall, a regular goomba's is 50 scaled by 1.5, and a scuttlebug's is 70, so they
-stand at about 0.47x and 0.44x his height.
+tall and a scuttlebug's is 70, so the bug stands at about 0.44x his height. The
+slime is the exception: it is authored art rather than a decomp export, so its
+height is the model's own — 0.70 m, the width of the dome — while it keeps the
+0.70 m radius of the goomba it replaced, which is what the crowd's spacing and
+flow-field arithmetic were tuned against.
 
 The immunity after a hit gates the *whole* resolution and not only the damage.
 That is not a detail. A knocked-back player is thrown up and off the enemy that
 hit him and comes back down on its head, so without it every enemy that touches
 somebody standing perfectly still stomps itself within a couple of seconds —
-and a warp pipe whose every goomba destroys itself before you turn round is a
+and a warp pipe whose every slime destroys itself before you turn round is a
 warp pipe that appears to spawn nothing at all.
 
 ## The debug console
@@ -458,7 +461,7 @@ the UI as well and the HUD comes out blurred along with the world. A test in
 The thing that costs a frame here is **draw calls, not pixels and not
 triangles**. Bevy marks every skinned mesh `NoAutomaticBatching`, because each
 one needs its own joint matrices, so a skinned actor costs one draw call per
-mesh primitive and no two of them ever merge — four for a goomba, fifteen for a
+mesh primitive and no two of them ever merge — two for a slime, fifteen for a
 scuttlebug, which is fifteen draw calls to put seventy-six triangles on screen.
 Two thousand enemies drawn that way is around nineteen thousand draw calls a
 frame. The castle, for comparison, is 785 triangles and 45 draws.
@@ -471,11 +474,11 @@ fewer things, keeping fewer entities, and properly simulating fewer of them.
 - **Impostors.** Past `enemy_draw` an enemy is drawn as a camera-facing sprite
   from a baked atlas rather than as a skeleton, and the whole distant crowd of
   one kind is rebuilt every frame into a *single* mesh — one draw call for a
-  thousand goombas. See `impostor.rs`, and `impostor/bake.rs` for the baker.
+  thousand slimes. See `impostor.rs`, and `impostor/bake.rs` for the baker.
 
   The baker runs `drawing()` — the game's own post-update chain — rather than a
   copy of it, and that is not tidiness. It was a copy once, missing the
-  billboard half, so the goomba's face and the scuttlebug's three billboard
+  billboard half, so the scuttlebug's three billboard
   joints baked at the quarter scale the exporter puts on the skeleton instead of
   having it put back by `billboard::aim`, and single-sided, so they were culled
   from half the angles too. Sprites covered **52% of the pixels the models did**
@@ -496,7 +499,7 @@ fewer things, keeping fewer entities, and properly simulating fewer of them.
 
 ### Keeping fewer entities
 
-An enemy is not one entity. It is a glTF scene — about 15 for a goomba, 63 for
+An enemy is not one entity. It is a glTF scene — about 9 for a slime, 63 for
 a scuttlebug — and every one of those is a transform to propagate and an
 archetype row to walk past. A mixed field of two thousand used to be 85,000
 entities and eight thousand was a third of a million, at which point the entity
@@ -550,7 +553,7 @@ first and none of the failures looked like what it was:
 - **Height is interpolated between cells, not taken from the cell.** Taking the
   cell's own height stands every enemy in it at the height of that cell's
   centre, so on a slope half are buried and half float — 0.46 m of average
-  error against a goomba 0.9 m tall, which reads as the crowd flickering in and
+  error against a slime 0.7 m tall, which reads as the crowd flickering in and
   out of the hillsides.
 - **The alarm spreads as a wave.** `enemy::alert`'s shouting chain cascades
   through a dense field within a tick or two, which is why a fully simulated
@@ -572,7 +575,7 @@ walks each one to its slot and asks nothing about what is standing there, so a
 squad following the player was a heap of Marios in the same place walking
 through each other and through him.
 
-They share a pass rather than having one each because a Mario, a goomba and a
+They share a pass rather than having one each because a Mario, a slime and a
 scuttlebug are all bodies of some radius standing on some ground, and two
 answers to how bodies avoid each other is two answers that disagree at the
 boundary between them.
@@ -594,9 +597,12 @@ Three things it does that are not obvious:
 ### Where an enemy's feet are
 
 **A transform is not where the model is.** The scuttlebug's rig root sits up
-inside its body, so its geometry hangs 31 cm below its own origin; the goomba's
-hangs 6.5 cm. Seat that origin on the ground — which is what every placement in
-the game does — and a third of the scuttlebug is underground on flat stone.
+inside its body, so its geometry hangs 31 cm below its own origin. Seat that
+origin on the ground — which is what every placement in the game does — and a
+third of the scuttlebug is underground on flat stone. The slime is the case
+this wants and the reason `Kind::lift` is a fact about the asset rather than a
+tuning knob: it was authored with its mesh on `y = 0`, so its lift is zero and
+nothing has to be corrected for. The goomba it replaced hung 6.5 cm.
 
 `Kind::lift` carries the offset, measured off the baked impostor sheets rather
 than guessed: those are renders of the real posed actor through the game's own

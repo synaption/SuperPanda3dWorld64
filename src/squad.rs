@@ -563,8 +563,8 @@ pub fn move_allies(
             continue;
         }
         // What it has noticed, if it is still there to be noticed. This beats
-        // both the order and the amble: a Mario that has seen a goomba deals
-        // with the goomba and picks its errand back up afterwards, which is
+        // both the order and the amble: a Mario that has seen a slime deals
+        // with the slime and picks its errand back up afterwards, which is
         // what the order still sitting in `goal` is for.
         let hunting = aggro
             .and_then(|aggro| aggro.target.map(|_| aggro.at))

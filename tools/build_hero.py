@@ -88,7 +88,7 @@ def main(argv):
     raw_dir = tempfile.mkdtemp(prefix="hero-export-")
     raw = os.path.join(raw_dir, "hero_raw.glb")
 
-    cmd = [blender, "--background", "--factory-startup", args.blend,
+    cmd = [blender, "--background", "-noaudio", "--factory-startup", args.blend,
            "--python", os.path.join(HERE, "export_hero_gltf.py"),
            "--python-exit-code", "1", "--", "--out", raw]
     proc = subprocess.run(cmd, capture_output=not args.verbose, text=True)

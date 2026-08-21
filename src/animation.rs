@@ -110,7 +110,7 @@ pub struct AnimationOwner(pub ActiveCharacter);
 ///
 /// Every player needs a graph before an index into one means anything, and an
 /// enemy's whole animation is a single looping clip. Building one graph each
-/// would put an asset in the table for every goomba on the field, and the field
+/// would put an asset in the table for every slime on the field, and the field
 /// cap goes to five thousand; keying by the clip the kind loads means two
 /// graphs however many enemies are alive, because `AssetServer::load` hands
 /// back the same handle for the same path.

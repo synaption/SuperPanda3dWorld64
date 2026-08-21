@@ -320,7 +320,7 @@ impl Plugin for N64Plugin {
 /// order is load-bearing: `two_sided` writes `cull_mode` onto the *standard*
 /// material of every billboarded quad, and this reads it a moment later to
 /// decide the same thing on the pipeline. Run the other way round, every tree
-/// and every goomba's face would be culled from half the angles it is looked
+/// and every scuttlebug's eyes would be culled from half the angles they are looked
 /// at from.
 pub fn systems() -> ScheduleConfigs<ScheduleSystem> {
     (convert, relight).chain()

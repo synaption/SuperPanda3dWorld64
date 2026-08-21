@@ -21,11 +21,20 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools"
+# Actor -> its clip sidecar, or None where the actor does not animate.
 ACTORS = {
     "goomba": "goomba_clips.json",
     "scuttlebug": "scuttlebug_clips.json",
+    "slime": "slime_clips.json",
     "tree": None,
     "warp_pipe": None,
+}
+
+# The node an actor's skinned mesh belongs under, where it is not the decomp
+# exporter's ``armature``. The slime was authored in Blender and names its
+# armature after itself.
+SKELETON_ROOTS = {
+    "slime": "Slime_Rig",
 }
 
 
@@ -60,8 +69,11 @@ def main(argv=None):
                 staged_sidecar = staging / sidecar_name
                 staged_runtime = staging / f"{actor}.glb"
                 shutil.copy2(source_sidecar, staged_sidecar)
-                run([sys.executable, TOOLS / "adopt_blender_export.py", raw,
-                     "--out", staged_runtime, "--sidecar", staged_sidecar])
+                adopt = [sys.executable, TOOLS / "adopt_blender_export.py", raw,
+                         "--out", staged_runtime, "--sidecar", staged_sidecar]
+                if actor in SKELETON_ROOTS:
+                    adopt.extend(["--skeleton-root", SKELETON_ROOTS[actor]])
+                run(adopt)
                 os.replace(staged_runtime, runtime)
                 os.replace(staged_sidecar, source_sidecar)
             else:

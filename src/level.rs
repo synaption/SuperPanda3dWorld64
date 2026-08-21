@@ -14,7 +14,7 @@ pub struct LevelData {
 /// 64 puts the castle's cells at about 2.5 m on a side. It was 16 -- cells of
 /// ten metres, holding an average of nine floor triangles each and up to
 /// forty-one -- which was fine when the only things asking were the player and a
-/// handful of goombas, and is not when a field of two thousand is asking several
+/// handful of slimes, and is not when a field of two thousand is asking several
 /// times each per tick.
 ///
 /// Measured against the real castle rather than guessed: 16 -> 64 takes the

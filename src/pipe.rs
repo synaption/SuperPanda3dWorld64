@@ -4,7 +4,7 @@
 //! does not place something beside itself: it throws it up out of the barrel,
 //! and the thing flies a ballistic arc with its own behaviour suspended until
 //! it lands. That suspension is the whole trick -- every behaviour in the game
-//! writes its own speed each tick, so a launch handed straight to a goomba's
+//! writes its own speed each tick, so a launch handed straight to a slime's
 //! walk is gone within a tick or two and it lands back on the pipe it came out
 //! of.
 //!

@@ -6,9 +6,9 @@
 //! Bevy marks every skinned mesh `NoAutomaticBatching`, because each one needs
 //! its own joint matrices, so **a skinned model is one draw call per mesh
 //! primitive and no two of them ever merge**. The actors here are split by
-//! material: four primitives for a goomba, fifteen for a scuttlebug -- fifteen
+//! material: two primitives for a slime, fifteen for a scuttlebug -- fifteen
 //! draw calls to put seventy-six triangles on the screen. A field of two
-//! thousand is around nineteen thousand draw calls a frame, which is the whole
+//! thousand is around seventeen thousand draw calls a frame, which is the whole
 //! frame, and no amount of lowering the internal resolution touches it because
 //! the cost is in submitting the draws rather than in filling the pixels.
 //!
@@ -20,7 +20,7 @@
 //!
 //! The saving comes from the quads being *one mesh*. They are not one entity
 //! each: the whole crowd of a kind is rebuilt every frame into a single vertex
-//! buffer, which is one draw call for a thousand goombas rather than four
+//! buffer, which is one draw call for a thousand slimes rather than two
 //! thousand. That is also why this does not use a per-instance storage buffer
 //! and a vertex-pulling shader, which would be marginally faster on a good GPU:
 //! a plain vertex buffer works on anything, and the machine this is aimed at is
@@ -116,7 +116,7 @@ impl SheetMeta {
     ///
     /// The angle is the bearing of the camera *in the model's own frame*, so
     /// turning the enemy and orbiting the camera pick the same picture -- which
-    /// is what makes a goomba walking away from you show you its back.
+    /// is what makes a slime crawling away from you show you its back.
     ///
     /// Rounded to the nearest angle rather than truncated, so the error is half
     /// a step either way instead of a whole step in one direction, and wrapped
@@ -159,13 +159,13 @@ pub struct Sheet {
 /// Every sheet the game has, and the quads built out of them.
 #[derive(Resource, Default)]
 pub struct Impostors {
-    goomba: Option<Sheet>,
+    slime: Option<Sheet>,
     scuttlebug: Option<Sheet>,
     /// Every distant enemy's shadow, of every kind, in one mesh.
     ///
     /// One mesh rather than one per kind because a shadow is a shadow: they all
     /// share the disc texture and the solid rung of the fade ladder, so nothing
-    /// distinguishes a goomba's from a scuttlebug's except its radius. That
+    /// distinguishes a slime's from a scuttlebug's except its radius. That
     /// makes the whole far crowd's shadows a single extra draw call.
     shadows: Option<Handle<Mesh>>,
 }
@@ -173,7 +173,7 @@ pub struct Impostors {
 impl Impostors {
     fn get(&self, kind: Kind) -> Option<&Sheet> {
         match kind {
-            Kind::Goomba => self.goomba.as_ref(),
+            Kind::Slime => self.slime.as_ref(),
             Kind::Scuttlebug => self.scuttlebug.as_ref(),
         }
     }
@@ -210,7 +210,7 @@ pub struct ImpostorField;
 /// The stem of the two files a kind's sheet lives in.
 fn stem(kind: Kind) -> &'static str {
     match kind {
-        Kind::Goomba => "goomba",
+        Kind::Slime => "slime",
         Kind::Scuttlebug => "scuttlebug",
     }
 }
@@ -268,7 +268,7 @@ pub fn prepare(
         bevy::light::NotShadowReceiver,
     ));
     impostors.shadows = Some(shadows);
-    for kind in [Kind::Goomba, Kind::Scuttlebug] {
+    for kind in [Kind::Slime, Kind::Scuttlebug] {
         let meta = match read_meta(root, kind) {
             Ok(meta) => meta,
             Err(error) => {
@@ -320,7 +320,7 @@ pub fn prepare(
             bevy::light::NotShadowReceiver,
         ));
         match kind {
-            Kind::Goomba => impostors.goomba = Some(sheet),
+            Kind::Slime => impostors.slime = Some(sheet),
             Kind::Scuttlebug => impostors.scuttlebug = Some(sheet),
         }
     }
@@ -486,7 +486,7 @@ pub fn draw(
     // for a crowd of two thousand is a thing worth not doing sixty times a
     // second.
     if buffers.is_empty() {
-        *buffers = vec![(Kind::Goomba, Vec::new()), (Kind::Scuttlebug, Vec::new())];
+        *buffers = vec![(Kind::Slime, Vec::new()), (Kind::Scuttlebug, Vec::new())];
     }
     for (_, members) in buffers.iter_mut() {
         members.clear();
@@ -586,7 +586,7 @@ pub(crate) mod tests {
 
     fn meta() -> SheetMeta {
         SheetMeta {
-            model: "goomba".into(),
+            model: "slime".into(),
             cell_px: 128,
             angles: 16,
             frames: 16,
@@ -788,7 +788,7 @@ pub(crate) mod tests {
     ///
     /// What it deliberately does **not** claim to catch is the worst bug these
     /// sheets have had. The baker was running without `billboard::systems()`,
-    /// so the goomba's face and the scuttlebug's three billboard joints came out
+    /// so the scuttlebug's three billboard joints came out
     /// at the quarter scale the exporter bakes onto the skeleton rather than
     /// having it put back -- and single-sided, so they were culled from half the
     /// angles too. The sprites covered 52% of the pixels the models did and
@@ -801,7 +801,7 @@ pub(crate) mod tests {
     #[test]
     fn every_baked_cell_holds_a_whole_actor() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
-        for kind in [Kind::Goomba, Kind::Scuttlebug] {
+        for kind in [Kind::Slime, Kind::Scuttlebug] {
             let meta = read_meta(&root, kind).expect("a committed sheet failed to load");
             let path = root.join(SHEETS).join(format!("{}.png", stem(kind)));
             let (size, alpha) = png_alpha(&path);
@@ -898,17 +898,49 @@ pub(crate) mod tests {
         hangs
     }
 
+    /// What the sheets can and cannot settle about [`Kind::lift`].
+    ///
+    /// For the scuttlebug they settle it exactly, and that is the case the
+    /// constant was written for: its hang is a rig-root offset, the same on
+    /// every frame and from every angle, so the lowest opaque pixel of a cell
+    /// really is where the model stops.
+    ///
+    /// The slime taught us what the instrument cannot do, and it is worth
+    /// writing down rather than rediscovering. A sheet cell is a *silhouette*,
+    /// drawn by a camera tilted `ELEVATION` degrees down, so the near rim of a
+    /// wide body projects below where its own origin projects even when there
+    /// is nothing at all below it in world space -- and the measurement takes
+    /// the deepest frame of the walk, which for the slime is the middle of a
+    /// squash rather than anything it rests at. Between them those put the
+    /// slime at 0.33 m when the posed mesh says it rests on 0.000 and dips to
+    /// 0.177 for a few frames of `Scoot_Move`. Believing 0.33 would float a
+    /// 0.70 m creature by half its height to stop a squash touching the floor
+    /// it is squashing against.
+    ///
+    /// So what is asserted here is what remains true either way: a lift is
+    /// never more than the silhouette reaches, because a model held further up
+    /// than its own picture ever extends is a model hovering. The number
+    /// itself comes from `tools/measure_actor_hang.py`, which evaluates the
+    /// skinned mesh frame by frame and can tell a resting offset from a dip.
     #[test]
     fn the_lift_matches_what_the_baked_sheets_show() {
-        for kind in [Kind::Goomba, Kind::Scuttlebug] {
+        let measured = hang_in_sheet(Kind::Scuttlebug);
+        let claimed = Kind::Scuttlebug.lift();
+        assert!(
+            (measured - claimed).abs() < 0.02,
+            "the scuttlebug hangs {measured:.3} m below its origin in the \
+             sheets but `Kind::lift` claims {claimed:.3} m -- an enemy seated \
+             on the ground will be that far into it"
+        );
+        for kind in [Kind::Slime, Kind::Scuttlebug] {
             let measured = hang_in_sheet(kind);
             let claimed = kind.lift();
             assert!(
-                (measured - claimed).abs() < 0.02,
-                "{kind:?} hangs {measured:.3} m below its origin in the sheets \
-                 but `Kind::lift` claims {claimed:.3} m -- an enemy seated on \
-                 the ground will be that far into it"
+                claimed <= measured + 0.02,
+                "{kind:?} is lifted {claimed:.3} m but its silhouette only \
+                 ever reaches {measured:.3} m below its origin, so it hovers"
             );
+            assert!(claimed >= 0.0, "{kind:?} is lifted downwards");
         }
     }
 
@@ -941,7 +973,7 @@ pub(crate) mod tests {
             "build_windows.sh does not copy assets/{SHEETS}, so the packaged \
              game will draw no distant enemies at all"
         );
-        for kind in [Kind::Goomba, Kind::Scuttlebug] {
+        for kind in [Kind::Slime, Kind::Scuttlebug] {
             for suffix in ["png", "json"] {
                 let file = format!("{}.{suffix}", stem(kind));
                 assert!(
@@ -958,7 +990,7 @@ pub(crate) mod tests {
     #[test]
     fn the_committed_sheets_match_their_atlases() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
-        for kind in [Kind::Goomba, Kind::Scuttlebug] {
+        for kind in [Kind::Slime, Kind::Scuttlebug] {
             let meta = read_meta(&root, kind).expect("a committed sheet failed to load");
             let path = root.join(SHEETS).join(format!("{}.png", stem(kind)));
             assert_eq!(

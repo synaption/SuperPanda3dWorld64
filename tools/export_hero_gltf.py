@@ -89,7 +89,7 @@ def export(path=OUT):
 
     meshes = selected_for_export(rig)
     try:
-        bpy.ops.export_scene.gltf(
+        options = dict(
             filepath=path,
             export_format="GLB",
             use_selection=True,
@@ -107,6 +107,11 @@ def export(path=OUT):
             # drive action timing.
             export_optimize_animation_size=False,
         )
+        # Do not use Blender 5.2's export_armature_object_remove here. Rigify's
+        # DEF bones are constraint-driven and intentionally flat; removing the
+        # rig object makes Blender emit the meshes without any skin at all.
+        # adopt_blender_export normalizes this required root after export.
+        bpy.ops.export_scene.gltf(**options)
     finally:
         rig.data.pose_position = was_rest
         if eyes is not None and eyes_action is not None:

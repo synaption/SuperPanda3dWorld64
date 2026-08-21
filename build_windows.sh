@@ -58,7 +58,7 @@ cp "$REPO_ROOT/assets/bevy/castle.glb" "$REPO_ROOT/assets/bevy/water.png" \
 cp \
     "$REPO_ROOT/assets/actors/tree.glb" \
     "$REPO_ROOT/assets/actors/warp_pipe.glb" \
-    "$REPO_ROOT/assets/actors/goomba.glb" \
+    "$REPO_ROOT/assets/actors/slime.glb" \
     "$REPO_ROOT/assets/actors/scuttlebug.glb" \
     "$DIST_DIR/assets/actors/"
 cp "$REPO_ROOT/assets/hero/hero.glb" "$DIST_DIR/assets/hero/"

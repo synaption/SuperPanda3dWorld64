@@ -3,13 +3,43 @@
 > [Documentation home](README.md) · [Project guide](project-guide.md) ·
 > [Aiming and attack animation design](aim.md)
 
-Everything the game loads is committed under `assets/`. The tools here only
-need to run when the source data changes; a clone plays without them, and
-without the 12 GB of reference material they read from.
+## Source-of-truth policy
+
+Do not read, import, or regenerate anything from the original SM64 reference
+files. The committed Blender scenes and repository-native asset data are the
+sources of truth from now on. New models, rigs, animations, materials, level
+geometry, collision, textures, and audio must be authored directly or derived
+from those committed sources.
+
+The tools that parse the decomp, ROM extracts, or `reference/` remain only as
+historical migration utilities. They are not part of the supported pipeline
+and must not be called by export-all, packaging, or normal development. The
+active model path is:
+
+```text
+committed .blend source -> Blender 5.2 glTF export -> runtime .glb
+```
+
+Everything the game loads is committed under `assets/`. A clone plays and can
+rebuild its Blender-authored models without the old reference material.
 
 The tools are Python and stay Python. They do not ship with the game, they run
 once and write a file, and numpy plus a Blender install is a far better place
 to do mesh and animation surgery than the game's own language.
+
+The pipeline prefers the project-local Blender 5.2 LTS executable at
+`blender-5.2.0-linux-x64/blender`. `BLENDER=/path/to/blender` or the existing
+`--blender` options can override it. Blender 5.2's glTF exporter is configured
+to remove its redundant Armature object wrapper while retaining the standard
+skin joints, weights, and animations. The Hero is the deliberate exception:
+removing its Rigify object also removes its skin, so its specialized exporter
+retains the rig root and the adoption pass normalizes it.
+
+Legacy imported actor sources were normalized with
+`tools/convert_legacy_blend.py`: animated actors retain a conventional Blender
+Rig object and Armature modifier, while static actors have deformation baked
+and contain no armature. This conversion is only for old SM64 imports; new
+models should be authored normally in Blender and do not need it.
 
 ## What is committed
 
@@ -31,8 +61,9 @@ assets/
     textures/                    the 21 PNGs those groups reference (2.9 MB)
   mario/          mario.glb + mario_clips.json   (209 animations)
   hero/           hero.glb + hero_clips.json     (20 animations, 53 joints)
-  actors/         goomba, scuttlebug, tree, warp_pipe; a clips sidecar each
-                  where the actor animates
+  actors/         slime, scuttlebug, tree, warp_pipe; a clips sidecar each
+                  where the actor animates. goomba.* is the retired enemy the
+                  slime replaced, kept as source rather than loaded.
   sounds/mario64/ full source library plus 57 runtime WAVs and .source marker
   sounds/se_zelda, sounds/vc_zelda   the Hero's effect and voice sets
 ```
@@ -54,14 +85,20 @@ For a rigged actor, export to a temporary GLB and run the adoption pass so
 Blender's armature wrapper is normalized and the clip sidecar stays current:
 
 ```bash
-python3 tools/blend_to_glb.py assets/actors/goomba.blend -o /tmp/goomba.glb
-python3 tools/adopt_blender_export.py /tmp/goomba.glb \
-    --out assets/actors/goomba.glb \
-    --sidecar assets/actors/goomba_clips.json
+python3 tools/blend_to_glb.py assets/actors/slime.blend -o /tmp/slime.glb
+python3 tools/adopt_blender_export.py /tmp/slime.glb \
+    --out assets/actors/slime.glb \
+    --sidecar assets/actors/slime_clips.json \
+    --skeleton-root Slime_Rig
 ```
 
+`--skeleton-root` is only needed where the armature is not called `armature`,
+which is what the decomp exporter names it. The slime was authored in Blender
+and its rig is `Slime_Rig`; `tools/export_all_actors.py` carries the same map so
+the batch export does not need it spelled out.
+
 To export every Blender-authored model currently loaded by the game—Mario,
-Hero, castle grounds, and all four runtime actors—run:
+Hero, castle grounds, and the runtime actors—run:
 
 ```bash
 python3 tools/export_all_blender_assets.py
@@ -69,7 +106,7 @@ python3 tools/export_all_blender_assets.py
 
 The Hero source needs Blender 5.x. Successful exports replace the GLBs the
 game already loads; no Rust changes or asset registration step is required.
-`tools/export_all_actors.py` remains available when only the four files under
+`tools/export_all_actors.py` remains available when only the files under
 `assets/actors/` should be rebuilt. Weapons are excluded because the game does
 not currently load them.
 
@@ -108,9 +145,51 @@ decomp said rather than something the runtime consults. They are kept current
 anyway: the data cannot be recovered from a `.glb` at all, and the moves still
 to port are the ones that will want it.
 
-## Regenerating
+## The slime
 
-All of these read from `reference/` and write into `assets/`.
+The one enemy that is not a decomp export. It came from a bought model pack —
+`Slime.blend` and a GLB, ten authored animations, one dome mesh in two material
+groups — and it replaced the goomba, whose decomp-derived rig and billboarded
+face made it awkward to edit in Blender at all.
+
+Three things had to be reconciled with the rest of the pipeline, and all three
+live in `enemy::Kind` rather than in the asset, because they are facts about
+where the model came from:
+
+- **Scale.** The decomp actors are in SM64 units, a hundred to the metre, and
+  are drawn at 1/100. The slime is authored at metre scale, one unit tall.
+  `Kind::draw_scale` carries the difference. Its 0.7 is not a look: the mesh is
+  a unit-radius dome, so 0.7 of it is exactly the 0.70 m collision radius the
+  crowd's spacing is measured in, and a model wider than the cylinder that
+  spaces it is a crowd that visibly interpenetrates.
+- **Which clip is the walk.** A decomp actor has exactly one animation, so
+  `#Animation0` was never a choice. The slime has ten, and the game wants
+  `Scoot_Move` — index 6. Blender writes actions out alphabetically, so adding
+  one animation renumbers the rest; `the_clip_index_is_still_the_walk` pins the
+  index to the name so that is a failing test rather than a crowd pulling
+  faces on the spot.
+- **Materials.** The pack ships the body as `BLEND` at 56% alpha. Faithful to a
+  slime and ruinous to a field of two thousand — a translucent surface is a
+  sorted draw that cannot join the opaque pass — so it was flattened to opaque
+  when the runtime GLB was first made, and `slime.blend` carries that.
+
+The impostor sheets are per-model and had to be rebaked:
+
+```bash
+cargo run --release -- bake-impostors slime
+```
+
+The pack itself lives in `reference/slime-pack/`, which is not tracked. Its
+licence permits integrating it into a project and forbids redistributing the
+pack, so the derived `assets/actors/slime.glb` and `slime.blend` are what is
+committed. That distinction matters before publishing this repository anywhere,
+alongside the note about the Nintendo-derived assets above.
+
+## Legacy migration commands
+
+The commands in this section document how the initial conversion was made.
+They read from `reference/` and are no longer an approved regeneration path.
+Do not use them for current assets.
 
 ```bash
 python3 tools/parse_collision.py \

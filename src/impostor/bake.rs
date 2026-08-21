@@ -3,7 +3,7 @@
 //! Run it with
 //!
 //! ```text
-//! cargo run --release -- bake-impostors [goomba|scuttlebug]
+//! cargo run --release -- bake-impostors [slime|scuttlebug]
 //! ```
 //!
 //! and it writes `assets/impostors/<kind>.png` and `<kind>.json`.
@@ -74,7 +74,7 @@ const FRAMES: usize = 16;
 /// How far the camera is tilted down towards the model, in degrees.
 ///
 /// The playing camera sits above the player and looks slightly down, so a sheet
-/// baked dead level would show a goomba's face where the game shows the top of
+/// baked dead level would show an enemy's face where the game shows the top of
 /// its head. Fifteen degrees is roughly where the follow camera sits at the
 /// distance the swap happens.
 const ELEVATION: f32 = 15.0;
@@ -235,8 +235,11 @@ fn setup(
         crate::billboard::BillboardActor,
         crate::WorldAssetRoot(assets.load(format!("{}#Scene0", model(bake.kind)))),
         // The same scale the game spawns these at, so the world units the
-        // camera measures are the game's world units.
-        Transform::from_scale(Vec3::splat(0.01)),
+        // camera measures are the game's world units. Asked of the kind rather
+        // than written here: the two actors are authored at different scales,
+        // and a sheet baked at the wrong one is a sprite that changes size at
+        // the swap distance.
+        Transform::from_scale(Vec3::splat(bake.kind.draw_scale())),
     ));
 }
 
@@ -276,7 +279,11 @@ fn claim(
     let Ok(player) = players.single() else {
         return;
     };
-    let handle: Handle<AnimationClip> = assets.load(format!("{}#Animation0", model(bake.kind)));
+    let handle: Handle<AnimationClip> = assets.load(format!(
+        "{}#Animation{}",
+        model(bake.kind),
+        bake.kind.clip()
+    ));
     let Some(clip) = clips.get(&handle) else {
         return;
     };

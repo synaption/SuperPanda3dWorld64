@@ -46,7 +46,7 @@ const WIDTH: usize = 96;
 /// centres, which are further apart than a walking step: this is what makes the
 /// field refuse to route a crowd off the castle wall or up a cliff. Without it
 /// the sweep happily walks up sheer faces and the flow points a thousand
-/// goombas at a wall.
+/// slimes at a wall.
 const CLIMB: f32 = 1.2;
 
 /// How high off the ground the survey looks for something in the way.
@@ -254,7 +254,7 @@ impl FlowField {
     /// cell's own height puts every enemy in a cell at the height of that
     /// cell's centre, so on a slope half of them stand buried and the other
     /// half float, by up to half the drop across a cell. Measured on the
-    /// castle that was 0.46 m of average error against a goomba 0.9 m tall --
+    /// castle that was 0.46 m of average error against a slime 0.7 m tall --
     /// enemies sinking into hillsides and popping back out, which reads exactly
     /// like the crowd flickering in and out of existence.
     pub fn at(&self, at: Vec3) -> Guidance {
@@ -673,7 +673,7 @@ mod tests {
     ///
     /// Before it, 35 of the field's 4,390 routes crossed something the near
     /// tier would have been stopped by -- few in the count, but each one is a
-    /// stream of goombas walking through a fence somebody is standing next to.
+    /// stream of slimes walking through a fence somebody is standing next to.
     #[test]
     fn the_flow_never_routes_through_a_wall() {
         let (level, _) = crate::level::load();

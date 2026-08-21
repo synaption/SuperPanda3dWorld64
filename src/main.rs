@@ -140,13 +140,13 @@ fn main() {
     log_panics_to_a_file();
     // The impostor baker runs inside the game rather than beside it, so that
     // the sprites it draws are lit by the same material the skinned models are.
-    // `cargo run --release -- bake-impostors [goomba|scuttlebug]`.
+    // `cargo run --release -- bake-impostors [slime|scuttlebug]`.
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.first().map(String::as_str) == Some("bake-impostors") {
         let named: Vec<enemy::Kind> = arguments[1..]
             .iter()
             .filter_map(|word| match word.to_ascii_lowercase().as_str() {
-                "goomba" => Some(enemy::Kind::Goomba),
+                "slime" => Some(enemy::Kind::Slime),
                 "scuttlebug" => Some(enemy::Kind::Scuttlebug),
                 other => {
                     eprintln!("bake-impostors: {other:?} is not an actor with a sheet");
@@ -154,7 +154,7 @@ fn main() {
                 }
             })
             .collect();
-        let all = [enemy::Kind::Goomba, enemy::Kind::Scuttlebug];
+        let all = [enemy::Kind::Slime, enemy::Kind::Scuttlebug];
         impostor::bake::run(if named.is_empty() { &all } else { &named });
         return;
     }
@@ -284,8 +284,8 @@ pub fn game_systems(app: &mut App) {
 ///
 /// A named chain rather than three calls at each site, because **the impostor
 /// baker has to run exactly this and getting it wrong is invisible.** It did:
-/// the baker was drawing actors without the billboard half, so the goomba's
-/// face and the scuttlebug's three billboard joints came out at a quarter of
+/// the baker was drawing actors without the billboard half, so the
+/// scuttlebug's three billboard joints came out at a quarter of
 /// their size -- `billboard::aim` is what puts back the 0.25 the exporter bakes
 /// onto the skeleton -- and single-sided, so they were culled from half the
 /// angles. The sheets that came out covered 52% of the pixels the real models
@@ -535,9 +535,9 @@ fn setup(
     ));
 
     let spawns = [
-        (enemy::Kind::Goomba, Vec3::new(-3., 3., 26.)),
-        (enemy::Kind::Goomba, Vec3::new(-24., 3., 29.)),
-        (enemy::Kind::Goomba, Vec3::new(9., 3., 34.)),
+        (enemy::Kind::Slime, Vec3::new(-3., 3., 26.)),
+        (enemy::Kind::Slime, Vec3::new(-24., 3., 29.)),
+        (enemy::Kind::Slime, Vec3::new(9., 3., 34.)),
         (enemy::Kind::Scuttlebug, Vec3::new(-29., 3., 21.)),
         (enemy::Kind::Scuttlebug, Vec3::new(4., 3., 19.)),
     ];
@@ -558,7 +558,7 @@ fn setup(
     let pipes = [
         (pipe::Spawn::Mario, Vec3::new(-9.15, 2.6, 46.3)),
         (
-            pipe::Spawn::Enemy(enemy::Kind::Goomba),
+            pipe::Spawn::Enemy(enemy::Kind::Slime),
             Vec3::new(-55.1, 5.4, -39.2),
         ),
         (
@@ -1090,8 +1090,8 @@ mod tests {
 
     /// The warp pipes have to actually populate the world.
     ///
-    /// Each pipe fires every few seconds and its goomba walks straight at the
-    /// player. Before the combat rules were ported in full, that goomba threw
+    /// Each pipe fires every few seconds and its slime walks straight at the
+    /// player. Before the combat rules were ported in full, that slime threw
     /// a player who was doing nothing at all into the air and was then stomped
     /// by his own descent -- so every pipe emptied itself within seconds and
     /// the pipes looked like they spawned nothing. Twenty-five seconds is
@@ -1151,7 +1151,7 @@ mod tests {
 
     /// Each pipe produces its own thing, and throws it clear of itself.
     ///
-    /// Three pipes and three different broods: goombas out of one, scuttlebugs
+    /// Three pipes and three different broods: slimes out of one, scuttlebugs
     /// out of another, and Marios out of the one on the castle path. And every
     /// one of them is *thrown* -- it goes up out of the barrel and comes down
     /// somewhere else -- so a brood that never left the ground, or one that
@@ -1206,7 +1206,7 @@ mod tests {
         for enemy in enemies.iter(app.world()) {
             *after.entry(enemy.kind).or_insert(0) += 1;
         }
-        for kind in [enemy::Kind::Goomba, enemy::Kind::Scuttlebug] {
+        for kind in [enemy::Kind::Slime, enemy::Kind::Scuttlebug] {
             let (was, now) = (before.get(&kind).copied(), after.get(&kind).copied());
             assert!(
                 now > was,

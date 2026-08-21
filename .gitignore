@@ -73,3 +73,5 @@ Thumbs.db
 desktop.ini
 
 *.exe
+
+blender-5.2.0-linux-x64/*
