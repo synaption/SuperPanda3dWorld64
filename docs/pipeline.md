@@ -40,6 +40,39 @@ assets/
 `hero.glb` is built out of Blender rather than out of the decomp, so it goes
 through a different pipeline — see [Exporting the Hero](#exporting-the-hero).
 
+Every primary 3D asset also has a committed, self-contained Blender source.
+Run `python3 tools/build_blender_sources.py --check` to audit that invariant.
+The files under `assets/packs/reference/` are packaged copies, not separate
+authoring assets, and intentionally share the primary asset's source. New
+models can be adopted once with `python3 tools/build_blender_sources.py`; edit
+and export their `.blend` files after that instead of returning to the SM64
+decomp exporter. Special pipelines retain their established source names:
+`castle.glb` uses `castle_grounds.blend`, and both Hero GLBs use
+`TheHero.blend`.
+
+For a rigged actor, export to a temporary GLB and run the adoption pass so
+Blender's armature wrapper is normalized and the clip sidecar stays current:
+
+```bash
+python3 tools/blend_to_glb.py assets/actors/goomba.blend -o /tmp/goomba.glb
+python3 tools/adopt_blender_export.py /tmp/goomba.glb \
+    --out assets/actors/goomba.glb \
+    --sidecar assets/actors/goomba_clips.json
+```
+
+To export every Blender-authored model currently loaded by the game—Mario,
+Hero, castle grounds, and all four runtime actors—run:
+
+```bash
+python3 tools/export_all_blender_assets.py
+```
+
+The Hero source needs Blender 5.x. Successful exports replace the GLBs the
+game already loads; no Rust changes or asset registration step is required.
+`tools/export_all_actors.py` remains available when only the four files under
+`assets/actors/` should be rebuilt. Weapons are excluded because the game does
+not currently load them.
+
 The textures are copied in by `parse_f3d.py` rather than referenced in place.
 They used to point back into `reference/RENDER96-HD-TEXTURE-PACK/`, which is 12
 GB of third-party material that cannot be tracked — so a fresh clone parsed

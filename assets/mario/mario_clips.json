@@ -18,7 +18,7 @@
     "start_frame": 0
   },
   "anim_03": {
-    "frames": 62,
+    "frames": 63,
     "loop_end": 62,
     "loop_start": 0,
     "start_frame": 0
@@ -48,7 +48,7 @@
     "start_frame": 0
   },
   "anim_08": {
-    "frames": 19,
+    "frames": 20,
     "loop_end": 19,
     "loop_start": 0,
     "start_frame": 1
@@ -60,7 +60,7 @@
     "start_frame": 0
   },
   "anim_0A": {
-    "frames": 35,
+    "frames": 36,
     "loop_end": 35,
     "loop_start": 0,
     "start_frame": 0
@@ -96,19 +96,19 @@
     "start_frame": 0
   },
   "anim_10": {
-    "frames": 17,
+    "frames": 18,
     "loop_end": 17,
     "loop_start": 0,
     "start_frame": 1
   },
   "anim_11": {
-    "frames": 15,
+    "frames": 16,
     "loop_end": 15,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_12": {
-    "frames": 17,
+    "frames": 18,
     "loop_end": 17,
     "loop_start": 0,
     "start_frame": 0
@@ -132,25 +132,25 @@
     "start_frame": 0
   },
   "anim_16": {
-    "frames": 99,
+    "frames": 100,
     "loop_end": 99,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_17": {
-    "frames": 75,
+    "frames": 76,
     "loop_end": 75,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_18": {
-    "frames": 99,
+    "frames": 100,
     "loop_end": 99,
     "loop_start": 0,
     "start_frame": 42
   },
   "anim_19": {
-    "frames": 85,
+    "frames": 86,
     "loop_end": 85,
     "loop_start": 0,
     "start_frame": 0
@@ -162,7 +162,7 @@
     "start_frame": 0
   },
   "anim_1B": {
-    "frames": 62,
+    "frames": 63,
     "loop_end": 62,
     "loop_start": 0,
     "start_frame": 0
@@ -174,13 +174,13 @@
     "start_frame": 0
   },
   "anim_1D": {
-    "frames": 34,
+    "frames": 35,
     "loop_end": 34,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_1E": {
-    "frames": 29,
+    "frames": 30,
     "loop_end": 29,
     "loop_start": 0,
     "start_frame": 0
@@ -198,7 +198,7 @@
     "start_frame": 0
   },
   "anim_21": {
-    "frames": 34,
+    "frames": 35,
     "loop_end": 34,
     "loop_start": 0,
     "start_frame": 0
@@ -210,7 +210,7 @@
     "start_frame": 0
   },
   "anim_23": {
-    "frames": 99,
+    "frames": 100,
     "loop_end": 99,
     "loop_start": 0,
     "start_frame": 0
@@ -222,13 +222,13 @@
     "start_frame": 0
   },
   "anim_25": {
-    "frames": 99,
+    "frames": 100,
     "loop_end": 99,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_26": {
-    "frames": 93,
+    "frames": 94,
     "loop_end": 93,
     "loop_start": 0,
     "start_frame": 0
@@ -252,13 +252,13 @@
     "start_frame": 0
   },
   "anim_2A": {
-    "frames": 39,
+    "frames": 40,
     "loop_end": 39,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_2B": {
-    "frames": 39,
+    "frames": 40,
     "loop_end": 39,
     "loop_start": 0,
     "start_frame": 0
@@ -276,13 +276,13 @@
     "start_frame": 0
   },
   "anim_2E": {
-    "frames": 46,
+    "frames": 47,
     "loop_end": 46,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_2F": {
-    "frames": 99,
+    "frames": 100,
     "loop_end": 99,
     "loop_start": 0,
     "start_frame": 0
@@ -294,7 +294,7 @@
     "start_frame": 0
   },
   "anim_31": {
-    "frames": 139,
+    "frames": 140,
     "loop_end": 139,
     "loop_start": 0,
     "start_frame": 0
@@ -306,31 +306,31 @@
     "start_frame": 0
   },
   "anim_33": {
-    "frames": 49,
+    "frames": 50,
     "loop_end": 49,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_34": {
-    "frames": 15,
+    "frames": 16,
     "loop_end": 15,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_35": {
-    "frames": 53,
+    "frames": 54,
     "loop_end": 53,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_36": {
-    "frames": 45,
+    "frames": 46,
     "loop_end": 45,
     "loop_start": 0,
     "start_frame": 10
   },
   "anim_37": {
-    "frames": 99,
+    "frames": 100,
     "loop_end": 99,
     "loop_start": 0,
     "start_frame": 0
@@ -342,7 +342,7 @@
     "start_frame": 0
   },
   "anim_39": {
-    "frames": 154,
+    "frames": 155,
     "loop_end": 154,
     "loop_start": 0,
     "start_frame": 0
@@ -354,7 +354,7 @@
     "start_frame": 0
   },
   "anim_3B": {
-    "frames": 15,
+    "frames": 16,
     "loop_end": 15,
     "loop_start": 0,
     "start_frame": 0
@@ -372,13 +372,13 @@
     "start_frame": 10
   },
   "anim_3E": {
-    "frames": 154,
+    "frames": 155,
     "loop_end": 154,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_3F": {
-    "frames": 60,
+    "frames": 61,
     "loop_end": 60,
     "loop_start": 0,
     "start_frame": 0
@@ -396,7 +396,7 @@
     "start_frame": 0
   },
   "anim_42": {
-    "frames": 15,
+    "frames": 16,
     "loop_end": 15,
     "loop_start": 0,
     "start_frame": 2
@@ -432,13 +432,13 @@
     "start_frame": 0
   },
   "anim_48": {
-    "frames": 76,
+    "frames": 77,
     "loop_end": 76,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_49": {
-    "frames": 15,
+    "frames": 16,
     "loop_end": 15,
     "loop_start": 0,
     "start_frame": 0
@@ -450,7 +450,7 @@
     "start_frame": 0
   },
   "anim_4B": {
-    "frames": 17,
+    "frames": 18,
     "loop_end": 17,
     "loop_start": 0,
     "start_frame": 0
@@ -504,13 +504,13 @@
     "start_frame": 0
   },
   "anim_54": {
-    "frames": 29,
+    "frames": 30,
     "loop_end": 29,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_55": {
-    "frames": 151,
+    "frames": 152,
     "loop_end": 151,
     "loop_start": 0,
     "start_frame": 0
@@ -522,13 +522,13 @@
     "start_frame": 0
   },
   "anim_57": {
-    "frames": 23,
+    "frames": 24,
     "loop_end": 23,
     "loop_start": 0,
     "start_frame": 9
   },
   "anim_58": {
-    "frames": 19,
+    "frames": 20,
     "loop_end": 19,
     "loop_start": 0,
     "start_frame": 0
@@ -552,7 +552,7 @@
     "start_frame": 0
   },
   "anim_5C": {
-    "frames": 19,
+    "frames": 20,
     "loop_end": 19,
     "loop_start": 0,
     "start_frame": 0
@@ -564,7 +564,7 @@
     "start_frame": 0
   },
   "anim_5E": {
-    "frames": 154,
+    "frames": 155,
     "loop_end": 154,
     "loop_start": 0,
     "start_frame": 0
@@ -576,7 +576,7 @@
     "start_frame": 0
   },
   "anim_60": {
-    "frames": 49,
+    "frames": 50,
     "loop_end": 49,
     "loop_start": 0,
     "start_frame": 0
@@ -600,7 +600,7 @@
     "start_frame": 0
   },
   "anim_64": {
-    "frames": 17,
+    "frames": 18,
     "loop_end": 17,
     "loop_start": 0,
     "start_frame": 0
@@ -612,7 +612,7 @@
     "start_frame": 0
   },
   "anim_66": {
-    "frames": 25,
+    "frames": 26,
     "loop_end": 25,
     "loop_start": 0,
     "start_frame": 0
@@ -654,13 +654,13 @@
     "start_frame": 0
   },
   "anim_6D": {
-    "frames": 17,
+    "frames": 18,
     "loop_end": 17,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_6E": {
-    "frames": 15,
+    "frames": 16,
     "loop_end": 15,
     "loop_start": 0,
     "start_frame": 0
@@ -678,43 +678,43 @@
     "start_frame": 0
   },
   "anim_71": {
-    "frames": 23,
+    "frames": 24,
     "loop_end": 23,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_72": {
-    "frames": 71,
+    "frames": 72,
     "loop_end": 71,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_73": {
-    "frames": 71,
+    "frames": 72,
     "loop_end": 71,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_74": {
-    "frames": 23,
+    "frames": 24,
     "loop_end": 23,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_75": {
-    "frames": 23,
+    "frames": 24,
     "loop_end": 23,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_76": {
-    "frames": 99,
+    "frames": 100,
     "loop_end": 99,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_77": {
-    "frames": 99,
+    "frames": 100,
     "loop_end": 99,
     "loop_start": 0,
     "start_frame": 0
@@ -738,19 +738,19 @@
     "start_frame": 0
   },
   "anim_7B": {
-    "frames": 29,
+    "frames": 30,
     "loop_end": 29,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_7C": {
-    "frames": 29,
+    "frames": 30,
     "loop_end": 29,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_7D": {
-    "frames": 39,
+    "frames": 40,
     "loop_end": 39,
     "loop_start": 0,
     "start_frame": 0
@@ -762,19 +762,19 @@
     "start_frame": 0
   },
   "anim_7F": {
-    "frames": 62,
+    "frames": 63,
     "loop_end": 62,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_80": {
-    "frames": 62,
+    "frames": 63,
     "loop_end": 62,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_81": {
-    "frames": 49,
+    "frames": 50,
     "loop_end": 49,
     "loop_start": 0,
     "start_frame": 0
@@ -786,49 +786,49 @@
     "start_frame": 0
   },
   "anim_83": {
-    "frames": 58,
+    "frames": 59,
     "loop_end": 58,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_84": {
-    "frames": 62,
+    "frames": 63,
     "loop_end": 62,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_85": {
-    "frames": 39,
+    "frames": 40,
     "loop_end": 39,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_86": {
-    "frames": 39,
+    "frames": 40,
     "loop_end": 39,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_87": {
-    "frames": 49,
+    "frames": 50,
     "loop_end": 49,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_88": {
-    "frames": 19,
+    "frames": 20,
     "loop_end": 19,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_89": {
-    "frames": 19,
+    "frames": 20,
     "loop_end": 19,
     "loop_start": 0,
     "start_frame": 18
   },
   "anim_8A": {
-    "frames": 39,
+    "frames": 40,
     "loop_end": 39,
     "loop_start": 0,
     "start_frame": 0
@@ -858,7 +858,7 @@
     "start_frame": 0
   },
   "anim_8F": {
-    "frames": 19,
+    "frames": 20,
     "loop_end": 19,
     "loop_start": 0,
     "start_frame": 1
@@ -876,7 +876,7 @@
     "start_frame": 0
   },
   "anim_92": {
-    "frames": 115,
+    "frames": 116,
     "loop_end": 115,
     "loop_start": 0,
     "start_frame": 27
@@ -918,7 +918,7 @@
     "start_frame": 0
   },
   "anim_99": {
-    "frames": 91,
+    "frames": 92,
     "loop_end": 91,
     "loop_start": 0,
     "start_frame": 0
@@ -936,25 +936,25 @@
     "start_frame": 0
   },
   "anim_9C": {
-    "frames": 62,
+    "frames": 63,
     "loop_end": 62,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_9D": {
-    "frames": 25,
+    "frames": 26,
     "loop_end": 25,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_9E": {
-    "frames": 49,
+    "frames": 50,
     "loop_end": 49,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_9F": {
-    "frames": 15,
+    "frames": 16,
     "loop_end": 15,
     "loop_start": 0,
     "start_frame": 0
@@ -966,7 +966,7 @@
     "start_frame": 0
   },
   "anim_A1": {
-    "frames": 23,
+    "frames": 24,
     "loop_end": 23,
     "loop_start": 0,
     "start_frame": 0
@@ -978,13 +978,13 @@
     "start_frame": 0
   },
   "anim_A3": {
-    "frames": 29,
+    "frames": 30,
     "loop_end": 29,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_A4": {
-    "frames": 29,
+    "frames": 30,
     "loop_end": 29,
     "loop_start": 0,
     "start_frame": 0
@@ -996,25 +996,25 @@
     "start_frame": 0
   },
   "anim_A6": {
-    "frames": 69,
+    "frames": 70,
     "loop_end": 69,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_A7": {
-    "frames": 39,
+    "frames": 40,
     "loop_end": 39,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_A8": {
-    "frames": 49,
+    "frames": 50,
     "loop_end": 49,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_A9": {
-    "frames": 19,
+    "frames": 20,
     "loop_end": 19,
     "loop_start": 0,
     "start_frame": 0
@@ -1032,7 +1032,7 @@
     "start_frame": 0
   },
   "anim_AC": {
-    "frames": 23,
+    "frames": 24,
     "loop_end": 23,
     "loop_start": 0,
     "start_frame": 8
@@ -1062,13 +1062,13 @@
     "start_frame": 0
   },
   "anim_B1": {
-    "frames": 27,
+    "frames": 28,
     "loop_end": 27,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_B2": {
-    "frames": 29,
+    "frames": 30,
     "loop_end": 29,
     "loop_start": 0,
     "start_frame": 0
@@ -1080,31 +1080,31 @@
     "start_frame": 0
   },
   "anim_B4": {
-    "frames": 23,
+    "frames": 24,
     "loop_end": 23,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_B5": {
-    "frames": 19,
+    "frames": 20,
     "loop_end": 19,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_B6": {
-    "frames": 19,
+    "frames": 20,
     "loop_end": 19,
     "loop_start": 0,
     "start_frame": 18
   },
   "anim_B7": {
-    "frames": 39,
+    "frames": 40,
     "loop_end": 39,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_B8": {
-    "frames": 49,
+    "frames": 50,
     "loop_end": 49,
     "loop_start": 0,
     "start_frame": 0
@@ -1116,7 +1116,7 @@
     "start_frame": 0
   },
   "anim_BA": {
-    "frames": 19,
+    "frames": 20,
     "loop_end": 19,
     "loop_start": 0,
     "start_frame": 0
@@ -1134,7 +1134,7 @@
     "start_frame": 0
   },
   "anim_BD": {
-    "frames": 17,
+    "frames": 18,
     "loop_end": 17,
     "loop_start": 0,
     "start_frame": 1
@@ -1146,19 +1146,19 @@
     "start_frame": 0
   },
   "anim_BF": {
-    "frames": 23,
+    "frames": 24,
     "loop_end": 23,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_C0": {
-    "frames": 31,
+    "frames": 32,
     "loop_end": 31,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_C1": {
-    "frames": 35,
+    "frames": 36,
     "loop_end": 35,
     "loop_start": 0,
     "start_frame": 0
@@ -1170,37 +1170,37 @@
     "start_frame": 0
   },
   "anim_C3": {
-    "frames": 29,
+    "frames": 30,
     "loop_end": 29,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_C4": {
-    "frames": 29,
+    "frames": 30,
     "loop_end": 29,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_C5": {
-    "frames": 29,
+    "frames": 30,
     "loop_end": 29,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_C6": {
-    "frames": 49,
+    "frames": 50,
     "loop_end": 49,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_C7": {
-    "frames": 49,
+    "frames": 50,
     "loop_end": 49,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_C8": {
-    "frames": 19,
+    "frames": 20,
     "loop_end": 19,
     "loop_start": 0,
     "start_frame": 6
@@ -1212,7 +1212,7 @@
     "start_frame": 0
   },
   "anim_CA": {
-    "frames": 29,
+    "frames": 30,
     "loop_end": 29,
     "loop_start": 0,
     "start_frame": 25
@@ -1230,13 +1230,13 @@
     "start_frame": 0
   },
   "anim_CD": {
-    "frames": 62,
+    "frames": 63,
     "loop_end": 62,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_CE": {
-    "frames": 17,
+    "frames": 18,
     "loop_end": 17,
     "loop_start": 0,
     "start_frame": 0
@@ -1254,7 +1254,7 @@
     "start_frame": 0
   },
   "anim_skate_glide": {
-    "frames": 29,
+    "frames": 30,
     "loop_end": 29,
     "loop_start": 0,
     "start_frame": 0
@@ -1266,13 +1266,13 @@
     "start_frame": 0
   },
   "anim_zombie_idle": {
-    "frames": 39,
+    "frames": 40,
     "loop_end": 39,
     "loop_start": 0,
     "start_frame": 0
   },
   "anim_zombie_walk": {
-    "frames": 39,
+    "frames": 40,
     "loop_end": 39,
     "loop_start": 0,
     "start_frame": 0

@@ -4,5 +4,11 @@
     "loop_end": 50,
     "loop_start": 0,
     "start_frame": 0
+  },
+  "scuttlebug_seg6_anim_0601504C_Armature": {
+    "frames": 50,
+    "loop_end": 50,
+    "loop_start": 0,
+    "start_frame": 0
   }
 }

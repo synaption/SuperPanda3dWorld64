@@ -4,5 +4,11 @@
     "loop_end": 30,
     "loop_start": 0,
     "start_frame": 0
+  },
+  "goomba_seg8_anim_0801DA34_Armature": {
+    "frames": 30,
+    "loop_end": 30,
+    "loop_start": 0,
+    "start_frame": 0
   }
 }

@@ -12,13 +12,13 @@
     "start_frame": 0
   },
   "Attack 2 baked": {
-    "frames": 31,
+    "frames": 32,
     "loop_end": 31,
     "loop_start": 0,
     "start_frame": 0
   },
   "Idle ": {
-    "frames": 30,
+    "frames": 31,
     "loop_end": 30,
     "loop_start": 0,
     "start_frame": 0
@@ -36,37 +36,43 @@
     "start_frame": 0
   },
   "Spin Kick": {
-    "frames": 46,
+    "frames": 47,
     "loop_end": 46,
     "loop_start": 0,
     "start_frame": 0
   },
   "Walk Var happy": {
-    "frames": 39,
+    "frames": 40,
     "loop_end": 39,
     "loop_start": 0,
     "start_frame": 0
   },
+  "_run": {
+    "frames": 44,
+    "loop_end": 44,
+    "loop_start": 0,
+    "start_frame": 0
+  },
   "attack 1 Stepped": {
-    "frames": 39,
+    "frames": 40,
     "loop_end": 39,
     "loop_start": 0,
     "start_frame": 0
   },
   "idle normal": {
-    "frames": 30,
+    "frames": 31,
     "loop_end": 30,
     "loop_start": 0,
     "start_frame": 0
   },
   "idle var": {
-    "frames": 23,
+    "frames": 24,
     "loop_end": 23,
     "loop_start": 0,
     "start_frame": 0
   },
   "jump Heavy": {
-    "frames": 19,
+    "frames": 20,
     "loop_end": 19,
     "loop_start": 0,
     "start_frame": 0
@@ -78,13 +84,13 @@
     "start_frame": 0
   },
   "jump Impact": {
-    "frames": 23,
+    "frames": 24,
     "loop_end": 23,
     "loop_start": 0,
     "start_frame": 0
   },
   "jump all": {
-    "frames": 84,
+    "frames": 85,
     "loop_end": 84,
     "loop_start": 0,
     "start_frame": 0
@@ -114,7 +120,7 @@
     "start_frame": 0
   },
   "walk Var1": {
-    "frames": 39,
+    "frames": 40,
     "loop_end": 39,
     "loop_start": 0,
     "start_frame": 0
