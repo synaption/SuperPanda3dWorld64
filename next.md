@@ -11,7 +11,6 @@ bigger hit box/valid attack area
 
 is it possible for some items to not be vertex shaded?  
 
-esc menue should be mouse interactive.  
 vars in the console should spawn sliders like the panda3d did
 get rid of everything that pulls assets from sm64.  Just keep the assets that have already been pulled and not the code to pull them.  
 

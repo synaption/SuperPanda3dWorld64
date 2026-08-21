@@ -36,6 +36,33 @@ const UV_SCALE: f32 = 1.0 / 20.48;
 const DRIFT_SPEED: f32 = 0.25;
 const DRIFT_DIRECTIONS: [Vec2; 2] = [Vec2::new(0.60, 0.80), Vec2::new(-0.80, 0.60)];
 
+/// The castle waterfall is not a collision water box. It is SM64's separate
+/// 15-vertex `MOVTEX_CASTLE_WATERFALL` mesh, whose first texture coordinate is
+/// advanced by 70/1024 of a repeat on every 30 Hz game tick.
+const WATERFALL_UV_SPEED: f32 = 70.0 * 30.0 / 1024.0;
+const WATERFALL_ALPHA: f32 = 0xb4 as f32 / 255.0;
+const WATERFALL_VERTICES: [[i16; 5]; 15] = [
+    [-4469, -800, -6413, 0, 0],
+    [-5525, 1171, -7026, 2, 0],
+    [-6292, 2028, -7463, 4, 0],
+    [-7302, 2955, -7461, 6, 0],
+    [-4883, -800, -5690, 0, 3],
+    [-5547, 1110, -6097, 2, 3],
+    [-6732, 2587, -6770, 4, 3],
+    [-7603, 3004, -7160, 6, 3],
+    [-5580, -800, -4740, 0, 6],
+    [-6205, 1068, -5347, 2, 6],
+    [-7249, 2566, -6192, 4, 6],
+    [-6895, -800, -4714, 0, 9],
+    [-7201, 1083, -5071, 2, 9],
+    [-7578, 2042, -5766, 4, 9],
+    [-8132, 2961, -6761, 6, 9],
+];
+const WATERFALL_INDICES: [u32; 51] = [
+    0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5, 2, 3, 6, 3, 7, 6, 4, 5, 9, 4, 9, 8, 5, 6, 9, 6, 10, 9, 6,
+    7, 10, 8, 9, 12, 8, 12, 11, 9, 10, 13, 9, 13, 12, 10, 7, 14, 10, 14, 13,
+];
+
 /// Sky and underwater colours, shared with the fog and the clear colour.
 pub const SKY_COLOUR: Color = Color::srgb(0.32, 0.60, 0.86);
 pub const UNDERWATER_COLOUR: Color = Color::srgb(0.06, 0.28, 0.36);
@@ -51,10 +78,10 @@ const UNDERWATER_FOG: (f32, f32) = (2.0, 42.0);
 /// A drawn water sheet, holding what the drift needs to move it.
 #[derive(Component)]
 pub struct WaterSurface {
-    direction: Vec2,
+    uv_velocity: Vec2,
     /// The UVs at rest, so drift is an offset from a fixed base rather than an
     /// accumulation that loses precision as the session runs on.
-    base_uvs: [[f32; 2]; 4],
+    base_uvs: Vec<[f32; 2]>,
 }
 
 /// The fog the camera is currently in, so the swap only runs on a change.
@@ -113,12 +140,47 @@ fn quad(water: &WaterBox) -> Mesh {
     // this sheet's UVs every frame through `Assets<Mesh>`, and a mesh kept only
     // in the render world has nothing left on the CPU side to rewrite -- the
     // lookup returns `None` and the water silently stops moving.
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; 4]);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_indices(Indices::U32(vec![0, 1, 2, 0, 2, 3]));
     mesh
+}
+
+/// Rebuilds the exact curved waterfall strip from the original N64 movtex
+/// data. Keeping it local to its centre gives Bevy a useful transparent-sort
+/// origin, just as it does for the horizontal sheets.
+fn waterfall() -> (Mesh, Vec3) {
+    const SCALE: f32 = 0.01;
+    let origin = WATERFALL_VERTICES.iter().fold(Vec3::ZERO, |sum, vertex| {
+        sum + Vec3::new(vertex[0] as f32, vertex[1] as f32, vertex[2] as f32) * SCALE
+    }) / WATERFALL_VERTICES.len() as f32;
+    let positions: Vec<[f32; 3]> = WATERFALL_VERTICES
+        .iter()
+        .map(|vertex| {
+            (Vec3::new(vertex[0] as f32, vertex[1] as f32, vertex[2] as f32) * SCALE - origin)
+                .to_array()
+        })
+        .collect();
+    // Movtex coordinates are 6.10 fixed point; the integer offsets in the
+    // level data therefore name whole texture repeats.
+    let uvs: Vec<[f32; 2]> = WATERFALL_VERTICES
+        .iter()
+        .map(|vertex| [vertex[3] as f32, vertex[4] as f32])
+        .collect();
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; 15]);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(Indices::U32(WATERFALL_INDICES.to_vec()));
+    (mesh, origin)
 }
 
 /// Spawns one sheet per water box. Called from startup with the loaded level.
@@ -159,7 +221,9 @@ pub fn spawn(
         });
         commands.spawn((
             WaterSurface {
-                direction: DRIFT_DIRECTIONS[index % DRIFT_DIRECTIONS.len()],
+                uv_velocity: DRIFT_DIRECTIONS[index % DRIFT_DIRECTIONS.len()]
+                    * DRIFT_SPEED
+                    * UV_SCALE,
                 base_uvs,
             },
             // A transparent sheet has no business darkening the lakebed.
@@ -170,18 +234,39 @@ pub fn spawn(
             Transform::from_translation(centre(water)),
         ));
     }
+
+    let (mesh, origin) = waterfall();
+    let base_uvs = uvs_of(&mesh);
+    let material = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 1.0, 1.0, WATERFALL_ALPHA),
+        base_color_texture: Some(texture),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        double_sided: true,
+        cull_mode: None,
+        ..default()
+    });
+    commands.spawn((
+        WaterSurface {
+            // SM64 advances the S coordinate, not T, for this movtex.
+            uv_velocity: Vec2::new(WATERFALL_UV_SPEED, 0.0),
+            base_uvs,
+        },
+        NotShadowCaster,
+        NotShadowReceiver,
+        Mesh3d(meshes.add(mesh)),
+        MeshMaterial3d(material),
+        Transform::from_translation(origin),
+    ));
 }
 
-fn uvs_of(mesh: &Mesh) -> [[f32; 2]; 4] {
-    let mut base = [[0.0; 2]; 4];
+fn uvs_of(mesh: &Mesh) -> Vec<[f32; 2]> {
     if let Some(bevy::render::mesh::VertexAttributeValues::Float32x2(uvs)) =
         mesh.attribute(Mesh::ATTRIBUTE_UV_0)
     {
-        for (slot, uv) in base.iter_mut().zip(uvs) {
-            *slot = *uv;
-        }
+        return uvs.clone();
     }
-    base
+    Vec::new()
 }
 
 /// Drifts each sheet's texture across the surface.
@@ -195,13 +280,11 @@ pub fn drift(
     mut meshes: ResMut<Assets<Mesh>>,
     surfaces: Query<(&WaterSurface, &Mesh3d)>,
 ) {
-    // World units the sheet has travelled, converted into texture repeats.
-    let distance = DRIFT_SPEED * time.elapsed_secs() * UV_SCALE;
     for (surface, handle) in &surfaces {
         let Some(mut mesh) = meshes.get_mut(&handle.0) else {
             continue;
         };
-        let offset = surface.direction * distance;
+        let offset = surface.uv_velocity * time.elapsed_secs();
         let moved: Vec<[f32; 2]> = surface
             .base_uvs
             .iter()
@@ -317,6 +400,22 @@ mod tests {
         for direction in DRIFT_DIRECTIONS {
             assert!((direction.length() - 1.0).abs() < 1e-3, "{direction:?}");
         }
+    }
+
+    #[test]
+    fn waterfall_matches_the_original_movtex_strip() {
+        let (mesh, origin) = waterfall();
+        let Some(bevy::render::mesh::VertexAttributeValues::Float32x3(positions)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("the waterfall has no positions");
+        };
+        assert_eq!(positions.len(), 15);
+        assert_eq!(mesh.indices().map(|indices| indices.len()), Some(51));
+        assert_eq!(uvs_of(&mesh).len(), 15);
+        let first = Vec3::from_array(positions[0]) + origin;
+        assert!((first - Vec3::new(-44.69, -8.0, -64.13)).length() < 1e-4);
+        assert!((WATERFALL_UV_SPEED - 2.0507813).abs() < 1e-6);
     }
 
     #[test]
