@@ -199,18 +199,25 @@ pub fn spawn(commands: &mut Commands) {
                     for index in 0..ROWS {
                         rows.spawn((
                             MenuRow(index),
+                            Interaction::default(),
                             Text::new(""),
                             TextFont {
                                 font_size: FontSize::Px(22.0),
                                 ..default()
                             },
                             TextColor(Color::WHITE),
+                            // Give every label a full-width, comfortably tall
+                            // hit target instead of making only its glyphs
+                            // clickable.
+                            Node {
+                                width: Val::Percent(100.0),
+                                padding: UiRect::axes(Val::Px(8.0), Val::Px(5.0)),
+                                ..default()
+                            },
                         ));
                     }
                     rows.spawn((
-                        Text::new(
-                            "up/down choose  ·  left/right change  ·  Enter select  ·  Esc back",
-                        ),
+                        Text::new("mouse or up/down choose  ·  click/Enter select  ·  Esc back"),
                         TextFont {
                             font_size: FontSize::Px(15.0),
                             ..default()
@@ -295,6 +302,7 @@ pub fn input(
     mut settings: ResMut<DisplaySettings>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
+    interactions: Query<(&MenuRow, &Interaction), Changed<Interaction>>,
     mut exit: MessageWriter<AppExit>,
 ) {
     menu.closed_this_frame = false;
@@ -315,6 +323,19 @@ pub fn input(
             (true, None) => menu.close(),
         }
     } else if menu.open {
+        // Hover follows the pointer immediately; pressing a row performs the
+        // same operation as choosing it with Enter. `Interaction::Pressed`
+        // is an edge here because the query only contains changed values.
+        let mut clicked = false;
+        for (row, interaction) in &interactions {
+            if row.0 >= menu.page.items().len() {
+                continue;
+            }
+            if matches!(interaction, Interaction::Hovered | Interaction::Pressed) {
+                menu.row = row.0;
+            }
+            clicked |= *interaction == Interaction::Pressed;
+        }
         if press.back {
             match menu.page.parent() {
                 Some(parent) => menu.go(parent),
@@ -331,7 +352,7 @@ pub fn input(
         if step != 0 {
             adjust(menu.selected(), step, &mut settings, &mut windows);
         }
-        if press.select {
+        if press.select || clicked {
             match menu.selected() {
                 Item::Resume => menu.close(),
                 Item::Options => menu.go(Page::Options),
@@ -646,4 +667,21 @@ mod tests {
         assert_eq!(menu.selected(), Item::RenderScale);
     }
 
+    #[test]
+    fn hovering_and_clicking_rows_drives_the_menu() {
+        let mut world = paused();
+        world.resource_mut::<MenuState>().open();
+
+        let hover = world.spawn((MenuRow(2), Interaction::Hovered)).id();
+        world.run_system_once(input).expect("the menu did not run");
+        assert_eq!(world.resource::<MenuState>().selected(), Item::Quit);
+
+        // Move the same pointer target to Options and press it. The click
+        // should select that row before activating it, even though Quit was
+        // selected on the previous frame.
+        world.entity_mut(hover).insert(MenuRow(1));
+        world.entity_mut(hover).insert(Interaction::Pressed);
+        world.run_system_once(input).expect("the menu did not run");
+        assert_eq!(world.resource::<MenuState>().page, Page::Options);
+    }
 }

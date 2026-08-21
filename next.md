@@ -19,6 +19,7 @@ camera/aim/player pose adjustment
 - like overwatch
 - the players torso should be able to twist up to 20 degrees in the direction of aim before the legs start moving along too
 - need sideways movement animation
+- head should also look where aiming
 
 need vfx energy/aura/trails on weapons
 
@@ -27,3 +28,5 @@ cool centipied enemy that jumps in and out of the ground like LTTP sand worm
 
 
 pylons! should share logic with pathing.  traveling salemen problem, creeper world
+
+grid2quad system
