@@ -88,9 +88,18 @@ pub(crate) const GOLDEN_ANGLE: f32 = 2.399_963_2;
 /// How near an ally has to be before it counts as standing on its slot.
 const ALLY_RADIUS: f32 = 0.4;
 
-/// How close a Mario walks to what it is going to hit. Inside its own punch's
-/// reach, so that arriving and connecting are not two separate strides.
-const STRIKE_RANGE: f32 = 1.2;
+/// How close a Mario walks to what it is going to hit, measured from that
+/// thing's body rather than from its middle. Inside its own punch's reach, so
+/// that arriving and connecting are not two separate strides.
+///
+/// **Wider than `enemy::PERSONAL_SPACE`, and that is the constraint rather than
+/// a preference.** `enemy::spread` will not let a Mario stand nearer a body than
+/// the two radii plus that gap, so a strike range shorter than it is an order to
+/// stand somewhere the shove immediately undoes -- and the Mario spends the
+/// fight being walked in and pushed out, inside the thing it is punching. As an
+/// absolute 1.2 m it was a metre and a half inside an ant, which is exactly what
+/// that looked like.
+pub(crate) const STRIKE_RANGE: f32 = 0.5;
 
 /// The amble an ally falls back on with nobody to follow: how far from where
 /// it was left it will wander, how near it has to get before that counts as
@@ -568,7 +577,16 @@ pub fn move_allies(
         // what the order still sitting in `goal` is for.
         let hunting = aggro
             .and_then(|aggro| aggro.target.map(|_| aggro.at))
-            .map(|at| (Vec2::new(at.x, at.z), STRIKE_RANGE));
+            .map(|at| {
+                let room = aggro.map_or(0.0, |aggro| aggro.room);
+                // Its own body, not `ALLY_RADIUS` -- that is how near counts as
+                // arriving, and what matters here is how much of it the shove
+                // will insist on keeping outside the thing it is hitting.
+                (
+                    Vec2::new(at.x, at.z),
+                    room + crate::player::PLAYER_RADIUS + STRIKE_RANGE,
+                )
+            });
         // Standing about between ambles. An ally that has nowhere to be is
         // still for seconds at a time, which is what lets the idle actually
         // play.

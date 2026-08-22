@@ -95,6 +95,8 @@ src/
   input.rs       keyboard, mouse and pad merged into one latched snapshot
   animation.rs   which clip each character plays, and how fast
   billboard.rs   turning billboarded objects and actor parts to face the camera
+  aim.rs         the AIM_TORSO twist: where he is aiming and how far he turns
+  weapon.rs      what is in his hand, and what happens when he fires it
   enemy.rs       slimes and ants: behaviour, LOD, hit resolution
   pipe.rs        warp pipes, and the arc they throw their brood out on
   squad.rs       aiming at the ground, and the Marios whistled up and sent out
@@ -123,9 +125,10 @@ once and neither has to be selected.
 | Move | `WASD` / arrows | left stick or d-pad |
 | Look | mouse, or `Q` / `E` | right stick |
 | Jump (booster take-off while skating) | `Space` | south (A) |
-| Attack | Left Shift or left mouse | east (B) |
+| Attack: swing the sword, or fire the gun | Left Shift or left mouse | east (B) |
 | Skate on the ground, fly in the air (Hero) | hold `V` | hold north (Y) or left trigger |
 | Aim | hold `F` or right mouse | right trigger |
+| Switch weapon (sword / pistol) | `Y` | left shoulder |
 | Recenter camera | `R` | right shoulder |
 | Squad: hold to whistle, tap to send | `X` | west (X) |
 | Switch Hero/Mario in place | `F2` | Start |
@@ -133,6 +136,11 @@ once and neither has to be selected.
 | Tuning console (pauses the simulation) | `` ` `` | — |
 | Debug text | `F1` | — |
 | Window/fullscreen | `F11` | — |
+
+The attack control is one button carrying two weapons: with the sword out it
+swings, and with the pistol out it fires. Both read the same latched edge and
+only the equipped one is allowed to take it, so a press never does both. See
+`src/weapon.rs`.
 
 Landing on an enemy defeats it whichever character is active. A pad plugged in
 mid-game is picked up without a restart, and the pad's sticks use circular
@@ -390,16 +398,21 @@ throws him back and costs a heart. Each enemy is an upright cylinder — a radiu
 and a height — rather than a point, so standing on a roof above one is not
 touching it.
 
-Radii come from the originals' hitboxes rather than from eye, and both enemies
-keep the radius of the decomp actor they replaced — 0.70 m from the goomba,
-0.60 m from the scuttlebug — because the crowd's spacing, its flow-field
-arithmetic and its shove resolution are all expressed in body radii and every
-one of them was tuned against those two numbers. The heights are the models'
-own, since both are authored art: 0.70 m for the slime, which is the width of
-its dome, and 0.65 m for the ant. Mario's hitbox is 160 units tall against the
-scuttlebug's 70, so an enemy of this size stands at about 0.44x his height.
-`the_cylinders_are_the_size_the_models_are_drawn_at` reads all of it back out
-of the glTF, so a re-export that changes a model's size fails a test.
+**That cylinder is measured, not written down.** `Kind::body` reads the
+model's own position bounds out of the glTF the renderer loads: the radius is
+how far the mesh reaches from its origin in the horizontal plane, the height is
+how tall it is. There is no scale factor anywhere in the code, so an actor is
+drawn at the size it was authored at and spaced, shadowed, stomped and punched
+at the size it is drawn. **Size is set in Blender** — `tools/resize_actor.py`,
+or by hand — and everything downstream follows, because the crowd's spacing, its
+flow-field arithmetic and its shove distances are all expressed in body radii.
+
+The decomp actors these replaced were drawn at a hundred units to the metre and
+had a `draw_scale` constant each to undo it; the sizes were then written out a
+second time as hitboxes, and the pair drifted the first time an actor was
+re-exported. What guards the arrangement now is a band rather than a number:
+`an_actor_is_the_size_it_was_authored_at` fails an actor outside the size this
+game's crowd arithmetic was built for, which is what a four-metre ant tripped.
 
 The immunity after a hit gates the *whole* resolution and not only the damage.
 That is not a detail. A knocked-back player is thrown up and off the enemy that
@@ -497,6 +510,13 @@ fewer things, keeping fewer entities, and properly simulating fewer of them.
   chain took that to 95%. Nothing about it moves the silhouette — the face sits
   inside the head, and the survey extents are identical to four decimals — so no
   test on the sheets can catch it; only running the same code can.
+
+  The bake is two passes: a survey at a fixed camera size to find how big the
+  actor gets, then the sheet, sized to what the survey saw. An actor bigger than
+  the survey camera does not fail that first pass, it *saturates* it — every cell
+  comes back full, the crop is read as the measurement, and `world_size` becomes
+  a lie that the runtime then sizes its quads from. `survey_fits` notices the
+  bounding box touching the cell edge and looks again from twice as far back.
 - **MSAA is off** on the world camera. It is not off by default: Bevy registers
   `Msaa` as a required component of every `Camera` and the default is
   `Sample4`, so a camera that says nothing runs four-times multisampling. On
@@ -580,12 +600,12 @@ because it crossed a boundary it cannot see.
 
 ### One answer to how bodies avoid each other
 
-`enemy::spread` holds every creature out of every other one: the near-tier
-enemies, the Marios and the player, in one pass over one list. It did not
-always — the Marios were held out of *nothing*, because `squad::move_allies`
-walks each one to its slot and asks nothing about what is standing there, so a
-squad following the player was a heap of Marios in the same place walking
-through each other and through him.
+`enemy::spread` holds every creature out of every other one: every enemy in the
+field, the Marios and the player, in one pass over one list. It did not always —
+the Marios were held out of *nothing*, because `squad::move_allies` walks each
+one to its slot and asks nothing about what is standing there, so a squad
+following the player was a heap of Marios in the same place walking through each
+other and through him.
 
 They share a pass rather than having one each because a Mario, a slime and an
 ant are all bodies of some radius standing on some ground, and two
@@ -606,42 +626,149 @@ Three things it does that are not obvious:
 - **Crawlers are pushed within the surface they are stuck to.** Shoving a bug
   off its wall is the one thing this must not do.
 
+### Every reach and approach is measured from the body, not the centre
+
+`spread` holding two bodies apart is only half a rule. The other half is that
+**nothing may be told to walk somewhere the shove will not let it stand.** A
+chaser aimed at a body's centre is aimed inside it: the AI walks it in every
+tick, the shove pushes it out every tick, and what that looks like is a Mario
+standing inside an ant, vibrating. Two systems, two answers, and the argument
+runs for as long as the fight does.
+
+Every distance of this kind is therefore measured between *surfaces*:
+
+| | was | now |
+|---|---|---|
+| `enemy::STAND_OFF` — where an enemy waits by its quarry | 1.0 from its centre | both radii + 0.6 |
+| `squad::STRIKE_RANGE` — how near a Mario walks to punch | 1.2 from its centre | its radius + a Mario + 0.5 |
+| `enemy::MARIO_REACH` — the punch | 1.6 from its centre | its radius + 1.3 |
+| `enemy::ATTACK_REACH` — the player's sword | 2.2 from its centre | its radius + 1.9 |
+| `enemy::PLAYER_REACH` — the player's touch | already relative | unchanged |
+
+`Aggro::room` carries the target's radius so a chaser knows how wide the thing
+it is chasing is; `alert` fills it as it fills `Aggro::at`, because
+`enemy::update` walks the field in parallel and must not be reading other
+entities while it does.
+
+This was invisible for as long as the actors were decomp goombas 0.6 m across,
+which every one of those constants comfortably cleared. The authored ant is
+**5 m across**, and at that size the absolute numbers are all *inside* it: a
+Mario was ordered to stand 1.3 m within an ant's body, and the player's sword —
+2.2 m — could not reach an ant that `spread` correctly held 3.27 m away, so the
+Hero could not hit one at all. Measured on a settled field of 200, worst
+overlap: Mario/enemy 1.72 m and Mario/Mario 0.52 m before, **0.00 m** for both
+after, with three pairs of the two hundred in light contact.
+
+`enemy::tests::nothing_walks_to_a_spot_it_would_be_shoved_out_of` checks each
+approach distance against the room the shove will insist on, for every pair of
+kinds, and checks that a weapon still reaches what its owner is allowed to stand
+next to. It measures against the widest actor in `KINDS` rather than a named
+one, because the next re-export is allowed to change which that is.
+
+The geometry that follows is real and not a bug: sixty creatures 5 m wide
+cannot all stand next to one player, so they form a ring several deep and the
+back of it waits some way out. That is the authored size talking, not the
+spacing.
+
+### Spacing the whole field rather than the near tier
+
+For a while this was the near tier only — two hundred creatures standing
+politely apart while eighteen hundred stacked into each other — on the argument
+that two distant slimes in the same spot are two pixels in the same spot. They
+are, and a thousand of them are a crowd that has visibly collapsed into a heap,
+with bare lawn around it. Photographed from above at `crowd 800`: a tangle in
+one corner of the courtyard before, an evenly settled field after. An enemy
+promoted out of a stack also arrives already inside its neighbours.
+
+What made spacing all of them affordable is three techniques from
+`reference/potatoe.md`, and it is worth knowing what each one was actually worth
+here, at 2,000 enemies, measured on the same machine state:
+
+| `enemy::spread`, per fixed tick | ms |
+|---|---|
+| whole field, hashed cells and a `Vec` per bucket, no stride, `sqrt` per pair | 0.438 |
+| + flat spatial hash (counting sort into two arrays) | 0.223 |
+| + `CROWD_SPREAD_STRIDE`, a quarter of the cheap tier per tick | 0.183 |
+| + squared-distance reject before the `sqrt` | **0.178** |
+
+So: the striding is worth about as much as everything else put together, the
+grid rewrite is worth 0.045 ms, and **the squared-distance trick is worth
+nothing measurable** — one `sqrtps` is about a dozen pipelined cycles on this
+CPU, and the pairs that reach it are the small minority that overlap. It is kept
+because it is free and reads no worse, not because it bought anything. Somebody
+reading `potatoe.md` and expecting item 4 to be the big one should know it was
+item 3.
+
+The frame cost of the whole change at 2,000 is **26.9 → 28.0 ms**, of which only
+0.18 ms is the system: the rest is that a crowd occupying its real footprint puts
+more of itself inside `enemy_draw` (8,661 → 8,995 entities). At 8,000 the system
+costs 0.7–1.0 ms of a 48 ms frame.
+
+The hash has one hazard that direct cell addressing does not, and it is worth
+stating because nothing about the code makes it visible: **two of the nine cells
+a query reads can share a bucket**, and reading that bucket twice returns
+everything in it twice. A shove counting one neighbour double would push half
+again as hard, on some ticks, for some pairs — a twitch, and near-impossible to
+trace back. `Neighbourhood::near` deduplicates the nine bucket indices before it
+reads them, and
+`enemy::tests::the_spatial_hash_never_hands_back_the_same_body_twice` uses two
+thousand points because a nine-cell query collides about once in a hundred at
+that size: a smaller test would pass on a broken grid.
+
+A cheap-tier shove resolves against `flow::FlowField::clear` rather than
+`LevelData::resolve_walls`, for the reason the tier does everything else that
+way — one idea of what a wall is, shared with the step that has to live with the
+result.
+
 ### Where an enemy's feet are
 
 **A transform is not where the model is.** The scuttlebug's rig root sat up
 inside its body, so its geometry hung 31 cm below its own origin. Seat that
 origin on the ground — which is what every placement in the game does — and a
-third of the bug was underground on flat stone. The ant that replaced it is
-rigged the same way and hangs 22 cm. The slime is the case this wants and the
-reason `Kind::lift` is a fact about the asset rather than a tuning knob: it was
-authored with its mesh on `y = 0`, so its lift is zero and nothing has to be
-corrected for. The goomba hung 6.5 cm.
+third of the bug was underground on flat stone. The goomba hung 6.5 cm, and the
+first ant 22 cm.
 
-`Kind::lift` carries the offset, and `tools/measure_actor_hang.py` is the
-authority for it: it evaluates the skinned mesh on every frame of every clip,
-which is what tells a permanent rig offset from a squash that dips through the
-floor plane for a few frames of a walk cycle.
+**Both actors that ship now are the case this wants**, and their lifts are zero:
+they are authored with their meshes on `y = 0`, so an origin already is its
+feet. That is the fix this always wanted — one origin moved in Blender beats a
+correction carried through every placement in the game — and the mechanism stays
+for the next actor that arrives without it.
+
+`Kind::lift` is measured off the model, like the cylinder above it, and for the
+same reason: the constant it replaced outlived the model it was measured from. A
+re-exported ant that had *stopped* hanging spent a session floating a third of
+its own height above the ground on a stale 0.216 nobody had re-measured.
+
+`tools/measure_actor_hang.py` is the authority when the two disagree. `lift`
+reads the bind pose, which is what a glTF's POSITION accessors hold; the tool
+evaluates the *skinned* mesh on every frame of every clip, which is what tells a
+permanent rig offset from a squash that dips through the floor plane for a few
+frames of a walk cycle.
 
 **The baked sheets are not that authority, and it is worth knowing why.** A
 sheet cell is a silhouette drawn by a camera tilted 15 degrees down, so the near
 rim of a wide body projects below where its own origin projects even with
 nothing at all below it in world space — half a metre of body reaching toward
 the camera buys 13 cm of that. It was the right instrument for the scuttlebug,
-which was tall and narrow, and it overstates both actors that ship now: the
-slime by a third of a metre, the ant by 15 cm. Believing either number would
-hover the enemy to keep its own picture off a floor it is standing on. So
+which was tall and narrow, and it overstates both actors that ship now. So
 `impostor::tests::the_lift_matches_what_the_baked_sheets_show` asserts only what
-survives that — a lift never exceeds what the silhouette reaches, because a
-model held further up than its own picture extends is a model hovering — and
-`enemy::tests::the_cylinders_are_the_size_the_models_are_drawn_at` pins the
-number itself to the glTF's own position bounds.
+survives that: a lift never exceeds what the silhouette reaches, because a model
+held further up than its own picture extends is a model hovering.
 
 `walk`, `settle` and `crawl` all keep answering in **contact points** — where the
 feet go — and `enemy::update` converts at the boundary. Keeping them pure means
 a test can walk an enemy across a level without knowing what it looks like.
 
-The real fix for both numbers is the exporter putting the origin on the floor,
-which would let the lift be zero. See `tools/export_actor_gltf.py`.
+**The sheets and the models are checked against each other**, by
+`the_sheets_agree_with_the_models_they_were_baked_from`. It is the only thing
+that puts the two ways of measuring an actor in the same room: `Kind::body`
+reads a glTF header and never renders anything, while a sheet's `world_size` is
+what the bake camera had to cover to fit the actor on screen — the renderer's
+answer, through skinning, billboards and every node transform in the file. It
+catches the ordinary mistake (resize an actor, re-export, forget to re-bake:
+drawn at the new size up close and the old size past `enemy_draw`) and the
+strange one (something in the file scaling what is drawn but not what the
+bounds say).
 
 Two related things are worth knowing about a crawler's `up`. Hanging under a
 ceiling and being buried under a floor are the *same state* — surface overhead,

@@ -62,6 +62,21 @@ cp \
     "$REPO_ROOT/assets/actors/ant.glb" \
     "$DIST_DIR/assets/actors/"
 cp "$REPO_ROOT/assets/hero/hero.glb" "$DIST_DIR/assets/hero/"
+# The weapon models, read out of `weapon::Weapon::spec` rather than listed, for
+# the same reason the samples below are read out of the sound tables: the two
+# cannot drift if there is only one of them.
+#
+# They drifted once already. The target pistol was added to the game and not to
+# this list, and a packaged build has no gun in it and says nothing -- Bevy logs
+# the failed load to a stderr that a `windows_subsystem = "windows"` build has
+# nobody attached to, exactly as with the impostor sheets below. What it looks
+# like from the outside is a weapon that does not exist.
+while read -r model; do
+    [[ -n "$model" ]] || continue
+    mkdir -p "$DIST_DIR/assets/$(dirname "$model")"
+    cp "$REPO_ROOT/assets/$model" "$DIST_DIR/assets/$model"
+done < <(grep -o '"[A-Za-z0-9_/]*\.glb#[A-Za-z0-9]*"' "$REPO_ROOT/src/weapon.rs" \
+    | tr -d '"' | cut -d'#' -f1 | sort -u)
 cp "$REPO_ROOT/assets/mario/mario.glb" "$DIST_DIR/assets/mario/"
 # The impostor sheets. Leaving these out does not fail and does not crash: the
 # game starts, and every enemy past `enemy_draw` is drawn as nothing at all,

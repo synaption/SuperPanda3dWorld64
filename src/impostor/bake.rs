@@ -79,15 +79,24 @@ const FRAMES: usize = 16;
 /// distance the swap happens.
 const ELEVATION: f32 = 15.0;
 
-/// How much room the first pass leaves around the model, as a multiple of its
-/// bind-pose height, and how much the second pass leaves around what the first
-/// one measured.
+/// How many world units across the first pass looks, and how much room the
+/// second pass leaves around what the first one measured.
 ///
 /// The first is generous because a walk cycle swings limbs well outside the
 /// bind pose and anything clipped in pass one is measured wrong for pass two.
-/// The second is the margin that survives into the sheet.
+/// It is a guess at how big an actor gets rather than a fact about one, so an
+/// actor bigger than it does not fail the bake -- see [`survey_fits`], which
+/// notices and looks again from further back. The second is the margin that
+/// survives into the sheet.
 const SURVEY_MARGIN: f32 = 2.6;
 const FINAL_MARGIN: f32 = 1.06;
+
+/// How many times the survey may double its camera before giving up.
+///
+/// Bounded because the alternative to a wrong sheet is a bake that never
+/// finishes, and four doublings is a fortyfold range of actor sizes: anything
+/// outside that is a model with a scale problem rather than a big model.
+const WIDENINGS: usize = 4;
 
 /// Frames rendered and thrown away after moving the model before the pixels are
 /// asked for.
@@ -129,6 +138,8 @@ struct Bake {
     /// The tightest box, in cell fractions, that held content in the survey.
     /// `(low, high)`, y measured downward like the image.
     seen: Option<(Vec2, Vec2)>,
+    /// How many times the survey has already been re-run from further back.
+    widened: usize,
     /// The finished sheet, `cols * cell_px` by `rows * cell_px`, RGBA8.
     atlas: Vec<u8>,
     /// The clip being sampled, and how long it is.
@@ -234,12 +245,10 @@ fn setup(
         // billboard seen from its back face is culled away entirely.
         crate::billboard::BillboardActor,
         crate::WorldAssetRoot(assets.load(format!("{}#Scene0", model(bake.kind)))),
-        // The same scale the game spawns these at, so the world units the
-        // camera measures are the game's world units. Asked of the kind rather
-        // than written here: the two actors are authored at different scales,
-        // and a sheet baked at the wrong one is a sprite that changes size at
-        // the swap distance.
-        Transform::from_scale(Vec3::splat(bake.kind.draw_scale())),
+        // Unscaled, exactly as the game spawns one, so the world units this
+        // camera measures are the game's world units. A sheet baked at any other
+        // size is a sprite that changes size at the swap distance.
+        Transform::default(),
     ));
 }
 
@@ -377,8 +386,29 @@ fn collect(
     // End of a pass.
     match bake.pass {
         Pass::Survey => {
-            tighten(&mut bake);
-            bake.pass = Pass::Final;
+            if survey_fits(&bake) {
+                tighten(&mut bake);
+                bake.pass = Pass::Final;
+            } else if bake.widened < WIDENINGS {
+                bake.widened += 1;
+                println!(
+                    "impostor bake: the actor filled the survey camera at {:.3} units; \
+                     looking again from {:.3}",
+                    bake.extent,
+                    bake.extent * 2.0,
+                );
+                bake.extent *= 2.0;
+                bake.focus = bake.extent * 0.25;
+                bake.seen = None;
+            } else {
+                eprintln!(
+                    "impostor bake: {:?} still fills a {:.3} unit camera after {WIDENINGS} \
+                     widenings -- baking it cropped, which is a Kind::draw_scale to check",
+                    bake.kind, bake.extent,
+                );
+                tighten(&mut bake);
+                bake.pass = Pass::Final;
+            }
             bake.cell = 0;
             if let Ok(mut projection) = projection.single_mut() {
                 *projection = Projection::from(OrthographicProjection {
@@ -418,6 +448,28 @@ fn note_bounds(bake: &mut Bake, pixels: &[u8]) {
         Some((old_low, old_high)) => (old_low.min(low), old_high.max(high)),
         None => (low, high),
     });
+}
+
+/// Whether the survey saw the whole actor, or ran out of cell.
+///
+/// A survey camera too small for its model does not fail, it saturates: every
+/// cell comes back full, [`tighten`] reads the crop as the measurement, and the
+/// sheet is written at the survey's own extent with the actor cut off at
+/// whichever angle it is longest. `world_size` is then a lie about what the cell
+/// contains, and since the runtime sizes its quads from `world_size` the sprites
+/// are wrong in the game as well as in the sheet.
+///
+/// That is not hypothetical. A re-exported ant arrived four times the size of
+/// the one it replaced, filled the 2.6-unit survey at every angle, and baked a
+/// sheet of ants missing their heads and abdomens. Both halves of the failure
+/// are worth keeping in mind: the *cause* was a stale [`Kind::draw_scale`], and
+/// this only makes the baker say so instead of quietly writing the crop.
+fn survey_fits(bake: &Bake) -> bool {
+    let Some((low, high)) = bake.seen else {
+        return true;
+    };
+    let edge = 1.0 / CELL_PX as f32;
+    low.x > edge && low.y > edge && high.x < 1.0 - edge && high.y < 1.0 - edge
 }
 
 /// Chooses the extent and focus the final pass renders at, from what the survey
@@ -569,6 +621,7 @@ pub fn run(kinds: &[Kind]) {
             // is a sheet with its actor's feet cut off.
             focus: extent * 0.25,
             seen: None,
+            widened: 0,
             atlas: vec![0; (FRAMES as u32 * CELL_PX * ANGLES as u32 * CELL_PX * 4) as usize],
             clip: None,
             started: std::time::Instant::now(),
@@ -588,22 +641,31 @@ pub fn run(kinds: &[Kind]) {
         // calls `update` exactly once and returns -- which looks precisely like
         // a bake that did nothing and said nothing about why.
         //
-        // The cap is a bug-stop, not a schedule: two passes of `angles * frames`
-        // cells at `SETTLE` frames each, and generous slack on top for the
-        // frames spent waiting on the glTF to load.
+        // The cap is a bug-stop, not a schedule: every pass this can run, at
+        // `angles * frames` cells of `SETTLE` frames each, and generous slack on
+        // top for the frames spent waiting on the glTF to load.
+        //
+        // **Every pass includes the re-surveys.** A survey that finds the actor
+        // filling its camera starts again from twice as far back, up to
+        // [`WIDENINGS`] times, and each of those is a whole pass of cells. Sized
+        // for two, an ant that needed two widenings ran out of budget partway
+        // through the final pass and reported it as "something upstream is not
+        // producing pixels" -- which is what running out of frames looks like
+        // from here, and sent the next reader looking at the renderer.
         app.finish();
         app.cleanup();
-        let cap = ANGLES * FRAMES * 2 * (SETTLE + 4) + 2_000;
+        let cap = ANGLES * FRAMES * (WIDENINGS + 2) * (SETTLE + 4) + 2_000;
         let mut frames = 0;
         while app.should_exit().is_none() {
             app.update();
             frames += 1;
             if frames > cap {
+                let bake = app.world().resource::<Bake>();
                 eprintln!(
-                    "impostor bake: gave up after {frames} frames on cell {} of pass {:?} -- \
-                     something upstream is not producing pixels",
-                    app.world().resource::<Bake>().cell,
-                    app.world().resource::<Bake>().pass,
+                    "impostor bake: gave up after {frames} frames on cell {} of pass {:?}, \
+                     having widened the survey {} time(s) -- either something upstream is not \
+                     producing pixels, or the cap is too small for the passes actually run",
+                    bake.cell, bake.pass, bake.widened,
                 );
                 break;
             }

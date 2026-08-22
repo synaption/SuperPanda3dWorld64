@@ -13,10 +13,11 @@ without them was drawn two different ways at once -- the new model up close and
 the old picture of it past `enemy_draw`. Rotating an actor is the case that
 shows it worst, since every sprite in the atlas then faces the wrong way.
 
-The five stages, in the order they have to run:
+The six stages, in the order they have to run:
 
     mario      assets/mario/mario.glb        + mario_clips.json
     hero       assets/hero/hero.glb          + hero_clips.json
+    weapons    assets/hero/*.glb             what the Hero carries
     castle     assets/bevy/castle.glb, castle.bin, water.png
     actors     assets/actors/*.glb           + a clips sidecar each
     impostors  assets/impostors/*.png, *.json
@@ -25,8 +26,7 @@ The five stages, in the order they have to run:
 script just wrote. It also needs `cargo`, since the baker runs inside the game
 so that its sprites are lit by the same material the skinned models are.
 
-Weapons are excluded -- they are authoring resources the game does not load --
-and so are the retired goomba and scuttlebug sources, which are kept as
+The retired goomba and scuttlebug sources are excluded: they are kept as
 sources for reference rather than exported.
 
 Every runtime asset here also has a committed Blender source. Run
@@ -45,6 +45,14 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools"
 ACTOR_DIR = ROOT / "assets" / "actors"
+WEAPON_DIR = ROOT / "assets" / "hero"
+
+# What the Hero can hold. Static props rather than actors: no rig, no clips,
+# and so no adoption pass -- the export is the runtime file. Each one is
+# authored with its grip on the origin and its bore down +Z, which is what
+# lets `weapon::follow_socket` place it from the hand joint alone. See
+# docs/pipeline.md, "Weapons".
+WEAPONS = ("target_pistol",)
 
 # Actor -> its clip sidecar, or None where the actor does not animate.
 ACTORS = {
@@ -62,7 +70,7 @@ SKELETON_ROOTS = {
     "slime": "Slime_Rig",
 }
 
-STAGES = ("mario", "hero", "castle", "actors", "impostors")
+STAGES = ("mario", "hero", "weapons", "castle", "actors", "impostors")
 
 
 def run(command):
@@ -129,6 +137,28 @@ def build_hero(staging, blender):
     os.replace(out, ROOT / "assets/hero/hero.glb")
     os.replace(sidecar, ROOT / "assets/hero/hero_clips.json")
     return ["assets/hero/hero.glb"]
+
+
+def build_weapons(staging, blender):
+    """The Hero's weapons: a plain mesh export each, straight to the runtime file.
+
+    No adoption pass and no sidecar. A weapon has no skeleton to normalise and
+    no clips to name, so `blend_to_glb` already writes exactly what the game
+    loads. The empties the .blend carries -- `MUZZLE` where the shot leaves the
+    barrel, `GRIP` where the hand takes hold -- survive the export as ordinary
+    childless nodes, which is how the runtime finds them.
+    """
+    built = []
+    for weapon in WEAPONS:
+        blend = WEAPON_DIR / f"{weapon}.blend"
+        if not blend.is_file():
+            raise SystemExit(f"missing Blender source: {blend}")
+        raw = staging / f"{weapon}.glb"
+        blend_to_glb(blend, raw, blender)
+        runtime = WEAPON_DIR / f"{weapon}.glb"
+        os.replace(raw, runtime)
+        built.append(str(runtime.relative_to(ROOT)))
+    return built
 
 
 def build_castle(_staging, _blender):
@@ -199,6 +229,7 @@ def bake_impostors(_staging, _blender):
 BUILDERS = {
     "mario": build_mario,
     "hero": build_hero,
+    "weapons": build_weapons,
     "castle": build_castle,
     "actors": build_actors,
     "impostors": bake_impostors,

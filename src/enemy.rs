@@ -17,7 +17,7 @@ use crate::{
     player::{Controller, Motion, Player, FIXED_DT, PLAYER_HEIGHT},
     squad::Ally,
 };
-use bevy::{platform::collections::HashMap, prelude::*, world_serialization::WorldAssetRoot};
+use bevy::{prelude::*, world_serialization::WorldAssetRoot};
 
 /// How far above an enemy's own feet counts as landing on top of it, as a
 /// fraction of its height.
@@ -28,10 +28,15 @@ const STOMP_MARGIN: f32 = 0.6;
 /// of walls with.
 const PLAYER_REACH: f32 = 0.37;
 
-/// How far a swing reaches. Wider than a touch on purpose: the Hero swings a
-/// sword, and a weapon that only hits what is already standing on him is not a
-/// weapon.
-const ATTACK_REACH: f32 = 2.2;
+/// How far a swing reaches past the body it is aimed at. Wider than a touch on
+/// purpose: the Hero swings a sword, and a weapon that only hits what is already
+/// standing on him is not a weapon.
+///
+/// Past the *body*, like [`PLAYER_REACH`] and unlike its own first version. As a
+/// distance to the target's centre it was unreachable against a large actor:
+/// [`spread`] holds an ant of radius 2.5 at 3.27 m from the player, and a swing
+/// of 2.2 never landed. The enemies got bigger and the sword did not.
+const ATTACK_REACH: f32 = 1.9;
 
 /// Up off a stomped enemy, and back off one that got a hit in.
 const BOUNCE_VELOCITY: f32 = 12.6;
@@ -104,6 +109,26 @@ const SPREAD_RATE: f32 = 0.25;
 const SPREAD_SLACK: f32 = 0.05;
 const SPREAD_LIMIT: f32 = 1.5;
 
+/// The most of an overlap one shove is allowed to take out, however many ticks
+/// that shove is standing in for.
+///
+/// A body that is only shoved every fourth tick is given four ticks' worth of
+/// rate so that a strided crowd settles as fast as an unstrided one -- but four
+/// quarters is the whole overlap, and a pair that each take the whole of it are
+/// a pair that swap places and come back. Half leaves the convergence
+/// monotonic no matter how coarse the stride gets.
+const SPREAD_RATE_CAP: f32 = 0.5;
+
+/// How many fixed ticks pass between two shoves of a cheap-tier body.
+///
+/// Four, which is the stride [`update`] already walks a far enemy at: something
+/// that only moves every fourth tick does not need holding out of its
+/// neighbours more often than it moves. The whole point of the number is that
+/// the cheap tier is *the whole rest of the field* -- eighteen hundred of the
+/// two thousand -- so a quarter of it a tick is what makes spacing all of them
+/// cost about what spacing the nearest two hundred used to.
+const CROWD_SPREAD_STRIDE: u32 = 4;
+
 /// Where a crawler's probes start and how far past its feet they reach.
 ///
 /// `PROBE_EYE` is the height the forward probe is cast from -- low, because a
@@ -157,10 +182,184 @@ const CRAWL_SKIN: f32 = 0.02;
 /// The enemies the port places. Each is resolved against the player as an
 /// upright cylinder, the way the original does: a radius in the horizontal
 /// plane and a height above its feet.
+///
+/// The discriminants index [`sizes`], so a kind added here is a kind measured
+/// there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     Slime,
     Ant,
+}
+
+/// Every kind, in discriminant order.
+pub const KINDS: [Kind; 2] = [Kind::Slime, Kind::Ant];
+
+/// How big an actor is, in world units, taken from the model itself.
+#[derive(Clone, Copy, Debug)]
+pub struct Size {
+    /// The furthest its mesh reaches from its origin in the horizontal plane.
+    pub radius: f32,
+    /// Base to top.
+    pub height: f32,
+    /// How far its mesh reaches *below* its origin, which is how far the
+    /// placement code has to hold it up to stand it on the floor.
+    pub lift: f32,
+}
+
+/// What the game falls back on when an actor's model cannot be measured.
+///
+/// Only reachable with the model missing from the install, which is a game with
+/// invisible enemies whatever this says -- but an enemy of size zero is one
+/// nothing can walk past and nothing can stomp, so it is worth being a
+/// creature-shaped number rather than a default.
+const UNMEASURED: Size = Size {
+    radius: 0.6,
+    height: 0.65,
+    lift: 0.0,
+};
+
+/// Every actor's size, measured from its glTF the first time one is asked for.
+///
+/// **This is why there is no scale factor in this file.** An actor is spawned at
+/// the size it was authored at and measured at the size it is drawn, so the two
+/// cannot disagree; changing how big a slime is means changing the slime, and
+/// `tools/resize_actor.py` is how. The alternative -- constants next to a
+/// `draw_scale` that multiplies them -- lasted exactly as long as it took to
+/// re-export an actor, and left ants drawn four metres long while being spaced,
+/// shadowed and punched as something 0.6 across.
+///
+/// Read from disk rather than from Bevy's loaded meshes because it is wanted
+/// before anything has loaded and by tests that never build a renderer. It is
+/// two files, once, at whatever the install's asset path is: about a megabyte
+/// read and a JSON chunk parsed, on the first enemy of a session.
+fn sizes() -> &'static [Size; KINDS.len()] {
+    static SIZES: std::sync::OnceLock<[Size; KINDS.len()]> = std::sync::OnceLock::new();
+    SIZES.get_or_init(|| KINDS.map(|kind| measure(kind.model()).unwrap_or(UNMEASURED)))
+}
+
+/// The size of the actor in a `.glb`, from its meshes' own position bounds.
+///
+/// Every glTF accessor carries `min` and `max`, so this is a header read rather
+/// than a walk over vertices. Those bounds are the **bind pose**, which is what
+/// the renderer skins from and what the exporter guarantees is in the file.
+///
+/// **Whether a node's transform counts depends on whether its mesh is skinned,
+/// and the two answers are opposite.** A skinned mesh's vertices are in the
+/// skin's own space: glTF says the node it hangs under is ignored, and the
+/// inverse bind matrices cancel whatever the skeleton root carries -- which is
+/// how `assets/actors/ant.blend` gets away with an armature scaled by 4.0,
+/// yawed 180 degrees and lifted 0.79 m without any of it showing, in Blender's
+/// viewport or in the game. An *unskinned* mesh in the same file takes its node
+/// chain in full, so its bounds have to be walked down from the scene roots.
+///
+/// Ignoring node transforms for everything was right while an actor was one
+/// skinned mesh and nothing else. Four spheres added to the ant in Blender were
+/// plain objects with no skin and a node scale of about 0.3, and their raw mesh
+/// data is a sphere of radius 1.681: measured flat, the ant became a creature
+/// 5.0 m across that hung 1.68 m below its own origin, and the size tests said
+/// so in four different ways.
+///
+/// Anything that did survive to change an actor's drawn size would show up in
+/// `the_sheets_agree_with_the_models_they_were_baked_from`, which checks this
+/// measurement against a sheet the renderer actually drew.
+fn measure(model: &str) -> Option<Size> {
+    let bytes = std::fs::read(crate::asset_path().join(model)).ok()?;
+    // 12 bytes of header, then the JSON chunk's length and type.
+    let length = u32::from_le_bytes(bytes.get(12..16)?.try_into().ok()?) as usize;
+    let json: serde_json::Value = serde_json::from_slice(bytes.get(20..20 + length)?).ok()?;
+    let (mut low, mut high) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    let corner = |accessor: &serde_json::Value, which: &str| {
+        let bounds = accessor[which].as_array()?;
+        Some(Vec3::new(
+            bounds.first()?.as_f64()? as f32,
+            bounds.get(1)?.as_f64()? as f32,
+            bounds.get(2)?.as_f64()? as f32,
+        ))
+    };
+    // A mesh's own bounds, unioned into the box under whatever transform the
+    // caller says applies to it. Both corners of the box are carried through,
+    // because a rotation or a negative scale swaps which one is which.
+    let mut swallow = |mesh: &serde_json::Value, into: Mat4| -> Option<()> {
+        for primitive in mesh["primitives"].as_array()? {
+            let at = primitive["attributes"]["POSITION"].as_u64()? as usize;
+            let accessor = &json["accessors"][at];
+            let (near, far) = (corner(accessor, "min")?, corner(accessor, "max")?);
+            for x in [near.x, far.x] {
+                for y in [near.y, far.y] {
+                    for z in [near.z, far.z] {
+                        let at = into.transform_point3(Vec3::new(x, y, z));
+                        low = low.min(at);
+                        high = high.max(at);
+                    }
+                }
+            }
+        }
+        Some(())
+    };
+    let nodes = json["nodes"].as_array()?;
+    // Down from the scene's roots, so an unskinned mesh is measured where it is
+    // actually drawn. Skinned meshes are taken flat wherever they are found --
+    // including ones hung under a node this walk never reaches, since being
+    // reachable is not what decides whether their vertices count.
+    let mut stack: Vec<(usize, Mat4)> = json["scenes"][json["scene"].as_u64().unwrap_or(0) as usize]
+        ["nodes"]
+        .as_array()?
+        .iter()
+        .filter_map(|node| Some((node.as_u64()? as usize, Mat4::IDENTITY)))
+        .collect();
+    // Cheap insurance against a file whose graph has a cycle in it: a glTF with
+    // one is invalid, and a loop here would hang the game before its first
+    // frame with nothing on screen to say why.
+    let mut left = nodes.len() * 4;
+    while let Some((index, above)) = stack.pop() {
+        left = left.checked_sub(1)?;
+        let node = nodes.get(index)?;
+        let here = above * node_matrix(node);
+        if let Some(mesh) = node["mesh"].as_u64() {
+            if node.get("skin").is_none() {
+                swallow(&json["meshes"][mesh as usize], here)?;
+            }
+        }
+        for child in node["children"].as_array().into_iter().flatten() {
+            stack.push((child.as_u64()? as usize, here));
+        }
+    }
+    for node in nodes {
+        if let Some(mesh) = node["mesh"].as_u64() {
+            if node.get("skin").is_some() {
+                swallow(&json["meshes"][mesh as usize], Mat4::IDENTITY)?;
+            }
+        }
+    }
+    if low.x > high.x {
+        return None;
+    }
+    Some(Size {
+        radius: low.x.abs().max(high.x).max(low.z.abs()).max(high.z),
+        height: high.y - low.y,
+        lift: (-low.y).max(0.0),
+    })
+}
+
+/// One glTF node's local transform, from whichever of the two forms it is
+/// written in: a 4x4 `matrix`, or `translation`/`rotation`/`scale` with each
+/// part optional.
+fn node_matrix(node: &serde_json::Value) -> Mat4 {
+    let numbers = |key: &str, count: usize| -> Option<Vec<f32>> {
+        let list = node[key].as_array()?;
+        (list.len() == count)
+            .then(|| list.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect())
+    };
+    if let Some(cells) = numbers("matrix", 16) {
+        return Mat4::from_cols_slice(&cells);
+    }
+    let translation = numbers("translation", 3).map_or(Vec3::ZERO, |v| Vec3::new(v[0], v[1], v[2]));
+    // glTF writes a quaternion x, y, z, w -- the same order `Quat::from_xyzw`
+    // takes, and not the order `Quat::from_array` documents itself with.
+    let rotation = numbers("rotation", 4)
+        .map_or(Quat::IDENTITY, |v| Quat::from_xyzw(v[0], v[1], v[2], v[3]));
+    let scale = numbers("scale", 3).map_or(Vec3::ONE, |v| Vec3::new(v[0], v[1], v[2]));
+    Mat4::from_scale_rotation_translation(scale, rotation, translation)
 }
 
 impl Kind {
@@ -193,72 +392,56 @@ impl Kind {
         }
     }
 
-    /// What the model is drawn at, world units per unit of its own file.
+    /// Radius and height of its collision cylinder, **measured from the model**.
     ///
-    /// **A fact about the asset, not a tuning knob.** Both actors are authored
-    /// in Blender at something near metre scale rather than exported from the
-    /// decomp at a hundred units to the metre, so both numbers are near one --
-    /// the 1/100 the decomp actors were drawn at is gone from this file with
-    /// the last of them.
+    /// Not written down here, and there is no scale factor anywhere in this file
+    /// for one to drift out of step with: an actor is drawn at the size it was
+    /// authored at, and this is that size read back out of the same glTF the
+    /// renderer loads. Set an actor's size in Blender -- see
+    /// `tools/resize_actor.py` -- and the crowd's spacing, its shove distances,
+    /// the height the player has to be above to stomp one and the width of its
+    /// shadow all follow, because every one of those is expressed in these.
     ///
-    /// Each is the number that makes the model's footprint its collision
-    /// radius. The slime is a unit-radius dome, so 0.7 of it is exactly the
-    /// 0.70 in [`Kind::body`]. The ant is longer than it is wide and reaches
-    /// 0.533 from its origin nose to tail, so 1.125 of that is 0.60. Footprint
-    /// matters more than height does, because crowd spacing is measured in body
-    /// radii -- a model wider than the cylinder that spaces it is a crowd that
-    /// visibly interpenetrates.
-    pub fn draw_scale(self) -> f32 {
-        match self {
-            Self::Slime => 0.7,
-            Self::Ant => 1.125,
-        }
-    }
-
-    /// Radius and height of its collision cylinder.
-    ///
-    /// Both keep the radius of the actor they replaced, deliberately: the whole
-    /// crowd's spacing, its flow-field arithmetic and its shove resolution are
-    /// expressed in body radii, and every one of them was tuned against the
-    /// goomba's 0.70 and the scuttlebug's 0.60. The heights are the models'
-    /// own, at [`Kind::draw_scale`] -- the slime is a dome as tall as it is
-    /// wide, and the ant is a low thing that stands about two thirds of its own
-    /// width tall. Keeping a replaced actor's height instead would let the
-    /// player punch one while stood a third of a body above it.
+    /// The radius is the furthest the mesh reaches from its origin in the
+    /// horizontal plane, which for the ant is nose to tail rather than side to
+    /// side. Footprint matters more than height does: a model wider than the
+    /// cylinder that spaces it is a crowd that visibly interpenetrates.
     pub fn body(self) -> (f32, f32) {
-        match self {
-            Self::Slime => (0.70, 0.70),
-            Self::Ant => (0.60, 0.65),
-        }
+        let size = self.size();
+        (size.radius, size.height)
     }
 
     /// How far the model's geometry hangs below its own transform origin.
     ///
-    /// **This is a fact about the asset, not a tuning knob.** The placement code
-    /// treats an enemy's translation as the point its feet rest on, and for a
-    /// rig whose root sits up inside the body that is simply not where its
-    /// origin is. Seat the origin on the floor -- which is exactly what
-    /// [`crawl`] does, two centimetres of skin above the surface it found --
-    /// and the bottom of the model is underground. That is the "scuttlebugs
+    /// The placement code treats an enemy's translation as the point its feet
+    /// rest on, and for a rig whose root sits up inside the body that is simply
+    /// not where its origin is. Seat the origin on the floor -- which is exactly
+    /// what [`crawl`] does, two centimetres of skin above the surface it found
+    /// -- and the bottom of the model is underground. That is the "scuttlebugs
     /// clipping through the floor" report, and it happened on flat stone with
-    /// nothing steep anywhere near, which is why nothing about walls or
-    /// ceilings or stale surface normals ever fixed it.
+    /// nothing steep anywhere near, which is why nothing about walls or ceilings
+    /// or stale surface normals ever fixed it.
     ///
-    /// The ant is the same shape of problem in a milder form: its armature sits
-    /// at the body, and its six feet plant 0.192 below that in its own file --
-    /// 0.216 at [`Kind::draw_scale`]. `tools/measure_actor_hang.py` is the
-    /// authority for this number. It evaluates the skinned mesh on every frame
-    /// of every clip, which is what tells a permanent offset apart from a
-    /// transient one: the ant's is on all fifteen frames it has, so it is the
-    /// rig and not the animation.
+    /// Both actors that ship now are authored with their feet on `y = 0`, so
+    /// both measure zero and nothing is lifted. Measuring rather than writing it
+    /// down is what stops the correction outliving the model it was measured
+    /// off: a re-exported ant that had *stopped* hanging spent a session
+    /// floating a third of its own height above the ground on a constant nobody
+    /// had re-measured.
     ///
-    /// The slime is the case this wants: its mesh sits on `y = 0` in its own
-    /// file, so its origin already is its feet and nothing has to be lifted.
+    /// This is the bind pose, which is what a glTF's POSITION accessors hold.
+    /// `tools/measure_actor_hang.py` is the authority on the difference: it
+    /// evaluates the *skinned* mesh on every frame of every clip, which is what
+    /// tells a permanent rig offset from a squash that dips through the floor
+    /// plane for a few frames of a walk cycle. For both shipped actors the two
+    /// agree.
     pub fn lift(self) -> f32 {
-        match self {
-            Self::Slime => 0.0,
-            Self::Ant => 0.216,
-        }
+        self.size().lift
+    }
+
+    /// How big this actor is, measured once on first use and kept.
+    fn size(self) -> Size {
+        sizes()[self as usize]
     }
 
     /// How wide a shadow it casts.
@@ -304,7 +487,7 @@ pub enum Side {
 /// until it dies or something else takes its attention, which is why the target
 /// is kept as *who* rather than as a flag: a second thing worth chasing is a
 /// change of target rather than a special case.
-#[derive(Component, Default)]
+#[derive(Component)]
 pub struct Aggro {
     /// Who it is after, or `None` while nothing has its attention.
     pub target: Option<Entity>,
@@ -314,16 +497,50 @@ pub struct Aggro {
     /// for the last place it knew of when the target is gone -- and so that
     /// the movement step needs nothing but the enemy's own components.
     pub at: Vec3,
+    /// How wide the thing it is chasing is.
+    ///
+    /// **Everything that walks towards something has to know this**, because
+    /// "walk to it" means walking to its *edge*: a chaser aimed at a body's
+    /// centre is aimed at a place [`spread`] will not let it stand, and the two
+    /// then argue about its position for as long as the fight lasts. What that
+    /// looks like is a Mario standing inside an ant, vibrating.
+    ///
+    /// Carried on the aggro rather than looked up where it is needed, because
+    /// [`update`] walks the field in parallel and cannot be reading other
+    /// entities while it does. [`alert`] has already found the target once and
+    /// fills this in as it writes [`Self::at`].
+    pub room: f32,
 }
 
-/// How wide a berth an enemy gives what it is chasing, and how far that berth
-/// varies from one to the next.
+impl Default for Aggro {
+    fn default() -> Self {
+        Self {
+            target: None,
+            at: Vec3::ZERO,
+            // The player, who is what most things are chasing most of the time,
+            // and the safest thing to assume for anything that sets a target
+            // without going through `alert`.
+            room: crate::player::PLAYER_RADIUS,
+        }
+    }
+}
+
+/// How wide a berth an enemy gives what it is chasing, on top of the two bodies
+/// involved, and how far that berth varies from one to the next.
 ///
 /// Without it every enemy in a brood walks to the same point -- the target's
 /// feet -- and a crowd chasing one player is a crowd converging on one spot,
 /// which is a scrum that [`spread`] then spends the fight pushing apart. With
 /// it they arrive around him instead.
-const STAND_OFF: f32 = 1.0;
+///
+/// **On top of the two bodies**, which it did not used to be. As an absolute
+/// distance it was a standing instruction to walk 1.0 m from the target's
+/// middle, which is fine against a slime 0.6 m across and is a metre and a half
+/// inside an ant 5 m across. Every number in this file that says how close two
+/// things get is measured between their surfaces for that reason; the actors
+/// are authored art now and their size is not a constant anybody here gets to
+/// assume.
+const STAND_OFF: f32 = 0.6;
 const STAND_OFF_SPREAD: f32 = 1.6;
 
 /// How far off the straight line to its goal an enemy wanders, and how quickly
@@ -368,9 +585,14 @@ impl Quirk {
     }
 
     /// The spot around a target it makes for, rather than the target itself.
-    fn stand_off(&self) -> Vec3 {
+    ///
+    /// `bodies` is the two radii involved -- the target's and its own -- so the
+    /// spot it picks is outside both of them however big either one is. Aiming
+    /// at somewhere it cannot stand is the one thing this must not do: [`spread`]
+    /// would spend the fight pushing it back out again.
+    fn stand_off(&self, bodies: f32) -> Vec3 {
         let angle = self.seed * 2.3;
-        let reach = STAND_OFF + STAND_OFF_SPREAD * (self.seed * 0.9).sin().abs();
+        let reach = bodies + STAND_OFF + STAND_OFF_SPREAD * (self.seed * 0.9).sin().abs();
         Vec3::new(angle.sin(), 0.0, angle.cos()) * reach
     }
 
@@ -514,7 +736,9 @@ pub fn spawn(
             // thousand build two thousand actor scenes and destroy all but a
             // couple of hundred of them again on the next frame.
             Visibility::Hidden,
-            Transform::from_translation(position).with_scale(Vec3::splat(kind.draw_scale())),
+            // No scale. The model is drawn at the size it was authored at, and
+            // [`Kind::body`] is that size measured back off it.
+            Transform::from_translation(position),
             // Parts of both of these are flat quads the original turns to face
             // the camera every frame.
             crate::billboard::BillboardActor,
@@ -588,6 +812,12 @@ pub fn crowd(
         let (count, kind) = match request {
             Request::ClearCrowd => (0, CrowdKind::Mix),
             Request::Crowd(count, kind) => (count, kind),
+            // Not this system's request. Put back, so whoever it does belong
+            // to still sees it -- `take_requests` drains the queue whole.
+            other => {
+                console.defer(other);
+                continue;
+            }
         };
         // Both cases clear first. `crowd 2000` twice is a field of two
         // thousand, not of four -- which is the whole point of a command whose
@@ -804,6 +1034,9 @@ type Creatures<'w, 's> = Query<
         &'static Transform,
         &'static Side,
         Option<&'static Detail>,
+        // How big it is, for whatever ends up chasing it. The player and the
+        // Marios are not `Enemy` and answer with a Mario's own radius.
+        Option<&'static Enemy>,
     ),
 >;
 
@@ -828,6 +1061,25 @@ fn detailed(detail: Option<&Detail>) -> bool {
     detail != Some(&Detail::Crowd)
 }
 
+/// The working set [`alert`] keeps between ticks: the two crowds it sorts, the
+/// two grids it buckets them into, and the buffers the flood fill walks.
+///
+/// Fields rather than locals so that noticing allocates nothing. Every one of
+/// these was a fresh `Vec` or a fresh `HashMap` a tick, which is a handful of
+/// microseconds nobody would notice on its own and an allocator that never
+/// settles across the whole schedule.
+#[derive(Default)]
+pub struct Noticing {
+    crowd: Vec<(Entity, Vec3, Side)>,
+    hunting: Vec<(Entity, Vec3, Side, Option<Entity>)>,
+    seen: Neighbourhood,
+    earshot_grid: Neighbourhood,
+    nearby: Vec<usize>,
+    seeds: Vec<(usize, Entity)>,
+    shouting: Vec<usize>,
+    decided: Vec<(Entity, Option<Entity>)>,
+}
+
 /// Who has noticed whom, and who has been told about it.
 ///
 /// One rule for both sides. A creature with nothing to chase looks for the
@@ -845,64 +1097,84 @@ fn detailed(detail: Option<&Detail>) -> bool {
 /// Nothing is ever given up on except by dying: aggro is not a leash, and an
 /// enemy that has seen you comes until it or you are gone. What it does lose is
 /// a target that has been despawned, which is not giving up but having won.
-pub fn alert(tuning: Res<GameTuning>, everyone: Creatures, mut hunters: Hunters) {
+pub fn alert(
+    tuning: Res<GameTuning>,
+    everyone: Creatures,
+    mut hunters: Hunters,
+    mut scratch: Local<Noticing>,
+) {
+    let Noticing {
+        crowd,
+        hunting,
+        seen,
+        earshot_grid,
+        nearby,
+        seeds,
+        shouting,
+        decided,
+    } = &mut *scratch;
     // Only the tier being simulated in full takes part. Everything this system
     // does is quadratic-ish in the crowd it is handed -- two spatial grids and a
     // flood fill -- so handing it two hundred rather than two thousand is most
     // of what the budget buys. The rest of the field notices the player through
     // the flow field instead, in [`update`], at no cost at all.
-    let crowd: Vec<(Entity, Vec3, Side)> = everyone
-        .iter()
-        .filter(|(_, _, _, detail)| detailed(*detail))
-        .map(|(entity, transform, side, _)| (entity, transform.translation, *side))
-        .collect();
-    let mut hunting: Vec<(Entity, Vec3, Side, Option<Entity>)> = hunters
-        .iter()
-        .filter(|(_, _, _, _, detail)| detailed(*detail))
-        .map(|(entity, transform, side, aggro, _)| {
-            let target = aggro
-                .target
-                // A target that is no longer in the world is no target. This is
-                // how a Mario that has just flattened a slime goes looking for
-                // the next one rather than standing over the spot.
-                .filter(|target| everyone.get(*target).is_ok());
-            (entity, transform.translation, *side, target)
-        })
-        .collect();
+    crowd.clear();
+    crowd.extend(
+        everyone
+            .iter()
+            .filter(|(_, _, _, detail, _)| detailed(*detail))
+            .map(|(entity, transform, side, _, _)| (entity, transform.translation, *side)),
+    );
+    hunting.clear();
+    hunting.extend(
+        hunters
+            .iter()
+            .filter(|(_, _, _, _, detail)| detailed(*detail))
+            .map(|(entity, transform, side, aggro, _)| {
+                let target = aggro
+                    .target
+                    // A target that is no longer in the world is no target. This
+                    // is how a Mario that has just flattened a slime goes
+                    // looking for the next one rather than standing over the
+                    // spot.
+                    .filter(|target| everyone.get(*target).is_ok());
+                (entity, transform.translation, *side, target)
+            }),
+    );
     // Who can see something to go for. These are the seeds of the chain, and
     // the only ones that shout.
     let sight = tuning.enemy_sight;
-    let seen = Neighbourhood::new(crowd.iter().map(|(_, at, _)| *at), sight);
-    let mut nearby = Vec::new();
-    let seeds: Vec<(usize, Entity)> = hunting
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, _, _, target))| target.is_none())
-        .filter_map(|(index, &(_, at, side, _))| {
-            seen.near(at, &mut nearby);
-            nearby
-                .iter()
-                .map(|&other| crowd[other])
-                .filter(|(_, _, theirs)| *theirs != side)
-                .map(|(entity, theirs, _)| (entity, at.distance_squared(theirs)))
-                .filter(|(_, range)| *range < sight * sight)
-                .min_by(|(_, a), (_, b)| a.total_cmp(b))
-                .map(|(quarry, _)| (index, quarry))
-        })
-        .collect();
-    let mut shouting: Vec<usize> = Vec::new();
-    for (index, quarry) in seeds {
+    seen.fill(crowd.iter().map(|(_, at, _)| *at), sight);
+    seeds.clear();
+    for (index, &(_, at, side, target)) in hunting.iter().enumerate() {
+        if target.is_some() {
+            continue;
+        }
+        seen.near(at, nearby);
+        let quarry = nearby
+            .iter()
+            .map(|&other| crowd[other])
+            .filter(|(_, _, theirs)| *theirs != side)
+            .map(|(entity, theirs, _)| (entity, at.distance_squared(theirs)))
+            .filter(|(_, range)| *range < sight * sight)
+            .min_by(|(_, a), (_, b)| a.total_cmp(b));
+        if let Some((quarry, _)) = quarry {
+            seeds.push((index, quarry));
+        }
+    }
+    shouting.clear();
+    for &(index, quarry) in seeds.iter() {
         hunting[index].3 = Some(quarry);
         shouting.push(index);
     }
     // And the chain: everything on the same side within earshot of a shout
     // takes the same target and shouts in its turn.
     let earshot = tuning.enemy_alert;
-    let earshot_grid = Neighbourhood::new(hunting.iter().map(|(_, at, _, _)| *at), earshot);
+    earshot_grid.fill(hunting.iter().map(|(_, at, _, _)| *at), earshot);
     while let Some(index) = shouting.pop() {
         let (_, from, side, target) = hunting[index];
-        earshot_grid.near(from, &mut nearby);
-        for &other in &nearby {
+        earshot_grid.near(from, nearby);
+        for &other in nearby.iter() {
             let (_, theirs, their_side, their_target) = hunting[other];
             if their_target.is_some()
                 || their_side != side
@@ -915,11 +1187,22 @@ pub fn alert(tuning: Res<GameTuning>, everyone: Creatures, mut hunters: Hunters)
         }
     }
     // Written back by entity rather than by position in the iteration, which is
-    // not a thing to bet a fight on.
-    let decided: HashMap<Entity, Option<Entity>> = hunting
-        .iter()
-        .map(|(entity, _, _, target)| (*entity, *target))
-        .collect();
+    // not a thing to bet a fight on. Sorted and searched rather than hashed:
+    // this is looked up once per hunter and built once per tick, and a `HashMap`
+    // is a SipHash of every key on both sides of that.
+    decided.clear();
+    decided.extend(
+        hunting
+            .iter()
+            .map(|(entity, _, _, target)| (*entity, *target)),
+    );
+    decided.sort_unstable_by_key(|(entity, _)| *entity);
+    let decided = |entity: Entity| {
+        decided
+            .binary_search_by_key(&entity, |(entity, _)| *entity)
+            .ok()
+            .and_then(|found| decided[found].1)
+    };
     for (entity, transform, _, mut aggro, detail) in &mut hunters {
         // A crowd-tier enemy keeps whatever it was chasing when it was last in
         // the near tier, and is not given a new target here. Losing one by
@@ -927,15 +1210,19 @@ pub fn alert(tuning: Res<GameTuning>, everyone: Creatures, mut hunters: Hunters)
         if !detailed(detail) {
             continue;
         }
-        let target = decided.get(&entity).copied().flatten();
+        let target = decided(entity);
         if aggro.target != target {
             aggro.target = target;
         }
-        // Where that target is now, for the movement step to walk towards.
-        aggro.at = match target.and_then(|target| everyone.get(target).ok()) {
-            Some((_, seen, _, _)) => seen.translation,
-            None => transform.translation,
-        };
+        // Where that target is now, and how wide, for the movement step to
+        // walk towards the edge of rather than into.
+        match target.and_then(|target| everyone.get(target).ok()) {
+            Some((_, seen, _, _, kind)) => {
+                aggro.at = seen.translation;
+                aggro.room = kind.map_or(crate::player::PLAYER_RADIUS, |it| it.kind.body().0);
+            }
+            None => aggro.at = transform.translation,
+        }
     }
 }
 
@@ -980,6 +1267,10 @@ type Marios<'w, 's> = Query<
 
 /// One body in the press, reduced to what a shove needs to know.
 struct Body {
+    /// Who it is, which the shove does not need but the write-back checks: the
+    /// pushes are applied by walking the same queries a second time in the same
+    /// order, and "the same order" is worth an assertion in debug builds.
+    who: Entity,
     at: Vec3,
     /// The cylinder it is resolved as, which is the one it is already fought as.
     radius: f32,
@@ -988,17 +1279,30 @@ struct Body {
     /// it is stuck to, because shoving a bug off its wall is the one thing this
     /// must not do.
     up: Vec3,
+    /// Whether this is a cheap-tier body. It is shoved a quarter as often, and
+    /// its shove is resolved against the flow field's idea of a wall rather than
+    /// against the level itself.
+    crowd: bool,
 }
 
-/// Which query a shoved body came out of, so the push can be written back to it.
-///
-/// The player is deliberately not in here. He is in the body list -- everything
-/// else is held out of him -- but he is never pushed: the shove would fight the
-/// controller for his position, and being nudged about by the crowd you are
-/// walking through is a worse bug than the one being fixed.
-enum Shoved {
-    Enemy(Entity),
-    Ally(Entity),
+impl Body {
+    /// How many fixed ticks pass between two shoves of this body.
+    fn stride(&self) -> u32 {
+        match self.crowd {
+            true => CROWD_SPREAD_STRIDE,
+            false => 1,
+        }
+    }
+}
+
+/// The working set [`spread`] keeps between ticks, so that holding a field of
+/// two thousand apart allocates nothing at all after the first tick.
+#[derive(Default)]
+pub struct Press {
+    bodies: Vec<Body>,
+    pushes: Vec<Vec3>,
+    grid: Neighbourhood,
+    near: Vec<usize>,
 }
 
 /// Holds every creature out of every other one, so that a crowd converging on a
@@ -1017,76 +1321,110 @@ enum Shoved {
 /// ant are all bodies of some radius standing on some ground, and two
 /// separate answers to how bodies avoid each other is two answers that disagree
 /// at the boundary between them.
+///
+/// **The whole field is held apart, not just the near tier.** It used to be the
+/// near tier only, on the grounds that two distant slimes standing in the same
+/// spot are two pixels standing in the same spot. They are, but a thousand of
+/// them are a crowd that has visibly collapsed into a line of stacks, and an
+/// enemy promoted out of one arrives already inside its neighbours. What made
+/// that affordable is the three things a crowd of two thousand needs and a crowd
+/// of two hundred does not: a [`Neighbourhood`] that hashes into flat arrays
+/// instead of allocating a list per cell, a squared-distance reject so the
+/// square root is only paid for pairs that actually overlap, and a
+/// [`CROWD_SPREAD_STRIDE`] that shoves a quarter of the cheap tier per tick
+/// rather than all of it every tick.
 pub fn spread(
     level: Res<LevelData>,
+    field: Res<crate::flow::FlowField>,
     mut enemies: Jostling,
     mut allies: Marios,
-    player: Query<&Transform, With<Player>>,
+    player: Query<(Entity, &Transform), With<Player>>,
+    mut press: Local<Press>,
+    mut fixed_tick: Local<u32>,
 ) {
-    let mut bodies: Vec<Body> = Vec::new();
-    let mut shoved: Vec<Shoved> = Vec::new();
-    // The near tier only. Two distant slimes standing in the same spot are two
-    // pixels standing in the same spot, and untangling them costs a spatial
-    // grid over the whole field to fix something nobody can see.
+    *fixed_tick = fixed_tick.wrapping_add(1);
+    let tick = *fixed_tick;
+    let Press {
+        bodies,
+        pushes,
+        grid,
+        near,
+    } = &mut *press;
+    bodies.clear();
     for (entity, enemy, transform, crawler, detail) in &enemies {
-        if *detail != Detail::Full {
-            continue;
-        }
         let (radius, height) = enemy.kind.body();
         bodies.push(Body {
+            who: entity,
             at: transform.translation,
             radius,
             height,
             up: crawler.map_or(Vec3::Y, |crawler| crawler.up),
+            crowd: *detail == Detail::Crowd,
         });
-        shoved.push(Shoved::Enemy(entity));
     }
+    // Where the enemies stop and the Marios start, since the two are written
+    // back through different queries.
+    let enemy_count = bodies.len();
     for (entity, transform) in &allies {
         bodies.push(Body {
+            who: entity,
             at: transform.translation,
             // A Mario is a Mario: the same body the player is resolved against
             // walls with, rather than a second number that would drift from it.
             radius: crate::player::PLAYER_RADIUS,
             height: crate::player::PLAYER_HEIGHT,
             up: Vec3::Y,
+            crowd: false,
         });
-        shoved.push(Shoved::Ally(entity));
     }
-    // Solid, and last, so that everything after `shoved.len()` is a body that
-    // pushes without being pushed.
-    let fixed = shoved.len();
-    for transform in &player {
+    // Solid, and last, so that everything from here on is a body that pushes
+    // without being pushed.
+    let fixed = bodies.len();
+    for (entity, transform) in &player {
         bodies.push(Body {
+            who: entity,
             at: transform.translation,
             radius: crate::player::PLAYER_RADIUS,
             height: crate::player::PLAYER_HEIGHT,
             up: Vec3::Y,
+            crowd: false,
         });
     }
 
     let widest = bodies
         .iter()
         .fold(0.0_f32, |most, body| most.max(body.radius));
-    let grid = Neighbourhood::new(
+    grid.fill(
         bodies.iter().map(|body| body.at),
         widest * 2.0 + PERSONAL_SPACE,
     );
-    let mut pushes = vec![Vec3::ZERO; fixed];
-    let mut near = Vec::new();
+    pushes.clear();
+    pushes.resize(fixed, Vec3::ZERO);
     for (index, body) in bodies.iter().enumerate().take(fixed) {
+        // Whose turn it is. Offset by the body's own index rather than run for
+        // the whole cheap tier on every fourth tick, so the work is a quarter of
+        // the field every tick instead of the whole field in a spike.
+        if !(tick + index as u32).is_multiple_of(body.stride()) {
+            continue;
+        }
         let mut push = Vec3::ZERO;
-        grid.near(body.at, &mut near);
-        for &other in &near {
+        grid.near(body.at, near);
+        for &other in near.iter() {
             if other == index {
                 continue;
             }
             let theirs = &bodies[other];
-            let room = body.radius + theirs.radius + PERSONAL_SPACE;
+            let room = body.radius + theirs.radius + PERSONAL_SPACE - SPREAD_SLACK;
             let apart = body.at - theirs.at;
-            let overlap = room - apart.length() - SPREAD_SLACK;
-            if overlap <= 0.0 {
+            // Squared first. Most of what a bucket hands back is not touching --
+            // it is in the same cell, or in a cell that hashed to the same
+            // bucket -- and this is the test that throws those away, so it is
+            // the one that must not contain a square root. The length below is
+            // only ever taken for a pair that really is overlapping.
+            if apart.length_squared() >= room * room {
                 continue;
             }
+            let overlap = room - apart.length();
             // Stood in exactly the same place, which two spawned by the same
             // pipe on the same tick genuinely are, there is no direction to be
             // pushed in and one has to be invented. The golden angle again, so
@@ -1103,17 +1441,27 @@ pub fn spread(
             // player -- there is only one end, so it takes the whole share or
             // it is walked through.
             let share = if other < fixed { 1.0 } else { 2.0 };
-            push += away * overlap * SPREAD_RATE * share;
+            // A body shoved once every four ticks has to take out four ticks'
+            // worth of overlap, or a strided crowd untangles four times slower
+            // than the tier it is promoted into. Capped, because a shove that
+            // takes out the *whole* overlap in one go is one that overshoots and
+            // comes back next time -- which is the jitter [`SPREAD_RATE`] exists
+            // to prevent.
+            let rate = (SPREAD_RATE * body.stride() as f32).min(SPREAD_RATE_CAP);
+            push += away * overlap * rate * share;
         }
         pushes[index] = push;
     }
 
-    for (index, push) in pushes.into_iter().enumerate() {
-        if push == Vec3::ZERO {
-            continue;
-        }
-        let body = &bodies[index];
-        let push = push.clamp_length_max(SPREAD_LIMIT * FIXED_DT);
+    // Applied by walking the same two queries again in the same order rather
+    // than by looking each body up: a random `get_mut` per shoved body is a
+    // hash lookup and an archetype jump, and there are ten times as many of
+    // them as there were. Bevy iterates a query in archetype order and nothing
+    // here changes an archetype, so the second pass lines up with the first --
+    // asserted in debug builds rather than assumed.
+    let shove = |body: &Body, push: Vec3| -> Vec3 {
+        let push = push.clamp_length_max(SPREAD_LIMIT * FIXED_DT * body.stride() as f32);
+        let moved = body.at + push;
         // A press of bodies leaning on the one at the front is enough to post it
         // through a fence, and neither the walk step nor the crowd step gets a
         // say in where the shove puts it. So the shove resolves its own result,
@@ -1121,24 +1469,34 @@ pub fn spread(
         //
         // Not for crawlers: a bug is held out of walls by being *on* one, and
         // `resolve_walls` would push it off the surface it is standing on.
-        let shove = |at: Vec3| {
-            let moved = at + push;
-            match body.up == Vec3::Y {
-                true => level.resolve_walls(moved, body.radius, body.height),
-                false => moved,
-            }
-        };
-        match shoved[index] {
-            Shoved::Enemy(entity) => {
-                if let Ok((_, _, mut transform, _, _)) = enemies.get_mut(entity) {
-                    transform.translation = shove(transform.translation);
-                }
-            }
-            Shoved::Ally(entity) => {
-                if let Ok((_, mut transform)) = allies.get_mut(entity) {
-                    transform.translation = shove(transform.translation);
-                }
-            }
+        if body.up != Vec3::Y {
+            return moved;
+        }
+        match body.crowd {
+            // The cheap tier asks the level nothing, here as everywhere else.
+            // The flow field already knows what stands between two cells, and it
+            // is the same rule [`crowd_step`] walks by -- a shove that could put
+            // an enemy somewhere its own next step would refuse to go is a shove
+            // that has to be refused too.
+            true => match field.clear(body.at, moved) {
+                true => moved,
+                false => body.at,
+            },
+            false => level.resolve_walls(moved, body.radius, body.height),
+        }
+    };
+    for (index, (entity, _, mut transform, _, _)) in enemies.iter_mut().enumerate() {
+        let body = &bodies[index];
+        debug_assert_eq!(body.who, entity, "the jostling query changed order");
+        if pushes[index] != Vec3::ZERO {
+            transform.translation = shove(body, pushes[index]);
+        }
+    }
+    for (index, (entity, mut transform)) in allies.iter_mut().enumerate() {
+        let body = &bodies[enemy_count + index];
+        debug_assert_eq!(body.who, entity, "the Mario query changed order");
+        if pushes[enemy_count + index] != Vec3::ZERO {
+            transform.translation = shove(body, pushes[enemy_count + index]);
         }
     }
 }
@@ -1149,25 +1507,77 @@ pub fn spread(
 /// Square cells in the horizontal plane, looked up nine at a time. Height is
 /// left to the caller's own distance check: enemies are spread over a castle
 /// rather than a tower, and a third axis of buckets would be mostly empty.
+///
+/// **A flat spatial hash rather than a map of cells to lists.** The first
+/// version was a `HashMap<(i32, i32), Vec<usize>>`, which is a SipHash of two
+/// integers per point plus a heap allocation per occupied cell, rebuilt from
+/// nothing every tick. This is a counting sort into two integer arrays that the
+/// caller keeps between ticks: [`Self::begins`] says where each bucket's run
+/// starts in [`Self::items`], and `items` holds the point indices sorted by
+/// bucket. Two linear passes, and no allocation at all once the buffers have
+/// grown to the size of the field.
+///
+/// Cells are *hashed* rather than addressed, so the table is the size of the
+/// crowd rather than the size of the castle, and two cells at opposite ends of
+/// the map can share a bucket. That makes a query's answer a list of candidates
+/// rather than a list of neighbours -- every caller measures the distance
+/// anyway, since nine square cells are not a circle either. What a collision may
+/// *not* do is hand the same point back twice, which would let a shove count one
+/// neighbour double, so the nine bucket indices are deduplicated before they are
+/// read rather than the points afterwards.
+#[derive(Default)]
 struct Neighbourhood {
     cell: f32,
-    buckets: HashMap<(i32, i32), Vec<usize>>,
+    /// One less than the bucket count, which is a power of two so that the
+    /// hash is masked rather than divided.
+    mask: u32,
+    /// Where each bucket's run of [`Self::items`] begins. One longer than the
+    /// bucket count, so bucket `b` is `begins[b]..begins[b + 1]`.
+    begins: Vec<u32>,
+    items: Vec<u32>,
+    /// Which bucket each point landed in, kept from the counting pass to the
+    /// placing one, and a write cursor per bucket. Scratch, and fields only so
+    /// that they are allocated once rather than once a tick.
+    keys: Vec<u32>,
+    cursor: Vec<u32>,
 }
 
 impl Neighbourhood {
     /// Buckets `points` into cells of `cell` on a side, which must be at least
     /// the distance the caller intends to ask about -- [`Self::near`] looks one
     /// cell out in each direction and no further.
-    fn new(points: impl Iterator<Item = Vec3>, cell: f32) -> Self {
-        let cell = cell.max(0.001);
-        let mut buckets: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-        for (index, point) in points.enumerate() {
-            buckets
-                .entry(Self::at(cell, point))
-                .or_default()
-                .push(index);
+    ///
+    /// `ExactSizeIterator` rather than any old iterator because the table is
+    /// sized off the crowd before a single point is hashed, and counting them
+    /// twice to find that out would cost more than the hashing.
+    fn fill(&mut self, points: impl ExactSizeIterator<Item = Vec3>, cell: f32) {
+        // Two buckets a point, so that a crowd of any size mostly finds its own
+        // cell alone in one and the loads stay short.
+        let buckets = (points.len() * 2).next_power_of_two().max(64);
+        self.mask = buckets as u32 - 1;
+        self.cell = cell.max(0.001);
+        self.keys.clear();
+        self.begins.clear();
+        self.begins.resize(buckets + 1, 0);
+        for point in points {
+            let key = Self::bucket(self.mask, Self::at(self.cell, point));
+            self.keys.push(key);
+            // Counted one slot to the right, so that the prefix sum below turns
+            // the counts into starts in place.
+            self.begins[key as usize + 1] += 1;
         }
-        Self { cell, buckets }
+        for index in 1..self.begins.len() {
+            self.begins[index] += self.begins[index - 1];
+        }
+        self.cursor.clear();
+        self.cursor.extend_from_slice(&self.begins[..buckets]);
+        self.items.clear();
+        self.items.resize(self.keys.len(), 0);
+        for index in 0..self.keys.len() {
+            let slot = &mut self.cursor[self.keys[index] as usize];
+            self.items[*slot as usize] = index as u32;
+            *slot += 1;
+        }
     }
 
     fn at(cell: f32, point: Vec3) -> (i32, i32) {
@@ -1177,17 +1587,41 @@ impl Neighbourhood {
         )
     }
 
+    /// A cell's bucket: the two coordinates stirred together by multiplication
+    /// and one shift, because masking keeps the low bits and multiplication only
+    /// ever carries upwards.
+    fn bucket(mask: u32, (x, z): (i32, i32)) -> u32 {
+        let mixed = (x as u32)
+            .wrapping_mul(0x9E37_79B1)
+            .wrapping_add((z as u32).wrapping_mul(0x85EB_CA6B));
+        (mixed ^ (mixed >> 15)) & mask
+    }
+
     /// Everything in the nine cells around `point`, appended to `found` after
     /// emptying it. The caller passes the same buffer back in each time rather
     /// than allocating a fresh one per member of the crowd.
     fn near(&self, point: Vec3, found: &mut Vec<usize>) {
         found.clear();
+        if self.items.is_empty() {
+            return;
+        }
         let (x, z) = Self::at(self.cell, point);
+        // Nine cells, and any two of them may share a bucket. Reading one twice
+        // would return its points twice, so they are collected as they are
+        // visited and skipped if they come round again.
+        let mut read = [u32::MAX; 9];
+        let mut count = 0;
         for z in z - 1..=z + 1 {
             for x in x - 1..=x + 1 {
-                if let Some(bucket) = self.buckets.get(&(x, z)) {
-                    found.extend_from_slice(bucket);
+                let bucket = Self::bucket(self.mask, (x, z));
+                if read[..count].contains(&bucket) {
+                    continue;
                 }
+                read[count] = bucket;
+                count += 1;
+                let run = self.begins[bucket as usize] as usize
+                    ..self.begins[bucket as usize + 1] as usize;
+                found.extend(self.items[run].iter().map(|index| *index as usize));
             }
         }
     }
@@ -1318,7 +1752,12 @@ pub fn update(
                 return;
             }
             let (goal, speed) = match aggro.target {
-                Some(_) => (Some(aggro.at + quirk.stand_off()), tuning.enemy_speed),
+                Some(_) => (
+                    // Outside both bodies, not a metre from the target's
+                    // middle. An ant is 2.5 m of radius on its own.
+                    Some(aggro.at + quirk.stand_off(aggro.room + enemy.kind.body().0)),
+                    tuning.enemy_speed,
+                ),
                 None => (wander.goal(transform.translation, dt), WANDER_SPEED),
             };
             let speed = speed * quirk.pace();
@@ -1411,6 +1850,10 @@ fn crowd_step(
         });
         if noticed {
             aggro.target = Some(player);
+            // Set rather than left alone: this one may have been chasing a
+            // Mario, or an ant, before it was demoted out of the near tier, and
+            // a stale width is a standoff distance for the wrong creature.
+            aggro.room = crate::player::PLAYER_RADIUS;
         }
     }
     let speed = quirk.pace()
@@ -1839,15 +2282,19 @@ pub fn combat(
         let horizontal = Vec3::new(offset.x, 0.0, offset.z);
         let distance_squared = horizontal.length_squared();
         let bearing = horizontal.normalize_or_zero();
+        let (radius, height) = enemy.kind.body();
+        // From its surface, exactly as the touch below already is. As a
+        // distance to its centre the sword could not reach an ant at all:
+        // `spread` holds one 3.27 m from the player and the swing was 2.2.
+        let swing = radius + ATTACK_REACH;
         if controller.attack_left > 0.0
-            && distance_squared < ATTACK_REACH * ATTACK_REACH
+            && distance_squared < swing * swing
             && facing.dot(bearing) > -0.15
         {
             commands.entity(entity).despawn();
             sounds.push(Sfx::Defeat);
             continue;
         }
-        let (radius, height) = enemy.kind.body();
         let reach = radius + PLAYER_REACH;
         if distance_squared > reach * reach {
             continue;
@@ -1884,11 +2331,16 @@ pub fn combat(
     }
 }
 
-/// How long a Mario's punch takes from the moment he starts it, and how far it
-/// lands. The reach is the player's sword's less the difference between a
-/// sword and a fist.
+/// How long a Mario's punch takes from the moment he starts it, and how far
+/// past its target's body it lands. The reach is the player's sword's less the
+/// difference between a sword and a fist.
+///
+/// It has to be at least as long as [`crate::squad::STRIKE_RANGE`] plus a
+/// Mario's own radius, or a Mario walks to where it is allowed to stand and
+/// then cannot reach what it walked to -- a squad that surrounds a slime and
+/// then swings at the air forever.
 const MARIO_SWING: f32 = 0.45;
-const MARIO_REACH: f32 = 1.6;
+const MARIO_REACH: f32 = 1.3;
 
 /// The Marios' half of the fight: a Mario stood over what it has noticed hits
 /// it, and what it hits dies.
@@ -1905,22 +2357,27 @@ pub fn ally_combat(
     mut commands: Commands,
     mut sounds: ResMut<SoundQueue>,
     mut allies: Query<(&mut Ally, &Transform, &Aggro)>,
-    enemies: Query<&Transform, (With<Enemy>, Without<Ally>)>,
+    enemies: Query<(&Transform, &Enemy), Without<Ally>>,
 ) {
     for (mut ally, transform, aggro) in &mut allies {
-        let quarry = aggro
-            .target
-            .and_then(|target| enemies.get(target).ok().map(|at| (target, at.translation)));
-        let in_reach = quarry.is_some_and(|(_, at)| {
+        let quarry = aggro.target.and_then(|target| {
+            enemies
+                .get(target)
+                .ok()
+                .map(|(at, enemy)| (target, at.translation, enemy.kind.body().0))
+        });
+        let in_reach = quarry.is_some_and(|(_, at, radius)| {
             let apart = at - transform.translation;
-            Vec3::new(apart.x, 0.0, apart.z).length() < MARIO_REACH
+            // Past its body, so a punch reaches whatever the squad is allowed
+            // to stand next to. See [`MARIO_REACH`].
+            Vec3::new(apart.x, 0.0, apart.z).length() < radius + MARIO_REACH
         });
         if ally.swing_left > 0.0 {
             ally.swing_left = (ally.swing_left - FIXED_DT).max(0.0);
             ally.state.motion = Motion::Attack;
             ally.state.still_for = 0.0;
             if ally.swing_left == 0.0 && in_reach {
-                let (target, _) = quarry.expect("in reach of nothing");
+                let (target, _, _) = quarry.expect("in reach of nothing");
                 commands.entity(target).despawn();
                 sounds.push(Sfx::Defeat);
             }
@@ -2088,98 +2545,70 @@ mod tests {
         }
     }
 
-    /// The corners of a model's own geometry, in its own units.
+    /// How far a model's geometry reaches below its own origin.
     ///
-    /// Off the glTF rather than out of a mesh: every accessor carries the
-    /// bounds of what it holds, so the extent of the `POSITION` attribute of
-    /// every primitive is the whole model without decoding a single vertex.
-    /// Only `POSITION` -- the animations' accessors have bounds too, and
-    /// folding those in measures the range of a rotation.
-    fn model_bounds(kind: Kind) -> (Vec3, Vec3) {
-        let doc = gltf(kind.model());
-        let (mut low, mut high) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-        let corner = |accessor: &serde_json::Value, which: &str| {
-            let bounds = accessor[which]
-                .as_array()
-                .expect("an accessor with no bounds");
-            Vec3::new(
-                bounds[0].as_f64().expect("not a number") as f32,
-                bounds[1].as_f64().expect("not a number") as f32,
-                bounds[2].as_f64().expect("not a number") as f32,
-            )
-        };
-        for mesh in doc["meshes"].as_array().expect("no meshes") {
-            for primitive in mesh["primitives"]
-                .as_array()
-                .expect("a mesh with no primitives")
-            {
-                let at = primitive["attributes"]["POSITION"]
-                    .as_u64()
-                    .expect("a primitive with no positions") as usize;
-                let accessor = &doc["accessors"][at];
-                low = low.min(corner(accessor, "min"));
-                high = high.max(corner(accessor, "max"));
-            }
-        }
-        (low, high)
-    }
-
-    /// How far a model's geometry reaches below its own origin, in world units.
-    ///
-    /// Deliberately *not* [`Kind::lift`]: a test that subtracts back out the
-    /// very number the placement put in passes with the lift set to zero, which
-    /// is how two earlier versions of the floor test quietly proved nothing.
-    ///
-    /// This is the bind pose rather than the posed mesh, and the difference is
-    /// what `tools/measure_actor_hang.py` exists to settle. For both actors the
-    /// two agree: the ant's six feet plant at the same height on every frame of
-    /// both its clips, and the slime rests on `y = 0`.
+    /// The same measurement [`Kind::lift`] is, and deliberately so now: the
+    /// placement holds a model up by what the model says it hangs, so the two
+    /// cannot disagree. What that leaves this useful for is the thing it is
+    /// actually used for -- checking that the *placement* keeps a model's bottom
+    /// out of the ground while it walks, which the lift is only one term of.
+    /// `tools/measure_actor_hang.py` is the independent instrument, and it reads
+    /// the posed mesh rather than the bind pose.
     fn hang_in_model(kind: Kind) -> f32 {
-        (-model_bounds(kind).0.y * kind.draw_scale()).max(0.0)
+        measure(kind.model()).expect("a shipped actor could not be measured").lift
     }
 
-    /// [`Kind::draw_scale`], [`Kind::body`] and [`Kind::lift`] against the size
-    /// the models actually are.
+    /// That the game can measure both actors, and that what it measures is a
+    /// model rather than a units mix-up.
     ///
-    /// None of those three is a look. `draw_scale` is the number that makes a
-    /// mesh's footprint the collision radius the crowd is spaced on -- get it
-    /// wrong and enemies overlap each other by however far the two have drifted
-    /// apart -- `body`'s height is what the player has to be above to stomp one,
-    /// and `lift` is how far off its own origin it has to be drawn to stand on
-    /// the floor rather than in it. All three are readable straight out of the
-    /// asset, so all three are read out of the asset here rather than believed.
+    /// There is nothing here to compare [`Kind::body`] against: it *is* the
+    /// measurement, which is the point -- an actor is drawn at the size it was
+    /// authored at and spaced, shadowed and fought at the size it is drawn.
+    /// **How big an actor should be is a decision that belongs in Blender**, so
+    /// this deliberately does not have an opinion about it; a big enemy is a
+    /// design choice and not a bug.
     ///
-    /// The margin is two centimetres because these are round numbers written
-    /// down by hand against measurements that are not: the ant's footprint
-    /// works out at 0.600 against a body of 0.60, and its hang at 0.2161
-    /// against a lift of 0.216.
+    /// What it does check is that the measurement happened at all. A model
+    /// missing from the install leaves [`sizes`] on [`UNMEASURED`], and a
+    /// silently plausible fallback is the failure this codebase has already had
+    /// twice -- the impostor sheets missing from the Windows package drew no
+    /// sprites at all and said so only on a stderr nobody was attached to.
+    ///
+    /// The band around that is wide enough to be about units rather than taste:
+    /// a model exported at a hundred units to the metre, the way every decomp
+    /// actor was, or at Blender's default two-metre cube when it was meant to be
+    /// a beetle. Anything a person could plausibly want on this map passes.
+    /// What catches a *stale* size -- an actor re-exported bigger without its
+    /// sheet being re-baked -- is
+    /// `impostor::tests::the_sheets_agree_with_the_models_they_were_baked_from`,
+    /// which compares the model against something the renderer drew.
     #[test]
-    fn the_cylinders_are_the_size_the_models_are_drawn_at() {
-        for kind in [Kind::Slime, Kind::Ant] {
-            let (low, high) = model_bounds(kind);
-            let scale = kind.draw_scale();
-            let (radius, height) = kind.body();
-
-            // The widest it reaches from its origin in the horizontal plane,
-            // which for the ant is nose to tail rather than side to side.
-            let footprint = low.x.abs().max(high.x).max(low.z.abs()).max(high.z) * scale;
+    fn an_actor_is_the_size_it_was_authored_at() {
+        for kind in KINDS {
+            let size = measure(kind.model()).unwrap_or_else(|| {
+                panic!("{kind:?}'s model could not be measured, so the game would \
+                        silently use {UNMEASURED:?}")
+            });
             assert!(
-                (footprint - radius).abs() < 0.02,
-                "{kind:?} is drawn {footprint:.3} m across and spaced {radius:.3} m apart"
+                (0.05..20.0).contains(&size.radius) && (0.05..20.0).contains(&size.height),
+                "{kind:?} is authored {:.3} m across and {:.3} m tall, which is a \
+                 units problem rather than a size. Set the size in Blender -- \
+                 tools/resize_actor.py measures and changes it.",
+                size.radius * 2.0,
+                size.height,
             );
-
-            let tall = (high.y - low.y) * scale;
+            // Feet on the origin: the pipeline's rule, and the thing that lets
+            // every placement in the game seat a translation on the ground
+            // without a correction. `Kind::lift` still carries one for an actor
+            // that arrives without it, so this is a nudge rather than a
+            // requirement -- but an actor whose origin is not its feet gets its
+            // shadow, its stomp height and its sprite's footing from a guess.
             assert!(
-                (tall - height).abs() < 0.02,
-                "{kind:?} is drawn {tall:.3} m tall and fought as {height:.3} m"
-            );
-
-            let hang = hang_in_model(kind);
-            assert!(
-                (hang - kind.lift()).abs() < 0.02,
-                "{kind:?}'s art stops {hang:.3} m below its origin but \
-                 `Kind::lift` claims {:.3} m",
-                kind.lift()
+                size.lift < 0.05,
+                "{kind:?}'s art hangs {:.3} m below its own origin. It works -- \
+                 `Kind::lift` holds it up -- but the model wants its origin moved \
+                 to its feet in Blender.",
+                size.lift,
             );
         }
     }
@@ -2739,10 +3168,22 @@ mod tests {
         )
     }
 
-    fn field(placed: &[Vec3]) -> (World, Entity, Vec<Entity>) {
+    /// A world with the lawn in it and the flow field over it.
+    ///
+    /// [`spread`] wants the field as well as the level now: a cheap-tier body's
+    /// shove is resolved against the same table [`crowd_step`] walks by, so a
+    /// world that can be shoved in is a world that has one.
+    fn lawn_world() -> World {
         let mut world = World::new();
+        let level = lawn();
+        world.insert_resource(crate::flow::FlowField::new(&level));
+        world.insert_resource(level);
+        world
+    }
+
+    fn field(placed: &[Vec3]) -> (World, Entity, Vec<Entity>) {
+        let mut world = lawn_world();
         world.insert_resource(GameTuning::default());
-        world.insert_resource(lawn());
         let player = world
             .spawn((Player, Side::Friendly, Transform::default()))
             .id();
@@ -2845,6 +3286,274 @@ mod tests {
         );
     }
 
+    /// Nothing is ever told to stand somewhere [`spread`] will not let it stand.
+    ///
+    /// This is the rule that "units on top of each other" turned out to be. A
+    /// chaser walks to a point and the shove holds it off a body, and if the
+    /// point is inside the body the two argue about its position for as long as
+    /// the fight lasts -- the chaser walked in every tick, pushed out every
+    /// tick, drawn inside the thing it is attacking. It is invisible while the
+    /// actors are small, because every one of these distances was written
+    /// against a goomba 0.6 m across and comfortably clears one. An ant is 5 m
+    /// across and clears nothing.
+    ///
+    /// So each approach distance is checked against the room the shove will
+    /// insist on, for every pair of kinds that can chase each other. Measured
+    /// against the *widest* actor there is rather than against a particular one,
+    /// because the next re-export is allowed to change which that is.
+    #[test]
+    fn nothing_walks_to_a_spot_it_would_be_shoved_out_of() {
+        let widest = KINDS
+            .iter()
+            .fold(crate::player::PLAYER_RADIUS, |most, kind| {
+                most.max(kind.body().0)
+            });
+        for kind in KINDS {
+            let (mine, _) = kind.body();
+            for theirs in KINDS.iter().map(|kind| kind.body().0).chain([widest]) {
+                // The nearest the shove will let these two settle.
+                let held = mine + theirs + PERSONAL_SPACE - SPREAD_SLACK;
+
+                // An enemy of `kind` chasing a body of radius `theirs`.
+                let stood = Quirk::new(0.0).stand_off(theirs + mine).length();
+                assert!(
+                    stood >= held,
+                    "an enemy {mine:.2} across aims {stood:.2} from something \
+                     {theirs:.2} across, which the shove holds at {held:.2}"
+                );
+            }
+            // And a Mario walking up to one to punch it, which is the pair the
+            // report was actually about.
+            let mario = crate::player::PLAYER_RADIUS;
+            let held = mario + mine + PERSONAL_SPACE - SPREAD_SLACK;
+            let walks = mine + mario + crate::squad::STRIKE_RANGE;
+            assert!(
+                walks >= held,
+                "a Mario walks to {walks:.2} from an actor {mine:.2} across, \
+                 which the shove holds at {held:.2}"
+            );
+            // Having walked there, its punch has to reach.
+            assert!(
+                mine + MARIO_REACH >= walks,
+                "a Mario stands at {walks:.2} and punches {:.2}",
+                mine + MARIO_REACH
+            );
+            // And the player's sword has to reach what the shove holds off him.
+            let held = mario + mine + PERSONAL_SPACE - SPREAD_SLACK;
+            assert!(
+                mine + ATTACK_REACH >= held,
+                "the player's swing reaches {:.2} and the shove holds an actor \
+                 {mine:.2} across at {held:.2}",
+                mine + ATTACK_REACH
+            );
+        }
+    }
+
+    /// The spatial hash answers with everything nearby, and with nothing twice.
+    ///
+    /// Two properties, and the second is the one that needed a test written for
+    /// it. Addressing cells directly cannot hand a point back twice; *hashing*
+    /// them can, because two of the nine cells a query reads may share a bucket
+    /// and reading that bucket twice returns everything in it twice. A shove
+    /// that counted one neighbour double would push half again as hard in that
+    /// direction, on some ticks, for some pairs -- a bug that would show up as
+    /// an occasional twitch in a crowd and would be very hard to find from
+    /// there.
+    ///
+    /// Two thousand points, because the table is two buckets a point and a
+    /// nine-cell query at that size collides about once in a hundred: rare
+    /// enough that a smaller test would pass on a broken grid, common enough
+    /// that two thousand queries meet it a dozen times over.
+    #[test]
+    fn the_spatial_hash_never_hands_back_the_same_body_twice() {
+        let cell = 1.5;
+        let points: Vec<Vec3> = (0..2000)
+            .map(|index| {
+                let angle = index as f32 * crate::squad::GOLDEN_ANGLE;
+                Vec3::new(angle.sin(), 0.0, angle.cos()) * (index as f32).sqrt() * cell
+            })
+            .collect();
+        let mut grid = Neighbourhood::default();
+        grid.fill(points.iter().copied(), cell);
+        let mut found = Vec::new();
+        let mut seen = vec![false; points.len()];
+        for (index, point) in points.iter().enumerate() {
+            grid.near(*point, &mut found);
+            for &other in &found {
+                assert!(
+                    !seen[other],
+                    "the query at point {index} returned point {other} twice"
+                );
+                seen[other] = true;
+            }
+            for &other in &found {
+                seen[other] = false;
+            }
+            // And it is a bucket rather than a filter: everything within a cell
+            // of the query must be in the answer, or a pair that is overlapping
+            // never finds out. Checked over the first two hundred only, because
+            // the check itself is the quadratic scan the grid exists to avoid.
+            if index < 200 {
+                for (other, theirs) in points.iter().enumerate() {
+                    if point.distance(*theirs) < cell * 0.999 {
+                        assert!(
+                            found.contains(&other),
+                            "point {other} is inside a cell of point {index} and was missed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// And the cheap tier is held apart too, which it was not.
+    ///
+    /// [`spread`] used to take the near tier only, so a field of two thousand
+    /// was two hundred creatures standing politely apart and eighteen hundred
+    /// stacked into each other. This is the same heap as
+    /// [`enemies_are_held_out_of_one_another`] with every one of them demoted:
+    /// it must come apart the same way, only a quarter as often.
+    ///
+    /// Registered rather than run one-shot, because [`CROWD_SPREAD_STRIDE`] is
+    /// counted off a `Local` that a fresh system every call would reset to zero
+    /// -- which would shove the same quarter of the field forever and leave the
+    /// other three quarters in the pile.
+    #[test]
+    fn the_cheap_tier_is_held_apart_as_well_as_the_near_one() {
+        let heap: Vec<Vec3> = (0..24)
+            .map(|index| {
+                let angle = index as f32 * crate::squad::GOLDEN_ANGLE;
+                Vec3::new(angle.sin(), 0., angle.cos()) * (index as f32 * 0.04)
+            })
+            .collect();
+        let (mut world, _, enemies) = field(&heap);
+        for enemy in &enemies {
+            world.entity_mut(*enemy).insert(Detail::Crowd);
+        }
+        let jostle = world.register_system(spread);
+        // Four times the ticks the near tier is given, which is the whole of
+        // what the stride costs: the same settled crowd, arrived at later.
+        for _ in 0..2400 {
+            world.run_system(jostle).expect("spread could not run");
+        }
+        let places: Vec<Vec3> = enemies
+            .iter()
+            .map(|enemy| world.get::<Transform>(*enemy).expect("gone").translation)
+            .collect();
+        let room = Kind::Slime.body().0 * 2.0 + PERSONAL_SPACE - SPREAD_SLACK;
+        for (index, one) in places.iter().enumerate() {
+            for other in &places[index + 1..] {
+                assert!(
+                    one.distance(*other) > room - 0.05,
+                    "two of the cheap tier ended up {} apart, inside the {room} they are owed",
+                    one.distance(*other)
+                );
+            }
+        }
+        // And having settled, it holds still. A body shoved once every four
+        // ticks is given four ticks' worth of rate to make up for it, and a
+        // rate that overshoots is a crowd that shuffles forever -- which is
+        // what [`SPREAD_RATE_CAP`] is for.
+        for _ in 0..40 {
+            world.run_system(jostle).expect("spread could not run");
+        }
+        let moved = enemies
+            .iter()
+            .zip(&places)
+            .fold(0.0_f32, |most, (enemy, was)| {
+                let now = world.get::<Transform>(*enemy).expect("gone").translation;
+                most.max(was.distance(now))
+            });
+        assert!(moved < 0.01, "a settled cheap tier was still shuffling {moved}");
+    }
+
+    /// A press of cheap-tier bodies expanding across the castle never pushes one
+    /// of its own through a wall.
+    ///
+    /// This is the shove's half of what
+    /// [`a_crowd_walks_the_castle_without_walking_through_it`] checks for the
+    /// step, and it needs its own test because the two resolve against different
+    /// things: the near tier's shove is put back by `resolve_walls`, and a
+    /// cheap-tier one asks the flow field, which is the only thing it is allowed
+    /// to ask. A heap of three hundred at one spot is a press that keeps pushing
+    /// outward for as long as it is run, so it reaches the courtyard's walls
+    /// under its own steam rather than being aimed at them.
+    ///
+    /// It has teeth, and only just enough of them to be worth having: with the
+    /// [`crate::flow::FlowField::clear`] guard taken out of the shove and the
+    /// push simply taken, this reports **13 crossings** out of 180,000
+    /// enemy-ticks. A shove is a few centimetres and a wall is metres thick, so
+    /// posting one through takes a press leaning on it for a while -- which is
+    /// exactly the case the near tier's own wall resolution was added for, and
+    /// exactly why the cheap tier needs one too.
+    #[test]
+    fn a_press_of_the_cheap_tier_never_shoves_one_of_its_own_through_a_wall() {
+        let (level, _) = crate::level::load();
+        let mut world = World::new();
+        world.insert_resource(crate::flow::FlowField::new(&level));
+        let courtyard = Vec3::new(-13.28, 3.0, 46.64);
+        let enemies: Vec<Entity> = (0..300)
+            .map(|index| {
+                let angle = index as f32 * crate::squad::GOLDEN_ANGLE;
+                let at = courtyard + Vec3::new(angle.sin(), 0., angle.cos()) * (index as f32 * 0.004);
+                world
+                    .spawn((
+                        Enemy {
+                            kind: Kind::Slime,
+                            animation: Handle::default(),
+                        },
+                        Transform::from_translation(at),
+                        Detail::Crowd,
+                    ))
+                    .id()
+            })
+            .collect();
+        world.insert_resource(level);
+        let jostle = world.register_system(spread);
+        let knee = Vec3::Y * STEP_UP;
+        let mut was: Vec<Vec3> = enemies
+            .iter()
+            .map(|enemy| world.get::<Transform>(*enemy).expect("gone").translation)
+            .collect();
+        let mut through = 0;
+        for _ in 0..600 {
+            world.run_system(jostle).expect("spread could not run");
+            for (index, enemy) in enemies.iter().enumerate() {
+                let now = world.get::<Transform>(*enemy).expect("gone").translation;
+                let moved = Vec3::new(now.x - was[index].x, 0.0, now.z - was[index].z);
+                if moved.length_squared() > 1e-8 {
+                    let from = was[index] + knee;
+                    let level = world.resource::<LevelData>();
+                    let hit = level
+                        .surface_hit(from, from + moved)
+                        .is_some_and(|(_, normal)| {
+                            normal.y.abs() <= crate::level::GROUND_NORMAL_Y
+                        });
+                    // Only what left a cell, for the reason
+                    // [`a_crowd_walks_the_castle_without_walking_through_it`]
+                    // gives at length: a grid cannot record a fence that does
+                    // not separate two cell centres, and neither tier claims it
+                    // can. The shove is asked for exactly what the step is.
+                    let field = world.resource::<crate::flow::FlowField>();
+                    if hit && !field.same_cell(was[index], now) {
+                        through += 1;
+                    }
+                }
+                was[index] = now;
+            }
+        }
+        assert_eq!(through, 0, "the press shoved its own through a wall");
+        // And it really did press outward far enough to meet something. Without
+        // this the test passes just as well on a crowd that never moved.
+        let widest = was
+            .iter()
+            .fold(0.0_f32, |most, at| most.max(at.distance(courtyard)));
+        assert!(
+            widest > 8.0,
+            "the press only reached {widest:.1} m, which is short of anything to hit"
+        );
+    }
+
     /// A crowd untangles and then holds still. The one in the middle of a press
     /// has neighbours leaning on it from every side, and if the shove takes out
     /// the whole overlap every tick, what it does with that is vibrate.
@@ -2895,8 +3604,7 @@ mod tests {
     /// jostling on a wall stay on the wall.
     #[test]
     fn crawlers_are_shoved_along_the_surface_they_are_stuck_to() {
-        let mut world = World::new();
-        world.insert_resource(lawn());
+        let mut world = lawn_world();
         let wall = Vec3::new(4., 3., 0.);
         let pair: Vec<Entity> = [wall, wall + Vec3::new(0., 0.2, 0.)]
             .iter()
@@ -3170,12 +3878,12 @@ mod tests {
     fn no_two_enemies_walk_quite_alike() {
         let (first, second) = (Quirk::new(1.0), Quirk::new(2.0));
         assert!((first.pace() - second.pace()).abs() > 0.01);
-        assert!(first.stand_off().distance(second.stand_off()) > 0.1);
+        assert!(first.stand_off(0.0).distance(second.stand_off(0.0)) > 0.1);
         assert!((first.weave(3.0) - second.weave(3.0)).abs() > 0.01);
         // Within bounds, both of them: a quirk is a difference, not a licence.
         for quirk in [&first, &second] {
             assert!((quirk.pace() - 1.0).abs() <= PACE_SPREAD + 1e-6);
-            assert!(quirk.stand_off().length() <= STAND_OFF + STAND_OFF_SPREAD + 1e-6);
+            assert!(quirk.stand_off(0.0).length() <= STAND_OFF + STAND_OFF_SPREAD + 1e-6);
             assert!(quirk.weave(7.0).abs() <= WEAVE_WIDTH + 1e-6);
         }
     }
@@ -3513,8 +4221,7 @@ mod tests {
     /// following the player was a heap of Marios in one place.
     #[test]
     fn the_marios_are_held_out_of_each_other_and_out_of_the_player() {
-        let mut world = World::new();
-        world.insert_resource(lawn());
+        let mut world = lawn_world();
         let at = Vec3::new(0.0, 0.0, 0.0);
         world.spawn((Player, Transform::from_translation(at)));
         // All four in the same spot, on top of him.

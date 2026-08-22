@@ -86,3 +86,10 @@ Huge distant army — tens of thousands: effectively GPU particles that happen t
 Very distant units: billboards/impostors or extremely low-poly models. *(Done — see `impostor.rs` and `flow.rs`.)*
 
 goal oriented action planning GOAP
+
+The presentation of the game should be like a "recomp" of a fictional N64/PSX game.  This will ballence the retro nostalgia with modern QOL and mix updated graphics with older low poly assets.  per pixel lighting, vertex lighting, and ray tracing.  
+
+Gearbits - indie AC + bugs
+Megaton Musashi W: Wired - terrain
+dysonsphere project - interplanetary RTS.  
+

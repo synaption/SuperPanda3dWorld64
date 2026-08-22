@@ -61,6 +61,7 @@ assets/
     textures/                    the 21 PNGs those groups reference (2.9 MB)
   mario/          mario.glb + mario_clips.json   (209 animations)
   hero/           hero.glb + hero_clips.json     (20 animations, 53 joints)
+                  target_pistol.glb              the weapon he carries
   actors/         slime, ant, tree, warp_pipe; a clips sidecar each where
                   the actor animates. goomba.* and scuttlebug.* are the two
                   retired decomp enemies those replaced, kept as source rather
@@ -99,6 +100,42 @@ theirs themselves — the slime's rig is `Slime_Rig`, the ant's is the object
 Blender made for it, `Armature` — and `tools/build_assets.py` carries the same
 map so a batch build does not need it spelled out.
 
+## Weapons
+
+A weapon is a static prop, not an actor: no rig, no clips, and so no adoption
+pass. `blend_to_glb.py` already writes exactly what the game loads, which is
+why the `weapons` stage is three lines long.
+
+What makes a weapon .blend a weapon is the empties it carries.
+`notes4LLMs.md` asks every one of them for hit boxes, colliders, hand placement
+and where the bullet comes out; for something held in a hand the last two are
+the ones that matter, and they are what `assets/hero/target_pistol.blend` has:
+
+| empty | what it is | read by |
+| --- | --- | --- |
+| `PISTOL_ROOT` | the parent everything hangs off, carrying the orientation and the scale | — |
+| `GRIP` | where the hand takes hold. On the origin, so the socket transform alone places the weapon | — |
+| `MUZZLE` | the end of the bore, where a shot leaves | `weapon::fire` |
+
+Three conventions, and all three are load-bearing:
+
+- **The grip sits on the origin.** The weapon is spawned as a child of the
+  `WEAPON_SOCKET` joint, so its origin is where the hand is. A model authored
+  around its own centre floats a hand's width away from the fist holding it.
+- **The bore points down Blender's -Y.** glTF export maps Blender `(x, y, z)`
+  to `(x, z, -y)`, so -Y becomes +Z — the forward this port uses everywhere,
+  the same one `player::movement` turns the body in and `billboard::facing`
+  aims quads in. Authoring it any other way means a correction in code.
+- **It is authored at life size, in metres.** The target pistol is 0.32 m from
+  muzzle to heel. `weapon::carry` cancels the socket's inherited scale so that
+  0.32 m arrives as 0.32 m in the world, whatever the Hero's 0.81 and his
+  Rigify stretch bones are doing to it — which keeps the size question answered
+  in the .blend, where the rest of this document insists it lives.
+
+The empties survive the export as ordinary childless nodes and are found by
+name at runtime, the same way `AIM_TORSO`, `WEAPON_SOCKET` and the
+`billboard_*` joints are. A name is the only thing a glTF export preserves.
+
 ## Building every asset the game needs
 
 One command rebuilds everything the game loads, in the order the dependencies
@@ -108,19 +145,19 @@ require:
 python3 tools/build_assets.py
 ```
 
-Five stages, and `--only <stage>` runs just one of them:
+Six stages, and `--only <stage>` runs just one of them:
 
 | stage | writes | from |
 | --- | --- | --- |
 | `mario` | `assets/mario/mario.glb` + clips | `mario.blend` |
 | `hero` | `assets/hero/hero.glb` + clips | `TheHero.blend`, via `build_hero.py` |
+| `weapons` | `assets/hero/target_pistol.glb` | the weapon `.blend` files |
 | `castle` | `assets/bevy/castle.glb`, `castle.bin`, `water.png` | the committed NPZs, via `convert_level.py` |
 | `actors` | `assets/actors/*.glb` + a clips sidecar each | the actor `.blend` files |
 | `impostors` | `assets/impostors/*.png`, `*.json` | the actor GLBs above, rendered by the game |
 
 The Hero source needs Blender 5.x. Successful runs replace the files the game
-already loads; no Rust changes or asset registration step is required. Weapons
-are excluded because the game does not currently load them.
+already loads; no Rust changes or asset registration step is required.
 
 Two things about that table are worth knowing, because both used to be traps:
 
@@ -138,6 +175,70 @@ Two things about that table are worth knowing, because both used to be traps:
   at once — the new model up close and the old picture of it past `enemy_draw`.
   Rotating an actor shows it worst, since every sprite in the atlas then faces
   the wrong way.
+
+### How big an actor is
+
+In the .blend, and nowhere else. The game measures an actor's collision radius,
+its height and how far it hangs below its own origin straight out of the glTF it
+loads — `enemy::Kind::body` — so there is no scale factor in the code to keep in
+step with the art, and changing how big a creature is means changing the
+creature:
+
+```bash
+python3 tools/resize_actor.py assets/actors/ant.blend            # just measure
+python3 tools/resize_actor.py assets/actors/ant.blend --reach 0.60
+python3 tools/build_assets.py --only actors --only impostors
+```
+
+`--reach` is the horizontal distance from the origin that becomes the collision
+radius; `--height` and `--factor` are the other two ways to say it. Re-baking
+is not optional: a sheet is a picture of the model, so an actor resized without
+one is drawn at the new size up close and the old size past `enemy_draw`.
+`impostor::tests::the_sheets_agree_with_the_models_they_were_baked_from` fails
+if they drift.
+
+**Typing a number into the armature's scale field does nothing.** A rigged
+actor's size lives in its mesh data and bone rest positions, and an object-level
+scale on the armature is cancelled twice over: Blender's own parent-inverse
+cancels it for the child mesh in the viewport, and glTF's inverse bind matrices
+cancel it again on export. `ant.blend` carried a 4.0 that changed neither. So
+the scale has to be **applied**, which is what the tool does — and then repaired,
+because applying scale to an armature rewrites the rest skeleton that keyframed
+bone locations are measured against and leaves the keyframes alone. The ant
+survived that unaided, since both its clips are pure rotation; the slime's ten
+all key location, and its walk cycle came out 12% too big. The tool scales the
+location channels to match and then evaluates the posed mesh over every frame of
+every clip, refusing to save unless every extent came out scaled by exactly the
+factor asked for.
+
+**Anything you add to an actor has to be skinned to its rig.** A plain mesh
+object dropped into an actor's .blend — an eye, a bead, anything modelled rather
+than rigged — is the one case where the paragraph above stops being true, and it
+fails in three ways at once. Four spheres added to `ant.blend` came out **four
+times the size, yawed 180 degrees, floating over the courtyard, and duplicated**,
+because:
+
+- `adopt_blender_export.py` re-parents an actor's mesh under the skeleton root,
+  which is free for a *skinned* mesh — glTF ignores the node a skinned mesh
+  hangs under, and the inverse bind matrices cancel whatever the skeleton root
+  carries. An unskinned mesh takes that node's transform in full: the ant's
+  armature carries a 4.0 scale, a 180-degree yaw and a 0.79 m lift, none of
+  which its own body has ever noticed. That step now moves skinned meshes only.
+- The spheres were also still listed among the scene's roots, so the model held
+  two copies of each: one at the root, correct, and one under the armature,
+  giant. A glTF node is meant to be reachable by exactly one path.
+- `enemy::Kind::body` measured every mesh flat, on the same "node transforms do
+  not count" reasoning, which is right for the skinned body and wrong for a
+  prop. The spheres' raw mesh data is a ball of radius 1.681 scaled to about
+  0.3 by its node, so the ant measured 5.0 m across and 1.68 m below its own
+  origin. It now walks the scene graph for unskinned meshes and takes skinned
+  ones flat, which is the same rule the exporter follows.
+
+The size tests caught all of it, in four different ways, which is what they are
+for. But the fix in the .blend is to parent the spheres to the rig with weights
+(or join them into the body mesh) — loose objects also do not follow the
+animation, and each one is an extra primitive and an extra draw call on every
+ant in the field.
 
 Everything except the impostors is bit-reproducible: run it twice on unchanged
 sources and `git status` stays clean. The sheets are a GPU render rather than a

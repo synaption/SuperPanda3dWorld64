@@ -3,6 +3,7 @@ use crate::{
     console::GameTuning,
     input::InputState,
     level::LevelData,
+    weapon::Loadout,
     ActiveCharacter, GameState,
 };
 use bevy::prelude::*;
@@ -189,6 +190,7 @@ pub fn movement(
     level: Res<LevelData>,
     state: Res<GameState>,
     tuning: Res<GameTuning>,
+    loadout: Res<Loadout>,
     mut sounds: ResMut<SoundQueue>,
     mut player: Query<(&mut Transform, &mut PreviousPose, &mut Controller), With<Player>>,
     camera: Query<&Transform, (With<Camera3d>, Without<Player>)>,
@@ -204,7 +206,11 @@ pub fn movement(
     // Latched edges are consumed here rather than polled, so each press acts
     // on exactly one fixed step however many steps this frame runs.
     let jump_pressed = InputState::take(&mut input_state.jump);
-    let attack_pressed = InputState::take(&mut input_state.attack);
+    // The trigger belongs to whichever weapon is out. With a gun in hand the
+    // edge is left for `weapon::fire` to take, so one press either swings or
+    // shoots and never does both.
+    let attack_pressed =
+        !loadout.equipped.is_ranged() && InputState::take(&mut input_state.attack);
     let input = input_state.move_axis;
     // `forward`/`right` hand back a `Direction3d` rather than a `Vec3` now: a
     // vector the type system knows is unit length. Flattening one onto the
@@ -490,6 +496,7 @@ mod tests {
         world.insert_resource(GameTuning::default());
         world.insert_resource(InputState::default());
         world.insert_resource(SoundQueue::default());
+        world.insert_resource(Loadout::default());
         let spawn = Transform::from_translation(spawn_at);
         world.spawn((
             Player,

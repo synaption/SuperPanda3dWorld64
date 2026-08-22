@@ -109,6 +109,86 @@ pub const SPECS: &[TunableSpec] = &[
         step: 0.2,
         doc: "Hero wading speed",
     },
+    // The aiming layer. Every one of these came off a slider in the Panda3D
+    // build rather than out of a calculation -- `docs/aim.md`, "As Built" --
+    // so they are back on sliders here, at the values that build ended on.
+    TunableSpec {
+        name: "torso_limit",
+        low: 0.0,
+        high: 90.0,
+        step: 1.0,
+        doc: "degrees the torso twists before the feet come round",
+    },
+    TunableSpec {
+        name: "torso_comfort",
+        low: 0.0,
+        high: 90.0,
+        step: 1.0,
+        doc: "degrees of twist he will stand still holding",
+    },
+    TunableSpec {
+        name: "torso_response",
+        low: 0.02,
+        high: 0.6,
+        step: 0.01,
+        doc: "seconds the torso takes to reach a new aim",
+    },
+    TunableSpec {
+        name: "torso_pitch",
+        low: 0.0,
+        high: 1.0,
+        step: 0.05,
+        doc: "share of the shot's elevation the chest takes",
+    },
+    TunableSpec {
+        name: "torso_pitch_up",
+        low: 0.0,
+        high: 90.0,
+        step: 1.0,
+        doc: "degrees the torso may lean back",
+    },
+    TunableSpec {
+        name: "torso_pitch_down",
+        low: 0.0,
+        high: 90.0,
+        step: 1.0,
+        doc: "degrees the torso may lean forward",
+    },
+    TunableSpec {
+        name: "torso_turn_rate",
+        low: 30.0,
+        high: 720.0,
+        step: 10.0,
+        doc: "degrees a second the feet come round at",
+    },
+    TunableSpec {
+        name: "gun_projectile",
+        low: 0.0,
+        high: 1.0,
+        step: 1.0,
+        doc: "fire every gun as a projectile rather than hitscan",
+    },
+    TunableSpec {
+        name: "tracer_seconds",
+        low: 0.0,
+        high: 0.5,
+        step: 0.005,
+        doc: "how long a hitscan tracer stays on screen",
+    },
+    TunableSpec {
+        name: "tracer_width",
+        low: 0.005,
+        high: 0.3,
+        step: 0.005,
+        doc: "how thick a tracer and a bullet are drawn",
+    },
+    TunableSpec {
+        name: "bullet_speed",
+        low: 5.0,
+        high: 300.0,
+        step: 5.0,
+        doc: "metres a second a projectile shot travels",
+    },
     TunableSpec {
         name: "cam_distance",
         low: 2.0,
@@ -262,6 +342,27 @@ pub struct GameTuning {
     /// `sm64py/hero/constants.py` is 0.45 of his walk, which is where the
     /// default below comes from.
     pub hero_wade: f32,
+    /// The aiming layer, from `docs/aim.md`'s "As Built". See
+    /// [`crate::aim`], which is the only reader of all seven.
+    pub torso_limit: f32,
+    pub torso_comfort: f32,
+    pub torso_response: f32,
+    pub torso_pitch: f32,
+    pub torso_pitch_up: f32,
+    pub torso_pitch_down: f32,
+    pub torso_turn_rate: f32,
+    /// Non-zero puts every gun on the projectile path instead of its own
+    /// choice, so both resolutions stay reachable in a build shipping one gun.
+    pub gun_projectile: f32,
+    /// How a shot is *seen*. On sliders rather than in constants because a
+    /// tracer is drawn nearly end-on -- it runs from the muzzle toward what the
+    /// crosshair is over, which is roughly where the camera is already looking,
+    /// so its whole length projects into a short streak beside the gun. What
+    /// that looks like is not something the number predicts, and it took one
+    /// wrong guess from a still frame to establish that it needed a slider.
+    pub tracer_seconds: f32,
+    pub tracer_width: f32,
+    pub bullet_speed: f32,
     pub cam_distance: f32,
     pub cam_aim_distance: f32,
     pub cam_height: f32,
@@ -301,6 +402,22 @@ impl Default for GameTuning {
             jet_rise: 6.0,
             mario_swim: 5.5,
             hero_wade: 5.13,
+            torso_limit: 60.0,
+            torso_comfort: 20.0,
+            torso_response: 0.12,
+            torso_pitch: 0.55,
+            torso_pitch_up: 60.0,
+            torso_pitch_down: 45.0,
+            // Not one of the recorded numbers -- the Panda3D build drove the
+            // turn from its own controller rather than a rate -- so this is a
+            // starting point rather than a tuned value. Roughly two thirds of a
+            // turn a second, which keeps up with a stick without spinning.
+            torso_turn_rate: 240.0,
+            gun_projectile: 0.0,
+            // The values the tracer shipped with and was legible at.
+            tracer_seconds: 0.035,
+            tracer_width: 0.03,
+            bullet_speed: 90.0,
             cam_distance: 9.5,
             cam_aim_distance: 5.7,
             cam_height: 1.35,
@@ -354,6 +471,17 @@ impl GameTuning {
             "jet_rise" => self.jet_rise,
             "mario_swim" => self.mario_swim,
             "hero_wade" => self.hero_wade,
+            "torso_limit" => self.torso_limit,
+            "torso_comfort" => self.torso_comfort,
+            "torso_response" => self.torso_response,
+            "torso_pitch" => self.torso_pitch,
+            "torso_pitch_up" => self.torso_pitch_up,
+            "torso_pitch_down" => self.torso_pitch_down,
+            "torso_turn_rate" => self.torso_turn_rate,
+            "gun_projectile" => self.gun_projectile,
+            "tracer_seconds" => self.tracer_seconds,
+            "tracer_width" => self.tracer_width,
+            "bullet_speed" => self.bullet_speed,
             "cam_distance" => self.cam_distance,
             "cam_aim_distance" => self.cam_aim_distance,
             "cam_height" => self.cam_height,
@@ -395,6 +523,17 @@ impl GameTuning {
             "jet_rise" => self.jet_rise = value,
             "mario_swim" => self.mario_swim = value,
             "hero_wade" => self.hero_wade = value,
+            "torso_limit" => self.torso_limit = value,
+            "torso_comfort" => self.torso_comfort = value,
+            "torso_response" => self.torso_response = value,
+            "torso_pitch" => self.torso_pitch = value,
+            "torso_pitch_up" => self.torso_pitch_up = value,
+            "torso_pitch_down" => self.torso_pitch_down = value,
+            "torso_turn_rate" => self.torso_turn_rate = value,
+            "gun_projectile" => self.gun_projectile = value,
+            "tracer_seconds" => self.tracer_seconds = value,
+            "tracer_width" => self.tracer_width = value,
+            "bullet_speed" => self.bullet_speed = value,
             "cam_distance" => self.cam_distance = value,
             "cam_aim_distance" => self.cam_aim_distance = value,
             "cam_height" => self.cam_height = value,
@@ -504,6 +643,13 @@ pub enum Request {
     Crowd(usize, CrowdKind),
     /// Take every enemy off it again.
     ClearCrowd,
+    /// Put a named weapon in the Hero's hand.
+    ///
+    /// The weapon is a resource rather than a tunable float, so unlike every
+    /// slider it cannot be set by writing into [`GameTuning`] -- hence a
+    /// request. It is what lets `cargo run -- screenshot` photograph the gun:
+    /// `SHOT_SETUP="weapon pistol"`, through the same path a player uses.
+    Equip(crate::weapon::Weapon),
 }
 
 #[derive(Resource)]
@@ -636,7 +782,8 @@ impl ConsoleState {
         }
         self.echo(format!("> {line}"));
         match words[0].to_ascii_lowercase().as_str() {
-            "help" | "?" => self.echo("commands: <name> [value], vars, reset <name|all>, close <name|all>, clear\ncrowd <n> [slime|ant|mix] puts a whole field down at once; crowd clear takes it away.\nLeft/Right/Home/End move the caret; Up/Down recall; Tab completes.\nSelect a variable then use [ and ] (Shift = 10x) to tune it. Wheel/PageUp/PageDown scroll the log."),
+            "help" | "?" => self.echo("commands: <name> [value], vars, reset <name|all>, close <name|all>, clear\ncrowd <n> [slime|ant|mix] puts a whole field down at once; crowd clear takes it away.
+weapon <sword|pistol> puts one in the Hero's hand; Y cycles it in play.\nLeft/Right/Home/End move the caret; Up/Down recall; Tab completes.\nSelect a variable then use [ and ] (Shift = 10x) to tune it. Wheel/PageUp/PageDown scroll the log."),
             "vars" | "list" => {
                 for spec in SPECS {
                     self.echo(format!("  {:<18} {:>7.3}  [{:.3} .. {:.3}]  {}", spec.name, tuning.get(spec.name).unwrap(), spec.low, spec.high, spec.doc));
@@ -644,6 +791,7 @@ impl ConsoleState {
             }
             "clear" => self.log.clear(),
             "crowd" => self.crowd(&words[1..]),
+            "weapon" | "equip" => self.weapon(&words[1..]),
             "reset" => self.reset(&words[1..], tuning),
             "close" | "hide" => self.close(&words[1..]),
             "set" | "slider" | "var" if words.len() > 1 => self.tunable(words[1], &words[2..], tuning),
@@ -660,6 +808,43 @@ impl ConsoleState {
     /// read: a request carried out twice is a crowd placed twice.
     pub fn take_requests(&mut self) -> Vec<Request> {
         std::mem::take(&mut self.pending)
+    }
+
+    /// Puts back a request this reader was not the one for.
+    ///
+    /// [`take_requests`](Self::take_requests) drains the queue whole, which is
+    /// what stops a crowd being placed twice, but it also means the first
+    /// reader to run takes everything -- including the requests meant for
+    /// somebody else. Handing those back is how more than one system can share
+    /// the queue without either of them having to know what the others want.
+    pub fn defer(&mut self, request: Request) {
+        self.pending.push(request);
+    }
+
+    /// `weapon <sword|pistol>`, or `weapon` to say what is in hand.
+    ///
+    /// Named rather than cycled, so a screenshot or a repro asks for the
+    /// weapon it wants instead of counting presses of `Y` from whatever the
+    /// last session left equipped.
+    fn weapon(&mut self, words: &[&str]) {
+        let names: Vec<&'static str> = crate::weapon::Weapon::ALL
+            .iter()
+            .map(|weapon| weapon.spec().name)
+            .collect();
+        let Some(asked) = words.first() else {
+            self.echo(format!("weapon <{}>", names.join("|")));
+            return;
+        };
+        let found = crate::weapon::Weapon::ALL
+            .iter()
+            .find(|weapon| weapon.spec().name == *asked);
+        match found {
+            Some(weapon) => {
+                self.pending.push(Request::Equip(*weapon));
+                self.echo(format!("equipped {asked}"));
+            }
+            None => self.echo(format!("no weapon {asked:?} -- try {}", names.join(", "))),
+        }
     }
 
     /// `crowd <n> [slime|ant|mix]`, or `crowd clear`.

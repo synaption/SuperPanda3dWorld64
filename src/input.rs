@@ -32,7 +32,7 @@ pub const THRUST_THRESHOLD: f32 = 0.3;
 ///
 /// The `bool` fields split into two kinds. Held controls (`boost`, `aim`) are
 /// rewritten every frame and read freely. Latched edges (`jump`, `attack`,
-/// `swap`, `debug`, `recenter`) stay set until the system that acts on them
+/// `swap`, `swap_weapon`, `debug`, `recenter`) stay set until the system that acts on them
 /// calls [`InputState::take`], so no press is lost or double-counted across the
 /// fixed-step boundary.
 #[derive(Resource, Default, Debug, Clone, Copy)]
@@ -54,6 +54,8 @@ pub struct InputState {
     pub squad: bool,
     pub squad_released: bool,
     pub swap: bool,
+    /// Cycle the weapon in the Hero's hand. Latched: `weapon::swap` takes it.
+    pub swap_weapon: bool,
     pub debug: bool,
     /// Whether a pad was seen this frame, for the debug readout.
     pub pad: bool,
@@ -139,6 +141,7 @@ pub fn gather(
         keys.just_pressed(KeyCode::ShiftLeft) || buttons.just_pressed(MouseButton::Left);
     let mut recenter = keys.just_pressed(KeyCode::KeyR);
     let mut swap = keys.just_pressed(KeyCode::F2);
+    let mut swap_weapon = keys.just_pressed(KeyCode::KeyY);
     let mut squad = keys.pressed(KeyCode::KeyX);
     let mut squad_released = keys.just_released(KeyCode::KeyX);
 
@@ -181,6 +184,10 @@ pub fn gather(
         jump |= just(GamepadButton::South);
         attack |= just(GamepadButton::East);
         swap |= just(GamepadButton::Start);
+        // The left shoulder, which is the one control both free triggers left
+        // unclaimed: `RightTrigger` recenters and both `*Trigger2` are the
+        // booster and the aim.
+        swap_weapon |= just(GamepadButton::LeftTrigger);
         recenter |= just(GamepadButton::RightTrigger);
         squad |= button(GamepadButton::West);
         squad_released |= pad.just_released(GamepadButton::West);
@@ -204,6 +211,7 @@ pub fn gather(
     state.recenter |= recenter;
     state.squad_released |= squad_released;
     state.swap |= swap;
+    state.swap_weapon |= swap_weapon;
     state.debug |= keys.just_pressed(KeyCode::F1);
 }
 

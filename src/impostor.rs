@@ -926,9 +926,7 @@ pub(crate) mod tests {
     ///
     /// So what is asserted here is what remains true either way: a lift is
     /// never more than the silhouette reaches, because a model held further up
-    /// than its own picture ever extends is a model hovering. The number itself
-    /// is pinned to the geometry by
-    /// `enemy::tests::the_cylinders_are_the_size_the_models_are_drawn_at`, and
+    /// than its own picture ever extends is a model hovering.
     /// `tools/measure_actor_hang.py` is what settles a resting offset against a
     /// transient dip when the two disagree.
     #[test]
@@ -942,6 +940,47 @@ pub(crate) mod tests {
                  ever reaches {measured:.3} m below its origin, so it hovers"
             );
             assert!(claimed >= 0.0, "{kind:?} is lifted downwards");
+        }
+    }
+
+    /// That a sheet is a picture of the model the game is loading now.
+    ///
+    /// The two halves of an actor's size are measured in completely different
+    /// ways, and this is the only thing that puts them in the same room.
+    /// `enemy::Kind::body` reads the glTF's own position bounds -- a header,
+    /// never rendered -- while `world_size` is what the bake camera had to cover
+    /// to fit the actor on screen, which is the *renderer's* answer, through
+    /// skinning, billboards and every node transform in the file. A model whose
+    /// drawn size differs from its authored bounds shows up here and nowhere
+    /// else.
+    ///
+    /// It is also the guard against the ordinary version of the same mistake:
+    /// resizing an actor and re-exporting it without re-baking, which draws it
+    /// at the new size up close and the old one past `enemy_draw`.
+    ///
+    /// The band is wide on purpose. A cell has to hold a walk cycle's widest
+    /// pose plus `FINAL_MARGIN`, and it is square, so a flat wide actor's cell
+    /// is much taller than the actor -- the slime's is 1.26x its own width.
+    /// What it is looking for is a factor, not a percentage. It reaches slightly
+    /// below 1.0 because a bind pose can be wider than anything the actor ever
+    /// does -- a T-pose is the standard example -- and the cell is fitted to the
+    /// poses.
+    #[test]
+    fn the_sheets_agree_with_the_models_they_were_baked_from() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        for kind in [Kind::Slime, Kind::Ant] {
+            let meta = read_meta(&root, kind).expect("a committed sheet failed to load");
+            let (radius, height) = kind.body();
+            let across = (radius * 2.0).max(height);
+            assert!(
+                (0.95..2.0).contains(&(meta.world_size / across)),
+                "{kind:?}'s model is {across:.3} m at its largest but its sheet was \
+                 baked to cover {:.3} m. Either the model was re-exported at a \
+                 different size without re-baking -- run tools/build_assets.py \
+                 --only impostors -- or something in the file is scaling what the \
+                 renderer draws.",
+                meta.world_size,
+            );
         }
     }
 

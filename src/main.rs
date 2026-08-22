@@ -7,6 +7,7 @@
 //! the port took over; they are provenance for a constant or a rule rather
 //! than files to open, and `git log` still has them if one needs reading.
 
+mod aim;
 mod animation;
 mod audio;
 mod billboard;
@@ -26,6 +27,7 @@ mod shadow;
 mod shot;
 mod squad;
 mod water;
+mod weapon;
 
 use bevy::{
     core_pipeline::tonemapping::Tonemapping,
@@ -262,6 +264,8 @@ pub fn game_resources(app: &mut App) {
         .init_resource::<menu::MenuState>()
         .init_resource::<display::DisplaySettings>()
         .init_resource::<impostor::ImpostorStats>()
+        .init_resource::<weapon::Loadout>()
+        .init_resource::<aim::Aim>()
         .insert_resource(Time::<Fixed>::from_hz(30.0));
 }
 
@@ -271,10 +275,15 @@ pub fn game_resources(app: &mut App) {
 /// The input pipeline is not here: it reads real devices, and the headless
 /// callers have none.
 pub fn game_systems(app: &mut App) {
-    app.add_systems(Startup, setup)
+    app.add_systems(Startup, (setup, weapon::load_shot_assets))
         .add_systems(FixedUpdate, simulation())
         .add_systems(Update, presentation())
         .add_systems(Update, overlay())
+        // Chained: `weapon::carry` points the gun down `aim::Aim`, which
+        // `aim::drive` writes. Unordered they would still both run in this
+        // window, but the gun would spend half its frames a step behind the
+        // torso carrying it.
+        .add_systems(PostUpdate, (aim::systems(), weapon::systems()).chain())
         .add_systems(PostUpdate, drawing());
 }
 
@@ -346,6 +355,13 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
         squad::maintain_population,
         squad::update_goals,
         squad::move_allies,
+        // Before `enemy::combat`, so a shot and a swing in the same tick are
+        // resolved in the order the trigger was pulled rather than the swing
+        // silently winning. Both take the same latched edge and only one of
+        // them is allowed to, so in practice they never both act -- but the
+        // order is the cheap half of making that true.
+        weapon::swap,
+        weapon::fire,
         enemy::combat,
         // After the walk step: a Mario mid-punch is punching, whatever the walk
         // made of it.
@@ -362,6 +378,12 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
         // next one rather than being stepped on the tick it was created.
         pipe::fly,
         pipe::fire,
+        // After everything that moved an enemy this tick, so a bullet is
+        // tested against where its target actually ended up.
+        weapon::fly,
+        // The feet come round after the walk step that decided where he was
+        // facing, for the same reason `ally_combat` follows the walk.
+        aim::turn_body,
     )
         .chain()
         .run_if(console::is_closed)
@@ -383,6 +405,7 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
         water::drift,
         water::camera_medium,
         shadow::systems(),
+        weapon::fade,
         controls,
         update_hud,
     )
@@ -404,6 +427,9 @@ fn overlay() -> ScheduleConfigs<ScheduleSystem> {
         // the moment a `crowd` command is typed, and a field that only arrived
         // once you shut the console is a field you never saw arrive.
         enemy::crowd,
+        // Straight after it, because the two share the console's request queue
+        // and each hands back what the other one wanted. See `ConsoleState::defer`.
+        weapon::equip,
         enemy::sync_animation_visibility,
         audio::play,
         console::draw,
@@ -797,6 +823,7 @@ fn toggle_fullscreen(
 fn update_hud(
     state: Res<GameState>,
     input: Res<InputState>,
+    loadout: Res<weapon::Loadout>,
     squad: Res<squad::Squad>,
     player: Query<&Controller, With<Player>>,
     mut text: Query<&mut Text, With<Hud>>,
@@ -811,10 +838,11 @@ fn update_hud(
     // extra runs are child entities rather than a `sections` vector.
     **hud = if state.debug {
         let device = if input.pad { "gamepad" } else { "keyboard" };
+        let weapon = loadout.equipped.spec().name;
         let following = squad.members.len();
         let marching = squad.marching();
         let holding = squad.sent.len() - marching;
-        format!("Super Bevy World 64\n{:?}  ·  {:?}  ·  Health {}  ·  {device}\nSquad {following} following · {marching} marching · {holding} holding\nWASD move · mouse look · Space jump · V jetpack/skate\nShift attack · X squad (hold to whistle, tap to send)\nF/right mouse aim · ` console · F2 switch · Esc menu · F11 window", state.active, ctrl.motion, ctrl.health)
+        format!("Super Bevy World 64\n{:?}  ·  {:?}  ·  Health {}  ·  {device}\nSquad {following} following · {marching} marching · {holding} holding\nWASD move · mouse look · Space jump · V jetpack/skate\nShift attack · X squad (hold to whistle, tap to send)\nF/right mouse aim · Y weapon ({weapon}) · ` console · F2 switch · Esc menu · F11 window", state.active, ctrl.motion, ctrl.health)
     } else {
         String::new()
     };

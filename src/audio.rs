@@ -41,6 +41,11 @@ pub enum Sfx {
     Splash,
     /// One swimming stroke.
     Stroke,
+    /// A gun fired. Shared: it is the weapon that makes this one, not the
+    /// character holding it.
+    Shoot,
+    /// A weapon changed hands.
+    Draw,
 }
 
 /// One event's samples: a list of layers that play together, each layer a list
@@ -95,11 +100,23 @@ const MARIO_HURT: Layers = &[&["mario64/mario_ooof.wav"]];
 const SPLASH: Layers = &[&["mario64/water_plunge.wav"]];
 const STROKE: Layers = &[&["mario64/swim_stroke.wav"]];
 const DEFEAT: Layers = &[&["se_zelda/se_zelda_smash_L01.wav"]];
+// Placeholders, and knowingly so: there is no gunshot anywhere in either sound
+// set, because neither game this port borrows from has a gun in it. The smash
+// is the sharpest transient available and the appeal is the nearest thing to a
+// weapon being readied. Both are here so that firing and swapping are *audible*
+// while the pistol is being tuned; replace them when the real samples exist.
+const SHOOT: Layers = &[&[
+    "se_zelda/se_zelda_smash_S01.wav",
+    "se_zelda/se_zelda_smash_S02.wav",
+]];
+const DRAW: Layers = &[&["se_zelda/se_zelda_appeal_S01.wav"]];
 
 /// The samples an event plays for a character.
 pub fn layers(character: ActiveCharacter, sfx: Sfx) -> Layers {
     match (sfx, character) {
         (Sfx::Defeat, _) => DEFEAT,
+        (Sfx::Shoot, _) => SHOOT,
+        (Sfx::Draw, _) => DRAW,
         (Sfx::Splash, _) => SPLASH,
         (Sfx::Stroke, _) => STROKE,
         (Sfx::Jump, ActiveCharacter::Hero) => HERO_JUMP,
@@ -117,7 +134,7 @@ pub fn layers(character: ActiveCharacter, sfx: Sfx) -> Layers {
 
 /// Every sample the game can play, for preloading and for the file check.
 pub fn all_paths() -> impl Iterator<Item = &'static str> {
-    const EVENTS: [Sfx; 8] = [
+    const EVENTS: [Sfx; 10] = [
         Sfx::Jump,
         Sfx::Land,
         Sfx::Step,
@@ -126,6 +143,8 @@ pub fn all_paths() -> impl Iterator<Item = &'static str> {
         Sfx::Defeat,
         Sfx::Splash,
         Sfx::Stroke,
+        Sfx::Shoot,
+        Sfx::Draw,
     ];
     [ActiveCharacter::Hero, ActiveCharacter::Mario]
         .into_iter()
@@ -312,6 +331,8 @@ mod tests {
                 Sfx::Defeat,
                 Sfx::Splash,
                 Sfx::Stroke,
+                Sfx::Shoot,
+                Sfx::Draw,
             ] {
                 let takes = takes(character, sfx, &mut rng);
                 assert!(!takes.is_empty(), "{character:?} {sfx:?} is silent");

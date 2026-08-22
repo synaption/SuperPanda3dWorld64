@@ -17,3 +17,9 @@ use datastructures and algorithems where apropriate
 Use headless testing even for rendering or else it keeps bringing up windows on my desktop.  
 
 I am using windows to run the program, not wsl.  
+
+blender should include
+- hit boxes
+- colliders
+- hand placment information
+- where the bullet comes out information

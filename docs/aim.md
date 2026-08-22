@@ -4,14 +4,17 @@
 > [Quick start](../README.md)
 
 > **Status.** This is a design document, and it was written against the
-> Panda3D implementation the game was ported from. The design intent stands
-> and the rig work is done — `tools/aim_rig.py` still exports the `AIM_TORSO`
-> pivot and the `WEAPON_SOCKET` — but the procedural layer described under
-> "The runtime" below was Panda3D-side and has **not** been ported to Bevy.
-> Nothing currently drives the pivot. Where the text names a Panda3D API
-> (`Actor` subparts, `exposeJoint`, `controlJoint`, `NodePath`), read it as the
-> shape of the problem rather than as the call to make; `src/billboard.rs`
-> solves the equivalent joint-driving problem in Bevy and is the closer model.
+> Panda3D implementation the game was ported from. The design intent stands and
+> the rig work is done — `tools/aim_rig.py` exports the `AIM_TORSO` pivot and
+> the `WEAPON_SOCKET`. The single-bone half of the procedural layer is now
+> ported: `src/aim.rs` drives the pivot, and `src/weapon.rs` hangs a gun off the
+> socket and fires it. What is still unported is everything *past* one bone —
+> distributed rotation, aim-offset poses, left-hand IK and the melee commitment
+> curve — for the reasons "As Built" gives at the bottom. Where the text names a
+> Panda3D API (`Actor` subparts, `exposeJoint`, `controlJoint`, `NodePath`),
+> read it as the shape of the problem rather than as the call to make;
+> `src/billboard.rs` solves the equivalent joint-driving problem in Bevy and is
+> the model both new modules follow.
 
 Overview
 
@@ -1180,7 +1183,7 @@ The cost is that the twist is rigid: the spine chain rides inside the group rath
 
 The runtime
 
-**Not ported.** The procedural layer -- `AimController`, an `AimProfile` per weapon, and the melee commitment curve -- was built on the Panda3D side, fed the camera's aim ray, and applied the body turn it asked for. It went with that implementation and has no Bevy equivalent yet; the game has an aim *mode* that frames the camera, and nothing that turns the torso. What it was tuned to, for whoever ports it:
+**Ported, for one bone.** The procedural layer -- `AimController`, an `AimProfile` per weapon, and the melee commitment curve -- was built on the Panda3D side, fed the camera's aim ray, and applied the body turn it asked for. It went with that implementation. `src/aim.rs` is the Bevy equivalent of the yaw/pitch half: it reads the camera into an `Aim` resource, converts that to player-local yaw and pitch, clamps, springs, and writes the result onto `AIM_TORSO`, and `aim::turn_body` spends on the feet whatever the twist could not cover. There is no `AimProfile` yet -- one gun does not need per-weapon response curves -- and the melee curve is still unported, since the sword is resolved by `enemy::combat` off a timer rather than by a tracked attack. The numbers it was tuned to, which are the numbers `src/aim.rs` uses:
 
     torso limit         60 degrees, then his feet come round
     comfort limit       20 degrees, standing still
@@ -1188,8 +1191,10 @@ The runtime
     response            a critically damped spring, 0.12 s
     tracking            the sights' blend, or the melee curve, whichever is more
 
-All of it was on console sliders (`torso_limit`, `torso_response`, `torso_pitch`, `torso_comfort`, `torso_turn_rate`), and should be again — every one of those numbers was arrived at by moving a slider, not by reasoning.
+All of it was on console sliders (`torso_limit`, `torso_response`, `torso_pitch`, `torso_comfort`, `torso_turn_rate`), and is again — every one of those numbers was arrived at by moving a slider, not by reasoning. The port splits the single pitch clamp into `torso_pitch_up` and `torso_pitch_down`, because -45 to +60 is not one number, and `torso_turn_rate` is a starting point rather than a recovered value: the Panda3D build turned the body from its controller rather than from a rate, so there was no number to recover.
 
 Not built yet
 
-Upper/lower body subparts -- he has no clip that would use them until there is a weapon to hold. WEAPON_SOCKET exists, under DEF-hand.R, with nothing attached to it. No WeaponController, no muzzle, no melee hitboxes or weapon sweep; the melee tracking curve is wired up and steers the swing, but nothing yet reads it for hit detection.
+Upper/lower body subparts -- he still has no clip that would use them, and **this is the gap you will see first.** `WEAPON_SOCKET` now carries the target pistol, but there is no `rifle_idle` and no `rifle_fire`, so the hand holding it is in whatever pose the idle or the run left it in: down by his hip. `src/weapon.rs` works around that by cancelling the socket's rotation and pointing the gun down the aim itself, which puts the shot where the crosshair is and reads as hip firing rather than as a man taking aim. An authored pair of clips -- a gun idle and a gun fire, played on the upper body only -- is what fixes it properly, and it is a rig job rather than a code one.
+
+Still absent: distributed aim rotation, aim-offset poses and left-hand IK, all three of which need the Rigify DEF bones parented properly in `TheHero.blend` first. No melee hitboxes and no weapon sweep; the melee tracking curve is described above, but nothing reads it for hit detection, because the sword is still resolved on a timer.

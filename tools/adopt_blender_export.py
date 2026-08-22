@@ -54,7 +54,22 @@ SKELETON_ROOT = "armature"
 
 
 def mesh_nodes(gltf):
-    return [i for i, n in enumerate(gltf.json["nodes"]) if "mesh" in n]
+    """The *skinned* meshes, which are the only ones this may move.
+
+    The `skin` test is not a refinement, it is the whole rule. A skinned mesh
+    ignores the transform of the node it hangs under -- glTF says its vertices
+    are in the skin's own space, and the inverse bind matrices cancel whatever
+    the skeleton root happens to carry -- so re-parenting one is free. An
+    unskinned mesh takes that transform in full.
+
+    An ant proved it. Four spheres added to the model in Blender were loose
+    objects, unparented and unskinned; this moved them under a skeleton root
+    carrying a 4x scale, a 180-degree yaw and a 0.79 m lift left over from
+    rigging, none of which the ant's own body had ever noticed. They came out
+    four times the size, upside down and floating over the courtyard.
+    """
+    return [i for i, n in enumerate(gltf.json["nodes"])
+            if "mesh" in n and "skin" in n]
 
 
 def reparent_mesh(gltf, skeleton_root=SKELETON_ROOT):
@@ -72,6 +87,15 @@ def reparent_mesh(gltf, skeleton_root=SKELETON_ROOT):
             children = gltf.json["nodes"][parent].get("children", [])
             if mesh in children:
                 children.remove(mesh)
+        # A node with no parent is a *scene root*, and taking it out of one
+        # place without taking it out of the other leaves it in both: listed
+        # among the scene's roots and listed again among the skeleton's
+        # children. glTF says a node is reachable by exactly one path; a loader
+        # that walks the scene the obvious way draws it twice, once with the
+        # skeleton root's transform on it and once without.
+        for scene in gltf.json.get("scenes", []):
+            if mesh in scene.get("nodes", []):
+                scene["nodes"].remove(mesh)
         gltf.json["nodes"][skeleton].setdefault("children", []).append(mesh)
         moved.append((gltf.json["nodes"][mesh].get("name"),
                       gltf.json["nodes"][parent].get("name") if parent is not None
