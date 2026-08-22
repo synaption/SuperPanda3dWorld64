@@ -331,7 +331,7 @@ impl Default for GameTuning {
             // inside this and drawn as a real skeleton. What is beyond it is
             // scenery, and scenery a dozen pixels tall is exactly what an
             // impostor is for. Past here the whole far crowd is two draw calls
-            // instead of two per slime and fifteen per scuttlebug.
+            // instead of two per slime and one per ant.
             enemy_draw: 25.0,
             enemy_rate: 7.0,
             enemy_limit: 20.0,
@@ -433,15 +433,58 @@ const CROWD_LIMIT: usize = 20_000;
 /// ambiguous abbreviation from an unknown one.
 const CROWD_NAMES: [(&str, CrowdKind); 3] = [
     ("slime", CrowdKind::Slime),
-    ("scuttlebug", CrowdKind::Scuttlebug),
+    ("ant", CrowdKind::Ant),
     ("mix", CrowdKind::Mix),
 ];
+
+/// Which kind a `crowd` argument names, or what to say about it.
+///
+/// Prefixes, so `crowd 2000 m` works: this is a command typed between two
+/// readings of a frame-rate counter, not a configuration file. Matched against
+/// every name rather than taken in order, because first match wins is how
+/// `crowd 2000 s` quietly ran a benchmark of the wrong enemy back when the
+/// slime and the scuttlebug shared a letter.
+///
+/// Free-standing, and handed its table rather than reading [`CROWD_NAMES`]
+/// itself, so that the ambiguous case stays under test: the three names the
+/// game ships now start with three different letters, and no line a player can
+/// type reaches that branch any more.
+fn crowd_kind(word: &str, names: &[(&str, CrowdKind)]) -> Result<CrowdKind, String> {
+    let matched: Vec<_> = names
+        .iter()
+        .filter(|(name, _)| name.starts_with(word))
+        .map(|(name, kind)| (*name, *kind))
+        .collect();
+    match matched.as_slice() {
+        [(_, kind)] => Ok(*kind),
+        [] => {
+            let all: Vec<_> = names.iter().map(|(name, _)| *name).collect();
+            Err(format!("{word:?} is not {}", or_list(&all)))
+        }
+        several => {
+            let all: Vec<_> = several.iter().map(|(name, _)| *name).collect();
+            Err(format!(
+                "{word:?} could be {} -- say more of it",
+                or_list(&all)
+            ))
+        }
+    }
+}
+
+/// `["slime", "ant", "mix"]` as `"slime, ant or mix"`.
+fn or_list(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+    }
+}
 
 /// Which enemies a `crowd` command asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CrowdKind {
     Slime,
-    Scuttlebug,
+    Ant,
     /// Half of each, alternating, which is the case the draw-call cost of a
     /// mixed field is actually measured on.
     Mix,
@@ -593,7 +636,7 @@ impl ConsoleState {
         }
         self.echo(format!("> {line}"));
         match words[0].to_ascii_lowercase().as_str() {
-            "help" | "?" => self.echo("commands: <name> [value], vars, reset <name|all>, close <name|all>, clear\ncrowd <n> [slime|scuttlebug|mix] puts a whole field down at once; crowd clear takes it away.\nLeft/Right/Home/End move the caret; Up/Down recall; Tab completes.\nSelect a variable then use [ and ] (Shift = 10x) to tune it. Wheel/PageUp/PageDown scroll the log."),
+            "help" | "?" => self.echo("commands: <name> [value], vars, reset <name|all>, close <name|all>, clear\ncrowd <n> [slime|ant|mix] puts a whole field down at once; crowd clear takes it away.\nLeft/Right/Home/End move the caret; Up/Down recall; Tab completes.\nSelect a variable then use [ and ] (Shift = 10x) to tune it. Wheel/PageUp/PageDown scroll the log."),
             "vars" | "list" => {
                 for spec in SPECS {
                     self.echo(format!("  {:<18} {:>7.3}  [{:.3} .. {:.3}]  {}", spec.name, tuning.get(spec.name).unwrap(), spec.low, spec.high, spec.doc));
@@ -619,7 +662,7 @@ impl ConsoleState {
         std::mem::take(&mut self.pending)
     }
 
-    /// `crowd <n> [slime|scuttlebug|mix]`, or `crowd clear`.
+    /// `crowd <n> [slime|ant|mix]`, or `crowd clear`.
     ///
     /// The benchmark command. `enemy_limit` and `enemy_rate` can already fill
     /// the field, but they do it a brood at a time over a minute or more, and a
@@ -636,36 +679,15 @@ impl ConsoleState {
             self.echo("crowd: needs a count -- `crowd 2000 mix`, or `crowd clear`");
             return;
         };
-        // Prefixes, so `crowd 2000 m` works: this is a command typed between
-        // two readings of a frame-rate counter, not a configuration file.
-        //
-        // Matched against all three rather than taken in order, because the
-        // slime and the scuttlebug now share a first letter and first match
-        // wins would quietly hand `crowd 2000 s` to whichever of them this
-        // happened to list first. An ambiguous prefix says so instead.
         let kind = match args.get(1).map(|word| word.to_ascii_lowercase()) {
             None => CrowdKind::Mix,
-            Some(word) => {
-                let matched: Vec<_> = CROWD_NAMES
-                    .iter()
-                    .filter(|(name, _)| name.starts_with(&word))
-                    .collect();
-                match matched.as_slice() {
-                    [(_, kind)] => *kind,
-                    [] => {
-                        self.echo(format!("crowd: {word:?} is not slime, scuttlebug or mix"));
-                        return;
-                    }
-                    several => {
-                        let names: Vec<_> = several.iter().map(|(name, _)| *name).collect();
-                        self.echo(format!(
-                            "crowd: {word:?} could be {} -- say more of it",
-                            names.join(" or ")
-                        ));
-                        return;
-                    }
+            Some(word) => match crowd_kind(&word, &CROWD_NAMES) {
+                Ok(kind) => kind,
+                Err(why) => {
+                    self.echo(format!("crowd: {why}"));
+                    return;
                 }
-            }
+            },
         };
         let count = count.min(CROWD_LIMIT);
         self.pending.push(Request::Crowd(count, kind));
@@ -1191,7 +1213,7 @@ mod tests {
         let mut tuning = GameTuning::default();
         console.execute("crowd 2000 mix", &mut tuning);
         console.execute("crowd 40 sl", &mut tuning);
-        console.execute("crowd 40 scuttle", &mut tuning);
+        console.execute("crowd 40 ant", &mut tuning);
         // No kind named is the mixed field, which is the one worth measuring.
         console.execute("crowd 7", &mut tuning);
         console.execute("crowd clear", &mut tuning);
@@ -1200,7 +1222,7 @@ mod tests {
             vec![
                 Request::Crowd(2000, CrowdKind::Mix),
                 Request::Crowd(40, CrowdKind::Slime),
-                Request::Crowd(40, CrowdKind::Scuttlebug),
+                Request::Crowd(40, CrowdKind::Ant),
                 Request::Crowd(7, CrowdKind::Mix),
                 Request::ClearCrowd,
             ]
@@ -1210,36 +1232,41 @@ mod tests {
         assert!(console.take_requests().is_empty());
     }
 
-    /// `s` is not an abbreviation any more.
+    /// An abbreviation that could mean two things must not quietly pick one.
     ///
-    /// The slime and the scuttlebug share a first letter, and the version of
-    /// this that took the first name to match would have silently handed a
-    /// benchmark of one to a benchmark of the other -- two fields with quite
-    /// different draw costs, told apart only by squinting at them.
+    /// The version of this that took the first name to match would have handed
+    /// a benchmark of one enemy to a benchmark of the other -- two fields with
+    /// quite different draw costs, told apart only by squinting at them. That
+    /// was a live bug for exactly as long as the slime stood next to the
+    /// scuttlebug; the ant that replaced the bug gave the three kinds three
+    /// different first letters again, so the colliding table is supplied here
+    /// rather than typed at the console, and the branch keeps its test after
+    /// the collision it was written for went away.
     #[test]
-    fn an_ambiguous_kind_queues_nothing_and_says_why() {
-        let mut console = ConsoleState::default();
-        let mut tuning = GameTuning::default();
-        console.execute("crowd 40 s", &mut tuning);
-        assert!(
-            console.take_requests().is_empty(),
-            "an ambiguous prefix placed a field anyway"
-        );
-        let said = console.log.back().expect("nothing was echoed").clone();
+    fn an_ambiguous_kind_is_refused_and_says_why() {
+        let colliding = [
+            ("slime", CrowdKind::Slime),
+            ("scuttlebug", CrowdKind::Ant),
+            ("mix", CrowdKind::Mix),
+        ];
+        let said = crowd_kind("s", &colliding).expect_err("an ambiguous prefix resolved anyway");
         assert!(
             said.contains("slime") && said.contains("scuttlebug"),
             "the ambiguity was not explained: {said:?}"
         );
         // Enough of it to tell them apart still works, both ways.
-        console.execute("crowd 40 sl", &mut tuning);
-        console.execute("crowd 40 sc", &mut tuning);
-        assert_eq!(
-            console.take_requests(),
-            vec![
-                Request::Crowd(40, CrowdKind::Slime),
-                Request::Crowd(40, CrowdKind::Scuttlebug),
-            ]
-        );
+        assert_eq!(crowd_kind("sl", &colliding), Ok(CrowdKind::Slime));
+        assert_eq!(crowd_kind("sc", &colliding), Ok(CrowdKind::Ant));
+
+        // And with the names the game actually ships, one letter is enough for
+        // every one of them -- which is the property a player relies on.
+        for (name, kind) in CROWD_NAMES {
+            assert_eq!(
+                crowd_kind(&name[..1], &CROWD_NAMES),
+                Ok(kind),
+                "{name:?} is not reachable by its first letter"
+            );
+        }
     }
 
     /// A mistyped count must not queue anything, and a fat-fingered one must

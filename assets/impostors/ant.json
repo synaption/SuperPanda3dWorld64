@@ -1,0 +1,10 @@
+{
+  "model": "ant",
+  "cell_px": 128,
+  "angles": 16,
+  "frames": 16,
+  "world_size": 2.7559998,
+  "foot": 0.2530955,
+  "fps": 38.4,
+  "elevation": 15.0
+}

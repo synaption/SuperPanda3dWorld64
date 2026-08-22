@@ -95,7 +95,7 @@ src/
   input.rs       keyboard, mouse and pad merged into one latched snapshot
   animation.rs   which clip each character plays, and how fast
   billboard.rs   turning billboarded objects and actor parts to face the camera
-  enemy.rs       slimes and scuttlebugs: behaviour, LOD, hit resolution
+  enemy.rs       slimes and ants: behaviour, LOD, hit resolution
   pipe.rs        warp pipes, and the arc they throw their brood out on
   squad.rs       aiming at the ground, and the Marios whistled up and sent out
   water.rs       the water sheets and the underwater view
@@ -306,7 +306,12 @@ though the tree's geo has no `GEO_BILLBOARD` in it at all.
 
 **Part of an actor** — most of a scuttlebug — is skinned to a
 joint, where no transform on the object can reach it. The exporter makes each
-such quad a joint named `billboard_*`, and those are driven one at a time.
+such quad a joint named `billboard_*`, and those are driven one at a time. No
+actor the game loads carries one any more: the goomba and the scuttlebug both
+went, and the slime and the ant that replaced them are authored art with real
+skinned meshes and nothing flat on them. The machinery stays because it is what
+any decomp actor coming back would need, and the tests for it now measure the
+unedited decomp export kept under `assets/packs/reference`.
 
 Driving a joint takes two things that are easy to get wrong. The rotation is
 composed against the inverse of the parent joint's world rotation, because the
@@ -337,7 +342,7 @@ isolated.
 ## Warp pipes
 
 Three pipes, and each produces one thing: slimes out of the one in the far
-west corner, scuttlebugs out of the one in the far east, and Marios out of the
+west corner, ants out of the one in the far east, and Marios out of the
 one by the spawn on the castle path. The two enemy pipes are where they are on
 purpose — they are somewhere to go rather than something to trip over on the
 way out of the gate.
@@ -352,8 +357,8 @@ outwards throughout and landing about four pipe-widths away.
 
 For that second the thing's own behaviour is suspended and the arc alone moves
 it. That suspension is the trick: every behaviour writes its own speed each
-tick — a slime bleeds whatever it has back toward a walk, a scuttlebug simply
-overwrites it with its crawl — so a launch handed to the behaviour is gone
+tick — a slime bleeds whatever it has back toward a walk, a crawling ant
+simply overwrites it with its crawl — so a launch handed to the behaviour is gone
 within a tick or two and the thing lands back on the pipe it came out of.
 
 Where it is thrown is chosen rather than taken: headings a golden angle apart
@@ -385,12 +390,16 @@ throws him back and costs a heart. Each enemy is an upright cylinder — a radiu
 and a height — rather than a point, so standing on a roof above one is not
 touching it.
 
-Sizes come from the originals' hitboxes rather than from eye. Mario's is 160
-tall and a scuttlebug's is 70, so the bug stands at about 0.44x his height. The
-slime is the exception: it is authored art rather than a decomp export, so its
-height is the model's own — 0.70 m, the width of the dome — while it keeps the
-0.70 m radius of the goomba it replaced, which is what the crowd's spacing and
-flow-field arithmetic were tuned against.
+Radii come from the originals' hitboxes rather than from eye, and both enemies
+keep the radius of the decomp actor they replaced — 0.70 m from the goomba,
+0.60 m from the scuttlebug — because the crowd's spacing, its flow-field
+arithmetic and its shove resolution are all expressed in body radii and every
+one of them was tuned against those two numbers. The heights are the models'
+own, since both are authored art: 0.70 m for the slime, which is the width of
+its dome, and 0.65 m for the ant. Mario's hitbox is 160 units tall against the
+scuttlebug's 70, so an enemy of this size stands at about 0.44x his height.
+`the_cylinders_are_the_size_the_models_are_drawn_at` reads all of it back out
+of the glTF, so a re-export that changes a model's size fails a test.
 
 The immunity after a hit gates the *whole* resolution and not only the damage.
 That is not a detail. A knocked-back player is thrown up and off the enemy that
@@ -461,10 +470,12 @@ the UI as well and the HUD comes out blurred along with the world. A test in
 The thing that costs a frame here is **draw calls, not pixels and not
 triangles**. Bevy marks every skinned mesh `NoAutomaticBatching`, because each
 one needs its own joint matrices, so a skinned actor costs one draw call per
-mesh primitive and no two of them ever merge — two for a slime, fifteen for a
-scuttlebug, which is fifteen draw calls to put seventy-six triangles on screen.
-Two thousand enemies drawn that way is around nineteen thousand draw calls a
-frame. The castle, for comparison, is 785 triangles and 45 draws.
+mesh primitive and no two of them ever merge. The decomp's scuttlebug was
+fifteen of them for seventy-six triangles, and two thousand enemies drawn that
+way was around nineteen thousand draw calls a frame. The authored actors that
+replaced it are far better behaved — two primitives for a slime, one for an ant
+— so the same field is now about three thousand. Still most of a frame. The
+castle, for comparison, is 785 triangles and 45 draws.
 
 So the crowd work is all about doing less per enemy, in three ways: drawing
 fewer things, keeping fewer entities, and properly simulating fewer of them.
@@ -499,10 +510,11 @@ fewer things, keeping fewer entities, and properly simulating fewer of them.
 
 ### Keeping fewer entities
 
-An enemy is not one entity. It is a glTF scene — about 9 for a slime, 63 for
-a scuttlebug — and every one of those is a transform to propagate and an
-archetype row to walk past. A mixed field of two thousand used to be 85,000
-entities and eight thousand was a third of a million, at which point the entity
+An enemy is not one entity. It is a glTF scene — about 9 for a slime, 33 for
+an ant, and 63 for the scuttlebug the ant replaced — and every one of those is a
+transform to propagate and an archetype row to walk past. A mixed field of two
+thousand used to be 85,000 entities and eight thousand was a third of a million,
+at which point the entity
 count, not the draws and not the AI, is what a frame is made of. That was
 measured: at eight thousand the simulation budget below saved nothing at all,
 because simulation was no longer the expensive part.
@@ -575,8 +587,8 @@ walks each one to its slot and asks nothing about what is standing there, so a
 squad following the player was a heap of Marios in the same place walking
 through each other and through him.
 
-They share a pass rather than having one each because a Mario, a slime and a
-scuttlebug are all bodies of some radius standing on some ground, and two
+They share a pass rather than having one each because a Mario, a slime and an
+ant are all bodies of some radius standing on some ground, and two
 answers to how bodies avoid each other is two answers that disagree at the
 boundary between them.
 
@@ -590,27 +602,39 @@ Three things it does that are not obvious:
 - **The shove resolves its own result against walls.** A press leaning on the
   one at the front is enough to post it through a fence, and neither the walk
   step nor the crowd step gets a say in where a shove puts it. Not for
-  crawlers: a scuttlebug is held out of walls by being *on* one.
+  crawlers: an ant is held out of walls by being *on* one.
 - **Crawlers are pushed within the surface they are stuck to.** Shoving a bug
   off its wall is the one thing this must not do.
 
 ### Where an enemy's feet are
 
-**A transform is not where the model is.** The scuttlebug's rig root sits up
-inside its body, so its geometry hangs 31 cm below its own origin. Seat that
+**A transform is not where the model is.** The scuttlebug's rig root sat up
+inside its body, so its geometry hung 31 cm below its own origin. Seat that
 origin on the ground — which is what every placement in the game does — and a
-third of the scuttlebug is underground on flat stone. The slime is the case
-this wants and the reason `Kind::lift` is a fact about the asset rather than a
-tuning knob: it was authored with its mesh on `y = 0`, so its lift is zero and
-nothing has to be corrected for. The goomba it replaced hung 6.5 cm.
+third of the bug was underground on flat stone. The ant that replaced it is
+rigged the same way and hangs 22 cm. The slime is the case this wants and the
+reason `Kind::lift` is a fact about the asset rather than a tuning knob: it was
+authored with its mesh on `y = 0`, so its lift is zero and nothing has to be
+corrected for. The goomba hung 6.5 cm.
 
-`Kind::lift` carries the offset, measured off the baked impostor sheets rather
-than guessed: those are renders of the real posed actor through the game's own
-draw chain, so the sheet metadata says where the origin sits in a cell and the
-lowest opaque pixel says where the model stops.
-`impostor::tests::the_lift_matches_what_the_baked_sheets_show` re-derives it from
-the PNGs on every run, so re-baking a sheet or re-rigging an actor fails a test
-instead of quietly sinking an enemy.
+`Kind::lift` carries the offset, and `tools/measure_actor_hang.py` is the
+authority for it: it evaluates the skinned mesh on every frame of every clip,
+which is what tells a permanent rig offset from a squash that dips through the
+floor plane for a few frames of a walk cycle.
+
+**The baked sheets are not that authority, and it is worth knowing why.** A
+sheet cell is a silhouette drawn by a camera tilted 15 degrees down, so the near
+rim of a wide body projects below where its own origin projects even with
+nothing at all below it in world space — half a metre of body reaching toward
+the camera buys 13 cm of that. It was the right instrument for the scuttlebug,
+which was tall and narrow, and it overstates both actors that ship now: the
+slime by a third of a metre, the ant by 15 cm. Believing either number would
+hover the enemy to keep its own picture off a floor it is standing on. So
+`impostor::tests::the_lift_matches_what_the_baked_sheets_show` asserts only what
+survives that — a lift never exceeds what the silhouette reaches, because a
+model held further up than its own picture extends is a model hovering — and
+`enemy::tests::the_cylinders_are_the_size_the_models_are_drawn_at` pins the
+number itself to the glTF's own position bounds.
 
 `walk`, `settle` and `crawl` all keep answering in **contact points** — where the
 feet go — and `enemy::update` converts at the boundary. Keeping them pure means
@@ -619,7 +643,7 @@ a test can walk an enemy across a level without knowing what it looks like.
 The real fix for both numbers is the exporter putting the origin on the floor,
 which would let the lift be zero. See `tools/export_actor_gltf.py`.
 
-Two related things are worth knowing about a scuttlebug's `up`. Hanging under a
+Two related things are worth knowing about a crawler's `up`. Hanging under a
 ceiling and being buried under a floor are the *same state* — surface overhead,
 body against its underside, `up` pointing down — so nothing local can tell them
 apart and nothing local can undo the second. A bug that has been moved without
@@ -735,11 +759,10 @@ Still to port:
   an approximation of a chain whose reach depends on how densely packed the
   crowd happens to be. `SHOT_SETTLE` and the pixel-counting comparison in the
   performance notes are how that was measured and how a fix would be judged.
-- atlasing the actor exports. A scuttlebug is fifteen mesh primitives and nine
-  materials for seventy-six triangles, and every one of them is its own draw
-  call. Impostors take care of the far crowd, but the near crowd still pays it:
-  packing each actor's textures into one atlas and merging its primitives in
-  `tools/export_actor_gltf.py` would be roughly a seven-fold cut in draw calls
-  for everything inside `enemy_draw`.
+- atlasing the actor exports. This was worth a seven-fold cut in draw calls
+  when the scuttlebug was fifteen mesh primitives and nine materials for
+  seventy-six triangles. Replacing both decomp enemies with authored art took
+  most of it already — a slime is two primitives and an ant is one — so what is
+  left of the idea belongs to Mario and the Hero rather than to the enemies.
 
 See `next.md` for what is wanted next.

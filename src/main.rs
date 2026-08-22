@@ -140,21 +140,21 @@ fn main() {
     log_panics_to_a_file();
     // The impostor baker runs inside the game rather than beside it, so that
     // the sprites it draws are lit by the same material the skinned models are.
-    // `cargo run --release -- bake-impostors [slime|scuttlebug]`.
+    // `cargo run --release -- bake-impostors [slime|ant]`.
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.first().map(String::as_str) == Some("bake-impostors") {
         let named: Vec<enemy::Kind> = arguments[1..]
             .iter()
             .filter_map(|word| match word.to_ascii_lowercase().as_str() {
                 "slime" => Some(enemy::Kind::Slime),
-                "scuttlebug" => Some(enemy::Kind::Scuttlebug),
+                "ant" => Some(enemy::Kind::Ant),
                 other => {
                     eprintln!("bake-impostors: {other:?} is not an actor with a sheet");
                     None
                 }
             })
             .collect();
-        let all = [enemy::Kind::Slime, enemy::Kind::Scuttlebug];
+        let all = [enemy::Kind::Slime, enemy::Kind::Ant];
         impostor::bake::run(if named.is_empty() { &all } else { &named });
         return;
     }
@@ -286,7 +286,7 @@ pub fn game_systems(app: &mut App) {
 /// baker has to run exactly this and getting it wrong is invisible.** It did:
 /// the baker was drawing actors without the billboard half, so the
 /// scuttlebug's three billboard joints came out at a quarter of
-/// their size -- `billboard::aim` is what puts back the 0.25 the exporter bakes
+/// their size -- `billboard::aim` is what puts back the 0.25 the exporter baked
 /// onto the skeleton -- and single-sided, so they were culled from half the
 /// angles. The sheets that came out covered 52% of the pixels the real models
 /// did, which is what a swap distance looks like when enemies visibly shrink
@@ -538,8 +538,8 @@ fn setup(
         (enemy::Kind::Slime, Vec3::new(-3., 3., 26.)),
         (enemy::Kind::Slime, Vec3::new(-24., 3., 29.)),
         (enemy::Kind::Slime, Vec3::new(9., 3., 34.)),
-        (enemy::Kind::Scuttlebug, Vec3::new(-29., 3., 21.)),
-        (enemy::Kind::Scuttlebug, Vec3::new(4., 3., 19.)),
+        (enemy::Kind::Ant, Vec3::new(-29., 3., 21.)),
+        (enemy::Kind::Ant, Vec3::new(4., 3., 19.)),
     ];
     for (i, (kind, position)) in spawns.into_iter().enumerate() {
         enemy::spawn(&mut commands, &assets, kind, position, i as f32);
@@ -562,7 +562,7 @@ fn setup(
             Vec3::new(-55.1, 5.4, -39.2),
         ),
         (
-            pipe::Spawn::Enemy(enemy::Kind::Scuttlebug),
+            pipe::Spawn::Enemy(enemy::Kind::Ant),
             Vec3::new(46.8, 5.4, -68.1),
         ),
     ];
@@ -994,7 +994,7 @@ mod tests {
                 (500, "mix"),
                 (1000, "mix"),
                 (2000, "mix"),
-                (2000, "scuttlebug"),
+                (2000, "ant"),
             ],
         };
         for (count, kind) in sweep {
@@ -1151,7 +1151,7 @@ mod tests {
 
     /// Each pipe produces its own thing, and throws it clear of itself.
     ///
-    /// Three pipes and three different broods: slimes out of one, scuttlebugs
+    /// Three pipes and three different broods: slimes out of one, ants
     /// out of another, and Marios out of the one on the castle path. And every
     /// one of them is *thrown* -- it goes up out of the barrel and comes down
     /// somewhere else -- so a brood that never left the ground, or one that
@@ -1206,7 +1206,7 @@ mod tests {
         for enemy in enemies.iter(app.world()) {
             *after.entry(enemy.kind).or_insert(0) += 1;
         }
-        for kind in [enemy::Kind::Slime, enemy::Kind::Scuttlebug] {
+        for kind in [enemy::Kind::Slime, enemy::Kind::Ant] {
             let (was, now) = (before.get(&kind).copied(), after.get(&kind).copied());
             assert!(
                 now > was,

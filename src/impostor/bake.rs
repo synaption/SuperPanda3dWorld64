@@ -3,7 +3,7 @@
 //! Run it with
 //!
 //! ```text
-//! cargo run --release -- bake-impostors [slime|scuttlebug]
+//! cargo run --release -- bake-impostors [slime|ant]
 //! ```
 //!
 //! and it writes `assets/impostors/<kind>.png` and `<kind>.json`.

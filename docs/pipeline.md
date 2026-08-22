@@ -61,9 +61,10 @@ assets/
     textures/                    the 21 PNGs those groups reference (2.9 MB)
   mario/          mario.glb + mario_clips.json   (209 animations)
   hero/           hero.glb + hero_clips.json     (20 animations, 53 joints)
-  actors/         slime, scuttlebug, tree, warp_pipe; a clips sidecar each
-                  where the actor animates. goomba.* is the retired enemy the
-                  slime replaced, kept as source rather than loaded.
+  actors/         slime, ant, tree, warp_pipe; a clips sidecar each where
+                  the actor animates. goomba.* and scuttlebug.* are the two
+                  retired decomp enemies those replaced, kept as source rather
+                  than loaded.
   sounds/mario64/ full source library plus 57 runtime WAVs and .source marker
   sounds/se_zelda, sounds/vc_zelda   the Hero's effect and voice sets
 ```
@@ -93,22 +94,55 @@ python3 tools/adopt_blender_export.py /tmp/slime.glb \
 ```
 
 `--skeleton-root` is only needed where the armature is not called `armature`,
-which is what the decomp exporter names it. The slime was authored in Blender
-and its rig is `Slime_Rig`; `tools/export_all_actors.py` carries the same map so
-the batch export does not need it spelled out.
+which is what the decomp exporter names it. Both Blender-authored actors name
+theirs themselves — the slime's rig is `Slime_Rig`, the ant's is the object
+Blender made for it, `Armature` — and `tools/build_assets.py` carries the same
+map so a batch build does not need it spelled out.
 
-To export every Blender-authored model currently loaded by the game—Mario,
-Hero, castle grounds, and the runtime actors—run:
+## Building every asset the game needs
+
+One command rebuilds everything the game loads, in the order the dependencies
+require:
 
 ```bash
-python3 tools/export_all_blender_assets.py
+python3 tools/build_assets.py
 ```
 
-The Hero source needs Blender 5.x. Successful exports replace the GLBs the
-game already loads; no Rust changes or asset registration step is required.
-`tools/export_all_actors.py` remains available when only the files under
-`assets/actors/` should be rebuilt. Weapons are excluded because the game does
-not currently load them.
+Five stages, and `--only <stage>` runs just one of them:
+
+| stage | writes | from |
+| --- | --- | --- |
+| `mario` | `assets/mario/mario.glb` + clips | `mario.blend` |
+| `hero` | `assets/hero/hero.glb` + clips | `TheHero.blend`, via `build_hero.py` |
+| `castle` | `assets/bevy/castle.glb`, `castle.bin`, `water.png` | the committed NPZs, via `convert_level.py` |
+| `actors` | `assets/actors/*.glb` + a clips sidecar each | the actor `.blend` files |
+| `impostors` | `assets/impostors/*.png`, `*.json` | the actor GLBs above, rendered by the game |
+
+The Hero source needs Blender 5.x. Successful runs replace the files the game
+already loads; no Rust changes or asset registration step is required. Weapons
+are excluded because the game does not currently load them.
+
+Two things about that table are worth knowing, because both used to be traps:
+
+- **The castle is not built from its `.blend`.** `castle_grounds.blend` exists
+  and opens, and exporting it produces a castle that is wrong in two ways at
+  once — it loses the `KHR_materials_unlit` that every one of the level's 45
+  materials carries, so the baked vertex lighting gets lit a second time on top
+  of itself, and it gains `alphaMode: BLEND` on all 45, which makes the whole
+  level a sorted draw. Neither surfaces as an error. `convert_level.py` is the
+  tool that produces what the game actually loads, so that is what this stage
+  runs; the `.blend` is an authoring copy.
+- **The impostor sheets are baked by the game, not by Blender.** That is why
+  they belong in this script: no Blender-facing tool would ever touch them, and
+  an enemy whose model was re-exported without them is drawn two different ways
+  at once — the new model up close and the old picture of it past `enemy_draw`.
+  Rotating an actor shows it worst, since every sprite in the atlas then faces
+  the wrong way.
+
+Everything except the impostors is bit-reproducible: run it twice on unchanged
+sources and `git status` stays clean. The sheets are a GPU render rather than a
+calculation, so they come back a few dozen pixels different every time, none of
+them off by more than a step or two.
 
 The textures are copied in by `parse_f3d.py` rather than referenced in place.
 They used to point back into `reference/RENDER96-HD-TEXTURE-PACK/`, which is 12
@@ -145,45 +179,72 @@ decomp said rather than something the runtime consults. They are kept current
 anyway: the data cannot be recovered from a `.glb` at all, and the moves still
 to port are the ones that will want it.
 
-## The slime
+## The two authored enemies
 
-The one enemy that is not a decomp export. It came from a bought model pack —
-`Slime.blend` and a GLB, ten authored animations, one dome mesh in two material
-groups — and it replaced the goomba, whose decomp-derived rig and billboarded
-face made it awkward to edit in Blender at all.
+Neither enemy in the game is a decomp export any more. The slime came from a
+bought model pack — ten authored animations, one dome mesh in two material
+groups — and replaced the goomba; the ant came from an old Blender project of
+its own — thirty bones, two clips, 838 triangles in a single material — and
+replaced the scuttlebug. Both decomp actors had rigs and billboarded faces that
+made them awkward to edit in Blender at all, which is what started each swap.
 
-Three things had to be reconciled with the rest of the pipeline, and all three
+Four things had to be reconciled with the rest of the pipeline. The first three
 live in `enemy::Kind` rather than in the asset, because they are facts about
 where the model came from:
 
-- **Scale.** The decomp actors are in SM64 units, a hundred to the metre, and
-  are drawn at 1/100. The slime is authored at metre scale, one unit tall.
-  `Kind::draw_scale` carries the difference. Its 0.7 is not a look: the mesh is
-  a unit-radius dome, so 0.7 of it is exactly the 0.70 m collision radius the
-  crowd's spacing is measured in, and a model wider than the cylinder that
-  spaces it is a crowd that visibly interpenetrates.
-- **Which clip is the walk.** A decomp actor has exactly one animation, so
-  `#Animation0` was never a choice. The slime has ten, and the game wants
-  `Scoot_Move` — index 6. Blender writes actions out alphabetically, so adding
-  one animation renumbers the rest; `the_clip_index_is_still_the_walk` pins the
-  index to the name so that is a failing test rather than a crowd pulling
-  faces on the spot.
-- **Materials.** The pack ships the body as `BLEND` at 56% alpha. Faithful to a
-  slime and ruinous to a field of two thousand — a translucent surface is a
-  sorted draw that cannot join the opaque pass — so it was flattened to opaque
-  when the runtime GLB was first made, and `slime.blend` carries that.
+- **Scale.** The decomp actors were in SM64 units, a hundred to the metre, and
+  were drawn at 1/100. Both of these are authored at something near metre
+  scale, so `Kind::draw_scale` is near 1 for each. Neither number is a look:
+  each is what makes the model's footprint its collision radius. The slime's
+  mesh is a unit-radius dome, so 0.7 of it is exactly its 0.70 m radius; the
+  ant reaches 0.533 nose to tail, so 1.125 of that is its 0.60 m. A model wider
+  than the cylinder that spaces it is a crowd that visibly interpenetrates.
+- **Which clip is the walk.** A decomp actor had exactly one animation, so
+  `#Animation0` was never a choice. The slime has ten and wants `Scoot_Move` at
+  index 6; the ant has two, `bite` and `walk`, and wants index 1. Blender writes
+  actions out alphabetically, so adding one animation renumbers the rest;
+  `the_clip_index_is_still_the_walk` pins each index to the name it is supposed
+  to be, so that is a failing test rather than a crowd pulling faces on the
+  spot.
+- **Where the model's feet are.** `Kind::lift` is how far the geometry hangs
+  below its own transform origin, because the placement code seats that origin
+  on the ground. The slime's mesh sits on `y = 0` and lifts by nothing; the
+  ant's armature sits up at the body and plants its feet 0.192 below it, 0.216
+  once drawn. `tools/measure_actor_hang.py` is the authority for that number —
+  it evaluates the skinned mesh frame by frame, which is what tells a permanent
+  rig offset from a squash that dips for a few frames of a walk.
 
-The impostor sheets are per-model and had to be rebaked:
+The fourth is the materials, and it is a different fix in each file:
+
+- The slime pack ships the body as `BLEND` at 56% alpha. Faithful to a slime and
+  ruinous to a field of two thousand — a translucent surface is a sorted draw
+  that cannot join the opaque pass — so it was flattened to opaque when the
+  runtime GLB was first made, and `slime.blend` carries that.
+- The ant arrived with a Blender-Internal-era material: its node tree was the
+  one Blender's versioning code rebuilds on load, named `Material Node Tree
+  Versioning`, and its Material Output node was targeted at `EEVEE`. **The glTF
+  exporter only follows an output targeted at `ALL` or `CYCLES`**, so it saw no
+  surface at all and wrote glTF's default material — white and fully metallic —
+  with no warning of any kind. Retargeting that node does not survive a save and
+  reload, so the material was rebuilt from nothing on a fresh node tree, which
+  does. If an actor ever exports as a white plastic version of itself, this is
+  the first thing to check.
+
+The impostor sheets are per-model and have to be rebaked whenever the model
+changes:
 
 ```bash
 cargo run --release -- bake-impostors slime
+cargo run --release -- bake-impostors ant
 ```
 
-The pack itself lives in `reference/slime-pack/`, which is not tracked. Its
-licence permits integrating it into a project and forbids redistributing the
-pack, so the derived `assets/actors/slime.glb` and `slime.blend` are what is
-committed. That distinction matters before publishing this repository anywhere,
-alongside the note about the Nintendo-derived assets above.
+The slime pack itself lives in `reference/slime-pack/`, which is not tracked.
+Its licence permits integrating it into a project and forbids redistributing
+the pack, so the derived `assets/actors/slime.glb` and `slime.blend` are what
+is committed. That distinction matters before publishing this repository
+anywhere, alongside the note about the Nintendo-derived assets above. The ant
+carries no pack of its own: `assets/actors/ant.blend` is the source, and where
+it came from before that is worth confirming before publishing too.
 
 ## Legacy migration commands
 

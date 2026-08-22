@@ -59,7 +59,7 @@ cp \
     "$REPO_ROOT/assets/actors/tree.glb" \
     "$REPO_ROOT/assets/actors/warp_pipe.glb" \
     "$REPO_ROOT/assets/actors/slime.glb" \
-    "$REPO_ROOT/assets/actors/scuttlebug.glb" \
+    "$REPO_ROOT/assets/actors/ant.glb" \
     "$DIST_DIR/assets/actors/"
 cp "$REPO_ROOT/assets/hero/hero.glb" "$DIST_DIR/assets/hero/"
 cp "$REPO_ROOT/assets/mario/mario.glb" "$DIST_DIR/assets/mario/"

@@ -215,16 +215,22 @@ mod tests {
     /// Claiming is by name, so the name is worth pinning: if the exporter ever
     /// stops marking these, nothing turns and nothing says why.
     ///
-    /// The scuttlebug is the only actor left that carries them. The goomba it
-    /// used to share this with was a decomp export, and its face was one of the
-    /// flat quads SM64 rebuilds every frame; the slime that replaced it is
-    /// authored art with a real skinned mesh and nothing flat anywhere on it.
+    /// No actor the game loads carries one any more. The goomba and the
+    /// scuttlebug did -- both were decomp exports, and their faces and eyes were
+    /// the flat quads SM64 rebuilds every frame -- and the slime and the ant
+    /// that replaced them are authored art with real skinned meshes and nothing
+    /// flat anywhere on them. So the name is pinned against the decomp's own
+    /// export, kept unedited under `assets/packs/reference`, and the loaded
+    /// actors are checked for the opposite: one arriving with a `billboard_*`
+    /// joint means this module is back in the business of driving joints, which
+    /// is worth hearing from a test rather than from a face pointing the wrong
+    /// way.
     #[test]
     fn the_actors_still_carry_the_joints_this_claims() {
-        let nodes = node_names("actors/scuttlebug.glb");
+        let nodes = node_names("packs/reference/actors/scuttlebug.glb");
         assert!(
             nodes.iter().any(|name| name.starts_with(JOINT_PREFIX)),
-            "the scuttlebug has no {JOINT_PREFIX}* joint for this to drive"
+            "the decomp scuttlebug has no {JOINT_PREFIX}* joint for this to drive"
         );
         // The tree is the other case: a whole object, with no joint of its own
         // to claim, turned bodily instead.
@@ -233,23 +239,33 @@ mod tests {
             !tree.iter().any(|name| name.starts_with(JOINT_PREFIX)),
             "the tree grew a billboard joint, so it wants driving the other way"
         );
-        // And the slime is a third case: an actor with no billboarded part at
-        // all. It still carries `BillboardActor`, which is what makes its
-        // surfaces double-sided, but there is nothing here for `aim` to turn.
-        let slime = node_names("actors/slime.glb");
-        assert!(
-            !slime.iter().any(|name| name.starts_with(JOINT_PREFIX)),
-            "the slime grew a billboard joint, so something has to drive it"
-        );
+        // And the two enemies are a third case: actors with no billboarded
+        // part at all. They still carry `BillboardActor`, which is what makes
+        // their surfaces double-sided, but there is nothing here for `aim` to
+        // turn.
+        for actor in ["slime", "ant"] {
+            let nodes = node_names(&format!("actors/{actor}.glb"));
+            assert!(
+                !nodes.iter().any(|name| name.starts_with(JOINT_PREFIX)),
+                "the {actor} grew a billboard joint, so something has to drive it"
+            );
+        }
     }
 
     /// Where `JOINT_SCALE` comes from. If the exporter ever stops baking the
     /// 0.25 onto the skeleton, putting 4.0 back would make these quads four
     /// times too big rather than the right size.
+    ///
+    /// Measured on the decomp export rather than on a runtime actor, for the
+    /// same reason as above: nothing the game loads carries a billboard joint
+    /// now. It is also the only copy that still carries the 0.25 at all -- the
+    /// runtime scuttlebug was rebuilt from a .blend and came back with no scale
+    /// on its skeleton, so this had been failing against it since before the
+    /// bug was replaced.
     #[test]
     fn the_scale_put_back_is_the_one_baked_in() {
-        let actor = "scuttlebug";
-        let baked = root_joint_scale(&format!("actors/{actor}.glb"))
+        let actor = "packs/reference/actors/scuttlebug";
+        let baked = root_joint_scale(&format!("{actor}.glb"))
             .unwrap_or_else(|| panic!("{actor} has no scale on its skeleton"));
         assert!(
             (baked * JOINT_SCALE - 1.0).abs() < 1e-4,

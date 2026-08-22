@@ -43,6 +43,42 @@ PROJECT_BLENDER = os.path.join(
 # Inside Blender
 # ---------------------------------------------------------------------------
 
+def aim_material_outputs_at_everything():
+    """Point every material's active output at ALL, in this session only.
+
+    The glTF exporter only follows a Material Output node targeted at ALL or
+    CYCLES. Given an EEVEE-only one it finds no surface, and rather than saying
+    so it writes glTF's default material: `baseColorFactor` white,
+    `metallicFactor` 1.0. On screen that is a white plastic actor, and nothing
+    anywhere in the export prints a warning.
+
+    Old files are how you get one. `assets/actors/ant.blend` came from the
+    Blender-Internal era, so Blender rebuilds its material graph on load -- the
+    tree is named `Material Node Tree Versioning` -- with an EEVEE-targeted
+    output and a stray CYCLES one hanging off an unused Diffuse BSDF. Repairing
+    the .blend works until somebody saves over it from a session opened before
+    the repair, which is exactly what happened once already.
+
+    So it is done here instead, where it cannot be undone: the *active* output
+    is promoted, because that is the one Blender itself renders through and the
+    one whose result the author was looking at, and any rival is demoted so the
+    choice stays unambiguous. Nothing is written back to the .blend.
+    """
+    for material in bpy.data.materials:
+        tree = material.node_tree
+        if tree is None:
+            continue
+        outputs = [node for node in tree.nodes if node.type == "OUTPUT_MATERIAL"]
+        active = next((node for node in outputs if node.is_active_output), None)
+        if active is None or active.target == "ALL":
+            continue
+        for node in outputs:
+            if node is not active and node.target == "ALL":
+                node.target = "EEVEE"
+        active.target = "ALL"
+        print("retargeted %r's active output to ALL" % material.name)
+
+
 def export_inside_blender(argv):
     """Run in the Blender process. argv is everything after the `--`."""
     ap = argparse.ArgumentParser(prog="blend_to_glb (in-blender)")
@@ -56,6 +92,8 @@ def export_inside_blender(argv):
     # the user's preferences having kept it that way.
     import addon_utils
     addon_utils.enable("io_scene_gltf2", default_set=False, persistent=False)
+
+    aim_material_outputs_at_everything()
 
     # The exporter reads evaluated data; pose or edit mode leaves parts of it
     # stale. A file saved in edit mode opens in edit mode.

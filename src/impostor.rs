@@ -6,11 +6,13 @@
 //! Bevy marks every skinned mesh `NoAutomaticBatching`, because each one needs
 //! its own joint matrices, so **a skinned model is one draw call per mesh
 //! primitive and no two of them ever merge**. The actors here are split by
-//! material: two primitives for a slime, fifteen for a scuttlebug -- fifteen
-//! draw calls to put seventy-six triangles on the screen. A field of two
-//! thousand is around seventeen thousand draw calls a frame, which is the whole
+//! material: two primitives for a slime, one for an ant, so a mixed field of
+//! two thousand is three thousand draw calls a frame. That is already most of a
 //! frame, and no amount of lowering the internal resolution touches it because
-//! the cost is in submitting the draws rather than in filling the pixels.
+//! the cost is in submitting the draws rather than in filling the pixels. It
+//! was far worse when this was written: the decomp's scuttlebug was fifteen
+//! primitives for seventy-six triangles, and the same field cost seventeen
+//! thousand draws.
 //!
 //! An impostor is the standard answer: past the distance where a model is a few
 //! pixels tall, replace it with a flat quad showing a picture of that model,
@@ -160,12 +162,12 @@ pub struct Sheet {
 #[derive(Resource, Default)]
 pub struct Impostors {
     slime: Option<Sheet>,
-    scuttlebug: Option<Sheet>,
+    ant: Option<Sheet>,
     /// Every distant enemy's shadow, of every kind, in one mesh.
     ///
     /// One mesh rather than one per kind because a shadow is a shadow: they all
     /// share the disc texture and the solid rung of the fade ladder, so nothing
-    /// distinguishes a slime's from a scuttlebug's except its radius. That
+    /// distinguishes a slime's from an ant's except its radius. That
     /// makes the whole far crowd's shadows a single extra draw call.
     shadows: Option<Handle<Mesh>>,
 }
@@ -174,7 +176,7 @@ impl Impostors {
     fn get(&self, kind: Kind) -> Option<&Sheet> {
         match kind {
             Kind::Slime => self.slime.as_ref(),
-            Kind::Scuttlebug => self.scuttlebug.as_ref(),
+            Kind::Ant => self.ant.as_ref(),
         }
     }
 }
@@ -211,7 +213,7 @@ pub struct ImpostorField;
 fn stem(kind: Kind) -> &'static str {
     match kind {
         Kind::Slime => "slime",
-        Kind::Scuttlebug => "scuttlebug",
+        Kind::Ant => "ant",
     }
 }
 
@@ -268,7 +270,7 @@ pub fn prepare(
         bevy::light::NotShadowReceiver,
     ));
     impostors.shadows = Some(shadows);
-    for kind in [Kind::Slime, Kind::Scuttlebug] {
+    for kind in [Kind::Slime, Kind::Ant] {
         let meta = match read_meta(root, kind) {
             Ok(meta) => meta,
             Err(error) => {
@@ -321,7 +323,7 @@ pub fn prepare(
         ));
         match kind {
             Kind::Slime => impostors.slime = Some(sheet),
-            Kind::Scuttlebug => impostors.scuttlebug = Some(sheet),
+            Kind::Ant => impostors.ant = Some(sheet),
         }
     }
     commands.insert_resource(impostors);
@@ -486,7 +488,7 @@ pub fn draw(
     // for a crowd of two thousand is a thing worth not doing sixty times a
     // second.
     if buffers.is_empty() {
-        *buffers = vec![(Kind::Slime, Vec::new()), (Kind::Scuttlebug, Vec::new())];
+        *buffers = vec![(Kind::Slime, Vec::new()), (Kind::Ant, Vec::new())];
     }
     for (_, members) in buffers.iter_mut() {
         members.clear();
@@ -789,7 +791,7 @@ pub(crate) mod tests {
     /// What it deliberately does **not** claim to catch is the worst bug these
     /// sheets have had. The baker was running without `billboard::systems()`,
     /// so the scuttlebug's three billboard joints came out
-    /// at the quarter scale the exporter bakes onto the skeleton rather than
+    /// at the quarter scale the exporter baked onto the skeleton rather than
     /// having it put back -- and single-sided, so they were culled from half the
     /// angles too. The sprites covered 52% of the pixels the models did and
     /// enemies visibly shrank as they crossed the swap distance. None of that
@@ -801,7 +803,7 @@ pub(crate) mod tests {
     #[test]
     fn every_baked_cell_holds_a_whole_actor() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
-        for kind in [Kind::Slime, Kind::Scuttlebug] {
+        for kind in [Kind::Slime, Kind::Ant] {
             let meta = read_meta(&root, kind).expect("a committed sheet failed to load");
             let path = root.join(SHEETS).join(format!("{}.png", stem(kind)));
             let (size, alpha) = png_alpha(&path);
@@ -853,9 +855,10 @@ pub(crate) mod tests {
     /// draw chain, and their metadata says exactly where the model's origin sits
     /// inside a cell -- `foot` of a cell-height up from the bottom edge. So the
     /// lowest opaque pixel of any cell, measured down from there, is how far the
-    /// actor's geometry hangs below its own transform origin. For the
-    /// scuttlebug that is a third of a metre, and seating that origin on the
-    /// floor is what buried the bug to its belly in solid stone.
+    /// actor's geometry hangs below its own transform origin. For a crawler
+    /// rigged from its body rather than its feet that is a fifth of a metre or
+    /// more, and seating that origin on the floor is what buried the scuttlebug
+    /// to its belly in solid stone.
     ///
     /// Checking it here rather than writing the number down twice means
     /// re-baking a sheet, re-rigging an actor or changing the exporter's root
@@ -900,39 +903,37 @@ pub(crate) mod tests {
 
     /// What the sheets can and cannot settle about [`Kind::lift`].
     ///
-    /// For the scuttlebug they settle it exactly, and that is the case the
-    /// constant was written for: its hang is a rig-root offset, the same on
-    /// every frame and from every angle, so the lowest opaque pixel of a cell
-    /// really is where the model stops.
+    /// They settled it exactly for the scuttlebug, which is the actor the
+    /// constant was written for: a tall, narrow bug whose hang was a rig-root
+    /// offset, the same on every frame and from every angle, so the lowest
+    /// opaque pixel of a cell really was where the model stopped.
     ///
-    /// The slime taught us what the instrument cannot do, and it is worth
-    /// writing down rather than rediscovering. A sheet cell is a *silhouette*,
-    /// drawn by a camera tilted `ELEVATION` degrees down, so the near rim of a
-    /// wide body projects below where its own origin projects even when there
-    /// is nothing at all below it in world space -- and the measurement takes
-    /// the deepest frame of the walk, which for the slime is the middle of a
-    /// squash rather than anything it rests at. Between them those put the
-    /// slime at 0.33 m when the posed mesh says it rests on 0.000 and dips to
-    /// 0.177 for a few frames of `Scoot_Move`. Believing 0.33 would float a
-    /// 0.70 m creature by half its height to stop a squash touching the floor
-    /// it is squashing against.
+    /// Neither actor that ships now is that shape, and what the instrument
+    /// cannot do is worth writing down rather than rediscovering. A sheet cell
+    /// is a *silhouette*, drawn by a camera tilted `ELEVATION` degrees down, so
+    /// the near rim of a wide body projects below where its own origin projects
+    /// even when there is nothing at all below it in world space -- half a
+    /// metre of body reaching towards the camera buys 13 cm of that at 15
+    /// degrees. The measurement also takes the deepest frame of the walk rather
+    /// than any frame the actor rests at.
+    ///
+    /// Between them those put the slime at 0.33 m when the posed mesh says it
+    /// rests on 0.000 and dips to 0.177 for a few frames of `Scoot_Move`, and
+    /// the ant at 0.36 m against a rig that plants its feet 0.216 below its
+    /// origin and holds them there all the way through both its clips.
+    /// Believing either number would hover the actor to keep its own picture
+    /// off a floor it is standing on.
     ///
     /// So what is asserted here is what remains true either way: a lift is
     /// never more than the silhouette reaches, because a model held further up
-    /// than its own picture ever extends is a model hovering. The number
-    /// itself comes from `tools/measure_actor_hang.py`, which evaluates the
-    /// skinned mesh frame by frame and can tell a resting offset from a dip.
+    /// than its own picture ever extends is a model hovering. The number itself
+    /// is pinned to the geometry by
+    /// `enemy::tests::the_cylinders_are_the_size_the_models_are_drawn_at`, and
+    /// `tools/measure_actor_hang.py` is what settles a resting offset against a
+    /// transient dip when the two disagree.
     #[test]
     fn the_lift_matches_what_the_baked_sheets_show() {
-        let measured = hang_in_sheet(Kind::Scuttlebug);
-        let claimed = Kind::Scuttlebug.lift();
-        assert!(
-            (measured - claimed).abs() < 0.02,
-            "the scuttlebug hangs {measured:.3} m below its origin in the \
-             sheets but `Kind::lift` claims {claimed:.3} m -- an enemy seated \
-             on the ground will be that far into it"
-        );
-        for kind in [Kind::Slime, Kind::Scuttlebug] {
+        for kind in [Kind::Slime, Kind::Ant] {
             let measured = hang_in_sheet(kind);
             let claimed = kind.lift();
             assert!(
@@ -973,7 +974,7 @@ pub(crate) mod tests {
             "build_windows.sh does not copy assets/{SHEETS}, so the packaged \
              game will draw no distant enemies at all"
         );
-        for kind in [Kind::Slime, Kind::Scuttlebug] {
+        for kind in [Kind::Slime, Kind::Ant] {
             for suffix in ["png", "json"] {
                 let file = format!("{}.{suffix}", stem(kind));
                 assert!(
@@ -990,7 +991,7 @@ pub(crate) mod tests {
     #[test]
     fn the_committed_sheets_match_their_atlases() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
-        for kind in [Kind::Slime, Kind::Scuttlebug] {
+        for kind in [Kind::Slime, Kind::Ant] {
             let meta = read_meta(&root, kind).expect("a committed sheet failed to load");
             let path = root.join(SHEETS).join(format!("{}.png", stem(kind)));
             assert_eq!(

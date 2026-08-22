@@ -160,106 +160,104 @@ const CRAWL_SKIN: f32 = 0.02;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     Slime,
-    Scuttlebug,
+    Ant,
 }
 
 impl Kind {
     pub fn model(self) -> &'static str {
         match self {
             Self::Slime => "actors/slime.glb",
-            Self::Scuttlebug => "actors/scuttlebug.glb",
+            Self::Ant => "actors/ant.glb",
         }
     }
 
     /// Which of the model's glTF animations is the one it walks on.
     ///
-    /// The decomp actors have exactly one clip each, so an index was never a
-    /// question: `#Animation0` was the only thing in the file. The slime is
-    /// authored art and carries ten -- three emotes, two idles, two ways of
-    /// moving, a squish and a wiggle -- of which the game wants the one it
-    /// crosses ground on. `Scoot_Move` is that one; `Jump_Move` hops, which
-    /// reads as a different creature at crowd distance and does not match the
-    /// flat speed [`update`] moves it at.
+    /// The decomp actors these replaced had exactly one clip each, so an index
+    /// was never a question: `#Animation0` was the only thing in the file.
+    /// Authored art carries a whole set. The slime has ten -- three emotes, two
+    /// idles, two ways of moving, a squish and a wiggle -- and `Scoot_Move` is
+    /// the one it crosses ground on; `Jump_Move` hops, which reads as a
+    /// different creature at crowd distance and does not match the flat speed
+    /// [`update`] moves it at. The ant has two, `bite` and `walk`, and only one
+    /// of those is a cycle.
     ///
     /// Kept as an index rather than a name because that is all a glTF asset
     /// label can carry. `the_clip_index_is_still_the_walk` pins each index to
     /// the name it is supposed to be, so a re-export that reorders the file is
-    /// a failing test rather than a crowd of slimes standing still and pulling
-    /// faces.
+    /// a failing test rather than a crowd standing still and pulling faces.
     pub fn clip(self) -> usize {
         match self {
             Self::Slime => 6,
-            Self::Scuttlebug => 0,
+            Self::Ant => 1,
         }
     }
 
     /// What the model is drawn at, world units per unit of its own file.
     ///
-    /// **A fact about the asset, not a tuning knob**, and the two actors
-    /// disagree about it because they came from different places. The decomp
-    /// exports are in SM64 units, a hundred to the metre, so they are drawn at
-    /// 1/100. The slime is authored in Blender at metre scale and one unit
-    /// tall, so drawing it at 1/100 would put a centimetre-high blob on the
-    /// floor.
+    /// **A fact about the asset, not a tuning knob.** Both actors are authored
+    /// in Blender at something near metre scale rather than exported from the
+    /// decomp at a hundred units to the metre, so both numbers are near one --
+    /// the 1/100 the decomp actors were drawn at is gone from this file with
+    /// the last of them.
     ///
-    /// The slime's 0.7 is the number that makes its footprint its collision
-    /// radius: the mesh is a unit-radius dome, so 0.7 of it is exactly the 0.70
-    /// in [`Kind::body`]. That matters more than its height does, because
-    /// crowd spacing is measured in body radii -- a model wider than the
-    /// cylinder that spaces it is a crowd that visibly interpenetrates.
+    /// Each is the number that makes the model's footprint its collision
+    /// radius. The slime is a unit-radius dome, so 0.7 of it is exactly the
+    /// 0.70 in [`Kind::body`]. The ant is longer than it is wide and reaches
+    /// 0.533 from its origin nose to tail, so 1.125 of that is 0.60. Footprint
+    /// matters more than height does, because crowd spacing is measured in body
+    /// radii -- a model wider than the cylinder that spaces it is a crowd that
+    /// visibly interpenetrates.
     pub fn draw_scale(self) -> f32 {
         match self {
             Self::Slime => 0.7,
-            Self::Scuttlebug => 0.01,
+            Self::Ant => 1.125,
         }
     }
 
     /// Radius and height of its collision cylinder.
     ///
-    /// The scuttlebug's is the decomp's, from `sm64py/objects.py`. The slime
-    /// keeps the radius of the goomba it replaced, deliberately: the whole
+    /// Both keep the radius of the actor they replaced, deliberately: the whole
     /// crowd's spacing, its flow-field arithmetic and its shove resolution are
-    /// expressed in body radii, and every one of them was tuned against 0.70.
-    /// Its height is its own -- the model is a dome as tall as it is wide at
-    /// [`Kind::draw_scale`], and keeping the goomba's metre would let the
-    /// player punch a slime while stood a third of a body above it.
+    /// expressed in body radii, and every one of them was tuned against the
+    /// goomba's 0.70 and the scuttlebug's 0.60. The heights are the models'
+    /// own, at [`Kind::draw_scale`] -- the slime is a dome as tall as it is
+    /// wide, and the ant is a low thing that stands about two thirds of its own
+    /// width tall. Keeping a replaced actor's height instead would let the
+    /// player punch one while stood a third of a body above it.
     pub fn body(self) -> (f32, f32) {
         match self {
             Self::Slime => (0.70, 0.70),
-            Self::Scuttlebug => (0.60, 0.80),
+            Self::Ant => (0.60, 0.65),
         }
     }
 
     /// How far the model's geometry hangs below its own transform origin.
     ///
     /// **This is a fact about the asset, not a tuning knob.** The placement code
-    /// treats an enemy's translation as the point its feet rest on, and for the
-    /// scuttlebug that is simply not where its origin is: the rig's root sits up
-    /// in the body, and the legs, the mandibles and the underside of the shell
-    /// all hang below it. Seat the origin on the floor -- which is exactly what
-    /// [`crawl`] does, two centimetres of skin above the surface it found -- and
-    /// a third of the bug is underground. That is the "scuttlebugs clipping
-    /// through the floor" report, and it happens on flat stone with nothing
-    /// steep anywhere near, which is why nothing about walls or ceilings or
-    /// stale surface normals ever fixed it.
+    /// treats an enemy's translation as the point its feet rest on, and for a
+    /// rig whose root sits up inside the body that is simply not where its
+    /// origin is. Seat the origin on the floor -- which is exactly what
+    /// [`crawl`] does, two centimetres of skin above the surface it found --
+    /// and the bottom of the model is underground. That is the "scuttlebugs
+    /// clipping through the floor" report, and it happened on flat stone with
+    /// nothing steep anywhere near, which is why nothing about walls or
+    /// ceilings or stale surface normals ever fixed it.
     ///
-    /// Measured off the baked impostor sheets rather than guessed, because those
-    /// are renders of the real posed actor through the game's own draw chain:
-    /// the sheet's metadata says where the origin sits in a cell, and the lowest
-    /// opaque pixel says where the model stops.
-    /// `the_lift_matches_what_the_baked_sheets_show` re-derives both from the
-    /// PNGs on every test run, so the constant cannot drift from the art.
+    /// The ant is the same shape of problem in a milder form: its armature sits
+    /// at the body, and its six feet plant 0.192 below that in its own file --
+    /// 0.216 at [`Kind::draw_scale`]. `tools/measure_actor_hang.py` is the
+    /// authority for this number. It evaluates the skinned mesh on every frame
+    /// of every clip, which is what tells a permanent offset apart from a
+    /// transient one: the ant's is on all fifteen frames it has, so it is the
+    /// rig and not the animation.
     ///
     /// The slime is the case this wants: its mesh sits on `y = 0` in its own
     /// file, so its origin already is its feet and nothing has to be lifted.
-    /// That is what authoring a model for the game buys over converting one --
-    /// the goomba it replaced hung 6.5 cm below its origin, and the scuttlebug
-    /// still hangs a third of a metre. The real fix for the bug is the exporter
-    /// putting the origin on the floor, which would let this be zero for both.
     pub fn lift(self) -> f32 {
         match self {
             Self::Slime => 0.0,
-            Self::Scuttlebug => 0.312,
+            Self::Ant => 0.216,
         }
     }
 
@@ -458,7 +456,7 @@ impl Wander {
 
 /// An enemy that walks the level's surfaces rather than its floors.
 ///
-/// A scuttlebug has eight legs and no opinion about which way is down, so it
+/// An ant has six legs and no opinion about which way is down, so it
 /// treats a wall and a ceiling as more floor: it keeps its own up vector, which
 /// is the normal of whatever it is stuck to at the time, and everything it does
 /// -- which way it steps, which way it faces, which way it probes -- is asked
@@ -522,7 +520,7 @@ pub fn spawn(
             crate::billboard::BillboardActor,
             crate::shadow::ShadowCaster::new(kind.shadow_radius()),
         ))
-        .insert_if(Crawler::default(), || kind == Kind::Scuttlebug)
+        .insert_if(Crawler::default(), || kind == Kind::Ant)
         .id()
 }
 
@@ -600,9 +598,9 @@ pub fn crowd(
         for (index, spot) in crowd_spots(count, &level).into_iter().enumerate() {
             let kind = match kind {
                 CrowdKind::Slime => Kind::Slime,
-                CrowdKind::Scuttlebug => Kind::Scuttlebug,
+                CrowdKind::Ant => Kind::Ant,
                 CrowdKind::Mix if index % 2 == 0 => Kind::Slime,
-                CrowdKind::Mix => Kind::Scuttlebug,
+                CrowdKind::Mix => Kind::Ant,
             };
             spawn(&mut commands, &assets, kind, spot, index as f32);
         }
@@ -691,10 +689,10 @@ const CROWD_SIGHT: f32 = 1.0;
 /// Hiding a distant enemy stops it being *drawn*, which was the whole of the
 /// first version of this and bought the draw calls back. What it does not stop
 /// is the enemy existing: a slime is not one entity but a scene of about
-/// nine, a scuttlebug about sixty-three, and every one of them is a
+/// nine, an ant about thirty-three, and every one of them is a
 /// transform to propagate, a visibility to compute and an archetype row to walk
-/// past. A mixed field of two thousand is some seventy-five thousand entities,
-/// and eight thousand is close to three hundred thousand -- at which point the entity
+/// past. A mixed field of two thousand is some forty thousand entities,
+/// and eight thousand is close to a hundred and seventy thousand -- at which point the entity
 /// count, rather than the draws or the AI, is what a frame is made of. It was
 /// measured: at eight thousand the simulation budget saved nothing at all,
 /// because the simulation was no longer the expensive part.
@@ -1015,8 +1013,8 @@ enum Shoved {
 /// each one to its slot and asks nothing about what else is standing there, so a
 /// squad following the player was a heap of Marios in the same place walking
 /// through each other and through him. That they are held apart by the enemies'
-/// pass rather than by one of their own is the point: a Mario, a slime and a
-/// scuttlebug are all bodies of some radius standing on some ground, and two
+/// pass rather than by one of their own is the point: a Mario, a slime and an
+/// ant are all bodies of some radius standing on some ground, and two
 /// separate answers to how bodies avoid each other is two answers that disagree
 /// at the boundary between them.
 pub fn spread(
@@ -1473,14 +1471,14 @@ fn crowd_step(
 /// Puts a crawler the right way up, and is the only thing that ever rescues one
 /// from under the floor.
 ///
-/// A scuttlebug carries its own idea of which way is up, and walking onto a
+/// An ant carries its own idea of which way is up, and walking onto a
 /// ceiling turns that idea upside down -- which is the feature. The trouble is
 /// that hanging under a ceiling and being buried under a floor are *the same
 /// state*: a surface overhead, the body against its underside, `up` pointing
 /// down. Nothing local can tell them apart, so nothing local can undo the
 /// second, and [`crawl`]'s probes are perfectly happy to keep a bug there
 /// forever -- it finds the floor's underside every tick and clings to it. On
-/// screen that is a scuttlebug swimming about inside the lawn.
+/// screen that is an ant swimming about inside the lawn.
 ///
 /// What puts one there is any move it did not make itself: the crowd tier
 /// planting it on the ground at [`crowd_step`], a knockback, a shove from
@@ -1609,7 +1607,7 @@ fn ground_under(level: &LevelData, position: Vec3) -> bool {
 /// Walks a crawler one tick towards `goal`, turning it as it goes, and reports
 /// where it ended up.
 ///
-/// This is the whole of what a scuttlebug does, kept out of [`update`] so that a
+/// This is the whole of what an ant does, kept out of [`update`] so that a
 /// bug can be walked across a level in a test without an app around it.
 /// `position` and the result are the model's *origin*; `lift` is how far its
 /// geometry hangs below that ([`Kind::lift`]). Everything in between works in
@@ -1673,7 +1671,7 @@ fn crawl_towards(
 }
 
 /// Rolls `up` towards `wanted` by at most `most` radians, and is the whole of
-/// why a scuttlebug going round a corner has frames in it.
+/// why an ant going round a corner has frames in it.
 ///
 /// `heading` is only the fallback axis, for the one case that has no other
 /// answer: a surface exactly opposite the one it is on -- walking off a lip onto
@@ -2042,10 +2040,7 @@ mod tests {
     /// both clips.
     #[test]
     fn the_clip_index_is_still_the_walk() {
-        for (kind, wanted) in [
-            (Kind::Slime, "Scoot_Move"),
-            (Kind::Scuttlebug, "scuttlebug_seg6_anim_0601504C"),
-        ] {
+        for (kind, wanted) in [(Kind::Slime, "Scoot_Move"), (Kind::Ant, "walk")] {
             let doc = gltf(kind.model());
             let clips = doc["animations"].as_array().expect("no animations");
             let found = clips
@@ -2063,34 +2058,134 @@ mod tests {
         }
     }
 
-    /// [`Kind::draw_scale`] against the size the model actually is.
+    /// An actor that exports with no material at all is a white plastic actor.
     ///
-    /// The slime's scale is not a look, it is the number that makes the mesh's
-    /// footprint the collision radius the crowd is spaced on. Read the dome's
-    /// own radius out of the file and multiply, and it has to come back as
-    /// [`Kind::body`]'s radius -- otherwise slimes overlap each other by
-    /// however far the two have drifted apart.
+    /// glTF's defaults are `baseColorFactor` white and `metallicFactor` 1.0, so
+    /// a material written with no `pbrMetallicRoughness` at all is not a subtle
+    /// wrong -- it is the model rendered in white plastic, and it is what
+    /// Blender's exporter silently produces when it cannot find a surface to
+    /// follow. See `aim_material_outputs_at_everything` in
+    /// `tools/blend_to_glb.py` for the one that caused this: a Material Output
+    /// node targeted at EEVEE, which the exporter skips without a word.
+    ///
+    /// Cheap to guard and expensive to notice by eye, because the near tier
+    /// goes white while the far tier keeps whatever the sheets were baked from
+    /// -- so the crowd looks right until you walk up to one.
     #[test]
-    fn the_slime_is_drawn_at_the_width_it_is_spaced_at() {
-        let doc = gltf(Kind::Slime.model());
-        let radius = doc["accessors"]
-            .as_array()
-            .expect("no accessors")
-            .iter()
-            .filter_map(|accessor| accessor["max"].as_array())
-            .filter(|bounds| bounds.len() == 3)
-            .filter_map(|bounds| bounds[0].as_f64())
-            .fold(0.0_f64, f64::max) as f32;
-        let drawn = radius * Kind::Slime.draw_scale();
-        assert!(
-            (drawn - Kind::Slime.body().0).abs() < 0.02,
-            "the slime is drawn {drawn:.3} m wide and spaced {:.3} m apart",
-            Kind::Slime.body().0
-        );
+    fn every_actor_exports_a_material_it_can_be_lit_by() {
+        for kind in [Kind::Slime, Kind::Ant] {
+            let doc = gltf(kind.model());
+            let materials = doc["materials"].as_array().expect("no materials");
+            for material in materials {
+                let name = material["name"].as_str().unwrap_or("<unnamed>");
+                let pbr = &material["pbrMetallicRoughness"];
+                assert!(
+                    pbr.get("baseColorFactor").is_some() || pbr.get("baseColorTexture").is_some(),
+                    "{kind:?}'s {name:?} carries no base colour, so glTF's own \
+                     default applies and it draws as white plastic"
+                );
+            }
+        }
+    }
+
+    /// The corners of a model's own geometry, in its own units.
+    ///
+    /// Off the glTF rather than out of a mesh: every accessor carries the
+    /// bounds of what it holds, so the extent of the `POSITION` attribute of
+    /// every primitive is the whole model without decoding a single vertex.
+    /// Only `POSITION` -- the animations' accessors have bounds too, and
+    /// folding those in measures the range of a rotation.
+    fn model_bounds(kind: Kind) -> (Vec3, Vec3) {
+        let doc = gltf(kind.model());
+        let (mut low, mut high) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        let corner = |accessor: &serde_json::Value, which: &str| {
+            let bounds = accessor[which]
+                .as_array()
+                .expect("an accessor with no bounds");
+            Vec3::new(
+                bounds[0].as_f64().expect("not a number") as f32,
+                bounds[1].as_f64().expect("not a number") as f32,
+                bounds[2].as_f64().expect("not a number") as f32,
+            )
+        };
+        for mesh in doc["meshes"].as_array().expect("no meshes") {
+            for primitive in mesh["primitives"]
+                .as_array()
+                .expect("a mesh with no primitives")
+            {
+                let at = primitive["attributes"]["POSITION"]
+                    .as_u64()
+                    .expect("a primitive with no positions") as usize;
+                let accessor = &doc["accessors"][at];
+                low = low.min(corner(accessor, "min"));
+                high = high.max(corner(accessor, "max"));
+            }
+        }
+        (low, high)
+    }
+
+    /// How far a model's geometry reaches below its own origin, in world units.
+    ///
+    /// Deliberately *not* [`Kind::lift`]: a test that subtracts back out the
+    /// very number the placement put in passes with the lift set to zero, which
+    /// is how two earlier versions of the floor test quietly proved nothing.
+    ///
+    /// This is the bind pose rather than the posed mesh, and the difference is
+    /// what `tools/measure_actor_hang.py` exists to settle. For both actors the
+    /// two agree: the ant's six feet plant at the same height on every frame of
+    /// both its clips, and the slime rests on `y = 0`.
+    fn hang_in_model(kind: Kind) -> f32 {
+        (-model_bounds(kind).0.y * kind.draw_scale()).max(0.0)
+    }
+
+    /// [`Kind::draw_scale`], [`Kind::body`] and [`Kind::lift`] against the size
+    /// the models actually are.
+    ///
+    /// None of those three is a look. `draw_scale` is the number that makes a
+    /// mesh's footprint the collision radius the crowd is spaced on -- get it
+    /// wrong and enemies overlap each other by however far the two have drifted
+    /// apart -- `body`'s height is what the player has to be above to stomp one,
+    /// and `lift` is how far off its own origin it has to be drawn to stand on
+    /// the floor rather than in it. All three are readable straight out of the
+    /// asset, so all three are read out of the asset here rather than believed.
+    ///
+    /// The margin is two centimetres because these are round numbers written
+    /// down by hand against measurements that are not: the ant's footprint
+    /// works out at 0.600 against a body of 0.60, and its hang at 0.2161
+    /// against a lift of 0.216.
+    #[test]
+    fn the_cylinders_are_the_size_the_models_are_drawn_at() {
+        for kind in [Kind::Slime, Kind::Ant] {
+            let (low, high) = model_bounds(kind);
+            let scale = kind.draw_scale();
+            let (radius, height) = kind.body();
+
+            // The widest it reaches from its origin in the horizontal plane,
+            // which for the ant is nose to tail rather than side to side.
+            let footprint = low.x.abs().max(high.x).max(low.z.abs()).max(high.z) * scale;
+            assert!(
+                (footprint - radius).abs() < 0.02,
+                "{kind:?} is drawn {footprint:.3} m across and spaced {radius:.3} m apart"
+            );
+
+            let tall = (high.y - low.y) * scale;
+            assert!(
+                (tall - height).abs() < 0.02,
+                "{kind:?} is drawn {tall:.3} m tall and fought as {height:.3} m"
+            );
+
+            let hang = hang_in_model(kind);
+            assert!(
+                (hang - kind.lift()).abs() < 0.02,
+                "{kind:?}'s art stops {hang:.3} m below its origin but \
+                 `Kind::lift` claims {:.3} m",
+                kind.lift()
+            );
+        }
     }
 
     /// A room with a floor, one wall across the far end of it and a ceiling:
-    /// the three surfaces a scuttlebug is supposed to treat as the same thing.
+    /// the three surfaces an ant is supposed to treat as the same thing.
     ///
     /// The wall is at `x = 4` and the ceiling at `y = 4`, both spanning the
     /// floor's footprint, so a bug that keeps walking in `+x` meets each of
@@ -2148,7 +2243,7 @@ mod tests {
             .collect()
     }
 
-    /// The whole point of the thing: a scuttlebug chasing something it cannot
+    /// The whole point of the thing: an ant chasing something it cannot
     /// reach along the floor climbs the wall in its way, carries on over the
     /// top of it onto the ceiling, and walks that upside down.
     #[test]
@@ -2238,19 +2333,20 @@ mod tests {
         );
     }
 
-    /// A scuttlebug walking the castle keeps its body out of the floor.
+    /// A crawler walking the castle keeps its body out of the floor.
     ///
     /// This is the report, and it took three passes to find because every guess
     /// was about *behaviour* -- stale surface normals, walls, ceilings, the tier
-    /// boundary -- when the cause was arithmetic and constant. The scuttlebug's
-    /// rig root sits up inside its body, so the model hangs 31 cm below its own
-    /// transform origin, and every placement in the game seated that origin on
-    /// the ground. The bug was buried to its belly on flat stone with nothing
-    /// steep within twenty metres.
+    /// boundary -- when the cause was arithmetic and constant. The scuttlebug
+    /// this was first found on had a rig root up inside its body, so the model
+    /// hung 31 cm below its own transform origin, and every placement in the
+    /// game seated that origin on the ground. The bug was buried to its belly
+    /// on flat stone with nothing steep within twenty metres.
     ///
-    /// What finally found it was looking at one: a screenshot of a single
-    /// scuttlebug on the castle courtyard, where the floor cuts a flat line
-    /// across the bottom of its shell.
+    /// What finally found it was looking at one: a screenshot of a single bug
+    /// on the castle courtyard, where the floor cut a flat line across the
+    /// bottom of its shell. The ant that replaced it is rigged the same way and
+    /// hangs 22 cm, so the test outlived the actor it was written about.
     ///
     /// The test drives [`update`] rather than [`crawl_towards`] on purpose. A
     /// test that passes a lift in and then subtracts the same lift back out
@@ -2267,7 +2363,7 @@ mod tests {
     /// one tier and buried by the other is an enemy that sinks into the ground
     /// as you walk away from it.
     #[test]
-    fn a_scuttlebug_keeps_its_body_out_of_the_floor() {
+    fn a_crawler_keeps_its_body_out_of_the_floor() {
         bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
         let (level, _) = crate::level::load();
         let mut world = World::new();
@@ -2289,7 +2385,7 @@ mod tests {
                 world
                     .spawn((
                         Enemy {
-                            kind: Kind::Scuttlebug,
+                            kind: Kind::Ant,
                             animation: Handle::default(),
                         },
                         Transform::from_translation(*at),
@@ -2309,12 +2405,19 @@ mod tests {
         let step = world.register_system(update);
 
         // How far the art hangs below the origin, which is the thing the
-        // placement has to hold clear of the ground. Read off the baked sheet
+        // placement has to hold clear of the ground. Measured off the model
         // rather than taken from `Kind::lift`: a test that subtracts back out
         // the very number the placement put in passes with the lift set to
         // zero, which is how the first two versions of this quietly proved
         // nothing.
-        let hang = crate::impostor::tests::hang_in_sheet(Kind::Scuttlebug);
+        //
+        // It used to be read off the baked sheet, which was the right
+        // instrument for the scuttlebug this was written about and is the
+        // wrong one for the ant -- a cell is a silhouette under a camera tilted
+        // 15 degrees down, and the near rim of a body 1.2 m long projects a
+        // good 15 cm below where its own origin does. See
+        // `impostor::tests::the_lift_matches_what_the_baked_sheets_show`.
+        let hang = hang_in_model(Kind::Ant);
         // Counted per tier, because they fail differently and only one of them
         // is under test here.
         let (mut standing, mut sunk) = ([0; 2], [0; 2]);
@@ -2402,7 +2505,7 @@ mod tests {
     /// afresh every tick which way the player is, a bug at the foot of a wall
     /// climbs it (the way to the player is up), immediately steps back down
     /// (the way to the player is along the floor), and repeats: six hundred
-    /// changes of surface in half a minute, which on screen is a scuttlebug
+    /// changes of surface in half a minute, which on screen is an ant
     /// spinning like a top in the corner.
     #[test]
     fn a_crawler_on_the_castle_does_not_spin_between_surfaces() {
@@ -2430,7 +2533,7 @@ mod tests {
                     goal,
                     4.0,
                     FIXED_DT,
-                    Kind::Scuttlebug.lift(),
+                    Kind::Ant.lift(),
                 );
                 if crawler.up.distance(was) < 1e-4 && crawler.up.distance(resting) > 0.5 {
                     flips += 1;
@@ -2801,7 +2904,7 @@ mod tests {
                 world
                     .spawn((
                         Enemy {
-                            kind: Kind::Scuttlebug,
+                            kind: Kind::Ant,
                             animation: Handle::default(),
                         },
                         Crawler {
@@ -3164,7 +3267,7 @@ mod tests {
         assert_eq!(health, 3, "a stomp is not supposed to hurt");
     }
 
-    /// A scuttlebug hanging from a ceiling reaches down out of it, and the
+    /// An ant hanging from a ceiling reaches down out of it, and the
     /// player walking underneath is walking into the bug rather than under it.
     /// Measured upright -- from its feet upwards -- it would be a storey away.
     #[test]
@@ -3194,7 +3297,7 @@ mod tests {
         assert_eq!(controller(&mut world).1, 3, "hurt from a storey up");
     }
 
-    /// A scuttlebug that has been under the world is stood back up by the
+    /// An ant that has been under the world is stood back up by the
     /// crowd tier, and that is the only thing in the game that will do it.
     ///
     /// The state being fixed is a real one and reachable in a couple of
@@ -3242,7 +3345,7 @@ mod tests {
         let bug = world
             .spawn((
                 Enemy {
-                    kind: Kind::Scuttlebug,
+                    kind: Kind::Ant,
                     animation: Handle::default(),
                 },
                 Transform::from_translation(ground + Vec3::X * 2.0),
