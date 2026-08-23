@@ -1,0 +1,19 @@
+{
+  "radius": 300.0,
+  "depth": 2,
+  "tile_res": 64,
+  "face_map_res": 513,
+  "min_altitude": -40.0,
+  "max_altitude": 40.0,
+  "sea_level": 0.0,
+  "snow_line": 22.0,
+  "steep_cos": 0.55,
+  "ground_normal": 0.7,
+  "lod1_depth": 0,
+  "seed": 20260822,
+  "relief": 1.1,
+  "detail": 0.35,
+  "detail_frequency": 6.0,
+  "detail_octaves": 5,
+  "generator_version": 1
+}
