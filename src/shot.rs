@@ -2,7 +2,16 @@
 //!
 //! ```text
 //! cargo run --release -- screenshot out.png [crowd] [x,y,z] [look-x,look-y,look-z]
+//! SHOT_LEVEL=planet cargo run --release -- screenshot planet.png
 //! ```
+//!
+//! `SHOT_LEVEL` names a level from [`crate::world::LevelId`] and waits for it
+//! before taking the picture. It is the only way to see the planet without a
+//! screen: its collision is read out of its glTF over however many frames that
+//! takes, so a shot on the usual settle count is a shot of an empty sky. With
+//! no camera coordinates given it frames whoever is standing on the level,
+//! which on a planet is the only sensible default -- the spot the player is put
+//! down on is chosen at load time and is not a number anyone could pass in.
 //!
 //! This exists because the game is developed in an environment that has no
 //! display: WSL with no `/dev/dri`, where the renderer is lavapipe and there is
@@ -15,7 +24,13 @@
 //! is what the game draws, less the stretch onto the window and the UI over the
 //! top of it.
 
-use crate::{console, display::SceneTarget};
+use crate::{
+    console,
+    display::SceneTarget,
+    gravity::Gravity,
+    player::Player,
+    world::{LevelId, LevelLoad, LoadLevel},
+};
 use bevy::{
     prelude::*,
     render::gpu_readback::{Readback, ReadbackComplete},
@@ -35,6 +50,11 @@ struct Shot {
     path: std::path::PathBuf,
     eye: Vec3,
     at: Vec3,
+    /// Which way is up for the shot. `+Y` on a flat level; on a planet, the
+    /// direction out of the ground being photographed -- a picture framed with
+    /// the world's `Y` up there is a picture taken sideways, and one taken from
+    /// directly over a pole is not a picture at all.
+    up: Vec3,
     left: usize,
     asked: bool,
 }
@@ -46,7 +66,7 @@ struct Shot {
 /// placement and the picture.
 fn aim(shot: Res<Shot>, mut camera: Query<&mut Transform, With<Camera3d>>) {
     for mut view in &mut camera {
-        *view = Transform::from_translation(shot.eye).looking_at(shot.at, Vec3::Y);
+        *view = Transform::from_translation(shot.eye).looking_at(shot.at, shot.up);
     }
 }
 
@@ -128,8 +148,13 @@ fn keep(
     exit.write(AppExit::Success);
 }
 
+/// The camera positions a shot of the castle falls back on: the view down the
+/// path from the spawn, which is what every screenshot of this game has been.
+const CASTLE_EYE: Vec3 = Vec3::new(-13.0, 8.0, 60.0);
+const CASTLE_AT: Vec3 = Vec3::new(-13.0, 3.0, 46.0);
+
 /// Runs the game long enough to photograph it.
-pub fn run(path: &std::path::Path, crowd: usize, eye: Vec3, at: Vec3) {
+pub fn run(path: &std::path::Path, crowd: usize, eye: Option<Vec3>, at: Option<Vec3>) {
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins
@@ -149,8 +174,9 @@ pub fn run(path: &std::path::Path, crowd: usize, eye: Vec3, at: Vec3) {
     crate::add_game(&mut app);
     app.insert_resource(Shot {
         path: path.to_path_buf(),
-        eye,
-        at,
+        eye: eye.unwrap_or(CASTLE_EYE),
+        at: at.unwrap_or(CASTLE_AT),
+        up: Vec3::Y,
         left: std::env::var("SHOT_SETTLE")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -171,6 +197,7 @@ pub fn run(path: &std::path::Path, crowd: usize, eye: Vec3, at: Vec3) {
     app.finish();
     app.cleanup();
     app.update();
+    photograph_the_level(&mut app, eye, at);
     // Console commands, so the shot is set up through the same path a player
     // would use. `SHOT_SETUP="enemy_draw 12"` is how the impostor swap is
     // photographed: pull the skinned models in until the far crowd is sprites.
@@ -200,4 +227,63 @@ pub fn run(path: &std::path::Path, crowd: usize, eye: Vec3, at: Vec3) {
             break;
         }
     }
+}
+
+/// Puts the level named by `SHOT_LEVEL` up, waits for it, and frames whoever is
+/// standing on it.
+///
+/// The waiting is the point. A level whose collision comes out of a glTF is not
+/// there on the frame it was asked for, and the settle count is measured from
+/// *after* it arrives rather than from the start of the run -- otherwise the
+/// picture is of the sky where the planet is going to be.
+fn photograph_the_level(app: &mut App, eye: Option<Vec3>, at: Option<Vec3>) {
+    let Ok(name) = std::env::var("SHOT_LEVEL") else {
+        return;
+    };
+    let name = name.trim().to_ascii_lowercase();
+    let Some(wanted) = LevelId::ALL
+        .into_iter()
+        .find(|id| id.name().to_ascii_lowercase().starts_with(&name))
+    else {
+        eprintln!(
+            "screenshot: SHOT_LEVEL={name:?} is not a level; try one of {:?}",
+            LevelId::ALL.map(LevelId::name)
+        );
+        return;
+    };
+    app.world_mut().write_message(LoadLevel(wanted));
+    let mut frames = 0;
+    while app.world().resource::<LevelLoad>().busy() || frames == 0 {
+        app.update();
+        frames += 1;
+        if frames > 6_000 {
+            eprintln!("screenshot: {} never finished loading", wanted.name());
+            return;
+        }
+    }
+    println!(
+        "screenshot: {} came up after {frames} frames",
+        wanted.name()
+    );
+    // Framed on the player unless the caller said where to stand. Over his
+    // shoulder and a little above him, along whichever tangent the local up
+    // happens to give -- on a planet there is no "north" for a default to mean.
+    let standing = app
+        .world_mut()
+        .query_filtered::<&Transform, With<Player>>()
+        .single(app.world())
+        .map(|transform| transform.translation);
+    let Ok(standing) = standing else {
+        return;
+    };
+    let up = app.world().resource::<Gravity>().up(standing);
+    let mut shot = app.world_mut().resource_mut::<Shot>();
+    shot.up = up;
+    shot.at = at.unwrap_or(standing + up * 1.0);
+    shot.eye = eye.unwrap_or(standing + up * 4.0 + up.any_orthonormal_vector() * 14.0);
+    // The clock starts again now that there is something to photograph.
+    shot.left = std::env::var("SHOT_SETTLE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(SETTLE);
 }

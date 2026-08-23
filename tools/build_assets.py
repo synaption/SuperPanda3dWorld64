@@ -13,12 +13,13 @@ without them was drawn two different ways at once -- the new model up close and
 the old picture of it past `enemy_draw`. Rotating an actor is the case that
 shows it worst, since every sprite in the atlas then faces the wrong way.
 
-The six stages, in the order they have to run:
+The seven stages, in the order they have to run:
 
     mario      assets/mario/mario.glb        + mario_clips.json
     hero       assets/hero/hero.glb          + hero_clips.json
     weapons    assets/hero/*.glb             what the Hero carries
     castle     assets/bevy/castle.glb, castle.bin, water.png
+    planet     assets/bevy/planet.glb        the generated planet, LOD0
     actors     assets/actors/*.glb           + a clips sidecar each
     impostors  assets/impostors/*.png, *.json
 
@@ -70,7 +71,7 @@ SKELETON_ROOTS = {
     "slime": "Slime_Rig",
 }
 
-STAGES = ("mario", "hero", "weapons", "castle", "actors", "impostors")
+STAGES = ("mario", "hero", "weapons", "castle", "planet", "actors", "impostors")
 
 
 def run(command):
@@ -184,6 +185,36 @@ def build_castle(_staging, _blender):
             "assets/bevy/water.png"]
 
 
+def build_planet(_staging, _blender):
+    """Adopt the generated planet from `experimental/planet_gen`.
+
+    A copy and not a build, and that is the honest description of it. The
+    generator is its own program with its own Blender pass -- see that
+    directory's readme -- and re-running it here would mean this script owning
+    a planet's worth of parameters it has no opinion about. What it does own is
+    the invariant that everything under `assets/` is derived from something
+    committed and can be produced again, so the copy is written down here
+    rather than being a thing somebody once did by hand.
+
+    Regenerate the source with, from `experimental/planet_gen`:
+
+        python3 -m planetgen.cli build
+        blender --background --factory-startup --python blender/export_tiles.py
+
+    LOD0 is what the game takes. The collision it stands on is read out of this
+    same mesh at load time, so a LOD1 planet would be a planet whose ground is
+    a few metres from where it is drawn.
+    """
+    source = ROOT / "experimental/planet_gen/out/planet.glb"
+    if not source.is_file():
+        raise SystemExit(
+            f"missing generated planet: {source}\n"
+            "run planetgen's build and export first; see its readme")
+    target = ROOT / "assets/bevy/planet.glb"
+    shutil.copy2(source, target)
+    return [str(target.relative_to(ROOT))]
+
+
 def build_actors(staging, blender):
     built = []
     for actor, sidecar_name in ACTORS.items():
@@ -231,6 +262,7 @@ BUILDERS = {
     "hero": build_hero,
     "weapons": build_weapons,
     "castle": build_castle,
+    "planet": build_planet,
     "actors": build_actors,
     "impostors": bake_impostors,
 }

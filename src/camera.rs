@@ -1,5 +1,6 @@
 use crate::{
     console::GameTuning,
+    gravity::Gravity,
     input::InputState,
     level::LevelData,
     player::{Player, RenderPose},
@@ -16,6 +17,37 @@ pub struct FollowCamera {
     /// player's head to 1 at the full [`Self::distance`]. Kept between frames
     /// because it is eased rather than applied raw -- see [`update`].
     pub clearance: f32,
+    /// The frame [`Self::yaw`] and [`Self::pitch`] are measured in.
+    ///
+    /// Identity on a flat level, where the orbit is about world `+Y` and always
+    /// was. On a planet it is carried along as the player walks: each frame it
+    /// is turned by the smallest rotation that takes its own up onto the local
+    /// one, which is parallel transport and is the only part of this that is
+    /// not obvious.
+    ///
+    /// The obvious thing -- rebuilding the frame from scratch out of the local
+    /// up every frame -- does not work. `Quat::from_rotation_arc(Vec3::Y, up)`
+    /// has no answer at the antipode of `+Y` and an arbitrary one near it, so a
+    /// player walking towards the planet's south pole would find the view
+    /// spinning faster and faster and then flipping over. Turning by the small
+    /// step from *last* frame's up to this one never asks that question,
+    /// because between two frames the up has barely moved.
+    pub frame: Quat,
+}
+
+impl Default for FollowCamera {
+    fn default() -> Self {
+        Self {
+            yaw: 0.0,
+            pitch: -0.2,
+            distance: 9.5,
+            // Starts fully extended: the first frame eases in from wherever the
+            // level actually leaves room, rather than out from the player's
+            // head.
+            clearance: 1.0,
+            frame: Quat::IDENTITY,
+        }
+    }
 }
 
 /// Pitch range, in radians. Short of straight up and straight down: the boom
@@ -60,12 +92,18 @@ pub fn update(
     mut cameras: Query<(&mut Transform, &mut FollowCamera), Without<Player>>,
     player: Res<RenderPose>,
     level: Res<LevelData>,
+    gravity: Res<Gravity>,
     mut state: ResMut<GameState>,
     tuning: Res<GameTuning>,
 ) {
     let Ok((mut camera, mut follow)) = cameras.single_mut() else {
         return;
     };
+    // Carried onto this frame's up before anything is measured in it. On the
+    // castle `up` is `+Y`, the correction is the identity, and every line below
+    // is the line that was there before.
+    let up = gravity.up(player.translation);
+    follow.frame = Quat::from_rotation_arc(follow.frame * Vec3::Y, up) * follow.frame;
     follow.yaw -= input.look_mouse.x * tuning.mouse_sens;
     follow.pitch = (follow.pitch - input.look_mouse.y * tuning.mouse_sens * 0.8333)
         .clamp(PITCH_LIMITS.0, PITCH_LIMITS.1);
@@ -82,7 +120,9 @@ pub fn update(
         follow.yaw -= 0.035;
     }
     if InputState::take(&mut input.recenter) {
-        let forward = player.rotation * Vec3::NEG_Z;
+        // Behind the player means behind him *in the camera's own frame*, which
+        // is what taking the facing back out of that frame asks.
+        let forward = follow.frame.inverse() * (player.rotation * Vec3::NEG_Z);
         follow.yaw = forward.x.atan2(forward.z);
     }
     state.aiming = input.aim;
@@ -93,8 +133,9 @@ pub fn update(
     };
     let smoothing = blend(tuning.cam_smooth, time.delta_secs());
     follow.distance += (desired_distance - follow.distance) * blend(0.16, time.delta_secs());
-    let focus = player.translation + Vec3::Y * tuning.cam_height;
-    let orbit = Quat::from_rotation_y(follow.yaw) * Quat::from_rotation_x(follow.pitch);
+    let focus = player.translation + up * tuning.cam_height;
+    let orbit =
+        follow.frame * Quat::from_rotation_y(follow.yaw) * Quat::from_rotation_x(follow.pitch);
     let boom = orbit * Vec3::new(0.0, 0.8, follow.distance);
 
     // How much of the boom is free this frame, measured along the boom rather
@@ -118,7 +159,7 @@ pub fn update(
     };
     let wanted = focus + boom * follow.clearance;
     camera.translation = camera.translation.lerp(wanted, smoothing);
-    camera.look_at(focus, Vec3::Y);
+    camera.look_at(focus, up);
 }
 
 #[cfg(test)]

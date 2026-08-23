@@ -1,9 +1,11 @@
 use crate::{
     audio::{Sfx, SoundQueue},
     console::GameTuning,
+    gravity::{self, Gravity},
     input::InputState,
     level::LevelData,
     weapon::Loadout,
+    world::Respawn,
     ActiveCharacter, GameState,
 };
 use bevy::prelude::*;
@@ -184,10 +186,29 @@ impl Default for Controller {
     }
 }
 
+impl Controller {
+    /// Puts the body back to a standing start.
+    ///
+    /// Everything about *where* the player is goes; everything about who he is
+    /// -- his health, the weapon in his hands, whether he is mid-combo -- stays,
+    /// because arriving on a new level is a change of place and not a death.
+    pub fn reset(&mut self) {
+        self.velocity = Vec3::ZERO;
+        self.grounded = false;
+        self.motion = Motion::Fall;
+        self.submersion = Submersion::Dry;
+        self.step_phase = 0.0;
+        self.stroke_phase = 0.0;
+        self.land_left = 0.0;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn movement(
     mut input_state: ResMut<InputState>,
     level: Res<LevelData>,
+    gravity: Res<Gravity>,
+    respawn: Res<Respawn>,
     state: Res<GameState>,
     tuning: Res<GameTuning>,
     loadout: Res<Loadout>,
@@ -203,6 +224,11 @@ pub fn movement(
     let Ok(cam) = camera.single() else {
         return;
     };
+    // Which way up is, once, for the whole tick. Everything below that used to
+    // read `.y` reads this instead: on the castle it is `+Y` and the arithmetic
+    // is the arithmetic it always was, and on a planet it is the direction out
+    // of the ground the player is standing on.
+    let up = gravity.up(transform.translation);
     // Latched edges are consumed here rather than polled, so each press acts
     // on exactly one fixed step however many steps this frame runs.
     let jump_pressed = InputState::take(&mut input_state.jump);
@@ -212,12 +238,14 @@ pub fn movement(
     let attack_pressed =
         !loadout.equipped.is_ranged() && InputState::take(&mut input_state.attack);
     let input = input_state.move_axis;
-    // `forward`/`right` hand back a `Direction3d` rather than a `Vec3` now: a
+    // `forward`/`right` hand back a `Direction3d` rather than a `Vec3`: a
     // vector the type system knows is unit length. Flattening one onto the
     // ground plane is exactly the operation that stops it being unit length,
     // so it is taken back to a plain `Vec3` first and renormalised after.
-    let forward = (Vec3::from(cam.forward()) * Vec3::new(1.0, 0.0, 1.0)).normalize_or_zero();
-    let right = (Vec3::from(cam.right()) * Vec3::new(1.0, 0.0, 1.0)).normalize_or_zero();
+    // Flattening used to mean zeroing `y`; it now means dropping whatever part
+    // of the vector points at the local sky.
+    let forward = gravity::flatten(cam.forward().into(), up);
+    let right = gravity::flatten(cam.right().into(), up);
     let wish = forward * input.y + right * input.x;
     let water_level = level.water_level(transform.translation.x, transform.translation.z);
     let was_wet = ctrl.submersion.in_water();
@@ -240,7 +268,12 @@ pub fn movement(
         tuning.walk_accel
     };
     let target = wish * speed;
-    let horizontal = Vec3::new(ctrl.velocity.x, 0.0, ctrl.velocity.z);
+    // The two halves of the velocity: how fast the player is climbing away
+    // from the ground, and how fast he is running along it. `rise` is carried
+    // by hand from here to the bottom of the tick and put back into
+    // `ctrl.velocity` once, because between the two there is a wall
+    // resolution that changes the run and must not touch the climb.
+    let (mut rise, horizontal) = gravity.split(ctrl.velocity, transform.translation);
     let next = if wish.length_squared() > 0.0 {
         horizontal.lerp(target, (accel * FIXED_DT).min(1.0))
     } else {
@@ -249,16 +282,15 @@ pub fn movement(
             (if skate { 0.35 } else { tuning.decel } * FIXED_DT).min(1.0),
         )
     };
-    ctrl.velocity.x = next.x;
-    ctrl.velocity.z = next.z;
+    ctrl.velocity = next + up * rise;
 
     match ctrl.submersion {
         Submersion::Swimming => {
             let surface = water_level.unwrap() - SWIM_FLOAT_DEPTH;
             let buoyancy = ((surface - transform.translation.y) * 2.0).clamp(-2.0, 3.0);
-            ctrl.velocity.y += (buoyancy - ctrl.velocity.y) * 0.16;
+            rise += (buoyancy - rise) * 0.16;
             if jump_pressed {
-                ctrl.velocity.y = (ctrl.velocity.y + 3.8).min(6.0);
+                rise = (rise + 3.8).min(6.0);
                 sounds.push(Sfx::Stroke);
             }
             ctrl.grounded = false;
@@ -268,16 +300,16 @@ pub fn movement(
                 // The Hero stays upright because he has no swim animation,
                 // but deep water must not swallow the jump control. Treat it
                 // as the same upward stroke Mario gets underwater.
-                ctrl.velocity.y = (ctrl.velocity.y + 3.8).min(6.0);
+                rise = (rise + 3.8).min(6.0);
                 ctrl.grounded = false;
                 sounds.push(Sfx::Stroke);
             } else {
-                ctrl.velocity.y = approach(ctrl.velocity.y, 0.0, WADE_SETTLE * FIXED_DT);
+                rise = approach(rise, 0.0, WADE_SETTLE * FIXED_DT);
             }
         }
         Submersion::Dry => {
             if jump_pressed && ctrl.grounded {
-                ctrl.velocity.y = if skate { 9.0 } else { tuning.jump_velocity };
+                rise = if skate { 9.0 } else { tuning.jump_velocity };
                 ctrl.grounded = false;
                 sounds.push(Sfx::Jump);
             }
@@ -288,9 +320,12 @@ pub fn movement(
     // the Hero's booster do not operate until the capsule leaves the box.
     if !ctrl.submersion.in_water() {
         if boost && !ctrl.grounded {
-            ctrl.velocity.y = (ctrl.velocity.y + tuning.jet_thrust).min(tuning.jet_rise);
+            rise = (rise + tuning.jet_thrust).min(tuning.jet_rise);
         } else if !ctrl.grounded {
-            ctrl.velocity.y -= 1.2;
+            // The original stepped a flat -1.2 onto the speed every frame at
+            // 30 Hz. Same number, said as the rate it always was, so that a
+            // planet can point it somewhere else without also changing it.
+            rise -= gravity.accel() * FIXED_DT;
         }
     }
 
@@ -305,8 +340,8 @@ pub fn movement(
         sounds.push(Sfx::Attack);
     }
     ctrl.attack_left = (ctrl.attack_left - FIXED_DT).max(0.0);
-    transform.translation.y += ctrl.velocity.y * FIXED_DT;
-    if ctrl.submersion == Submersion::Wading && ctrl.velocity.y <= 0.0 {
+    transform.translation += up * (rise * FIXED_DT);
+    if ctrl.submersion == Submersion::Wading && rise <= 0.0 {
         // Held at the surface rather than sinking. Approached instead of
         // snapped, so running off a bank into deep water does not pop him up
         // to it; and only a pull, so a bottom shallower than the float depth
@@ -316,14 +351,14 @@ pub fn movement(
         transform.translation.y =
             approach(transform.translation.y, float_line, WADE_RISE * FIXED_DT);
     }
-    let horizontal_step = Vec3::new(ctrl.velocity.x, 0.0, ctrl.velocity.z) * FIXED_DT;
+    let horizontal_step = (ctrl.velocity - up * ctrl.velocity.dot(up)) * FIXED_DT;
     let wanted = transform.translation + horizontal_step;
-    let corrected = level.resolve_walls(wanted, PLAYER_RADIUS, PLAYER_HEIGHT);
+    let corrected = level.resolve_walls(wanted, up, PLAYER_RADIUS, PLAYER_HEIGHT);
     // Cancel velocity into a wall while retaining tangential motion. This
     // produces natural sliding and avoids accumulating speed against walls.
     let correction = corrected - wanted;
     if correction.length_squared() > 1e-8 {
-        let normal = Vec3::new(correction.x, 0.0, correction.z).normalize_or_zero();
+        let normal = gravity::flatten(correction, up);
         let into_wall = ctrl.velocity.dot(normal);
         if into_wall < 0.0 {
             ctrl.velocity -= normal * into_wall;
@@ -333,29 +368,30 @@ pub fn movement(
     // A head bump stops the rise but not the run: the horizontal step above
     // has already been resolved against the walls, and a low arch should slow
     // a jump under it rather than stopping the player dead.
-    if !ctrl.submersion.swimming() && ctrl.velocity.y > 0.0 {
-        if let Some(ceiling) = level.ceiling_height(transform.translation, CEILING_CLEARANCE) {
-            if transform.translation.y + PLAYER_HEIGHT > ceiling {
-                transform.translation.y = ceiling - PLAYER_HEIGHT;
-                ctrl.velocity.y = 0.0;
+    if !ctrl.submersion.swimming() && rise > 0.0 {
+        if let Some(ceiling) = level.ceiling_above(transform.translation, up, CEILING_CLEARANCE) {
+            let head_room = (ceiling - transform.translation).dot(up);
+            if head_room < PLAYER_HEIGHT {
+                transform.translation += up * (head_room - PLAYER_HEIGHT);
+                rise = 0.0;
             }
         }
     }
     let was_grounded = ctrl.grounded;
-    let impact = ctrl.velocity.y;
-    let floor = level.floor_height(transform.translation + Vec3::Y * 0.75);
+    let impact = rise;
+    let floor = level.ground_below(transform.translation + up * 0.75, up);
     // A wader keeps the ordinary floor logic: in water shallower than the
     // float depth the bottom is under his feet and he walks along it, which is
     // the whole difference between wading and swimming.
     if ctrl.submersion.swimming() {
         ctrl.grounded = false;
-    } else if let Some(height) = floor {
-        let separation = transform.translation.y - height;
+    } else if let Some((ground, _)) = floor {
+        let separation = (transform.translation - ground).dot(up);
         let walking_on_floor = ctrl.grounded && separation <= 0.75;
-        let landed = transform.translation.y <= height && ctrl.velocity.y <= 0.0;
+        let landed = separation <= 0.0 && rise <= 0.0;
         if walking_on_floor || landed {
-            transform.translation.y = height;
-            ctrl.velocity.y = 0.0;
+            transform.translation = ground;
+            rise = 0.0;
             ctrl.grounded = true;
             if !was_grounded && impact < -LANDING_IMPACT {
                 sounds.push(Sfx::Land);
@@ -369,28 +405,45 @@ pub fn movement(
         // grounded flag here was the source of the visibly floating player.
         ctrl.grounded = false;
     }
-    if transform.translation.y < -20.0 {
-        transform.translation = Vec3::new(-13.28, 3.0, 46.64);
+    // The climb goes back into the velocity here, once, now that everything
+    // that changes it has run.
+    gravity::set_rise(&mut ctrl.velocity, up, rise);
+    if level.out_of_bounds(transform.translation) {
+        transform.translation = respawn.0;
         ctrl.velocity = Vec3::ZERO;
+        rise = 0.0;
         previous.translation = transform.translation;
         previous.rotation = transform.rotation;
     }
     if ctrl.health == 0 {
-        transform.translation = Vec3::new(-13.28, 3.0, 46.64);
+        transform.translation = respawn.0;
         ctrl.velocity = Vec3::ZERO;
+        rise = 0.0;
         ctrl.health = 3;
         ctrl.invulnerable_left = 1.5;
         previous.translation = transform.translation;
         previous.rotation = transform.rotation;
     }
+    // Stood upright first, then turned. On a flat level the first step is a
+    // no-op -- up never moves, so re-deriving the rotation from it gives the
+    // same rotation back -- and on a planet it is what keeps the character
+    // perpendicular to the ground instead of leaning further over the further
+    // he walks from where he set off.
+    let facing = gravity::flatten(transform.rotation * Vec3::Z, up);
+    if facing != Vec3::ZERO {
+        transform.rotation = Transform::default().looking_to(-facing, up).rotation;
+    }
     if wish.length_squared() > 0.01 {
-        let yaw = wish.x.atan2(wish.z);
-        transform.rotation = transform.rotation.slerp(Quat::from_rotation_y(yaw), 0.28);
+        // `wish` already lies flat against the ground: it is built out of the
+        // camera's flattened axes. The character model faces `+Z`, which is
+        // what `looking_to` is being handed the negative of.
+        let turned = Transform::default().looking_to(-wish, up).rotation;
+        transform.rotation = transform.rotation.slerp(turned, 0.28);
     }
     // Footfalls are paced by ground covered rather than by time, so they stay
     // in step with the run whatever the speed is tuned to; strokes are paced
     // by time, because swimming has no stride to measure.
-    let ground_speed = Vec3::new(ctrl.velocity.x, 0.0, ctrl.velocity.z).length();
+    let ground_speed = (ctrl.velocity - up * ctrl.velocity.dot(up)).length();
     if ctrl.submersion.swimming() {
         ctrl.step_phase = 0.0;
         ctrl.stroke_phase += FIXED_DT;
@@ -441,7 +494,7 @@ pub fn movement(
             Motion::Swim
         } else if boost {
             Motion::Fly
-        } else if ctrl.velocity.y > 0.0 {
+        } else if rise > 0.0 {
             Motion::Jump
         } else {
             Motion::Fall
@@ -492,6 +545,11 @@ mod tests {
     fn world_with(collision: level::LevelData, spawn_at: Vec3) -> World {
         let mut world = World::new();
         world.insert_resource(collision);
+        // Flat gravity and the castle's own spawn: these tests are about the
+        // castle, and the arithmetic they check is the arithmetic they have
+        // always checked.
+        world.insert_resource(Gravity::default());
+        world.insert_resource(Respawn(spawn_at));
         world.insert_resource(GameState::default());
         world.insert_resource(GameTuning::default());
         world.insert_resource(InputState::default());

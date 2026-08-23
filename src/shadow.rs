@@ -18,7 +18,10 @@
 //! the way the ground faces, which is right on a slope and wrong across the
 //! join between two of them.
 
-use crate::level::LevelData;
+use crate::{
+    gravity::Gravity,
+    level::{LevelData, Shape},
+};
 use bevy::{
     asset::RenderAssetUsages,
     ecs::{schedule::ScheduleConfigs, system::ScheduleSystem},
@@ -261,13 +264,21 @@ const SAME_SURFACE: f32 = 0.05;
 /// something it is not resting on. Falling back rather than giving up is the
 /// point: on the playable ground the two agree better than nine times in ten,
 /// and the rest still get a shadow instead of a hole where one should be.
-pub fn place(level: &LevelData, here: Vec3) -> Option<(f32, Vec3)> {
-    let floor = level.floor_height(here)?;
-    let up = level
+///
+/// A planet takes the shorter road. Its ground query is a ray rather than a
+/// column, so the surface it found and the surface whose slope it reports are
+/// the same triangle by construction, and there is nothing for the two answers
+/// to disagree about.
+pub fn place(level: &LevelData, here: Vec3, up: Vec3) -> Option<(Vec3, Vec3)> {
+    let (floor, normal) = level.ground_below(here, up)?;
+    if level.shape() != Shape::Flat {
+        return Some((floor, normal));
+    }
+    let slope = level
         .ground_at(here)
-        .filter(|(ground, _)| (ground - floor).abs() <= SAME_SURFACE)
-        .map_or(Vec3::Y, |(_, up)| up);
-    Some((floor, up))
+        .filter(|(ground, _)| (ground - floor.y).abs() <= SAME_SURFACE)
+        .map_or(up, |(_, slope)| slope);
+    Some((floor, slope))
 }
 
 /// `scale_shadow_with_distance` from `shadow.c`: a shadow shrinks to half its
@@ -341,6 +352,7 @@ pub fn attach(
 #[allow(clippy::type_complexity)]
 pub fn project(
     level: Res<LevelData>,
+    gravity: Res<Gravity>,
     art: Res<ShadowArt>,
     casters: Query<(&Transform, &ShadowCaster, Option<&Visibility>), Without<Shadow>>,
     mut shadows: Query<(
@@ -363,18 +375,19 @@ pub fn project(
             continue;
         }
         let here = caster.translation;
-        let Some((floor, up)) = place(&level, here) else {
+        let up = gravity.up(here);
+        let Some((floor, slope)) = place(&level, here, up) else {
             // Over open space -- off the edge of the map, or above a hole.
             // There is nothing for a shadow to land on.
             *visibility = Visibility::Hidden;
             continue;
         };
         *visibility = Visibility::Visible;
-        let drop = (here.y - floor).max(0.0);
+        let drop = (here - floor).dot(up).max(0.0);
         // Lifted along the floor's normal rather than straight up, so the
         // clearance is the same all the way round the disc on a slope.
-        transform.translation = Vec3::new(here.x, floor, here.z) + up * LIFT;
-        transform.rotation = Quat::from_rotation_arc(Vec3::Z, up);
+        transform.translation = floor + slope * LIFT;
+        transform.rotation = Quat::from_rotation_arc(Vec3::Z, slope);
         transform.scale = Vec3::splat(settings.radius * scale_with_drop(drop));
         // Assigned only when the rung actually changes. Writing the same
         // handle back would mark the component changed, and a changed material
@@ -432,7 +445,8 @@ mod tests {
         let mut worst = 1.0_f32;
         let mut at = Vec3::ZERO;
         for (here, _) in walkable(&level) {
-            let (_, up) = place(&level, here).expect("a floor was found and then lost");
+            let (_, up) =
+                place(&level, here, Vec3::Y).expect("a floor was found and then lost");
             if up.y < worst {
                 worst = up.y;
                 at = here;
@@ -455,7 +469,7 @@ mod tests {
         for (here, _) in walkable(&level) {
             standing += 1;
             assert!(
-                place(&level, here).is_some(),
+                place(&level, here, Vec3::Y).is_some(),
                 "a caster standing at {here:?} casts no shadow at all"
             );
         }

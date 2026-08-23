@@ -1,7 +1,10 @@
 # Outer Wilds player controller — Panda3D port
 
 A port of the blueprint-only Unreal project in
-`reference/OuterWildsPlayerControlle` to Panda3D.
+`reference/OuterWildsPlayerControlle` to Panda3D. Rocky bodies use the
+generated terrain mesh from `experimental/planet_gen/out/planet_lod1.glb`;
+their collision and gravity surfaces remain spherical, as in the original
+controller simulation.
 
 ```bash
 python3 -m ow.main              # fly the demo system
@@ -152,7 +155,11 @@ planet regardless of speed.
 | `level.py` | `L_DemoLevel` |
 | `world.py` | the tick `BP_PlayerController` drove |
 | `app.py` | `BP_Player`, the Unreal scene, Enhanced Input setup |
-| `geometry.py` | procedural meshes — the port has no asset dependencies |
+| `geometry.py` | procedural starfield and emissive sun meshes |
+
+The rocky planet render mesh is the space LOD exported by `planet_gen`. Run
+its Blender exporter again after changing its authored face maps to update the
+planets in this demo.
 
 `gravity`, `movement`, `world` and `level` never touch the scene graph or a
 window, which is what lets `--selftest` run the physics headlessly.

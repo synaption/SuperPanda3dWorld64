@@ -1,10 +1,15 @@
 //! The pause menu: Escape, and what is behind it.
 //!
-//! Three pages deep and no deeper -- the root, its options, and the display
-//! settings -- because a game with one screen of settings does not need a tree
-//! and a menu you can get lost in is worse than no menu. Each page is a list of
-//! rows; a row either does something when it is chosen or holds a value that
-//! left and right change.
+//! Two pages deep and no deeper -- the root, the level list, its options and
+//! the display settings -- because a game with one screen of settings does not
+//! need a tree and a menu you can get lost in is worse than no menu. Each page
+//! is a list of rows; a row either does something when it is chosen or holds a
+//! value that left and right change.
+//!
+//! The level list is the one page that does more than set a number. Choosing a
+//! row there takes the world down and puts another one up, which
+//! [`crate::world`] does; all this page contributes is the choice, and the
+//! patience to stay up while a level that cannot arrive in one frame arrives.
 //!
 //! It is drawn the way the console is: a fixed set of text nodes spawned once
 //! at startup and rewritten every frame, rather than entities despawned and
@@ -20,6 +25,7 @@
 use crate::{
     console::ConsoleState,
     display::{self, DisplaySettings, SceneTarget},
+    world::{LevelId, LevelLoad, LoadLevel},
 };
 use bevy::{
     app::AppExit,
@@ -27,17 +33,23 @@ use bevy::{
     window::{CursorGrabMode, CursorOptions, PrimaryWindow},
 };
 
+/// What the line under the rows says when there is nothing wrong.
+const CONTROLS: &str = "mouse or up/down choose  ·  click/Enter select  ·  Esc back";
+
 /// How many text rows are spawned for the menu to write into.
 ///
-/// The longest page has three, and one spare costs a text node that is hidden
-/// on every page rather than a fourth page's worth of respawning.
-const ROWS: usize = 4;
+/// The longest page is the root's four, and two spare cost two text nodes that
+/// are hidden on every page rather than a page's worth of respawning. The
+/// spares are what the level list grows into: it is the one page whose length
+/// is a property of the game rather than of the menu.
+const ROWS: usize = 6;
 
 /// Which page is showing.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Page {
     #[default]
     Root,
+    Levels,
     Options,
     Display,
 }
@@ -50,18 +62,40 @@ pub enum Page {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Item {
     Resume,
+    Levels,
     Options,
     Quit,
+    /// One row per level. The level travels in the row rather than the row
+    /// being the nth of a list, for the same reason animation clips are chosen
+    /// by name: an index shifts the moment a level is added between two others.
+    Level(LevelId),
     Display,
     RenderScale,
     WindowMode,
     Back,
 }
 
+/// The level page's rows: one per level the game has, then a way back.
+///
+/// Built out of [`LevelId::ALL`] rather than written out, so a level added to
+/// the catalogue appears in the menu without anyone having to remember this
+/// list exists. `items` has to hand back a `&'static [Item]`, which is why this
+/// is a const rather than something built when the page is drawn.
+const LEVEL_ROWS: [Item; LevelId::ALL.len() + 1] = {
+    let mut rows = [Item::Back; LevelId::ALL.len() + 1];
+    let mut at = 0;
+    while at < LevelId::ALL.len() {
+        rows[at] = Item::Level(LevelId::ALL[at]);
+        at += 1;
+    }
+    rows
+};
+
 impl Page {
     fn items(self) -> &'static [Item] {
         match self {
-            Page::Root => &[Item::Resume, Item::Options, Item::Quit],
+            Page::Root => &[Item::Resume, Item::Levels, Item::Options, Item::Quit],
+            Page::Levels => &LEVEL_ROWS,
             Page::Options => &[Item::Display, Item::Back],
             Page::Display => &[Item::RenderScale, Item::WindowMode, Item::Back],
         }
@@ -70,6 +104,7 @@ impl Page {
     fn title(self) -> &'static str {
         match self {
             Page::Root => "PAUSED",
+            Page::Levels => "LEVEL",
             Page::Options => "OPTIONS",
             Page::Display => "DISPLAY",
         }
@@ -80,6 +115,7 @@ impl Page {
     fn parent(self) -> Option<Page> {
         match self {
             Page::Root => None,
+            Page::Levels => Some(Page::Root),
             Page::Options => Some(Page::Root),
             Page::Display => Some(Page::Options),
         }
@@ -98,6 +134,14 @@ pub struct MenuState {
     /// Which row is highlighted. Always a valid index for `page`: every place
     /// that changes the page resets it.
     row: usize,
+    /// The level the player has chosen and is waiting for.
+    ///
+    /// The menu stays up until it arrives, and swallows every key while it is
+    /// waiting. That is not politeness: the planet's collision is read out of
+    /// its glTF over however many frames that takes, and the menu being open is
+    /// what holds the simulation still meanwhile. Close it early and the player
+    /// spends the load falling through a world with no ground in it yet.
+    wanted: Option<LevelId>,
 }
 
 impl MenuState {
@@ -124,7 +168,13 @@ impl MenuState {
     fn close(&mut self) {
         self.open = false;
         self.closed_this_frame = true;
+        self.wanted = None;
         self.go(Page::Root);
+    }
+
+    /// Whether the menu is holding the world still waiting for a level.
+    pub fn loading(&self) -> Option<LevelId> {
+        self.wanted
     }
 }
 
@@ -144,6 +194,11 @@ pub struct MenuTitle;
 /// One rewritable row, numbered so [`draw`] can find the nth.
 #[derive(Component)]
 pub struct MenuRow(usize);
+
+/// The line under the rows. Usually the controls; a level that would not load
+/// borrows it to say why, because a reason nobody can read is not a reason.
+#[derive(Component)]
+pub struct MenuHint;
 
 /// Spawns the menu, hidden.
 pub fn spawn(commands: &mut Commands) {
@@ -217,7 +272,8 @@ pub fn spawn(commands: &mut Commands) {
                         ));
                     }
                     rows.spawn((
-                        Text::new("mouse or up/down choose  ·  click/Enter select  ·  Esc back"),
+                        MenuHint,
+                        Text::new(CONTROLS),
                         TextFont {
                             font_size: FontSize::Px(15.0),
                             ..default()
@@ -300,6 +356,9 @@ pub fn input(
     console: Res<ConsoleState>,
     mut menu: ResMut<MenuState>,
     mut settings: ResMut<DisplaySettings>,
+    level: Res<LevelId>,
+    mut load: ResMut<LevelLoad>,
+    mut levels: MessageWriter<LoadLevel>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
     interactions: Query<(&MenuRow, &Interaction), Changed<Interaction>>,
@@ -309,11 +368,37 @@ pub fn input(
     if console.open || console.closed_this_frame {
         return;
     }
+    let was_open = menu.open;
+    // A level that has been asked for owns the menu until it is up. When it
+    // arrives the menu gets out of the way of it, and the block at the bottom
+    // takes the cursor back with it exactly as if Resume had been chosen.
+    //
+    // "Nothing is loading any more" rather than "the level asked for is up",
+    // because those come apart on the path that matters: a planet whose glTF
+    // will not load puts the castle back instead, and a menu waiting for the
+    // planet would sit over it for ever.
+    if menu.wanted.is_some() {
+        if !load.busy() {
+            // A level that did not arrive leaves the menu open on the list it
+            // was chosen from, with the reason on it. Shutting the menu on a
+            // failure is what makes a broken level look like a menu row that
+            // does nothing at all.
+            if load.trouble().is_some() {
+                menu.wanted = None;
+                menu.go(Page::Levels);
+            } else {
+                menu.close();
+            }
+        }
+        if menu.open != was_open {
+            release_cursor(menu.open, &mut cursor);
+        }
+        return;
+    }
     let press = pads
         .iter()
         .fold(keyboard(&keys), |press, pad| press.or(gamepad(pad)));
 
-    let was_open = menu.open;
     if press.toggle {
         // Escape inside the menu means "back", and back out of the root is
         // what shuts it. One key, one meaning, however deep you are.
@@ -355,6 +440,13 @@ pub fn input(
         if press.select || clicked {
             match menu.selected() {
                 Item::Resume => menu.close(),
+                Item::Levels => menu.go(Page::Levels),
+                // Choosing the level already up is choosing to get on with it.
+                Item::Level(id) if id == *level && !load.busy() => menu.close(),
+                Item::Level(id) => {
+                    levels.write(LoadLevel(id));
+                    menu.wanted = Some(id);
+                }
                 Item::Options => menu.go(Page::Options),
                 Item::Display => menu.go(Page::Display),
                 Item::Quit => {
@@ -372,17 +464,27 @@ pub fn input(
     }
 
     if menu.open != was_open {
-        // The menu is a mouse-shaped thing even though it is driven by keys:
-        // a player who opens it wants their cursor back, and one who resumes
-        // wants it out of the way and captured again.
-        if let Ok(mut cursor) = cursor.single_mut() {
-            cursor.grab_mode = if menu.open {
-                CursorGrabMode::None
-            } else {
-                CursorGrabMode::Locked
-            };
-            cursor.visible = menu.open;
+        release_cursor(menu.open, &mut cursor);
+        // The complaint is about the last attempt, not a standing state of the
+        // menu: leaving takes it with you rather than having it waiting the
+        // next time Escape is pressed.
+        if !menu.open {
+            load.failed = None;
         }
+    }
+}
+
+/// The menu is a mouse-shaped thing even though it is driven by keys: a player
+/// who opens it wants their cursor back, and one who resumes wants it out of
+/// the way and captured again.
+fn release_cursor(open: bool, cursor: &mut Query<&mut CursorOptions, With<PrimaryWindow>>) {
+    if let Ok(mut cursor) = cursor.single_mut() {
+        cursor.grab_mode = if open {
+            CursorGrabMode::None
+        } else {
+            CursorGrabMode::Locked
+        };
+        cursor.visible = open;
     }
 }
 
@@ -413,12 +515,15 @@ fn adjust(
 pub fn draw(
     menu: Res<MenuState>,
     settings: Res<DisplaySettings>,
+    level: Res<LevelId>,
+    load: Res<LevelLoad>,
     target: Res<SceneTarget>,
     images: Res<Assets<Image>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut root: Query<&mut Visibility, With<MenuRoot>>,
-    mut title: Query<&mut Text, (With<MenuTitle>, Without<MenuRow>)>,
-    mut rows: Query<(&MenuRow, &mut Text, &mut TextColor), Without<MenuTitle>>,
+    mut title: Query<&mut Text, (With<MenuTitle>, Without<MenuRow>, Without<MenuHint>)>,
+    mut hint: Query<(&mut Text, &mut TextColor), (With<MenuHint>, Without<MenuRow>, Without<MenuTitle>)>,
+    mut rows: Query<(&MenuRow, &mut Text, &mut TextColor), (Without<MenuTitle>, Without<MenuHint>)>,
 ) {
     if let Ok(mut visibility) = root.single_mut() {
         *visibility = if menu.open {
@@ -431,7 +536,11 @@ pub fn draw(
         return;
     }
     if let Ok(mut text) = title.single_mut() {
-        **text = menu.page.title().to_string();
+        **text = match (menu.loading(), load.trouble()) {
+            (Some(id), _) => format!("LOADING {}", id.name().to_uppercase()),
+            (None, Some(_)) if menu.page == Page::Levels => "LEVEL -- NOT LOADED".to_string(),
+            (None, _) => menu.page.title().to_string(),
+        };
     }
     // The size read back out of the image rather than recomputed, so the
     // number on the screen is the texture that exists rather than the one the
@@ -448,7 +557,23 @@ pub fn draw(
         .map(|window| display::is_windowed(window.mode))
         .unwrap_or(false);
 
-    let items = menu.page.items();
+    if let Ok((mut text, mut colour)) = hint.single_mut() {
+        match load.trouble() {
+            Some(trouble) if menu.loading().is_none() => {
+                **text = trouble.to_string();
+                *colour = TextColor(Color::srgb(1.0, 0.55, 0.45));
+            }
+            _ => {
+                **text = CONTROLS.to_string();
+                *colour = TextColor(Color::srgb(0.45, 0.5, 0.6));
+            }
+        }
+    }
+    let items: &[Item] = if menu.loading().is_some() {
+        &[]
+    } else {
+        menu.page.items()
+    };
     for (row, mut text, mut colour) in &mut rows {
         let Some(item) = items.get(row.0) else {
             **text = String::new();
@@ -457,6 +582,14 @@ pub fn draw(
         let chosen = row.0 == menu.row;
         let label = match item {
             Item::Resume => "Resume".to_string(),
+            Item::Levels => "Level".to_string(),
+            // A tick beside the one being played, because a list of levels with
+            // nothing marked is a list that does not say where you are.
+            Item::Level(id) => format!(
+                "{} {}",
+                if *id == *level { "*" } else { " " },
+                id.name()
+            ),
             Item::Options => "Options".to_string(),
             Item::Quit => "Quit".to_string(),
             Item::Display => "Display".to_string(),
@@ -507,6 +640,9 @@ mod tests {
         world.init_resource::<ConsoleState>();
         world.init_resource::<MenuState>();
         world.init_resource::<DisplaySettings>();
+        world.init_resource::<LevelId>();
+        world.init_resource::<LevelLoad>();
+        world.init_resource::<Messages<LoadLevel>>();
         world.init_resource::<Assets<Image>>();
         world.init_resource::<Messages<AppExit>>();
         let target = crate::display::create_target(&mut world.resource_mut::<Assets<Image>>());
@@ -570,6 +706,7 @@ mod tests {
 
         press(&mut world, KeyCode::Escape);
         press(&mut world, KeyCode::ArrowDown);
+        press(&mut world, KeyCode::ArrowDown);
         press(&mut world, KeyCode::Enter);
         assert_eq!(world.resource::<MenuState>().page, Page::Options);
 
@@ -595,6 +732,7 @@ mod tests {
     fn escape_walks_back_out_of_the_pages_it_walked_into() {
         let mut world = paused();
         press(&mut world, KeyCode::Escape);
+        press(&mut world, KeyCode::ArrowDown);
         press(&mut world, KeyCode::ArrowDown);
         press(&mut world, KeyCode::Enter);
         press(&mut world, KeyCode::Enter);
@@ -638,7 +776,7 @@ mod tests {
 
     #[test]
     fn every_page_has_rows_and_room_for_them() {
-        for page in [Page::Root, Page::Options, Page::Display] {
+        for page in [Page::Root, Page::Levels, Page::Options, Page::Display] {
             let items = page.items();
             assert!(!items.is_empty(), "{page:?} has no rows");
             assert!(
@@ -672,16 +810,129 @@ mod tests {
         let mut world = paused();
         world.resource_mut::<MenuState>().open();
 
-        let hover = world.spawn((MenuRow(2), Interaction::Hovered)).id();
+        let hover = world.spawn((MenuRow(3), Interaction::Hovered)).id();
         world.run_system_once(input).expect("the menu did not run");
         assert_eq!(world.resource::<MenuState>().selected(), Item::Quit);
 
         // Move the same pointer target to Options and press it. The click
         // should select that row before activating it, even though Quit was
         // selected on the previous frame.
-        world.entity_mut(hover).insert(MenuRow(1));
+        world.entity_mut(hover).insert(MenuRow(2));
         world.entity_mut(hover).insert(Interaction::Pressed);
         world.run_system_once(input).expect("the menu did not run");
         assert_eq!(world.resource::<MenuState>().page, Page::Options);
+    }
+
+    /// Every level the game has is reachable from the menu. The page lists them
+    /// by hand, which is the sort of list that quietly falls one behind.
+    #[test]
+    fn the_level_page_offers_every_level() {
+        let listed: Vec<LevelId> = Page::Levels
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                Item::Level(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(listed, LevelId::ALL.to_vec());
+    }
+
+    /// The path the request describes: Escape, into the level list, choose the
+    /// planet. The menu asks for it and then holds the world still, because
+    /// nothing has been loaded yet.
+    #[test]
+    fn choosing_a_level_asks_for_it_and_waits() {
+        let mut world = paused();
+        press(&mut world, KeyCode::Escape);
+        press(&mut world, KeyCode::ArrowDown);
+        press(&mut world, KeyCode::Enter);
+        assert_eq!(world.resource::<MenuState>().page, Page::Levels);
+
+        press(&mut world, KeyCode::ArrowDown);
+        assert_eq!(
+            world.resource::<MenuState>().selected(),
+            Item::Level(LevelId::Planet)
+        );
+        press(&mut world, KeyCode::Enter);
+        // The switch has not run yet, so nothing is loading and nothing has
+        // changed: the menu must not read that as the planet having arrived.
+        world.resource_mut::<LevelLoad>().pending = Some(LevelId::Planet);
+        let asked: Vec<LevelId> = world
+            .resource_mut::<Messages<LoadLevel>>()
+            .drain()
+            .map(|LoadLevel(id)| id)
+            .collect();
+        assert_eq!(asked, vec![LevelId::Planet], "nothing asked for the planet");
+        let menu = world.resource::<MenuState>();
+        assert!(menu.open, "the menu let go before the level arrived");
+        assert_eq!(menu.loading(), Some(LevelId::Planet));
+
+        // Escape does not get you out of a load, because the world behind the
+        // menu has no ground in it yet.
+        press(&mut world, KeyCode::Escape);
+        assert!(world.resource::<MenuState>().open);
+
+        // The level arrives; the menu gets out of the way of it and takes the
+        // cursor with it.
+        world.insert_resource(LevelLoad::default());
+        world.insert_resource(LevelId::Planet);
+        world.run_system_once(input).expect("the menu did not run");
+        let menu = world.resource::<MenuState>();
+        assert!(!menu.open, "the menu stayed up over a level that had arrived");
+        assert_eq!(menu.loading(), None);
+        assert_eq!(cursor(&mut world).grab_mode, CursorGrabMode::Locked);
+    }
+
+    /// A level that will not load leaves the menu open on the list, so the row
+    /// the player chose does not merely appear to do nothing.
+    ///
+    /// This is the exact shape of the bug that shipped: the packaged Windows
+    /// build had the planet in its menu and no glTF for it, the load failed,
+    /// the castle went back up and the menu shut as though nothing had
+    /// happened.
+    #[test]
+    fn a_level_that_will_not_load_says_so_instead_of_shutting_the_menu() {
+        let mut world = paused();
+        press(&mut world, KeyCode::Escape);
+        press(&mut world, KeyCode::ArrowDown);
+        press(&mut world, KeyCode::Enter);
+        press(&mut world, KeyCode::ArrowDown);
+        press(&mut world, KeyCode::Enter);
+        world.resource_mut::<LevelLoad>().pending = Some(LevelId::Planet);
+        assert_eq!(world.resource::<MenuState>().loading(), Some(LevelId::Planet));
+
+        // The load gives up and the castle stays where it was.
+        {
+            let mut load = world.resource_mut::<LevelLoad>();
+            load.pending = None;
+            load.failed = Some("bevy/planet.glb did not load".into());
+        }
+        world.run_system_once(input).expect("the menu did not run");
+        let menu = world.resource::<MenuState>();
+        assert!(menu.open, "the menu shut on a level that never arrived");
+        assert_eq!(menu.page, Page::Levels, "and it shut the list too");
+        assert_eq!(menu.loading(), None);
+
+        // And the list is usable again: the row can be chosen a second time
+        // rather than the menu being stuck on the complaint.
+        press(&mut world, KeyCode::ArrowDown);
+        press(&mut world, KeyCode::Enter);
+        let menu = world.resource::<MenuState>();
+        assert!(menu.open);
+        assert_eq!(menu.loading(), Some(LevelId::Planet));
+    }
+
+    /// Choosing the level already being played is choosing to get on with it,
+    /// rather than reloading the world out from under the player.
+    #[test]
+    fn choosing_the_level_you_are_on_just_resumes() {
+        let mut world = paused();
+        press(&mut world, KeyCode::Escape);
+        press(&mut world, KeyCode::ArrowDown);
+        press(&mut world, KeyCode::Enter);
+        press(&mut world, KeyCode::Enter);
+        assert!(!world.resource::<MenuState>().open);
+        assert!(world.resource_mut::<Messages<LoadLevel>>().is_empty());
     }
 }

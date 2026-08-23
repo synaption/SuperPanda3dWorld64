@@ -89,7 +89,9 @@ what `asset_path()` in `src/main.rs` chooses between.
 ```
 src/
   main.rs        app setup, schedules, the scene, character switching
-  level.rs       the level blob: geometry, collision, the 16x16 query grid
+  world.rs       which level is up: the catalogue, the switch, the planet load
+  level.rs       collision: the castle's X/Z grid and the planet's face grid
+  gravity.rs     which way is down -- flat, or towards the middle of a planet
   player.rs      both characters' controllers, the water medium, combat state
   camera.rs      the third-person aiming camera: look, follow, boom, occlusion
   input.rs       keyboard, mouse and pad merged into one latched snapshot
@@ -183,19 +185,110 @@ as the scale half.
 
 ## The level
 
-The castle grounds arrive as one blob, `assets/bevy/castle.bin`, embedded in
-the binary with `include_bytes!` — so the game needs neither Python nor numpy
-to start, and the level cannot go missing. It carries the render mesh, the
+There are two, and the pause menu's **Level** page chooses between them. What a
+level is, in this port, is three things: something to draw, something to
+collide with, and a direction for down. `world.rs` owns all three, and
+everything it spawns carries a `LevelEntity` marker so that changing level is
+one despawn rather than a list somebody has to keep up to date.
+
+### The castle grounds
+
+The castle arrives as one blob, `assets/bevy/castle.bin`, embedded in the
+binary with `include_bytes!` — so the game needs neither Python nor numpy to
+start, and the level cannot go missing. It carries the render mesh, the
 collision triangles and their surface types, the water boxes and the tree
 placements. `assets/bevy/castle.glb` is the same level as textured geometry.
 
-Static collision is partitioned into a 16×16 X/Z grid built at load time, so
+Static collision is partitioned into a 64×64 X/Z grid built at load time, so
 floor, wall and camera queries inspect only nearby triangles instead of all
 879.
 
 Castle walls occlude the camera and block actors. The warp pipes are drawn but
 not collided with — the level's own collision is all the physics reads, and the
 actors' `collision.inc.c` is not loaded, so you can walk through one.
+
+### The planet
+
+`assets/bevy/planet.glb` is the generated planet from
+[`experimental/planet_gen`](../experimental/planet_gen/readme.md): a cube-sphere
+about 300 m in radius with ±40 m of terrain on it, 786,432 triangles across 96
+tiles. Its collision **is** its render mesh, read back out of the glTF once
+Bevy has finished loading it. That is why choosing it is a wait rather than a
+frame: the pause menu stays up saying `LOADING PLANET` and, because the menu
+being open is what holds the simulation still, the player is not falling
+through an empty world meanwhile.
+
+Nothing else is on it yet — no enemies, no pipes, no water, no crowd. Those all
+assume a flat level in ways that are described below, and none of that work is
+needed to walk around a planet.
+
+#### Filing collision on a sphere
+
+The X/Z grid cannot be reused, and not as a matter of tuning. Project a sphere
+onto X/Z and the far side lands on top of the near side: every cell holds two
+hemispheres, and the highest surface in the column is on the wrong one. So a
+planet is filed by the **cube-sphere face cell** a direction points through —
+six faces, 96×96 cells each, about five metres on a side. A cell is a patch of
+surface again, and every query is the shape it always was.
+
+Two details in `level.rs` are load-bearing and neither is obvious:
+
+- **Triangles are filed by sampling, not by their corners.** Corners alone are
+  enough for this planet, whose terrain triangles are under two metres across
+  against a five-metre cell, and that is exactly the sort of thing that stops
+  being true when someone exports at a coarser depth or drops in an authored
+  tile with one big flat face. The sample spacing comes off the triangle's own
+  angular size, so a small triangle still costs three samples.
+- **Slivers are thrown away.** A mesh's poles are often several vertices that
+  ought to be one point and, in `f32` hundreds of metres from the origin, are
+  not. The triangles between them are metres long and microns wide. Their
+  normal normalises perfectly well, so a zero-area test does not see them, and
+  the determinant in the ray test — which exists to reject exactly this — comes
+  out thousands of times its own epsilon. The symptom is a ray straight down
+  reporting a hit two thirds of the way to the core, which is to say an
+  invisible floor in the middle of the world.
+
+Queries cross a face seam by perturbing the query direction and re-filing it,
+rather than by a neighbour table: the perturbed direction lands on whichever
+face is actually next door, which is the same answer a table would give and one
+fewer thing to keep correct.
+
+## Gravity
+
+`gravity.rs` is one resource with two shapes: `Down`, where up is `+Y`
+everywhere, and `Radial`, where up is away from a point. Everything that used
+to read `.y` asks it instead — the player's fall and jump, the floor and
+ceiling queries, the wall push-out, which way the character faces, and the
+camera's orbit.
+
+The strength is unchanged and is the original's: `app/main.py` stepped −1.2
+onto a body's speed every frame at 30 Hz, which is 36 m/s². It is now written
+as the rate it always was, so that pointing it somewhere else does not also
+change it.
+
+Three parts of the generalisation are worth knowing about.
+
+**The player's velocity is split, not rewritten.** Each tick it is separated
+into how fast he is climbing away from the ground and how fast he is running
+along it; the climb is carried by hand to the bottom of the tick and put back
+once. Between the two there is a wall resolution that changes the run and must
+not touch the climb.
+
+**The character is stood upright before he is turned.** On a flat level that
+step does nothing — up never moves, so re-deriving the rotation from it gives
+the same rotation back. On a planet it is what keeps him perpendicular to the
+ground rather than leaning further over the further he walks.
+
+**The camera carries its frame rather than rebuilding it.** `FollowCamera` owns
+a quaternion that yaw and pitch are measured in, and each frame it is turned by
+the smallest rotation taking its own up onto the local one. Rebuilding it from
+scratch — `Quat::from_rotation_arc(Vec3::Y, up)` — has no answer at the antipode
+of `+Y` and an arbitrary one near it, so walking towards a planet's south pole
+would spin the view faster and faster and then flip it over. Turning by the
+step between two consecutive frames never asks that question.
+
+On the castle every one of these is the identity and the arithmetic is the
+arithmetic it was before, which is what the collision and movement tests assert.
 
 ## Animation
 
@@ -450,13 +543,24 @@ gameplay tick.
 
 ## The pause menu and the internal render resolution
 
-Escape pauses the game and opens a menu — Resume, Options, Quit — with the
-display settings one page in. Escape goes back a page and closes it from the
+Escape pauses the game and opens a menu — Resume, Level, Options, Quit — with
+the level list and the display settings one page in each. Escape goes back a page and closes it from the
 root, so the key that opened it is the key that gets out of it whatever page
 you wandered into. It is keyboard-driven (arrows or `WASD`, Enter, and
 left/right to change a value) and the pad drives the same rows with the d-pad,
 south and east; Select opens it, because Start already swaps character. Opening
 it hands the mouse cursor back and resuming captures it again.
+
+The **Level** page lists every level in `world::LevelId`, with the one being
+played marked, and choosing one takes the world down and puts that one up. It
+is the one page that does more than set a number, and the one whose rows are
+generated rather than written out: a level added to the catalogue appears in
+the menu without anyone having to remember the page exists. A level that cannot
+arrive in one frame — the planet, whose collision is 14 MB of glTF — keeps the
+menu up while it loads, and the menu swallows every key until it is done. That
+is not politeness: the menu being open is what holds the simulation still, and
+closing it early is the player falling through a world with no ground in it
+yet.
 
 **The world is not drawn to the window.** It is drawn into an image, and a
 second camera stretches that image over the window with a nearest-neighbour
@@ -815,18 +919,29 @@ a packaged build that starts, runs, and is quietly missing something, saying so
 only on a stderr that a `windows_subsystem = "windows"` build has nobody
 attached to.
 
-It has now happened twice. `display.rs` guards the UI render plugin against it
-with a compile-time trick, and the impostor sheets were caught only after they
-had shipped: the packaged game drew *no distant enemies at all*, so enemies
-appeared out of nothing as you walked towards them, while every test passed
-because tests read the source tree.
+It has now happened three times. `display.rs` guards the UI render plugin
+against it with a compile-time trick; the impostor sheets were caught only after
+they had shipped, so the packaged game drew *no distant enemies at all* and
+enemies appeared out of nothing as you walked towards them; and the planet was
+caught by the person playing it — the packaged build had the level in its menu
+and no glTF for it, so choosing it loaded nothing, put the castle back and shut
+the menu, which from the outside is a menu row that does nothing. Every test
+passed each time, because tests read the source tree.
 
 Two guards came out of that, and anything new under `assets/` wants both:
 
-- a test that reads `build_windows.sh` and asserts the path is in it
-  (`impostor::tests::the_windows_package_ships_the_sheets`)
+- a test that reads `build_windows.sh` and asserts the asset will be copied
+  (`impostor::tests::the_windows_package_ships_the_sheets`,
+  `world::tests::the_windows_package_ships_every_level`)
 - a count on the corner readout of enemies drawn by *neither* path, so a missing
   atlas shows up in the game as `… / 704 UNDRAWN` rather than as a mystery
+
+Where the script can derive the list from the source rather than repeating it,
+it does — the weapons, the sound samples and now the levels are all grepped out
+of the module that names them, because a list that exists once cannot drift. A
+level that fails to load also says so on the pause menu now, which is the same
+lesson applied to the runtime: the report used to go only to the console, and
+nobody has the console open at the moment they choose a level.
 
 ### Measuring it
 

@@ -7,7 +7,18 @@ against the ported SM64 physics on the same level.
 
 The current build includes the castle grounds, water, enemies, warp pipes, a
 Mario squad, sound effects, a third-person aiming camera, keyboard/mouse and
-gamepad input, a pause menu with display settings, and a debug console.
+gamepad input, a pause menu with level selection and display settings, and a
+debug console.
+
+There is a second level, and it is round. The pause menu's **Level** page also
+offers the generated planet from
+[`experimental/planet_gen`](experimental/planet_gen/readme.md) — 300 m across,
+786,432 triangles of terrain, and gravity pointing at the middle of it. Walking
+far enough turns the ground over under your feet and takes you back where you
+started. Its collision is its render mesh, read out of the glTF as it loads, so
+choosing it is a short wait rather than a frame. See
+[The level](docs/project-guide.md#the-level) and
+[Gravity](docs/project-guide.md#gravity).
 
 Crowds are the thing it is built around. `crowd 4000 mix` in the console puts
 four thousand enemies on the lawn: the nearest couple of hundred are simulated
@@ -17,10 +28,10 @@ draw calls and no level queries at all. See the
 [performance notes](docs/project-guide.md#performance) for how it works and how
 to measure it.
 
-Escape pauses the game and opens the menu; its display page changes the
-internal render resolution, which is the world's own resolution rather than the
-window's — the setting that buys frame rate, and the one that puts the
-console's pixels back.
+Escape pauses the game and opens the menu; its level page swaps between the
+castle and the planet, and its display page changes the internal render
+resolution, which is the world's own resolution rather than the window's — the
+setting that buys frame rate, and the one that puts the console's pixels back.
 
 ## Run the project
 

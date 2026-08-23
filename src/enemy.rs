@@ -1482,7 +1482,9 @@ pub fn spread(
                 true => moved,
                 false => body.at,
             },
-            false => level.resolve_walls(moved, body.radius, body.height),
+            // `Vec3::Y` and not `body.up`: the branch above has already
+            // sent every enemy standing on anything else away.
+            false => level.resolve_walls(moved, Vec3::Y, body.radius, body.height),
         }
     };
     for (index, (entity, _, mut transform, _, _)) in enemies.iter_mut().enumerate() {

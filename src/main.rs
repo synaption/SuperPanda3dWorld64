@@ -16,6 +16,7 @@ mod console;
 mod display;
 mod enemy;
 mod flow;
+mod gravity;
 mod impostor;
 mod input;
 mod level;
@@ -28,6 +29,7 @@ mod shot;
 mod squad;
 mod water;
 mod weapon;
+mod world;
 
 use bevy::{
     core_pipeline::tonemapping::Tonemapping,
@@ -163,15 +165,17 @@ fn main() {
     // `cargo run --release -- screenshot out.png [crowd] [x,y,z] [look x,y,z]`,
     // which is the only way to see this game on a machine with no display.
     if arguments.first().map(String::as_str) == Some("screenshot") {
-        let triple = |word: Option<&String>, fallback: Vec3| -> Vec3 {
-            let Some(word) = word else { return fallback };
-            let parts: Vec<f32> = word
+        // `None` rather than a default, because where the default *is* depends
+        // on the level: the castle's is a fixed view down the path, and a
+        // planet's is wherever the load happened to put the player down.
+        let triple = |word: Option<&String>| -> Option<Vec3> {
+            let parts: Vec<f32> = word?
                 .split(',')
                 .filter_map(|part| part.trim().parse().ok())
                 .collect();
             match parts[..] {
-                [x, y, z] => Vec3::new(x, y, z),
-                _ => fallback,
+                [x, y, z] => Some(Vec3::new(x, y, z)),
+                _ => None,
             }
         };
         let path = arguments
@@ -179,8 +183,8 @@ fn main() {
             .cloned()
             .unwrap_or_else(|| "screenshot.png".into());
         let crowd = arguments.get(2).and_then(|n| n.parse().ok()).unwrap_or(0);
-        let eye = triple(arguments.get(3), Vec3::new(-13.0, 8.0, 60.0));
-        let at = triple(arguments.get(4), Vec3::new(-13.0, 3.0, 46.0));
+        let eye = triple(arguments.get(3));
+        let at = triple(arguments.get(4));
         shot::run(std::path::Path::new(&path), crowd, eye, at);
         return;
     }
@@ -266,6 +270,14 @@ pub fn game_resources(app: &mut App) {
         .init_resource::<impostor::ImpostorStats>()
         .init_resource::<weapon::Loadout>()
         .init_resource::<aim::Aim>()
+        // Which level is up, which one is on its way, where the player starts
+        // on it, and which way is down. All four used to be constants, and
+        // three of them were literals repeated at their use sites.
+        .init_resource::<world::LevelId>()
+        .init_resource::<world::LevelLoad>()
+        .init_resource::<world::Respawn>()
+        .init_resource::<gravity::Gravity>()
+        .add_message::<world::LoadLevel>()
         .insert_resource(Time::<Fixed>::from_hz(30.0));
 }
 
@@ -423,6 +435,12 @@ fn overlay() -> ScheduleConfigs<ScheduleSystem> {
         // After the console's, which resumes everything the frame it closes:
         // a menu open over a closed console still holds the world still.
         menu::pause_animations,
+        // Both out here rather than in `simulation`, because the menu that
+        // asks for a level is open at the time and `simulation` is held still
+        // while it is. `finish_planet` follows `switch` so that a planet asked
+        // for this frame is one frame further along by the end of it.
+        world::switch,
+        world::finish_planet,
         // Out here rather than in `simulation` because the console is open at
         // the moment a `crowd` command is typed, and a field that only arrived
         // once you shut the console is a field you never saw arrive.
@@ -465,6 +483,7 @@ fn setup(
     mut sprites: ResMut<Assets<n64::N64Material>>,
     mut images: ResMut<Assets<Image>>,
     mut console: ResMut<console::ConsoleState>,
+    mut load: ResMut<world::LevelLoad>,
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
     // Made before anything that refers to it: the world camera draws into it,
@@ -472,11 +491,6 @@ fn setup(
     // the window on the first frame.
     let scene_target = display::create_target(&mut images);
     commands.insert_resource(SceneTarget(scene_target.clone()));
-    let (collision, render) = level::load();
-    // Surveyed here, once, off the collision that was just loaded: every floor
-    // query the distant crowd will ever ask is answered in this call and never
-    // again.
-    commands.insert_resource(flow::FlowField::new(&collision));
     let shadow_art = shadow::prepare(&mut meshes, &mut images, &mut materials);
     impostor::prepare(
         &mut commands,
@@ -491,31 +505,21 @@ fn setup(
         &asset_path(),
     );
     commands.insert_resource(shadow_art);
-    water::spawn(
+    squad::spawn_circle(&mut commands, &mut meshes, &mut materials);
+    commands.insert_resource(animation::CharacterAnimations::load(&assets));
+    audio::preload(&mut commands, &assets);
+    // The level itself -- its collision, its gravity, its scenery and its
+    // inhabitants -- and nothing else here knows which one it is. Everything
+    // below this line outlives a level and is never respawned when one changes.
+    world::spawn(
+        world::LevelId::default(),
         &mut commands,
         &assets,
         &mut meshes,
         &mut materials,
-        &collision,
+        &mut load,
     );
-    squad::spawn_circle(&mut commands, &mut meshes, &mut materials);
-    commands.insert_resource(animation::CharacterAnimations::load(&assets));
-    audio::preload(&mut commands, &assets);
-    commands.insert_resource(collision);
-    commands.spawn(WorldAssetRoot(assets.load("bevy/castle.glb#Scene0")));
-    for position in render.trees {
-        commands.spawn((
-            // bhvTree is CYLBOARD in the original: it turns to face the camera
-            // about the vertical. Without it the trees are flat cards seen
-            // from one fixed side, and the mesh is exactly zero thick, so from
-            // ninety degrees away there is nothing there at all.
-            billboard::BillboardAxis,
-            billboard::BillboardActor,
-            WorldAssetRoot(assets.load("actors/tree.glb#Scene0")),
-            Transform::from_translation(position).with_scale(Vec3::splat(0.01)),
-        ));
-    }
-    let spawn = Transform::from_xyz(-13.28, 3.0, 46.64);
+    let spawn = Transform::from_translation(world::CASTLE_SPAWN);
     commands.insert_resource(RenderPose {
         translation: spawn.translation,
         rotation: spawn.rotation,
@@ -560,47 +564,6 @@ fn setup(
         Transform::from_scale(Vec3::splat(0.00667)),
     ));
 
-    let spawns = [
-        (enemy::Kind::Slime, Vec3::new(-3., 3., 26.)),
-        (enemy::Kind::Slime, Vec3::new(-24., 3., 29.)),
-        (enemy::Kind::Slime, Vec3::new(9., 3., 34.)),
-        (enemy::Kind::Ant, Vec3::new(-29., 3., 21.)),
-        (enemy::Kind::Ant, Vec3::new(4., 3., 19.)),
-    ];
-    for (i, (kind, position)) in spawns.into_iter().enumerate() {
-        enemy::spawn(&mut commands, &assets, kind, position, i as f32);
-    }
-    // The three pipes and what each produces, from `PIPE_SPAWNS` in
-    // `app/main.py`: one by the spawn on the castle path that produces company,
-    // and one in each far corner of the map that produces enemies -- so the two
-    // enemy pipes are somewhere to go rather than something to trip over on the
-    // way out of the gate. Every pipe's countdown runs at any distance, so a
-    // crowd is waiting when the player arrives rather than only starting to
-    // fill then.
-    //
-    // The pipes are drawn but not collided with: the level's own collision is
-    // what the physics reads and nothing here adds to it, so a pipe is scenery
-    // that you can walk through and that things come out of.
-    let pipes = [
-        (pipe::Spawn::Mario, Vec3::new(-9.15, 2.6, 46.3)),
-        (
-            pipe::Spawn::Enemy(enemy::Kind::Slime),
-            Vec3::new(-55.1, 5.4, -39.2),
-        ),
-        (
-            pipe::Spawn::Enemy(enemy::Kind::Ant),
-            Vec3::new(46.8, 5.4, -68.1),
-        ),
-    ];
-    for (index, (spawns, position)) in pipes.into_iter().enumerate() {
-        commands.spawn((
-            // The enemy pipes have their interval overwritten from the console
-            // every tick; the Mario pipe keeps the one it is given.
-            pipe::WarpPipe::new(spawns, pipe::MARIO_INTERVAL, index as f32),
-            WorldAssetRoot(assets.load("actors/warp_pipe.glb#Scene0")),
-            Transform::from_translation(position).with_scale(Vec3::splat(0.01)),
-        ));
-    }
     // No light entity and no ambient resource: every surface in the world is
     // drawn by `n64::N64Material`, which carries its own key and ambient terms
     // and reads neither. `n64::N64Lighting` is where the sun lives now.
@@ -618,14 +581,7 @@ fn setup(
             far: 1000.0,
             ..default()
         }),
-        FollowCamera {
-            yaw: 0.0,
-            pitch: -0.2,
-            distance: 9.5,
-            // Starts fully extended: the first frame eases in from wherever the
-            // level actually leaves room, rather than out from the player's head.
-            clearance: 1.0,
-        },
+        FollowCamera::default(),
         // N64 colours are already display-referred bytes. Filmic HDR grading
         // would alter their contrast, saturation, and hue a second time.
         Tonemapping::None,
@@ -882,7 +838,12 @@ mod tests {
     /// and clips never finish loading and the systems that wait on them take
     /// their not-ready path -- which is the same path they take on the first
     /// frames of the real game.
-    fn headless() -> App {
+    ///
+    /// Crate-visible because [`crate::world`]'s planet test needs the same
+    /// game with a glTF loader bolted on: it is the one test whose subject is
+    /// what happens *after* an asset arrives, and it must not be testing a
+    /// second hand-written copy of this list.
+    pub(crate) fn headless() -> App {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             // Input has no window behind it here; the resources exist and read
@@ -908,6 +869,13 @@ mod tests {
             .init_asset::<AnimationGraph>()
             .init_asset::<Image>()
             .init_asset::<bevy::gltf::Gltf>()
+            // The planet's collision is read back out of a loaded glTF, so
+            // `world::finish_planet` asks for the meshes inside one. Nothing
+            // ever finishes loading here, which is the not-ready path it takes
+            // on the real game's first frames -- but the store has to exist for
+            // the system to be allowed to run at all.
+            .init_asset::<bevy::gltf::GltfMesh>()
+            .init_asset::<bevy::gltf::GltfNode>()
             // A test loop runs far faster than real time, so without this the
             // clock would barely advance and the fixed step would never tick:
             // the simulation would go unexercised while the test still passed.
@@ -1367,6 +1335,10 @@ mod tests {
             .init_resource::<input::InputState>()
             .init_resource::<menu::MenuState>()
             .init_resource::<display::DisplaySettings>()
+            // The menu's level page asks for levels, and reads which one is up.
+            .init_resource::<world::LevelId>()
+            .init_resource::<world::LevelLoad>()
+            .add_message::<world::LoadLevel>()
             .add_systems(PreUpdate, input_pipeline());
         app.edit_schedule(PreUpdate, |schedule| {
             schedule.set_build_settings(ScheduleBuildSettings {

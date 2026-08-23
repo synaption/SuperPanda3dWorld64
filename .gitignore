@@ -4,9 +4,10 @@
 /reference/
 
 # assets/ IS tracked -- see README, "Assets". It holds only what the game
-# actually loads (~8.5 MB), so a clone runs without the 12 GB of reference
-# material. Everything in it is derived from Nintendo's game data; see the
-# note there before publishing this repository anywhere.
+# actually loads (~23 MB, of which the generated planet's glTF is 14), so a
+# clone runs without the 12 GB of reference material. Everything in it except
+# the planet is derived from Nintendo's game data; see the note there before
+# publishing this repository anywhere.
 #
 # Converter scratch that is not loaded at runtime:
 /assets/**/*.tmp

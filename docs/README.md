@@ -11,13 +11,17 @@ with the page that matches what you want to do:
   toolchain, the optional sound and gamepad features, and the Windows
   cross-build.
 - [Controls](project-guide.md#controls) — keyboard, mouse, and gamepad input.
-- [Pause menu and render resolution](project-guide.md#the-pause-menu-and-the-internal-render-resolution)
-  — Escape, the display settings, and how the world is drawn.
+- [Pause menu, levels and render resolution](project-guide.md#the-pause-menu-and-the-internal-render-resolution)
+  — Escape, choosing a level, the display settings, and how the world is drawn.
 - [Debug console](project-guide.md#the-debug-console) — in-game inspection and
   live tuning.
 
 ## Gameplay and design
 
+- [The level](project-guide.md#the-level) — the castle grounds and the planet,
+  and how collision is filed on each.
+- [Gravity](project-guide.md#gravity) — flat down, down towards the middle of a
+  planet, and what had to change to have both.
 - [Timing and the port](project-guide.md#timing-and-the-port) — the fixed 30 Hz
   tick, latched input, and the original quirks kept on purpose.
 - [Water](project-guide.md#water) — the surface sheets, the underwater view,

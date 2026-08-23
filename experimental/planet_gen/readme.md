@@ -398,7 +398,7 @@ vertical, and a wall you are pushed out of otherwise. About 45.6 degrees.
 **On a sphere, "vertical" is the radial direction, not `+Y`.** The generator
 classifies with `dot(normal, radial) > 0.7`. The runtime currently tests
 `normal.y` directly, which is correct for a flat level and wrong for a planet;
-see [Bevy, later](#bevy-later).
+see [Bevy, now](#bevy-now).
 
 Each triangle gets a surface type from the material table, written alongside
 the collision mesh. The table is a small committed file listing the handful of
@@ -594,22 +594,39 @@ by eye:
 
 Tests live in `tests/` and run under plain `python3`, no Blender.
 
-## Bevy, later
+## Bevy, now
 
-Nothing below is built now, but the tile data is specified so that none of it
-requires regenerating anything.
+The game loads this planet. `out/planet.glb` is copied to
+`assets/bevy/planet.glb` by the `planet` stage of
+[`tools/build_assets.py`](../../tools/build_assets.py), and the pause menu's
+level page puts it up. What the game does with it:
 
-- Each tile emits a collision mesh with per-triangle surface types alongside
-  its render mesh, in the same `.npz`.
-- The level blob format in [`src/level.rs`](../../src/level.rs) is one level.
-  A planet needs per-tile blobs and streaming; the current
-  `include_bytes!` embed does not scale to 96 of them.
-- The 16x16 collision grid is sized for one level. A tile needs its own
-  partition, or none at all — a 65x65 tile is small enough to test linearly.
-- `GROUND_NORMAL_Y` is tested against `normal.y`. On a planet it must become
-  `dot(normal, radial)`. Same constant, different up.
-- Gravity toward the core is the game's problem and is explicitly out of
-  scope here.
+- **Collision is the render mesh.** No separate collision export and no blob:
+  [`src/world.rs`](../../src/world.rs) reads the vertices and indices back out
+  of the loaded glTF and hands them to `LevelData::planet`. The
+  `include_bytes!` embed in [`src/level.rs`](../../src/level.rs) was never
+  going to scale to 786,432 triangles, and this needs it not to.
+- **The collision grid is a cube-sphere face grid**, 96x96 cells on each of the
+  six faces, filed by the direction a triangle points rather than by `(x, z)`.
+  The flat grid could not be reused: projected onto `(x, z)` the far side of a
+  planet lands on top of the near side.
+- **`GROUND_NORMAL_Y` is tested against `dot(normal, up)`**, exactly as
+  predicted below, where `up` is handed in by the gravity resource. Same
+  constant, different up.
+- **Gravity towards the core exists**, and is one resource with two shapes:
+  [`src/gravity.rs`](../../src/gravity.rs).
+
+Still not built, and still specified so that none of it needs a regenerate:
+
+- Per-tile collision meshes with surface types in the `.npz`. The game
+  classifies a surface from the triangle's own normal instead, which is enough
+  to tell floor from wall and nothing more.
+- Streaming. All 96 tiles load at once, which is 14 MB of glTF and a visible
+  pause on the level change.
+- Water. Nothing is drawn over the basins, so the ocean floor is walkable
+  ground the player can stroll across.
+- Anything living on it. Enemies, pipes, the squad and the far-crowd flow field
+  all assume a flat level; none of that was needed to walk around a planet.
 
 ## Open questions
 

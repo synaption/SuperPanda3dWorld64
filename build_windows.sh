@@ -53,8 +53,23 @@ mkdir -p \
 
 cp "$REPO_ROOT/target/$WINDOWS_TARGET/release/super-bevy-world-64.exe" \
     "$DIST_DIR/SuperBevyWorld64.exe"
-cp "$REPO_ROOT/assets/bevy/castle.glb" "$REPO_ROOT/assets/bevy/water.png" \
-    "$DIST_DIR/assets/bevy/"
+cp "$REPO_ROOT/assets/bevy/water.png" "$DIST_DIR/assets/bevy/"
+# The levels, read out of `world::LevelId::scene` rather than listed here, for
+# exactly the reason the weapons below are.
+#
+# They drifted the day the planet was added: the executable had the level in its
+# menu and the package had no glTF for it, so choosing it loaded nothing, put
+# the castle back, and said so only to a stderr that a
+# `windows_subsystem = "windows"` build has nobody attached to. What that looks
+# like from the outside is a menu row that does nothing.
+while read -r scene; do
+    [[ -n "$scene" ]] || continue
+    mkdir -p "$DIST_DIR/assets/$(dirname "$scene")"
+    cp "$REPO_ROOT/assets/$scene" "$DIST_DIR/assets/$scene"
+# The pattern insists on a directory component: `world.rs` also contains the
+# bare suffix `".glb"`, in the test that asserts every level names a scene.
+done < <(grep -o '"[A-Za-z0-9_]\+/[A-Za-z0-9_/]*\.glb"' "$REPO_ROOT/src/world.rs" \
+    | tr -d '"' | sort -u)
 cp \
     "$REPO_ROOT/assets/actors/tree.glb" \
     "$REPO_ROOT/assets/actors/warp_pipe.glb" \

@@ -4,9 +4,47 @@ use bevy::prelude::*;
 pub struct LevelData {
     pub water_boxes: Vec<WaterBox>,
     triangles: Vec<CollisionTriangle>,
-    cells: Vec<CollisionCell>,
-    grid_min: Vec2,
-    grid_cell: Vec2,
+    index: Index,
+}
+
+/// How a level's collision is filed, which is the same question as which way
+/// up runs across it.
+///
+/// A flat level is filed by `(x, z)`, because a column of world over one point
+/// of the ground holds a handful of triangles and every query is "what is
+/// under me". A planet cannot be: project one onto `(x, z)` and the far side
+/// lands on top of the near side, so every column holds two hemispheres and
+/// the highest surface in it is on the wrong one. Filed by the cube-sphere
+/// face a direction points through, a cell is a patch of *surface* again and
+/// the query is the same shape it was.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Shape {
+    /// Up is `+Y` everywhere.
+    Flat,
+    /// Up is away from `centre`. `radius` is the sea-level radius, which is
+    /// what the void test below the terrain is measured against rather than
+    /// anything the collision itself needs.
+    Planet { centre: Vec3, radius: f32 },
+}
+
+/// The spatial index, one variant per [`Shape`].
+enum Index {
+    Flat {
+        cells: Vec<CollisionCell>,
+        /// World position of the low corner of cell `(0, 0)`.
+        min: Vec2,
+        /// Metres along each side of one cell.
+        cell: Vec2,
+    },
+    Planet {
+        centre: Vec3,
+        radius: f32,
+        /// One list of triangles per face cell, `face * FACE_GRID * FACE_GRID`
+        /// plus the cell within the face. No floor/wall split, because on a
+        /// planet that split depends on where the triangle is and cannot be
+        /// decided when it is filed.
+        cells: Vec<Vec<u32>>,
+    },
 }
 
 /// Cells across the collision grid, in each of the two horizontal axes.
@@ -28,10 +66,44 @@ const WALL_GRID_MARGIN: f32 = 1.0;
 
 /// How far off horizontal a triangle may lean and still be ground rather than
 /// wall. Anything at or below this is something you are pushed out of instead
-/// of something you stand on, which is the split [`LevelData::build_grid`] has
-/// always sorted the collision by; naming it lets [`LevelData::ground_at`] ask
+/// of something you stand on, which is the split [`LevelData::new`] has always
+/// sorted the flat collision by; naming it lets [`LevelData::ground_at`] ask
 /// the same question rather than a second, differently drawn one.
+///
+/// The `_Y` in the name is now half true. A flat level measures the lean
+/// against `+Y` once, when the grid is built, because `+Y` is the same
+/// everywhere on it. A planet measures the same number against the local up in
+/// [`LevelData::walls_near`], because the same triangle is a floor on one side
+/// of a world and a ceiling on the other. Same constant, different up.
 pub const GROUND_NORMAL_Y: f32 = 0.7;
+
+/// Cells along one side of each of a planet's six cube-sphere faces.
+///
+/// 96 puts a cell at about five metres on the 300 m planet `planet_gen`
+/// writes, which is three of its terrain triangles across -- the same ratio
+/// [`GRID_WIDTH`] lands on for the castle, and for the same reason: fine enough
+/// that a cell is a handful of triangles, coarse enough that filing a triangle
+/// into it is one cell rather than nine.
+const FACE_GRID: usize = 96;
+
+/// How much arc one face cell spans, in radians. A face is a quarter turn
+/// across, whatever the planet's radius is, so this is a property of the grid
+/// and not of the planet.
+const FACE_CELL_ANGLE: f32 = std::f32::consts::FRAC_PI_2 / FACE_GRID as f32;
+
+/// How far below a point a planet's ground query looks before giving up.
+///
+/// It has to be bounded, and on a sphere that is not fussiness: a ray straight
+/// down from the surface leaves through the core and hits the far side, so an
+/// unbounded search finds the ground under someone's feet on the *other*
+/// hemisphere. Generous against the +-40 m of terrain relief, and far short of
+/// the 600 m to the antipode.
+const PLANET_REACH: f32 = 200.0;
+
+/// How far above a point that same query starts, so that standing exactly on
+/// the ground still finds it. The flat grid's equivalent is the `+ 0.5` in
+/// [`LevelData::highest_below`].
+const GROUND_SKIN: f32 = 0.5;
 
 #[derive(Clone, Copy)]
 struct CollisionTriangle {
@@ -191,67 +263,210 @@ impl LevelData {
             Vec2::ONE
         };
         let grid_cell = ((grid_max - grid_min) / GRID_WIDTH as f32).max(Vec2::splat(0.001));
-        let mut level = Self {
-            water_boxes,
-            triangles,
-            cells: vec![CollisionCell::default(); GRID_WIDTH * GRID_WIDTH],
-            grid_min,
-            grid_cell,
+        let mut cells = vec![CollisionCell::default(); GRID_WIDTH * GRID_WIDTH];
+        let coords = |point: Vec2| -> (usize, usize) {
+            let cell = ((point - grid_min) / grid_cell).floor();
+            (
+                (cell.x as isize).clamp(0, GRID_WIDTH as isize - 1) as usize,
+                (cell.y as isize).clamp(0, GRID_WIDTH as isize - 1) as usize,
+            )
         };
-        level.build_grid();
-        level
-    }
-
-    fn build_grid(&mut self) {
-        for (index, tri) in self.triangles.iter().enumerate() {
-            let all_min = self.cell_coords(tri.min);
-            let all_max = self.cell_coords(tri.max);
+        for (index, tri) in triangles.iter().enumerate() {
+            let all_min = coords(tri.min);
+            let all_max = coords(tri.max);
             for z in all_min.1..=all_max.1 {
                 for x in all_min.0..=all_max.0 {
-                    self.cells[z * GRID_WIDTH + x].all.push(index);
+                    cells[z * GRID_WIDTH + x].all.push(index);
                     // floor_height historically accepted either winding and
                     // selects by height, so retain that behavior here.
                     if tri.normal.y.abs() > 0.01 {
-                        self.cells[z * GRID_WIDTH + x].floors.push(index);
+                        cells[z * GRID_WIDTH + x].floors.push(index);
                     }
                 }
             }
             if tri.normal.y.abs() <= GROUND_NORMAL_Y {
                 let margin = Vec2::splat(WALL_GRID_MARGIN);
-                let wall_min = self.cell_coords(tri.min - margin);
-                let wall_max = self.cell_coords(tri.max + margin);
+                let wall_min = coords(tri.min - margin);
+                let wall_max = coords(tri.max + margin);
                 for z in wall_min.1..=wall_max.1 {
                     for x in wall_min.0..=wall_max.0 {
-                        self.cells[z * GRID_WIDTH + x].walls.push(index);
+                        cells[z * GRID_WIDTH + x].walls.push(index);
                     }
                 }
             }
         }
+        Self {
+            water_boxes,
+            triangles,
+            index: Index::Flat {
+                cells,
+                min: grid_min,
+                cell: grid_cell,
+            },
+        }
+    }
+
+    /// Builds collision for a planet: the same triangles, filed by the
+    /// cube-sphere face cells they cover.
+    ///
+    /// Two things are dropped on the way in, and both of them are the sort of
+    /// thing a mesh acquires without anyone meaning it to.
+    ///
+    /// Triangles naming a vertex that does not exist, because collision read
+    /// back out of a glTF is only as sound as the glTF, and an index past the
+    /// end of the array is a panic in the middle of a level load rather than a
+    /// tile that looks slightly wrong.
+    ///
+    /// Triangles with no area to speak of, because they are worse than
+    /// useless: [`degenerate`] has the whole story, and the short version is
+    /// that one of them is an invisible floor in the middle of the world.
+    pub fn planet(vertices: &[Vec3], indices: &[[u32; 3]], centre: Vec3, radius: f32) -> Self {
+        let triangles: Vec<_> = indices
+            .iter()
+            .filter(|tri| tri.iter().all(|&i| (i as usize) < vertices.len()))
+            .map(|tri| {
+                let a = vertices[tri[0] as usize];
+                let b = vertices[tri[1] as usize];
+                let c = vertices[tri[2] as usize];
+                CollisionTriangle {
+                    a,
+                    b,
+                    c,
+                    normal: (b - a).cross(c - a).normalize_or_zero(),
+                    min: Vec2::new(a.x.min(b.x).min(c.x), a.z.min(b.z).min(c.z)),
+                    max: Vec2::new(a.x.max(b.x).max(c.x), a.z.max(b.z).max(c.z)),
+                }
+            })
+            .filter(|tri| !degenerate(tri))
+            .collect();
+        let mut cells = vec![Vec::new(); 6 * FACE_GRID * FACE_GRID];
+        let mut filed = Vec::new();
+        for (index, tri) in triangles.iter().enumerate() {
+            file_triangle(tri, centre, index as u32, &mut filed, &mut cells);
+        }
+        Self {
+            water_boxes: Vec::new(),
+            triangles,
+            index: Index::Planet {
+                centre,
+                radius,
+                cells,
+            },
+        }
+    }
+
+    /// What shape of world this is, and where its middle is if it has one.
+    pub fn shape(&self) -> Shape {
+        match self.index {
+            Index::Flat { .. } => Shape::Flat,
+            Index::Planet { centre, radius, .. } => Shape::Planet { centre, radius },
+        }
+    }
+
+    /// Whether `point` has left the world altogether and wants putting back.
+    ///
+    /// Below the castle's lowest floor on a flat level; inside the core on a
+    /// planet, which is a hundred metres under the deepest terrain the
+    /// generator writes and so cannot be reached by walking into a valley.
+    pub fn out_of_bounds(&self, point: Vec3) -> bool {
+        match self.index {
+            Index::Flat { .. } => point.y < -20.0,
+            Index::Planet { centre, radius, .. } => {
+                (point - centre).length() < radius - PLANET_REACH * 0.5
+            }
+        }
+    }
+
+    fn flat(&self) -> Option<(&[CollisionCell], Vec2, Vec2)> {
+        match &self.index {
+            Index::Flat { cells, min, cell } => Some((cells, *min, *cell)),
+            Index::Planet { .. } => None,
+        }
     }
 
     fn cell_coords(&self, point: Vec2) -> (usize, usize) {
-        let cell = ((point - self.grid_min) / self.grid_cell).floor();
+        let Some((_, min, size)) = self.flat() else {
+            return (0, 0);
+        };
+        let cell = ((point - min) / size).floor();
         (
             (cell.x as isize).clamp(0, GRID_WIDTH as isize - 1) as usize,
             (cell.y as isize).clamp(0, GRID_WIDTH as isize - 1) as usize,
         )
     }
 
+    /// The flat grid's cell at `(x, z)`, or an empty one on a planet -- which
+    /// is what makes every flat-only query answer "nothing here" there rather
+    /// than answering wrongly. See [`Self::ground_below`] for the query the
+    /// planet does answer.
     fn cell(&self, x: f32, z: f32) -> &CollisionCell {
+        static NOTHING: CollisionCell = CollisionCell {
+            floors: Vec::new(),
+            walls: Vec::new(),
+            all: Vec::new(),
+        };
+        let Some((cells, _, _)) = self.flat() else {
+            return &NOTHING;
+        };
         let (x, z) = self.cell_coords(Vec2::new(x, z));
-        &self.cells[z * GRID_WIDTH + x]
+        &cells[z * GRID_WIDTH + x]
+    }
+
+    /// The face cells a query at `point` could find a triangle in.
+    ///
+    /// The three-by-three patch around the point's own cell, clamped to its
+    /// face, plus the cells one cell away along two tangent directions. Those
+    /// last two are the seam: clamping stops at the edge of a face, and a
+    /// player standing on one is a metre from triangles filed on the next face
+    /// along, which no amount of arithmetic *within* a face will ever reach.
+    /// Perturbing the direction and re-filing it lands on the neighbour
+    /// whatever the neighbour happens to be, which is the same trick the
+    /// generator's own neighbour table exists to avoid needing.
+    fn near_cells(&self, point: Vec3, out: &mut Vec<usize>) {
+        out.clear();
+        let Index::Planet { centre, .. } = self.index else {
+            return;
+        };
+        let radial = (point - centre).normalize_or(Vec3::Y);
+        let (face, u, v) = face_uv(radial);
+        let (column, row) = (cell_index(u) as isize, cell_index(v) as isize);
+        let last = FACE_GRID as isize - 1;
+        for down in -1..=1 {
+            for across in -1..=1 {
+                let x = (column + across).clamp(0, last) as usize;
+                let y = (row + down).clamp(0, last) as usize;
+                let cell = (face * FACE_GRID + y) * FACE_GRID + x;
+                if !out.contains(&cell) {
+                    out.push(cell);
+                }
+            }
+        }
+        let (along, across) = radial.any_orthonormal_pair();
+        for offset in [along, -along, across, -across] {
+            let cell = face_cell(radial + offset * FACE_CELL_ANGLE);
+            if !out.contains(&cell) {
+                out.push(cell);
+            }
+        }
     }
 
     /// The horizontal extent of the collision, as `(min, max)`.
     ///
     /// Read by [`crate::flow`] so the crowd's navigation grid covers exactly
     /// the ground that exists, rather than a rectangle picked by hand that
-    /// would have to be corrected every time the level changed.
+    /// would have to be corrected every time the level changed. A planet hands
+    /// back its bounding square: nothing navigates one yet, and a zero-sized
+    /// box would make the field's cell size meaningless rather than merely
+    /// empty.
     pub fn bounds(&self) -> (Vec2, Vec2) {
-        (
-            self.grid_min,
-            self.grid_min + self.grid_cell * GRID_WIDTH as f32,
-        )
+        match self.index {
+            Index::Flat { min, cell, .. } => (min, min + cell * GRID_WIDTH as f32),
+            Index::Planet { centre, radius, .. } => {
+                let middle = Vec2::new(centre.x, centre.z);
+                let reach = Vec2::splat(radius + PLANET_REACH * 0.25);
+                (middle - reach, middle + reach)
+            }
+        }
     }
 
     pub fn water_level(&self, x: f32, z: f32) -> Option<f32> {
@@ -340,6 +555,50 @@ impl LevelData {
         best
     }
 
+    /// The ground under `from`, as the point it is at and the way it slopes.
+    ///
+    /// The query [`Self::floor_height`] is on a flat level, asked in a way a
+    /// planet can answer too: `up` is handed in rather than assumed, the
+    /// answer is a position rather than a height, and the search runs along
+    /// `up` rather than down a column of `(x, z)`.
+    ///
+    /// The two shapes reach the same answer by different routes and that is
+    /// deliberate. Flat keeps the column lookup it has always used, so the
+    /// castle behaves to the millimetre as it did. A planet casts a ray from
+    /// [`GROUND_SKIN`] above the point to [`PLANET_REACH`] below it, because a
+    /// column is exactly the thing a sphere does not have.
+    pub fn ground_below(&self, from: Vec3, up: Vec3) -> Option<(Vec3, Vec3)> {
+        match self.index {
+            Index::Flat { .. } => self.highest_below(from, 0.0).map(|(height, normal)| {
+                (Vec3::new(from.x, height, from.z), normal)
+            }),
+            Index::Planet { .. } => {
+                let start = from + up * GROUND_SKIN;
+                self.surface_hit(start, from - up * PLANET_REACH)
+            }
+        }
+    }
+
+    /// The lowest thing overhead, as a point, or `None` when there is open sky.
+    ///
+    /// [`Self::ceiling_height`] with the same generalisation
+    /// [`Self::ground_below`] applies to the floor. A planet's terrain is a
+    /// heightfield wrapped onto a sphere and so has no overhangs today; the
+    /// cast is done anyway rather than returning `None`, so that the day one
+    /// is authored the player's head stops on it instead of passing through.
+    pub fn ceiling_above(&self, from: Vec3, up: Vec3, clearance: f32) -> Option<Vec3> {
+        match self.index {
+            Index::Flat { .. } => self
+                .ceiling_height(from, clearance)
+                .map(|height| Vec3::new(from.x, height, from.z)),
+            Index::Planet { .. } => {
+                let start = from + up * clearance;
+                self.surface_hit(start, start + up * PLANET_REACH * 0.05)
+                    .map(|(point, _)| point)
+            }
+        }
+    }
+
     /// Pushes a vertical player capsule out of steep collision triangles.
     ///
     /// Collision is deliberately independent of Bevy's renderer so movement
@@ -347,24 +606,32 @@ impl LevelData {
     /// line segment and a radius; testing three spheres along that segment is
     /// sufficient for the castle's triangulated walls and is much cheaper than
     /// bringing a general-purpose physics engine into the port.
-    pub fn resolve_walls(&self, position: Vec3, radius: f32, height: f32) -> Vec3 {
+    pub fn resolve_walls(&self, position: Vec3, up: Vec3, radius: f32, height: f32) -> Vec3 {
         let mut result = position;
+        let mut candidates = Vec::new();
+        let mut cells = Vec::new();
         for _ in 0..3 {
             let mut changed = false;
-            for &index in &self.cell(result.x, result.z).walls {
-                let tri = self.triangles[index];
+            self.walls_near(result, up, &mut cells, &mut candidates);
+            for &index in &candidates {
+                let tri = self.triangles[index as usize];
                 let (a, b, c, normal) = (tri.a, tri.b, tri.c, tri.normal);
-                for y in [radius, height * 0.5, height - radius] {
-                    let center = result + Vec3::Y * y;
+                for rise in [radius, height * 0.5, height - radius] {
+                    let center = result + up * rise;
                     let closest = closest_point_on_triangle(center, a, b, c);
                     let offset = center - closest;
-                    let horizontal = Vec3::new(offset.x, 0.0, offset.z);
-                    let distance = horizontal.length();
-                    if distance < radius && offset.y.abs() < radius * 1.25 {
+                    // "Horizontal" is whatever lies flat against the ground
+                    // here, which on a planet is a different plane at every
+                    // point. With `up` at `+Y` this is the `(x, z)` it always
+                    // was, to the bit.
+                    let climb = offset.dot(up);
+                    let flat = offset - up * climb;
+                    let distance = flat.length();
+                    if distance < radius && climb.abs() < radius * 1.25 {
                         let direction = if distance > 1e-5 {
-                            horizontal / distance
+                            flat / distance
                         } else {
-                            Vec3::new(normal.x, 0.0, normal.z).normalize_or_zero()
+                            (normal - up * normal.dot(up)).normalize_or_zero()
                         };
                         result += direction * (radius - distance + 0.001);
                         changed = true;
@@ -376,6 +643,35 @@ impl LevelData {
             }
         }
         result
+    }
+
+    /// The triangles near `at` that count as wall rather than floor.
+    ///
+    /// A flat level decided that once, when the grid was built, because `+Y` is
+    /// the same everywhere and so a triangle is a wall or it is not. On a
+    /// planet the same triangle is a floor on one side of the world and a
+    /// ceiling on the other, so the question is asked here, against the `up`
+    /// that holds where the query is.
+    fn walls_near(&self, at: Vec3, up: Vec3, cells: &mut Vec<usize>, out: &mut Vec<u32>) {
+        out.clear();
+        match &self.index {
+            Index::Flat { .. } => out.extend(
+                self.cell(at.x, at.z)
+                    .walls
+                    .iter()
+                    .map(|&index| index as u32),
+            ),
+            Index::Planet { cells: filed, .. } => {
+                self.near_cells(at, cells);
+                for &cell in cells.iter() {
+                    for &index in &filed[cell] {
+                        if self.triangles[index as usize].normal.dot(up).abs() <= GROUND_NORMAL_Y {
+                            out.push(index);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Returns the first collision point along a segment. Used to prevent the
@@ -423,14 +719,61 @@ impl LevelData {
         // Correctness never depended on it either way: the nearest hit is a
         // minimum over the candidates, and testing one of them twice returns
         // the same answer twice.
-        for z in cell_min.1..=cell_max.1 {
-            for x in cell_min.0..=cell_max.0 {
-                for &index in &self.cells[z * GRID_WIDTH + x].all {
-                    let tri = self.triangles[index];
-                    if let Some(t) = segment_triangle_time(start, direction, tri) {
-                        if t < nearest {
-                            nearest = t;
-                            hit = Some((start + direction * t, facing_back(tri.normal, direction)));
+        match &self.index {
+            Index::Flat { cells, .. } => {
+                for z in cell_min.1..=cell_max.1 {
+                    for x in cell_min.0..=cell_max.0 {
+                        for &index in &cells[z * GRID_WIDTH + x].all {
+                            let tri = self.triangles[index];
+                            if let Some(t) = segment_triangle_time(start, direction, tri) {
+                                if t < nearest {
+                                    nearest = t;
+                                    hit = Some((
+                                        start + direction * t,
+                                        facing_back(tri.normal, direction),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // A planet's cells are patches of surface rather than columns, so
+            // the segment is walked rather than boxed: one step per cell's
+            // worth of arc, each contributing the patch around where it landed.
+            // Stepping is what keeps a ray fired along the ground -- a bullet,
+            // the camera's boom -- from having to open a box the size of the
+            // hemisphere it crosses.
+            Index::Planet { centre, radius, cells: filed } => {
+                let arc = (FACE_CELL_ANGLE * radius).max(0.001);
+                let steps = ((direction.length() / arc).ceil() as usize + 1).min(PLANET_RAY_STEPS);
+                let mut cells_here = Vec::new();
+                let mut walked = Vec::new();
+                for step in 0..=steps {
+                    let along = start + direction * (step as f32 / steps as f32);
+                    // Points at the centre itself have no direction to file
+                    // under; the ray is still tested against everything the
+                    // steps either side of it turn up.
+                    if (along - *centre).length_squared() < 1e-6 {
+                        continue;
+                    }
+                    self.near_cells(along, &mut cells_here);
+                    for &cell in &cells_here {
+                        if walked.contains(&cell) {
+                            continue;
+                        }
+                        walked.push(cell);
+                        for &index in &filed[cell] {
+                            let tri = self.triangles[index as usize];
+                            if let Some(t) = segment_triangle_time(start, direction, tri) {
+                                if t < nearest {
+                                    nearest = t;
+                                    hit = Some((
+                                        start + direction * t,
+                                        facing_back(tri.normal, direction),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -458,6 +801,143 @@ impl LevelData {
         }
         hit
     }
+}
+
+/// The most steps a ray is walked in when it crosses a planet.
+///
+/// A cap rather than a limit anyone should reach: a hundred and twenty-eight
+/// steps is most of the way round the 300 m planet at one cell of arc each. It
+/// exists so that a ray fired at the sky -- which every aim probe is, some of
+/// the time -- costs a bounded amount rather than one step per cell out to
+/// wherever it was pointed.
+const PLANET_RAY_STEPS: usize = 128;
+
+/// Which of the six cube faces a direction points through, and where on that
+/// face it lands, with `u` and `v` each running -1 to 1.
+///
+/// The plain gnomonic mapping, without the tangent warp
+/// `experimental/planet_gen` applies when it *places* vertices. The two need
+/// not agree: this decides which drawer a triangle is filed in, and any
+/// mapping that is one-to-one and continuous within a face files and finds it
+/// alike. Matching the generator's warp would buy slightly more even cells and
+/// a second place for the two to drift apart.
+fn face_uv(direction: Vec3) -> (usize, f32, f32) {
+    let size = direction.abs();
+    if size.x >= size.y && size.x >= size.z {
+        let scale = size.x.max(f32::MIN_POSITIVE).recip();
+        if direction.x > 0.0 {
+            (0, direction.z * scale, direction.y * scale)
+        } else {
+            (1, -direction.z * scale, direction.y * scale)
+        }
+    } else if size.y >= size.z {
+        let scale = size.y.max(f32::MIN_POSITIVE).recip();
+        if direction.y > 0.0 {
+            (2, direction.x * scale, direction.z * scale)
+        } else {
+            (3, direction.x * scale, -direction.z * scale)
+        }
+    } else {
+        let scale = size.z.max(f32::MIN_POSITIVE).recip();
+        if direction.z > 0.0 {
+            (4, -direction.x * scale, direction.y * scale)
+        } else {
+            (5, direction.x * scale, direction.y * scale)
+        }
+    }
+}
+
+/// Whether a triangle is a sliver: so much longer than it is wide that it is
+/// not a surface, and cannot be intersected against without lying.
+///
+/// Not the same test as "zero area", and the difference is the whole reason
+/// this is a function. A UV sphere's pole is 96 vertices that ought to be the
+/// same point and, in `f32` at 300 metres out, are not: `sin(PI)` is 8.7e-8, so
+/// they are scattered over a few hundredths of a millimetre. The triangles
+/// between them are twenty metres long and a micron wide. Their normal
+/// normalises perfectly well, so a zero test does not see them, and the
+/// determinant in [`segment_triangle_time`] -- which exists to reject exactly
+/// this -- comes out thousands of times its own epsilon. What follows is a ray
+/// straight down the axis of the planet reporting a hit two thirds of the way
+/// to the core, on a surface that is not there.
+///
+/// Measured against the triangle's own size rather than an absolute area, so
+/// it means the same thing on a 300 m planet and in a 3 m test room. The ratio
+/// it rejects is a width under about a millionth of the length, which is
+/// rounding noise rather than geometry anybody authored.
+fn degenerate(tri: &CollisionTriangle) -> bool {
+    let cross = (tri.b - tri.a).cross(tri.c - tri.a);
+    let longest = (tri.b - tri.a)
+        .length_squared()
+        .max((tri.c - tri.b).length_squared())
+        .max((tri.a - tri.c).length_squared());
+    cross.length() <= longest * 1e-6
+}
+
+/// Files one triangle into every face cell it can be found in.
+///
+/// By sampling the triangle rather than by its corners alone. The corners are
+/// enough for the planet the generator writes -- its terrain triangles are
+/// under two metres across against a cell of five -- and that is exactly the
+/// sort of thing that is true until someone changes [`FACE_GRID`], or exports
+/// at a coarser depth, or drops in an authored tile with one big flat face on
+/// it. Then a triangle spans cells with none of its corners in them, and what
+/// that looks like from inside the game is a patch of ground the player falls
+/// through.
+///
+/// So the sample spacing is derived from the triangle's own angular size
+/// instead: half a cell between samples, which is close enough that any cell
+/// the triangle crosses has a sample somewhere inside it. A triangle smaller
+/// than a cell samples its three corners and nothing more, which is what makes
+/// this free in the case that actually occurs.
+fn file_triangle(
+    tri: &CollisionTriangle,
+    centre: Vec3,
+    index: u32,
+    filed: &mut Vec<usize>,
+    cells: &mut [Vec<u32>],
+) {
+    let corners = [tri.a - centre, tri.b - centre, tri.c - centre];
+    let directions = corners.map(|corner| corner.normalize_or(Vec3::Y));
+    let widest = [(0, 1), (1, 2), (2, 0)]
+        .into_iter()
+        .map(|(from, to)| directions[from].dot(directions[to]).clamp(-1.0, 1.0).acos())
+        .fold(0.0_f32, f32::max);
+    let steps = ((widest * 2.0 / FACE_CELL_ANGLE).ceil() as usize).clamp(1, MAX_FILE_STEPS);
+    filed.clear();
+    for i in 0..=steps {
+        for j in 0..=(steps - i) {
+            let k = steps - i - j;
+            // Direction only, so there is no need to normalise: a barycentric
+            // blend of three points around the planet points at the patch of
+            // sphere between them.
+            let at = corners[0] * i as f32 + corners[1] * j as f32 + corners[2] * k as f32;
+            let cell = face_cell(at);
+            if filed.contains(&cell) {
+                continue;
+            }
+            filed.push(cell);
+            cells[cell].push(index);
+        }
+    }
+}
+
+/// The most samples one triangle is filed by, along each of its edges.
+///
+/// A cap on the pathological case rather than a limit real geometry reaches:
+/// at 32 a single triangle covers a fifth of a face, and filing it exactly
+/// would cost more than testing it from a neighbouring cell occasionally.
+const MAX_FILE_STEPS: usize = 32;
+
+/// Where a face coordinate in -1..1 falls among [`FACE_GRID`] cells.
+fn cell_index(value: f32) -> usize {
+    (((value + 1.0) * 0.5 * FACE_GRID as f32) as isize).clamp(0, FACE_GRID as isize - 1) as usize
+}
+
+/// The single face cell a direction points at.
+fn face_cell(direction: Vec3) -> usize {
+    let (face, u, v) = face_uv(direction);
+    (face * FACE_GRID + cell_index(v)) * FACE_GRID + cell_index(u)
 }
 
 /// Height of a triangle's plane directly over `(x, z)`, when that column
@@ -589,7 +1069,7 @@ mod tests {
             ],
             &[[0, 1, 2]],
         );
-        let corrected = data.resolve_walls(Vec3::new(0.2, 0., 0.), 0.5, 1.8);
+        let corrected = data.resolve_walls(Vec3::new(0.2, 0., 0.), Vec3::Y, 0.5, 1.8);
         assert!(corrected.x >= 0.5);
     }
 
@@ -706,11 +1186,143 @@ mod tests {
     #[test]
     fn castle_grid_reduces_floor_candidates() {
         let (data, _) = load();
-        let total: usize = data.cells.iter().map(|cell| cell.floors.len()).sum();
-        let average = total as f32 / data.cells.len() as f32;
+        let Some((cells, _, _)) = data.flat() else {
+            panic!("the castle is not a flat level any more");
+        };
+        let total: usize = cells.iter().map(|cell| cell.floors.len()).sum();
+        let average = total as f32 / cells.len() as f32;
         assert!(
             average < data.triangles.len() as f32 * 0.2,
             "average {average}"
         );
+    }
+
+    /// A ball of terrain: a low-detail sphere of `radius`, wound outwards, with
+    /// every triangle small enough that the face grid files it the way a real
+    /// planet's is filed.
+    fn ball(radius: f32) -> LevelData {
+        let (mut vertices, mut indices) = (Vec::new(), Vec::new());
+        // A UV sphere rather than a cube-sphere on purpose: the index must not
+        // depend on the mesh having been built by the same mapping it files by.
+        let (rings, segments) = (48usize, 96usize);
+        for ring in 0..=rings {
+            let pitch = std::f32::consts::PI * ring as f32 / rings as f32;
+            for segment in 0..=segments {
+                let yaw = std::f32::consts::TAU * segment as f32 / segments as f32;
+                vertices.push(
+                    Vec3::new(
+                        pitch.sin() * yaw.cos(),
+                        pitch.cos(),
+                        pitch.sin() * yaw.sin(),
+                    ) * radius,
+                );
+            }
+        }
+        let at = |ring: usize, segment: usize| (ring * (segments + 1) + segment) as u32;
+        for ring in 0..rings {
+            for segment in 0..segments {
+                indices.push([at(ring, segment), at(ring + 1, segment), at(ring, segment + 1)]);
+                indices.push([
+                    at(ring, segment + 1),
+                    at(ring + 1, segment),
+                    at(ring + 1, segment + 1),
+                ]);
+            }
+        }
+        LevelData::planet(&vertices, &indices, Vec3::ZERO, radius)
+    }
+
+    /// The claim the whole face grid exists to support: a planet answers "what
+    /// is under my feet" everywhere on it, and the answer is the surface right
+    /// there rather than the one on the far side.
+    #[test]
+    fn a_planet_has_ground_under_every_point_of_it() {
+        let radius = 300.0;
+        let planet = ball(radius);
+        assert_eq!(
+            planet.shape(),
+            Shape::Planet {
+                centre: Vec3::ZERO,
+                radius
+            }
+        );
+        // Directions spread over the sphere rather than over one face, so the
+        // eight cube corners and all twelve seams are crossed.
+        let golden = std::f32::consts::PI * (3.0 - 5.0_f32.sqrt());
+        for step in 0..400 {
+            let height = 1.0 - 2.0 * (step as f32 + 0.5) / 400.0;
+            let ring = (1.0 - height * height).max(0.0).sqrt();
+            let yaw = golden * step as f32;
+            let up = Vec3::new(ring * yaw.cos(), height, ring * yaw.sin()).normalize();
+            let standing = up * (radius + 1.0);
+            let found = planet.ground_below(standing, up);
+            let Some((point, normal)) = found else {
+                panic!("no ground under {up} -- the face grid has a hole in it");
+            };
+            assert!(
+                (point.length() - radius).abs() < 1.0,
+                "{up}: ground at {} rather than {radius}",
+                point.length()
+            );
+            assert!(
+                normal.dot(up) > 0.8,
+                "{up}: the ground there faces {normal}, which is not upwards"
+            );
+        }
+    }
+
+    /// The far side of the world is not the floor. This is the failure the flat
+    /// `(x, z)` grid would produce on a planet, and the reason there is a
+    /// second index at all.
+    #[test]
+    fn a_planet_does_not_answer_with_the_other_hemisphere() {
+        let radius = 300.0;
+        let planet = ball(radius);
+        let up = Vec3::Y;
+        let (point, _) = planet
+            .ground_below(up * (radius + 2.0), up)
+            .expect("no ground at the north pole");
+        assert!(point.y > 0.0, "the north pole stood on the south pole");
+        // And nothing is found from deep inside, where the surface is further
+        // away than the search reaches.
+        assert_eq!(planet.ground_below(Vec3::ZERO, up), None);
+        assert!(planet.out_of_bounds(Vec3::ZERO));
+        assert!(!planet.out_of_bounds(up * radius));
+    }
+
+    /// Walls on a planet are steep against the local up rather than against
+    /// `+Y`, so the same capsule is pushed out of the same slope wherever on
+    /// the planet that slope is.
+    #[test]
+    fn a_planet_pushes_a_capsule_out_of_its_own_walls() {
+        let radius = 300.0;
+        let planet = ball(radius);
+        for up in [Vec3::Y, Vec3::NEG_Y, Vec3::X, Vec3::new(1., 1., 1.).normalize()] {
+            // Half a metre under the surface: the sphere's own facets are the
+            // wall here, and the capsule has to come back out along the local
+            // horizontal.
+            let sunk = up * (radius - 0.5);
+            let out = planet.resolve_walls(sunk, up, 0.42, 1.75);
+            assert!(
+                (out - sunk).length() < 1.0,
+                "{up}: pushed {} metres, which is not a nudge",
+                (out - sunk).length()
+            );
+        }
+    }
+
+    /// The flat level must come through the generalisation unchanged: the same
+    /// question asked the new way gets the old answer.
+    #[test]
+    fn the_castle_answers_the_general_query_the_way_it_answers_the_old_one() {
+        let (data, _) = load();
+        for z in (-80..=80).step_by(11) {
+            for x in (-80..=80).step_by(11) {
+                let point = Vec3::new(x as f32, 20.0, z as f32);
+                let height = data.floor_height(point);
+                let general = data.ground_below(point, Vec3::Y).map(|(at, _)| at.y);
+                assert_eq!(height, general, "at {point}");
+            }
+        }
     }
 }

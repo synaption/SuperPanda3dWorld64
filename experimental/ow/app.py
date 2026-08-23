@@ -5,6 +5,7 @@ they produce and feeds them input.
 """
 
 from collections import deque
+from pathlib import Path
 
 from direct.showbase.ShowBase import ShowBase
 from direct.gui.OnscreenText import OnscreenText
@@ -36,6 +37,15 @@ FAR_PLANE = 1.6e6
 STARFIELD_RADIUS = 8.0e5
 PERFORMANCE_WINDOW_SECONDS = 10.0
 FRAME_RATE_CAP = 120.0
+
+# planet_gen authors its mesh in metres around a 300 m sea-level radius.  The
+# OW port uses centimetres, but the per-body scale below is a ratio, so no unit
+# conversion is needed.
+PLANET_GEN_RADIUS = 300.0
+PLANET_MODEL = (
+    Path(__file__).resolve().parent.parent
+    / "planet_gen" / "out" / "planet_lod1.glb"
+)
 
 
 def configure():
@@ -92,14 +102,39 @@ class OuterWildsApp(ShowBase):
 
     def _build_scene(self):
         self.planet_nodes = []
-        for definition, body in zip(self.world.definitions, self.world.planets):
-            node = NodePath(make_sphere(definition.visual_radius, 48, 24, definition.color))
-            node.reparentTo(self.render)
+        terrain = self.loader.loadModel(str(PLANET_MODEL))
+        if terrain.isEmpty():
+            raise RuntimeError(
+                "planet_gen mesh is missing or unreadable: {}".format(PLANET_MODEL)
+            )
+
+        for index, (definition, body) in enumerate(
+            zip(self.world.definitions, self.world.planets)
+        ):
+            if definition.emissive:
+                # The generated asset is rocky terrain.  Keep the system's
+                # light source round and emissive rather than making it look
+                # like another shaded planet.
+                node = NodePath(
+                    make_sphere(
+                        definition.visual_radius, 48, 24, definition.color
+                    )
+                )
+                node.reparentTo(self.render)
+            else:
+                node = terrain.copyTo(self.render)
+                node.setScale(definition.visual_radius / PLANET_GEN_RADIUS)
+                # Every body shares the authored terrain, but a stable rotation
+                # keeps their silhouettes and landmarks from lining up.
+                node.setHpr(index * 137.5 % 360.0, index * 47.0 % 360.0, 0.0)
+                node.setColorScale(*definition.color)
             node.setPos(*body.position)
             if definition.emissive:
                 node.setLightOff()
                 node.setColorScale(1.6, 1.4, 1.0, 1.0)
             self.planet_nodes.append(node)
+
+        terrain.removeNode()
 
         # Stars ride with the camera's position but not its rotation, so they
         # read as infinitely far away.
