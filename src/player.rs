@@ -49,6 +49,27 @@ const LANDING_IMPACT: f32 = 2.0;
 const LAND_SECONDS: f32 = 0.25;
 const COMBO_WINDOW: f32 = 1.2;
 
+/// How fast the body swings upright onto the local down, per second.
+///
+/// A rate rather than an instant correction, and that is the single biggest
+/// difference between this and the Outer Wilds prototype in `experimental/ow`.
+/// Nothing there is ever *set* to face the ground; it is slewed towards it,
+/// at `GROUND_ALIGN_RATE`, which is this same 8. A time constant of an eighth
+/// of a second is short enough that standing still looks level and long enough
+/// that a surface turning under the feet arrives as a lean rather than a jolt.
+const UPRIGHT_RATE: f32 = 8.0;
+
+/// How fast the feet close a gap to the floor beneath them, per second, and
+/// the most daylight allowed under them while it closes.
+///
+/// Faster than the body rights itself: this one is a position, and the eye
+/// calls a floating character wrong long before it calls a leaning one wrong.
+/// The cap is what keeps the ease from reading as float -- running downhill
+/// opens the gap as fast as the filter shuts it, and without a ceiling the two
+/// find a balance several times higher than this.
+const FOOT_SETTLE_RATE: f32 = 18.0;
+const FOOT_SKIN: f32 = 0.12;
+
 #[derive(Component)]
 pub struct Player;
 
@@ -390,7 +411,22 @@ pub fn movement(
         let walking_on_floor = ctrl.grounded && separation <= 0.75;
         let landed = separation <= 0.0 && rise <= 0.0;
         if walking_on_floor || landed {
-            transform.translation = ground;
+            // Contact is a band to rest in rather than a place to be put.
+            // Dropping the feet exactly onto the triangle under them every
+            // step makes their height follow the mesh facet for facet, and a
+            // mesh whose triangles share vertices is continuous in height but
+            // not in slope -- so crossing an edge changes how fast the player
+            // is rising, in one step, with nothing in between. That step
+            // change is the chatter a planet's surface has and a flat floor
+            // does not. Easing the gap shut low-passes the slope instead.
+            //
+            // Sinking is not eased. Being below the floor is a wrong the
+            // player can see through, so `clamp` puts him back on it at once
+            // -- the same asymmetry the camera boom makes for the same reason:
+            // come in immediately, go back out gently.
+            let gap = (separation * (1.0 - gravity::settle(FOOT_SETTLE_RATE, FIXED_DT)))
+                .clamp(0.0, FOOT_SKIN);
+            transform.translation = ground + up * gap;
             rise = 0.0;
             ctrl.grounded = true;
             if !was_grounded && impact < -LANDING_IMPACT {
@@ -426,12 +462,22 @@ pub fn movement(
     }
     // Stood upright first, then turned. On a flat level the first step is a
     // no-op -- up never moves, so re-deriving the rotation from it gives the
-    // same rotation back -- and on a planet it is what keeps the character
+    // same rotation back, and easing towards a rotation already held is the
+    // rotation already held -- and on a planet it is what keeps the character
     // perpendicular to the ground instead of leaning further over the further
     // he walks from where he set off.
+    //
+    // Eased rather than assigned. Setting the body to the local up every step
+    // welds it to the geometry, so the surface is the only thing deciding how
+    // it moves; a rate leaves a body between the two with some say in it. Note
+    // that the turn below was always written this way -- it is the levelling
+    // that was snapping while the turning had give.
     let facing = gravity::flatten(transform.rotation * Vec3::Z, up);
     if facing != Vec3::ZERO {
-        transform.rotation = Transform::default().looking_to(-facing, up).rotation;
+        let upright = Transform::default().looking_to(-facing, up).rotation;
+        transform.rotation = transform
+            .rotation
+            .slerp(upright, gravity::settle(UPRIGHT_RATE, FIXED_DT));
     }
     if wish.length_squared() > 0.01 {
         // `wish` already lies flat against the ground: it is built out of the
@@ -530,6 +576,7 @@ mod tests {
     use super::*;
     use crate::{audio::Sfx, level};
     use bevy::{camera::Camera3d, ecs::system::RunSystemOnce};
+    use std::f32::consts::FRAC_PI_2;
 
     /// The castle's Hero spawn, on the lawn in front of the gate.
     const SPAWN: Vec3 = Vec3::new(-13.28, 3.0, 46.64);
@@ -587,6 +634,101 @@ mod tests {
 
     fn sounds(world: &mut World) -> Vec<Sfx> {
         world.resource_mut::<SoundQueue>().drain()
+    }
+
+    /// The body eases onto the local up instead of being set to it. Two
+    /// assertions, and the first is the one that matters: a single step must
+    /// *not* finish the job. Snapping passes every "does he end up upright"
+    /// test there is, which is how it survived this long.
+    #[test]
+    fn standing_up_on_a_planet_is_a_swing_and_not_a_snap() {
+        let mut world = world_with(
+            level::LevelData::planet(&[], &[], Vec3::ZERO, 300.0),
+            Vec3::X * 300.0,
+        );
+        world.insert_resource(Gravity::towards(Vec3::ZERO));
+        let body_up = |world: &mut World| {
+            let mut query = world.query_filtered::<&Transform, With<Player>>();
+            query.single(world).unwrap().rotation * Vec3::Y
+        };
+        // He arrives holding the castle's `+Y`, which a quarter turn round the
+        // planet means lying on his side.
+        assert!((body_up(&mut world).angle_between(Vec3::X) - FRAC_PI_2).abs() < 1e-4);
+        tick(&mut world, 1);
+        let after_one = body_up(&mut world).angle_between(Vec3::X);
+        assert!(after_one < FRAC_PI_2 - 0.05, "did not start standing up");
+        assert!(
+            after_one > 1.0,
+            "a quarter turn in a thirtieth of a second: {after_one} rad left"
+        );
+        tick(&mut world, 29);
+        assert!(
+            body_up(&mut world).angle_between(Vec3::X) < 0.02,
+            "a second later he is still not upright"
+        );
+    }
+
+    /// And the flat level is untouched by that, because up never moves there:
+    /// easing towards a rotation already held is the rotation already held.
+    #[test]
+    fn the_castle_still_stands_the_player_exactly_upright() {
+        let mut world = world();
+        tick(&mut world, 60);
+        let mut query = world.query_filtered::<&Transform, With<Player>>();
+        let up = query.single(&world).unwrap().rotation * Vec3::Y;
+        assert!((up - Vec3::Y).length() < 1e-5, "leaning: {up}");
+    }
+
+    /// Contact is a band, but only upwards. Below the floor is a wrong that can
+    /// be seen through, so it is corrected in the step it is noticed.
+    #[test]
+    fn sinking_into_the_floor_is_undone_in_one_step() {
+        let mut world = world();
+        tick(&mut world, 30);
+        let (settled, ..) = player(&mut world);
+        {
+            let mut query = world.query_filtered::<&mut Transform, With<Player>>();
+            query.single_mut(&mut world).unwrap().translation.y = settled.y - 0.33;
+        }
+        tick(&mut world, 1);
+        let (after, ..) = player(&mut world);
+        assert!(
+            after.y >= settled.y - 1e-3,
+            "left {} under the lawn",
+            settled.y - after.y
+        );
+    }
+
+    /// The other half: the gap the ease leaves open is bounded. Running across
+    /// the castle's slopes opens it as fast as the filter shuts it, and without
+    /// the cap the two settle several times higher than this.
+    #[test]
+    fn the_feet_never_float_further_than_the_skin() {
+        let mut world = world();
+        tick(&mut world, 30);
+        world.resource_mut::<InputState>().move_axis = Vec2::new(0.0, 1.0);
+        let mut walked = 0;
+        for step in 0..90 {
+            tick(&mut world, 1);
+            let mut query = world.query_filtered::<(&Transform, &Controller), With<Player>>();
+            let (transform, controller) = query.single(&world).unwrap();
+            if !controller.grounded {
+                continue;
+            }
+            let at = transform.translation;
+            let level = world.resource::<level::LevelData>();
+            let Some((ground, _)) = level.ground_below(at + Vec3::Y * 0.75, Vec3::Y) else {
+                continue;
+            };
+            let gap = (at - ground).dot(Vec3::Y);
+            assert!(
+                (-1e-3..=FOOT_SKIN + 1e-3).contains(&gap),
+                "step {step} left the feet {gap} off the floor"
+            );
+            walked += 1;
+        }
+        // Otherwise a run that never touched the ground passes this silently.
+        assert!(walked > 60, "only {walked} of 90 steps were spent walking");
     }
 
     #[test]

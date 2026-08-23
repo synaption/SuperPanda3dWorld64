@@ -110,6 +110,27 @@ pub fn flatten(direction: Vec3, up: Vec3) -> Vec3 {
     (direction - up * direction.dot(up)).normalize_or_zero()
 }
 
+/// How much of the remaining gap to close this step, for something easing
+/// towards where the local down says it should be at `rate` per second.
+///
+/// Three things follow the local down and none of them should follow it
+/// exactly: the body standing upright, the camera's idea of which way up is,
+/// and the feet settling onto the floor. Reading the answer straight off the
+/// ground puts every wobble in it on the screen in the frame it happens, which
+/// is what makes a curved surface feel jerky to walk on -- there is nothing
+/// between the geometry and the pixels.
+///
+/// A first-order ease is the thing between them. It keeps `exp(-rate * t)` of
+/// its error after `t` seconds whatever the step length was, so `rate` is a
+/// time constant of `1 / rate` seconds and says the same thing at 30 Hz, at
+/// 60, and at 240. A plain "fraction per frame" does not: the same number
+/// settles in half the wall-clock time at twice the frame rate, which is the
+/// bug `camera::blend` exists to undo for the factors that were
+/// already written that way.
+pub fn settle(rate: f32, delta: f32) -> f32 {
+    1.0 - (-rate * delta).exp()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +190,41 @@ mod tests {
         let up = Vec3::Y;
         assert!((flatten(Vec3::new(0.0, 5.0, 3.0), up) - Vec3::Z).length() < 1e-5);
         assert_eq!(flatten(Vec3::Y, up), Vec3::ZERO);
+    }
+
+    /// The reason it is a rate and not a fraction: a second of easing has to be
+    /// a second of easing whatever the frame rate is. Going fullscreen changes
+    /// the frame rate.
+    #[test]
+    fn a_second_of_easing_is_a_second_at_any_step_length() {
+        for rate in [4.0_f32, 8.0, 18.0] {
+            let left = |steps: u32| {
+                let delta = 1.0 / steps as f32;
+                (0..steps).fold(1.0_f32, |gap, _| gap * (1.0 - settle(rate, delta)))
+            };
+            let reference = (-rate).exp();
+            for steps in [30, 60, 144, 240] {
+                let there = left(steps);
+                assert!(
+                    (there - reference).abs() < 1e-4,
+                    "{rate}/s over {steps} steps left {there}, not {reference}"
+                );
+            }
+        }
+    }
+
+    /// A rate of `r` has a time constant of `1 / r` seconds: after that long,
+    /// `1 / e` of the gap is still open. That is what lets the tuning numbers
+    /// be read as "about an eighth of a second" rather than guessed at.
+    #[test]
+    fn a_rate_is_the_reciprocal_of_its_time_constant() {
+        let gap = 1.0 - settle(8.0, 1.0 / 8.0);
+        assert!((gap - std::f32::consts::E.recip()).abs() < 1e-6, "{gap}");
+    }
+
+    #[test]
+    fn easing_nowhere_in_no_time_moves_nothing() {
+        assert_eq!(settle(9.0, 0.0), 0.0);
+        assert_eq!(settle(0.0, 1.0), 0.0);
     }
 }

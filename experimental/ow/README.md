@@ -13,6 +13,10 @@ python3 -m ow.main --selftest   # headless physics checks, no window needed
 
 `python3 ow/main.py` works as well, from any directory.
 
+On Windows, including when the checkout is opened through `\\wsl.localhost`,
+run `python main.py` from this directory. The planet asset path is converted to
+Panda3D's virtual-filesystem form so the UNC share works like a local path.
+
 ## Controls
 
 | | |

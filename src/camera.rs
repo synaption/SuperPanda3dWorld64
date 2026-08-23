@@ -1,6 +1,6 @@
 use crate::{
     console::GameTuning,
-    gravity::Gravity,
+    gravity::{self, Gravity},
     input::InputState,
     level::LevelData,
     player::{Player, RenderPose},
@@ -33,6 +33,19 @@ pub struct FollowCamera {
     /// step from *last* frame's up to this one never asks that question,
     /// because between two frames the up has barely moved.
     pub frame: Quat,
+    /// The frame the view is actually built in, chasing [`Self::frame`].
+    ///
+    /// Two frames rather than one, which is how the Outer Wilds prototype in
+    /// `experimental/ow` is arranged and the reason walking a planet there does
+    /// not feel jerky: what the ground says and what the camera does are kept
+    /// apart, with a rate between them. `frame` is the ground's answer, exact
+    /// and updated every frame; `view` lags it by [`UP_ALIGN_RATE`].
+    ///
+    /// It is the *frame* that lags and not the whole orbit. Yaw and pitch are
+    /// the player's own input and stay immediate -- easing those would be input
+    /// latency, and the prototype avoids it the other way round, by running its
+    /// camera filter four times faster on foot than in flight.
+    pub view: Quat,
 }
 
 impl Default for FollowCamera {
@@ -46,6 +59,7 @@ impl Default for FollowCamera {
             // head.
             clearance: 1.0,
             frame: Quat::IDENTITY,
+            view: Quat::IDENTITY,
         }
     }
 }
@@ -61,6 +75,25 @@ const WALL_GAP: f32 = 0.3;
 /// The rate the boom is allowed back out at once a wall stops blocking it,
 /// as a fraction of the remaining gap per sixtieth of a second.
 const REOPEN_RATE: f32 = 0.08;
+
+/// How fast the view's idea of up chases the ground's, per second.
+///
+/// A ninth of a second of lag. The prototype in `experimental/ow` uses 20 on
+/// foot and 2.25 in flight; this sits nearer the walking end because there is
+/// no flight mode here to serve, and because it is not the only filter in the
+/// chain -- the body's own levelling in [`crate::player`] runs slower again,
+/// and what reaches the screen is the two of them in series.
+const UP_ALIGN_RATE: f32 = 9.0;
+
+/// Past this much of an angle between the two ups, the gap is not something to
+/// ease across.
+///
+/// Walking never opens one: on a planet a few hundred metres across, running
+/// flat out turns up by a couple of degrees a second, and the rate above holds
+/// the error well under one. What does open one is arriving somewhere else
+/// entirely -- a respawn, a warp pipe, the far side of the planet -- and easing
+/// across that is a second of the horizon rolling over for no reason.
+const UP_SNAP: f32 = 0.5;
 
 /// Reshapes a per-frame blend factor to cover `delta` seconds instead.
 ///
@@ -104,6 +137,23 @@ pub fn update(
     // is the line that was there before.
     let up = gravity.up(player.translation);
     follow.frame = Quat::from_rotation_arc(follow.frame * Vec3::Y, up) * follow.frame;
+    // And the view eases onto the frame. That is the whole of the lag, and
+    // every axis below is measured in `view` rather than `frame`, so the camera
+    // answers the ground through a filter while still answering the mouse
+    // directly.
+    let carried = follow.view * Vec3::Y;
+    follow.view = if carried.angle_between(up) > UP_SNAP {
+        follow.frame
+    } else {
+        let rate = gravity::settle(UP_ALIGN_RATE, time.delta_secs());
+        follow.view.slerp(follow.frame, rate)
+    };
+    // Roll is the axis this matters most on. Taking the camera's up straight
+    // off the ground puts every wobble in the surface onto the horizon, and a
+    // tilting horizon is the most legible motion there is on a screen -- far
+    // more so than the same wobble in pitch. Which is why `up` is not read
+    // again below this line.
+    let view_up = follow.view * Vec3::Y;
     follow.yaw -= input.look_mouse.x * tuning.mouse_sens;
     follow.pitch = (follow.pitch - input.look_mouse.y * tuning.mouse_sens * 0.8333)
         .clamp(PITCH_LIMITS.0, PITCH_LIMITS.1);
@@ -122,7 +172,7 @@ pub fn update(
     if InputState::take(&mut input.recenter) {
         // Behind the player means behind him *in the camera's own frame*, which
         // is what taking the facing back out of that frame asks.
-        let forward = follow.frame.inverse() * (player.rotation * Vec3::NEG_Z);
+        let forward = follow.view.inverse() * (player.rotation * Vec3::NEG_Z);
         follow.yaw = forward.x.atan2(forward.z);
     }
     state.aiming = input.aim;
@@ -133,9 +183,9 @@ pub fn update(
     };
     let smoothing = blend(tuning.cam_smooth, time.delta_secs());
     follow.distance += (desired_distance - follow.distance) * blend(0.16, time.delta_secs());
-    let focus = player.translation + up * tuning.cam_height;
+    let focus = player.translation + view_up * tuning.cam_height;
     let orbit =
-        follow.frame * Quat::from_rotation_y(follow.yaw) * Quat::from_rotation_x(follow.pitch);
+        follow.view * Quat::from_rotation_y(follow.yaw) * Quat::from_rotation_x(follow.pitch);
     let boom = orbit * Vec3::new(0.0, 0.8, follow.distance);
 
     // How much of the boom is free this frame, measured along the boom rather
@@ -159,12 +209,114 @@ pub fn update(
     };
     let wanted = focus + boom * follow.clearance;
     camera.translation = camera.translation.lerp(wanted, smoothing);
-    camera.look_at(focus, up);
+    camera.look_at(focus, view_up);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::level::LevelData;
+    use bevy::ecs::system::RunSystemOnce;
+    use std::time::Duration;
+
+    const PLANET: f32 = 300.0;
+
+    /// Everything [`update`] reads, with no renderer and no window: a bare
+    /// planet with no collision in it, so the boom is never cut short and the
+    /// only thing under test is which way the view thinks up is.
+    fn planet_world(at: Vec3) -> World {
+        let mut world = World::new();
+        world.insert_resource(Gravity::towards(Vec3::ZERO));
+        world.insert_resource(LevelData::planet(&[], &[], Vec3::ZERO, PLANET));
+        world.insert_resource(RenderPose {
+            translation: at,
+            rotation: Quat::IDENTITY,
+        });
+        world.insert_resource(InputState::default());
+        world.insert_resource(GameState::default());
+        world.insert_resource(GameTuning::default());
+        world.insert_resource(ButtonInput::<KeyCode>::default());
+        world.init_resource::<Time>();
+        let aligned = Quat::from_rotation_arc(Vec3::Y, at.normalize());
+        world.spawn((
+            Transform::default(),
+            FollowCamera {
+                frame: aligned,
+                view: aligned,
+                ..default()
+            },
+        ));
+        world
+    }
+
+    /// Advances the clock as well as the systems: the lag is a rate, so a
+    /// frame of no elapsed time is a frame in which nothing eases.
+    fn frames(world: &mut World, count: usize) {
+        for _ in 0..count {
+            world
+                .resource_mut::<Time>()
+                .advance_by(Duration::from_nanos(16_666_667));
+            world.run_system_once(update).expect("update could not run");
+        }
+    }
+
+    fn view_up(world: &mut World) -> Vec3 {
+        let mut query = world.query::<&FollowCamera>();
+        let follow = query.single(world).unwrap();
+        follow.view * Vec3::Y
+    }
+
+    /// The point of the whole exercise: the ground moves and the view arrives
+    /// afterwards. A step of walking is a fraction of the gap, not the gap.
+    #[test]
+    fn the_view_follows_the_ground_late_and_then_arrives() {
+        let mut world = planet_world(Vec3::X * PLANET);
+        // A sixth of a radian round the planet -- more than any single frame of
+        // running covers, and well inside the distance that counts as walking.
+        let moved = (Vec3::X * 0.986 + Vec3::Z * 0.166).normalize() * PLANET;
+        world.resource_mut::<RenderPose>().translation = moved;
+        let wanted = moved.normalize();
+        frames(&mut world, 1);
+        let after_one = view_up(&mut world).angle_between(wanted);
+        assert!(after_one > 0.1, "arrived in a single frame");
+        assert!(
+            after_one < 0.166,
+            "did not set off at all: {after_one} rad left of 0.166"
+        );
+        frames(&mut world, 30);
+        assert!(
+            view_up(&mut world).angle_between(wanted) < 0.01,
+            "half a second later the view still has not caught up"
+        );
+    }
+
+    /// And a gap that is not walking is not eased across. Respawning on the far
+    /// side of a planet would otherwise spend a second rolling the horizon.
+    #[test]
+    fn arriving_somewhere_else_entirely_snaps_the_view() {
+        let mut world = planet_world(Vec3::X * PLANET);
+        world.resource_mut::<RenderPose>().translation = Vec3::NEG_Z * PLANET;
+        frames(&mut world, 1);
+        assert!(
+            view_up(&mut world).angle_between(Vec3::NEG_Z) < 1e-4,
+            "eased across a teleport"
+        );
+    }
+
+    /// The castle is not paying for any of this. Up never moves there, so the
+    /// frame, the view and the horizon are `+Y` on every frame as before.
+    #[test]
+    fn a_flat_level_keeps_the_view_upright_throughout() {
+        let mut world = planet_world(Vec3::Y * PLANET);
+        world.insert_resource(Gravity::default());
+        world.insert_resource(LevelData::planet(&[], &[], Vec3::ZERO, PLANET));
+        world.resource_mut::<RenderPose>().translation = Vec3::new(-13.28, 3.0, 46.64);
+        for _ in 0..60 {
+            frames(&mut world, 1);
+            let up = view_up(&mut world);
+            assert!((up - Vec3::Y).length() < 1e-5, "the horizon tilted: {up}");
+        }
+    }
 
     /// One sixtieth of a second is the rate the tuning numbers were chosen at,
     /// so the reshaped factor has to leave them alone there.

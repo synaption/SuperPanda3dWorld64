@@ -275,9 +275,9 @@ once. Between the two there is a wall resolution that changes the run and must
 not touch the climb.
 
 **The character is stood upright before he is turned.** On a flat level that
-step does nothing — up never moves, so re-deriving the rotation from it gives
-the same rotation back. On a planet it is what keeps him perpendicular to the
-ground rather than leaning further over the further he walks.
+step does nothing — up never moves, so easing towards a rotation already held
+is the rotation already held. On a planet it is what keeps him perpendicular to
+the ground rather than leaning further over the further he walks.
 
 **The camera carries its frame rather than rebuilding it.** `FollowCamera` owns
 a quaternion that yaw and pitch are measured in, and each frame it is turned by
@@ -289,6 +289,62 @@ step between two consecutive frames never asks that question.
 
 On the castle every one of these is the identity and the arithmetic is the
 arithmetic it was before, which is what the collision and movement tests assert.
+
+### Nothing follows the local down exactly
+
+A curved surface felt jerky to walk on long before anything was wrong with it,
+and the reason was that every one of the three answers above was taken straight
+off the geometry in the frame it changed. There was nothing between the ground
+and the pixels. The fix is borrowed wholesale from the Outer Wilds prototype in
+`experimental/ow`, which walks a sphere without any of this and does exactly one
+thing differently: it never *sets* anything to the surface, it drives towards
+it at a rate.
+
+`gravity::settle(rate, delta)` is that rate, and returns how much of the
+remaining gap to close this step. It is a first-order ease, so `rate` is a time
+constant of `1 / rate` seconds and means the same thing at 30 Hz and at 240 —
+unlike a plain fraction-per-frame, which settles in half the wall-clock time at
+twice the frame rate. (`camera::blend` exists to undo that for the factors that
+were already written the other way; new ones should use `settle`.)
+
+Three things use it, at three deliberately different rates:
+
+| what | rate | why that one |
+|---|---|---|
+| the body standing upright | 8/s | the prototype's `GROUND_ALIGN_RATE`, unchanged |
+| the camera's idea of up | 9/s | between its 20 on foot and 2.25 in flight; there is no flight mode here |
+| the feet closing on the floor | 18/s | a position, and the eye calls floating wrong sooner than leaning |
+
+The camera one is the most load-bearing, because it lands on **roll**. Taking
+the camera's up off the ground normal puts every wobble in the surface onto the
+horizon, and a tilting horizon is the most legible motion on a screen — far more
+so than the same wobble in pitch. So `FollowCamera` carries two frames: `frame`
+is the ground's answer, transported exactly as above, and `view` chases it.
+Every axis the camera is built from is measured in `view`. Yaw and pitch are
+**not** eased — they are the player's own input, and lagging them is input
+latency rather than smoothing, which is the same split the prototype makes
+between its direction arrow and its camera.
+
+Two things are deliberately not eased:
+
+- **A gap that is not walking.** More than `UP_SNAP` between the two ups is a
+  respawn, a warp pipe or the far side of the planet, not a step, and easing
+  across it is a second of the horizon rolling over for no reason. Walking never
+  opens one: running flat out on a planet a few hundred metres across turns up
+  by a couple of degrees a second.
+- **Sinking.** Being below the floor is a wrong the player can see through, so
+  it is corrected in the step it is noticed. Only the gap *above* the floor
+  eases shut, and it is capped at `FOOT_SKIN`, because running downhill opens it
+  as fast as the filter closes it and the two would otherwise balance several
+  times higher.
+
+That last one is the only place the prototype could not simply be copied. Its
+planets are analytic spheres, so its ground has no facets and it can afford to
+treat contact as a 15 cm proximity band with no placement at all. Ours is a
+mesh: the triangles share vertices, so the height under the player is
+continuous, but the *slope* is not — crossing an edge changes how fast he is
+rising in a single step. That step change is the chatter, and easing the gap
+shut is what low-passes it.
 
 ## Animation
 

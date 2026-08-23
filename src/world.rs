@@ -347,6 +347,11 @@ fn put_the_player_down(
     }
     for (mut camera, mut follow) in &mut placement.p1() {
         follow.frame = Quat::from_rotation_arc(Vec3::Y, up);
+        // Set, not eased. `view` normally lags `frame` on purpose, and the one
+        // moment it must not is the moment it has no history worth keeping:
+        // arriving on a planet with the view still holding the castle's `+Y`
+        // would spend the first second of the level rolling the horizon over.
+        follow.view = follow.frame;
         follow.clearance = 1.0;
         camera.translation = at + up * 3.0 - facing * follow.distance;
         camera.look_at(at + up, up);

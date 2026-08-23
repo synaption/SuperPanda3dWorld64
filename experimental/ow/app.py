@@ -12,6 +12,7 @@ from direct.gui.OnscreenText import OnscreenText
 from panda3d.core import (
     AmbientLight,
     ClockObject,
+    Filename,
     NodePath,
     PointLight,
     TextNode,
@@ -102,7 +103,13 @@ class OuterWildsApp(ShowBase):
 
     def _build_scene(self):
         self.planet_nodes = []
-        terrain = self.loader.loadModel(str(PLANET_MODEL))
+        # Loader accepts native paths on POSIX, but a Windows Python launched
+        # from a WSL share sees this as a UNC path (\\wsl.localhost\...).
+        # Panda's VFS represents that path as /hosts/wsl.localhost/...; doing
+        # the conversion explicitly keeps Loader from treating the backslashes
+        # as part of a model-path filename.
+        planet_filename = Filename.fromOsSpecific(str(PLANET_MODEL))
+        terrain = self.loader.loadModel(planet_filename)
         if terrain.isEmpty():
             raise RuntimeError(
                 "planet_gen mesh is missing or unreadable: {}".format(PLANET_MODEL)
