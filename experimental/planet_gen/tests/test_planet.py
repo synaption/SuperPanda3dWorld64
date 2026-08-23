@@ -16,7 +16,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from planetgen import check, manifest, rasters, surface             # noqa: E402
+from planetgen import check, manifest, ocean, rasters, surface     # noqa: E402
 from planetgen.cubesphere import (VertexGrid, face_directions,      # noqa: E402
                                   grid_parameters, tile_quad_indices,
                                   tiles_at, warp)
@@ -183,6 +183,53 @@ class TestMaterialRasterRoundTrip(unittest.TestCase):
         self.assertEqual(set(np.unique(read).tolist()), {3, 7})
 
 
+class TestOcean(unittest.TestCase):
+    """The sea, which is one sphere and has to stay one sphere."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = manifest.load(ROOT)
+        cls.sea = ocean.build(cls.m, res=16)
+
+    def test_every_vertex_is_at_sea_level(self):
+        # Not "close to a sphere": the game measures sea level by averaging
+        # these vertices, and it is only allowed to do that because they are
+        # all the same distance out.
+        radius = ocean.sea_radius(self.m)
+        r = np.linalg.norm(self.sea["positions"].astype(np.float64), axis=1)
+        np.testing.assert_allclose(r, radius, atol=1e-3)
+        self.assertEqual(len(r), 6 * 16 * 16 + 2)
+
+    def test_the_sea_winds_outward(self):
+        # Inside-out water is invisible from the beach and solid from below,
+        # and neither reads as a bug until you are standing in it.
+        p = self.sea["positions"].astype(np.float64)[self.sea["triangles"]]
+        normal = np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0])
+        self.assertTrue(np.all(np.einsum("ij,ij->i", normal, p.mean(axis=1)) > 0))
+
+    def test_the_surface_tiles_in_metres(self):
+        """One repeat of the water texture is METRES_PER_REPEAT of sea.
+
+        Exactly so down the middle of a face, and off by up to a factor of
+        1.7 between the tightest and loosest places, which is the cube-sphere's
+        own doing rather than a mistake in the mapping: the tangent warp evens
+        out the spacing along a row of the grid, and nothing evens out how the
+        rows crowd together and shear as they approach a face edge or corner.
+        On a 20 m ripple pattern that is a slow stretch nobody sees. What it
+        must not do is drift far enough that the sea tiles at a different size
+        from the castle's moat, which is what this pins down.
+        """
+        data = ocean.build(self.m, res=32)
+        p = data["positions"].astype(np.float64)[data["triangles"]]
+        uv = data["uvs"].astype(np.float64)
+        edge = np.linalg.norm(p[:, 1] - p[:, 0], axis=1)
+        repeats = np.linalg.norm(uv[:, 1] - uv[:, 0], axis=1)
+        metres = edge / np.maximum(repeats, 1e-12)
+        self.assertAlmostEqual(float(np.median(metres)), ocean.METRES_PER_REPEAT,
+                               delta=0.05 * ocean.METRES_PER_REPEAT)
+        self.assertLess(metres.max() / metres.min(), 1.7)
+
+
 class TestBuiltPlanet(unittest.TestCase):
     """Integration checks against whatever is currently in tiles/."""
 
@@ -219,6 +266,28 @@ class TestBuiltPlanet(unittest.TestCase):
                 np.testing.assert_array_equal(fine[int(gid)], pos)
                 checked += 1
         self.assertGreater(checked, 0)
+
+    def test_the_sea_covers_the_basins_and_not_the_hills(self):
+        """The two meshes agree about where the waterline is.
+
+        Tautological only as long as both sides keep measuring altitude from
+        the same place. They are built by different code paths -- terrain from
+        the rasters, sea from the manifest -- and the day one of them changes
+        what it adds to `radius`, this is the coastline moving without anyone
+        having asked it to.
+        """
+        m = manifest.load(ROOT)
+        sea = ocean.sea_radius(m)
+        wet = dry = 0
+        for tile in self.tiles[0].values():
+            r = np.linalg.norm(tile["positions"].astype(np.float64), axis=1)
+            under = tile["altitude"] < m["sea_level"]
+            np.testing.assert_array_equal(r < sea, under)
+            wet += int(under.sum())
+            dry += int((~under).sum())
+        # And both kinds exist, or the assertion above is vacuous.
+        self.assertGreater(wet, 0)
+        self.assertGreater(dry, 0)
 
     def test_the_planet_is_mostly_one_walkable_region(self):
         report = check.traversal_report(self.tiles[0])

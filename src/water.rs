@@ -1,10 +1,17 @@
 //! The water sheet, and the view from under it.
 //!
 //! Ported from `sm64py/level.py`'s `build_water_surface`/`animate_water` and
-//! the camera medium in `app/main.py`. Water is not part of the level mesh --
-//! it is the axis-aligned boxes the collision data carries, drawn as one flat
-//! quad at each box's height, unlit and half transparent, seen from both sides
-//! because most of the time it is looked at from underneath.
+//! the camera medium in `app/main.py`. On the castle, water is not part of the
+//! level mesh -- it is the axis-aligned boxes the collision data carries,
+//! drawn as one flat quad at each box's height, unlit and half transparent,
+//! seen from both sides because most of the time it is looked at from
+//! underneath.
+//!
+//! A planet's sea is the other way round: it is one sphere at sea level,
+//! generated with the terrain and shipped in the same glTF, so this file finds
+//! it rather than building it. The two meet at [`camera_medium`], which asks
+//! the level how deep the camera is and gets an answer without knowing which
+//! kind of world it is in.
 //!
 //! Every constant here is the Panda3D build's, converted from SM64 units to
 //! the port's world scale of 1/100.
@@ -260,6 +267,73 @@ pub fn spawn(
     ));
 }
 
+/// The planet's sea: one node of the planet's own glTF, tagged on arrival.
+#[derive(Component)]
+pub struct Ocean;
+
+/// The axis the sea turns about. Any fixed axis will do -- it is a sphere --
+/// so this is the castle's first drift direction, laid on its side.
+const OCEAN_AXIS: Vec3 = Vec3::new(0.60, 0.80, 0.0);
+
+/// Finds the sea in the planet's scene and marks it, once.
+///
+/// The sea arrives as geometry rather than as something this game builds,
+/// because sea level is the generator's number and a mesh is how it is carried
+/// across -- `src/world.rs` reads the same node for the radius it swims
+/// against. All that is wanted here is a handle on the entity, and the name
+/// off the glTF node is the only thing that identifies it: by the time
+/// anything else could, [`crate::n64::convert`] has already moved it onto the
+/// port's own material along with the rest of the scene.
+pub fn find_ocean(mut commands: Commands, arrivals: Query<(Entity, &Name), Added<Name>>) {
+    for (entity, name) in &arrivals {
+        if is_the_sea(name.as_str()) {
+            commands.entity(entity).insert(Ocean);
+        }
+    }
+}
+
+/// Is this the glTF node holding the sea, rather than something under it?
+///
+/// `planetgen` names the node `ocean`, or `ocean_lod1` for the space mesh. The
+/// glTF loader then names the primitive hanging off it after its mesh and its
+/// material -- `ocean.PlanetOcean` -- so a prefix match finds the sea twice,
+/// once as itself and once as its own child. Tagging both would turn the sea
+/// at double speed, the child riding on the parent's rotation and adding its
+/// own.
+fn is_the_sea(name: &str) -> bool {
+    name == "ocean" || name.starts_with("ocean_")
+}
+
+/// Drifts the sea by turning it.
+///
+/// The flat sheets in [`drift`] move their UVs, which is four vertices' worth
+/// of work and no material support at all. Neither is available here: the sea
+/// is 25,344 vertices, and it is drawn with [`crate::n64::N64Material`], which
+/// has no texture transform to offset -- the console it imitates had nowhere
+/// to put one.
+///
+/// A sphere spun about its own centre occupies exactly the space it did
+/// before, so the turn moves nothing except what is drawn on it: the ripples
+/// slide across the surface and the coastline stays where it is. Rotating a
+/// sheet is the mistake the castle's water deliberately avoids -- one corner
+/// crawls while the other races -- and a globe is the one shape where it is
+/// not, because every point of it is the same distance from the axis except
+/// the two the axis runs through.
+pub fn drift_ocean(
+    time: Res<Time>,
+    level: Res<LevelData>,
+    mut sea: Query<&mut Transform, With<Ocean>>,
+) {
+    // Radians a second that put the surface at the same metres a second the
+    // castle's sheets drift at, whatever size the planet turns out to be.
+    let Some(spin) = level.sea_radius().map(|radius| DRIFT_SPEED / radius.max(1.0)) else {
+        return;
+    };
+    for mut transform in &mut sea {
+        transform.rotation = Quat::from_axis_angle(OCEAN_AXIS.normalize(), spin * time.elapsed_secs());
+    }
+}
+
 fn uvs_of(mesh: &Mesh) -> Vec<[f32; 2]> {
     if let Some(bevy::render::mesh::VertexAttributeValues::Float32x2(uvs)) =
         mesh.attribute(Mesh::ATTRIBUTE_UV_0)
@@ -310,8 +384,8 @@ pub fn camera_medium(
         return;
     };
     let submerged = level
-        .water_level(camera.translation.x, camera.translation.z)
-        .is_some_and(|surface| camera.translation.y < surface);
+        .water_depth(camera.translation)
+        .is_some_and(|depth| depth > 0.0);
     if submerged == medium.submerged {
         return;
     }
@@ -391,6 +465,16 @@ mod tests {
         };
         assert!((span(&narrow) - 1.0).abs() < 1e-4, "{}", span(&narrow));
         assert!((span(&wide) - 2.0).abs() < 1e-4, "{}", span(&wide));
+    }
+
+    /// The rule that keeps the sea from being found twice, and from being
+    /// missed entirely at LOD1.
+    #[test]
+    fn the_sea_is_the_node_and_not_the_primitive_hanging_off_it() {
+        assert!(is_the_sea("ocean"));
+        assert!(is_the_sea("ocean_lod1"));
+        assert!(!is_the_sea("ocean.PlanetOcean"));
+        assert!(!is_the_sea("tile_0_2_1_1"));
     }
 
     #[test]

@@ -415,6 +415,8 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
         squad::whistle,
         squad::animate_allies,
         water::drift,
+        water::find_ocean,
+        water::drift_ocean,
         water::camera_medium,
         shadow::systems(),
         weapon::fade,

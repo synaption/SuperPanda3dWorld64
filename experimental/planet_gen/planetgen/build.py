@@ -13,7 +13,7 @@ import numpy as np
 
 from . import rasters, surface
 from .cubesphere import (VertexGrid, grid_parameters, tile_quad_indices,
-                         tile_name, tiles_at)
+                         tile_name, tiles_at, welded_triangles)
 from .manifest import grid_size
 
 
@@ -46,14 +46,7 @@ class Planet:
 
     def triangles(self):
         """Every triangle on the planet, indexing the shared vertex array."""
-        out = []
-        for face in range(6):
-            ids = self.grid.ids[face]
-            a, b = ids[:-1, :-1], ids[:-1, 1:]
-            c, d = ids[1:, 1:], ids[1:, :-1]
-            out.append(np.stack([a, b, c], axis=-1).reshape(-1, 3))
-            out.append(np.stack([a, c, d], axis=-1).reshape(-1, 3))
-        return np.concatenate(out).astype(np.int64)
+        return welded_triangles(self.grid)
 
     def vertex_normals(self, positions, triangles):
         """Area-weighted vertex normals, accumulated planet-wide.

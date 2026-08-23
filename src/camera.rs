@@ -227,7 +227,7 @@ mod tests {
     fn planet_world(at: Vec3) -> World {
         let mut world = World::new();
         world.insert_resource(Gravity::towards(Vec3::ZERO));
-        world.insert_resource(LevelData::planet(&[], &[], Vec3::ZERO, PLANET));
+        world.insert_resource(LevelData::planet(&[], &[], Vec3::ZERO, PLANET, None));
         world.insert_resource(RenderPose {
             translation: at,
             rotation: Quat::IDENTITY,
@@ -309,7 +309,7 @@ mod tests {
     fn a_flat_level_keeps_the_view_upright_throughout() {
         let mut world = planet_world(Vec3::Y * PLANET);
         world.insert_resource(Gravity::default());
-        world.insert_resource(LevelData::planet(&[], &[], Vec3::ZERO, PLANET));
+        world.insert_resource(LevelData::planet(&[], &[], Vec3::ZERO, PLANET, None));
         world.resource_mut::<RenderPose>().translation = Vec3::new(-13.28, 3.0, 46.64);
         for _ in 0..60 {
             frames(&mut world, 1);

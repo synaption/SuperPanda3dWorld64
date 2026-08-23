@@ -190,7 +190,7 @@ pub fn spawn(
             // Empty collision and radial gravity from the first frame: the
             // world is already round while it loads, so nothing has to be
             // switched over a second time when the ground arrives.
-            let empty = LevelData::planet(&[], &[], PLANET_CENTRE, 1.0);
+            let empty = LevelData::planet(&[], &[], PLANET_CENTRE, 1.0, None);
             commands.insert_resource(FlowField::new(&empty));
             commands.insert_resource(empty);
             commands.insert_resource(Gravity::towards(PLANET_CENTRE));
@@ -425,16 +425,28 @@ pub fn finish_planet(
     let Some(gltf) = gltfs.get(&load.handle) else {
         return;
     };
-    let Some((vertices, indices)) = read_geometry(gltf, &nodes, &gltf_meshes, &meshes) else {
+    let Some(geometry) = read_geometry(gltf, &nodes, &gltf_meshes, &meshes) else {
         return;
     };
-    let (centre, radius) = sphere_of(&vertices);
-    let collision = LevelData::planet(&vertices, &indices, centre, radius);
-    let spawn = ground_to_stand_on(&collision, centre, radius);
-    console.report(format!(
-        "planet: {} triangles, radius {radius:.0} m",
-        indices.len()
-    ));
+    let (centre, radius) = sphere_of(&geometry.vertices);
+    let sea = sea_level_of(&geometry.ocean, centre);
+    let collision = LevelData::planet(&geometry.vertices, &geometry.indices, centre, radius, sea);
+    // Sea level rather than the measured mean wherever there is a sea. The
+    // mean sits four metres above the water on this planet -- it is an average
+    // over land and seabed both -- and "the lowest dry land" measured against
+    // it is land that is four metres dry, which is a beach the player never
+    // arrives on.
+    let spawn = ground_to_stand_on(&collision, centre, sea.unwrap_or(radius));
+    console.report(match sea {
+        Some(sea) => format!(
+            "planet: {} triangles, radius {radius:.0} m, sea level {sea:.0} m",
+            geometry.indices.len()
+        ),
+        None => format!(
+            "planet: {} triangles, radius {radius:.0} m, no sea",
+            geometry.indices.len()
+        ),
+    });
 
     put_the_player_down(spawn, gravity.up(spawn), &mut commands, &mut placement);
 
@@ -444,6 +456,27 @@ pub fn finish_planet(
     load.pending = None;
     load.handle = Handle::default();
 }
+
+/// What a planet's glTF is read for: the ground, and the sea over it.
+#[derive(Default)]
+struct Geometry {
+    vertices: Vec<Vec3>,
+    indices: Vec<[u32; 3]>,
+    /// The sea-level sphere's vertices, kept apart from the collision they
+    /// must never join. It is in the same file as the terrain because it is
+    /// part of the same planet and the generator owns where sea level is; it
+    /// is a separate node so that reading it as ground is a decision somebody
+    /// has to make rather than the default.
+    ocean: Vec<Vec3>,
+}
+
+/// The name a planet's sea goes by, in `planetgen`'s exporter and here.
+///
+/// Matched on the front of the name so that the LOD1 sphere -- `ocean_lod1` --
+/// is the sea too. Getting this wrong is not a subtle bug in either direction:
+/// a sea read as ground is a glass floor over the whole world, and ground read
+/// as sea is a planet with no collision at all.
+const OCEAN_NODE: &str = "ocean";
 
 /// Every triangle in a glTF, welded end to end into one mesh in world space.
 ///
@@ -461,7 +494,7 @@ fn read_geometry(
     nodes: &Assets<GltfNode>,
     gltf_meshes: &Assets<GltfMesh>,
     meshes: &Assets<Mesh>,
-) -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
+) -> Option<Geometry> {
     // The roots are the nodes nobody claims as a child. `Gltf::nodes` is every
     // node in the file, parents and children alike, so walking it directly
     // would visit a child once on its own and once under its parent.
@@ -469,7 +502,7 @@ fn read_geometry(
     for handle in &gltf.nodes {
         children.extend(nodes.get(handle)?.children.iter().map(|child| child.id()));
     }
-    let mut geometry = (Vec::new(), Vec::new());
+    let mut geometry = Geometry::default();
     for handle in &gltf.nodes {
         if children.contains(&handle.id()) {
             continue;
@@ -479,6 +512,21 @@ fn read_geometry(
     Some(geometry)
 }
 
+/// Where the water's surface is, out of the sea's own vertices.
+///
+/// Every one of them is the same distance from the centre -- the generator
+/// builds a sphere -- so the mean is that distance and not an estimate of it.
+/// This is why the sea travels as geometry: `sea_level` is a number in
+/// `planet.json`, the game does not read `planet.json`, and a shoreline drawn
+/// four metres out is a shoreline in the wrong place.
+fn sea_level_of(ocean: &[Vec3], centre: Vec3) -> Option<f32> {
+    if ocean.is_empty() {
+        return None;
+    }
+    let sum: f32 = ocean.iter().map(|&vertex| (vertex - centre).length()).sum();
+    Some(sum / ocean.len() as f32)
+}
+
 /// One node and everything under it, with `parent` already applied.
 fn read_node(
     handle: &Handle<GltfNode>,
@@ -486,11 +534,12 @@ fn read_node(
     nodes: &Assets<GltfNode>,
     gltf_meshes: &Assets<GltfMesh>,
     meshes: &Assets<Mesh>,
-    into: &mut (Vec<Vec3>, Vec<[u32; 3]>),
+    into: &mut Geometry,
 ) -> Option<()> {
     let node = nodes.get(handle)?;
     let here = parent * node.transform;
     if let Some(mesh_handle) = &node.mesh {
+        let sea = node.name.starts_with(OCEAN_NODE);
         for primitive in &gltf_meshes.get(mesh_handle)?.primitives {
             let mesh = meshes.get(&primitive.mesh)?;
             let Some(VertexAttributeValues::Float32x3(positions)) =
@@ -498,12 +547,19 @@ fn read_node(
             else {
                 continue;
             };
+            if sea {
+                // Read for its radius alone. The sea is drawn by the scene
+                // this same glTF spawns, and stood on by nobody.
+                into.ocean
+                    .extend(positions.iter().map(|p| here * Vec3::from(*p)));
+                continue;
+            }
             // Each tile brings its own vertex array, so every tile's indices
             // are offset past the tiles already read. The tiles do share a
             // boundary ring by value rather than by index; the duplicates cost
             // twelve bytes each and no correctness.
-            let base = into.0.len() as u32;
-            into.0
+            let base = into.vertices.len() as u32;
+            into.vertices
                 .extend(positions.iter().map(|p| here * Vec3::from(*p)));
             let corners: Vec<u32> = match mesh.indices() {
                 Some(Indices::U16(values)) => values.iter().map(|&i| base + i as u32).collect(),
@@ -512,7 +568,7 @@ fn read_node(
                 // order, which is what the glTF spec says it is.
                 None => (base..base + positions.len() as u32).collect(),
             };
-            into.1
+            into.indices
                 .extend(corners.chunks_exact(3).map(|tri| [tri[0], tri[1], tri[2]]));
         }
     }
@@ -556,12 +612,16 @@ fn sphere_of(vertices: &[Vec3]) -> (Vec3, f32) {
 /// the candidates are spread evenly over the sphere instead of bunching at the
 /// poles.
 ///
+/// Land is measured against `sea_level` rather than against the mean radius,
+/// because on a planet with an ocean they are not the same number and the
+/// difference is the beach.
+///
 /// The *lowest* land rather than the first, which is one comparison and worth
 /// it. The first is wherever the spiral happens to start, and on this planet
 /// that was a glacier: a mountaintop is the worst place to arrive on a world
 /// you are meant to walk around, and a white one is the worst place to
 /// photograph it from. Lowland is flat, walkable, and next to the sea.
-fn ground_to_stand_on(collision: &LevelData, centre: Vec3, radius: f32) -> Vec3 {
+fn ground_to_stand_on(collision: &LevelData, centre: Vec3, sea_level: f32) -> Vec3 {
     let golden = std::f32::consts::PI * (3.0 - 5.0_f32.sqrt());
     const CANDIDATES: usize = 256;
     let mut lowest_land: Option<(f32, Vec3)> = None;
@@ -571,13 +631,13 @@ fn ground_to_stand_on(collision: &LevelData, centre: Vec3, radius: f32) -> Vec3 
         let ring = (1.0 - height * height).max(0.0).sqrt();
         let yaw = golden * step as f32;
         let up = Vec3::new(ring * yaw.cos(), height, ring * yaw.sin()).normalize();
-        let from = centre + up * (radius + 60.0);
+        let from = centre + up * (sea_level + 60.0);
         let Some((point, _)) = collision.ground_below(from, up) else {
             continue;
         };
         let standing = point + up * DROP_IN;
         anywhere.get_or_insert(standing);
-        let altitude = (point - centre).length() - radius;
+        let altitude = (point - centre).length() - sea_level;
         if altitude > 0.0 && lowest_land.is_none_or(|(best, _)| altitude < best) {
             lowest_land = Some((altitude, standing));
         }
@@ -587,7 +647,7 @@ fn ground_to_stand_on(collision: &LevelData, centre: Vec3, radius: f32) -> Vec3 
     lowest_land
         .map(|(_, standing)| standing)
         .or(anywhere)
-        .unwrap_or(centre + Vec3::Y * (radius + DROP_IN))
+        .unwrap_or(centre + Vec3::Y * (sea_level + DROP_IN))
 }
 
 #[cfg(test)]
@@ -670,9 +730,49 @@ mod tests {
 
         let start = app.world().resource::<Respawn>().0;
         let up = gravity.up(start);
+
+        // The planet has a sea, and the player is on the dry side of it.
+        //
+        // Measured against the water rather than against `radius`, which is
+        // the mean distance to the surface and sits four metres above the
+        // waterline on this planet -- an average taken over the mountains and
+        // the seabed alike.
+        let level = app.world().resource::<LevelData>();
+        let sea = level
+            .sea_radius()
+            .expect("planet.glb has no ocean node, so there is no sea");
         assert!(
-            (start - centre).length() > radius,
-            "the player was put down under the sea"
+            (250.0..350.0).contains(&sea),
+            "the sea came out at r={sea} m round a planet of r={radius} m"
+        );
+        let depth = level.water_depth(start).unwrap();
+        assert!(depth < 0.0, "the player was put down {depth} m under the sea");
+        assert!(
+            depth > -10.0,
+            "the player was put down {} m above the water, which is a hillside \
+             and not the shore the spawn search is for",
+            -depth
+        );
+
+        // The sea is drawn and not stood on. Were the ocean node read as
+        // collision, the lowest ground anywhere on the planet would be the
+        // water's surface: a glass floor over every basin, and the seabed
+        // sealed underneath it.
+        let golden = std::f32::consts::PI * (3.0 - 5.0_f32.sqrt());
+        let mut deepest = f32::INFINITY;
+        for step in 0..256 {
+            let height = 1.0 - 2.0 * (step as f32 + 0.5) / 256.0;
+            let ring = (1.0 - height * height).max(0.0).sqrt();
+            let yaw = golden * step as f32;
+            let probe = Vec3::new(ring * yaw.cos(), height, ring * yaw.sin()).normalize();
+            if let Some((point, _)) = level.ground_below(centre + probe * (sea + 60.0), probe) {
+                deepest = deepest.min((point - centre).length());
+            }
+        }
+        assert!(
+            deepest < sea - 5.0,
+            "the deepest ground on the planet is at r={deepest} m against a sea \
+             at r={sea} m, which is the ocean being walked on"
         );
         assert!(up.dot(Vec3::Y).abs() < 0.999, "up is still the world's up");
 
@@ -704,6 +804,21 @@ mod tests {
         assert!(
             (transform.rotation * Vec3::Y).dot(gravity.up(at)) > 0.99,
             "the player is not perpendicular to the ground he is standing on"
+        );
+
+        // The sea is in the scene and moving. Both halves matter: the node has
+        // to have been found by its name, and the drift has to have turned it,
+        // a turn being the only motion an ocean has.
+        let mut seas = app
+            .world_mut()
+            .query_filtered::<&Transform, With<crate::water::Ocean>>();
+        let sea_transform = seas
+            .single(app.world())
+            .expect("the planet's scene has no ocean in it");
+        assert!(
+            sea_transform.rotation.angle_between(Quat::IDENTITY) > 1e-5,
+            "the sea never drifted: {:?}",
+            sea_transform.rotation
         );
     }
 
@@ -866,7 +981,7 @@ mod tests {
                 ]);
             }
         }
-        let collision = LevelData::planet(&vertices, &indices, Vec3::ZERO, radius);
+        let collision = LevelData::planet(&vertices, &indices, Vec3::ZERO, radius, Some(radius));
         let spawn = ground_to_stand_on(&collision, Vec3::ZERO, radius);
         let altitude = spawn.length() - radius - DROP_IN;
         assert!(altitude > 0.0, "spawned {altitude} m below sea level");
@@ -878,7 +993,7 @@ mod tests {
 
     #[test]
     fn a_planet_with_no_ground_still_has_a_spawn() {
-        let empty = LevelData::planet(&[], &[], Vec3::ZERO, 300.0);
+        let empty = LevelData::planet(&[], &[], Vec3::ZERO, 300.0, None);
         let spawn = ground_to_stand_on(&empty, Vec3::ZERO, 300.0);
         assert!(spawn.length() > 300.0, "{spawn}");
     }

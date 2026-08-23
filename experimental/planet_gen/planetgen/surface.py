@@ -14,11 +14,16 @@ import numpy as np
 OCEAN, SAND, GRASS, ROCK, SNOW = range(5)
 
 MATERIALS = (
-    {"name": "ocean_floor", "surface": "SURFACE_DEFAULT", "color": (0.16, 0.20, 0.26)},
-    {"name": "sand",        "surface": "SURFACE_SAND",    "color": (0.76, 0.70, 0.48)},
-    {"name": "grass",       "surface": "SURFACE_DEFAULT", "color": (0.24, 0.44, 0.16)},
-    {"name": "rock",        "surface": "SURFACE_HARD",    "color": (0.38, 0.36, 0.34)},
-    {"name": "snow",        "surface": "SURFACE_SNOW",    "color": (0.90, 0.92, 0.95)},
+    {"name": "ocean_floor", "surface": "SURFACE_DEFAULT", "color": (0.16, 0.20, 0.26),
+     "texture": "ocean.png", "texture_scale": 14.0},
+    {"name": "sand",        "surface": "SURFACE_SAND",    "color": (0.76, 0.70, 0.48),
+     "texture": "sand.png", "texture_scale": 10.0},
+    {"name": "grass",       "surface": "SURFACE_DEFAULT", "color": (0.24, 0.44, 0.16),
+     "texture": "grass.png", "texture_scale": 12.0},
+    {"name": "rock",        "surface": "SURFACE_HARD",    "color": (0.38, 0.36, 0.34),
+     "texture": "rock.png", "texture_scale": 10.0},
+    {"name": "snow",        "surface": "SURFACE_SNOW",    "color": (0.90, 0.92, 0.95),
+     "texture": "snow.png", "texture_scale": 12.0},
 )
 
 

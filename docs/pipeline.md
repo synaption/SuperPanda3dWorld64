@@ -53,8 +53,8 @@ assets/
   bevy/
     castle.bin                   the level, in the game's own format
     castle.glb                   the same level as renderable geometry
-    planet.glb                   the generated planet, LOD0 (14 MB, 96 tiles)
-    water.png                    the water sheet's texture
+    planet.glb                   the generated planet, LOD0 (34 MB, 96 tiles + sea)
+    water.png                    the water sheet's texture, and the planet's sea
   castle_grounds/
     collision.npz                490 vertices, 879 triangles, 2 water boxes
     collision_objects.json       special objects, including the 26 trees
@@ -426,6 +426,15 @@ be a planet whose ground is a few metres from where it is drawn. There is no
 `.bin` either — 786,432 triangles is far past what `include_bytes!` is a
 sensible way to ship, which is the same conclusion the generator's readme
 reaches from the other side.
+
+The sea rides in the same file, as one transparent sphere in a node named
+`ocean`. That is how sea level reaches the game at all: it is a number in
+`planet.json`, the game does not read `planet.json`, and the mean radius it can
+measure off the terrain sits four metres above the waterline. [`src/world.rs`](../src/world.rs)
+skips that node when it reads collision — the sea is drawn and swum in, never
+stood on — and takes its radius as sea level. Its texture is
+`assets/bevy/water.png`, packed into the `.glb` by the generator's Blender
+pass, so the ocean and the castle's moat are the same water.
 
 ## Exporting actors
 

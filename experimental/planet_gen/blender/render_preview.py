@@ -62,12 +62,15 @@ def show(lod):
             col.hide_viewport = col.hide_render = (name != f"LOD{lod}")
 
 
-def vista_tile():
-    """Pick a tile worth photographing: the most material variety, mid-height.
+def vista_tile(sea_level):
+    """Pick a tile worth photographing: material variety, and a coastline.
 
     The global peak is a bad choice -- it is pure snow at max altitude, so the
-    shot comes back as a white slope with nothing in it. A tile spanning coast,
-    grass and rock shows what the generator actually produced.
+    shot comes back as a white slope with nothing in it. Nor is the tile with
+    the most land on it, which is what this weighed before the planet had a
+    sea and which is a hill in the middle of a continent. What wants
+    photographing now is a coast: open water for the sea to read as sea, a
+    shore for the waterline, and enough dry ground to stand the camera on.
     """
     best, best_score = None, -1.0
     for path in sorted((ROOT / "tiles" / "lod0").glob("*.npz")):
@@ -75,9 +78,11 @@ def vista_tile():
             material, alt, pos = z["material"], z["altitude"], z["positions"]
             variety = len(np.unique(material))
             land = alt > 2.0
-            if land.mean() < 0.45:
+            if land.mean() < 0.2:
                 continue
-            score = variety + land.mean()
+            shore = float(np.mean(np.abs(alt - sea_level) < 3.0))
+            deep = float(np.mean(alt < sea_level - 4.0))
+            score = variety + shore + 2.0 * deep
             if score > best_score:
                 best_score = score
                 centre = pos[land].mean(axis=0).astype(float)
@@ -124,7 +129,7 @@ def main():
     # Down on the surface. Aimed along the ground rather than at it, so the
     # horizon curve is in frame -- on a 300 m planet that curve is the whole
     # point and a shot pointed at your feet hides it.
-    centre, alt, name, variety = vista_tile()
+    centre, alt, name, variety = vista_tile(m["sea_level"])
     up = centre.normalized()
     east = Vector((0, 0, 1)).cross(up)
     east = east.normalized() if east.length > 0.1 else Vector((1, 0, 0)).cross(up).normalized()

@@ -132,6 +132,23 @@ class VertexGrid:
         return self.ids[face, v0:v0 + res + 1, u0:u0 + res + 1]
 
 
+def welded_triangles(grid):
+    """Every triangle over a grid's six faces, indexing the shared vertices.
+
+    Wound outward, and welded: a triangle on a face edge names the canonical
+    vertex its neighbour on the far side names too, so the surface has no
+    crack there for the same reason the terrain does not.
+    """
+    out = []
+    for face in range(6):
+        ids = grid.ids[face]
+        a, b = ids[:-1, :-1], ids[:-1, 1:]
+        c, d = ids[1:, 1:], ids[1:, :-1]
+        out.append(np.stack([a, b, c], axis=-1).reshape(-1, 3))
+        out.append(np.stack([a, c, d], axis=-1).reshape(-1, 3))
+    return np.concatenate(out).astype(np.int64)
+
+
 def tile_quad_indices(res):
     """Triangle indices into a (res+1)^2 tile block, wound outward."""
     row = res + 1

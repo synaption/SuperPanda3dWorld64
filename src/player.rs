@@ -146,8 +146,8 @@ impl Submersion {
 /// Split out from the controller so the rule is checked without a level, a
 /// water box or a renderer -- it is the part that decides whether the Hero
 /// swims, which he must never do.
-pub fn submersion(character: ActiveCharacter, y: f32, water_level: Option<f32>) -> Submersion {
-    if !water_level.is_some_and(|surface| y < surface - SUBMERGED_DEPTH) {
+pub fn submersion(character: ActiveCharacter, depth: Option<f32>) -> Submersion {
+    if !depth.is_some_and(|depth| depth > SUBMERGED_DEPTH) {
         return Submersion::Dry;
     }
     match character {
@@ -268,9 +268,11 @@ pub fn movement(
     let forward = gravity::flatten(cam.forward().into(), up);
     let right = gravity::flatten(cam.right().into(), up);
     let wish = forward * input.y + right * input.x;
-    let water_level = level.water_level(transform.translation.x, transform.translation.z);
+    // How far under the surface he is, measured along his own up, so the sea
+    // wrapped round a planet asks the same question the castle's moat does.
+    let depth = level.water_depth(transform.translation);
     let was_wet = ctrl.submersion.in_water();
-    ctrl.submersion = submersion(state.active, transform.translation.y, water_level);
+    ctrl.submersion = submersion(state.active, depth);
     if ctrl.submersion.in_water() != was_wet {
         sounds.push(Sfx::Splash);
     }
@@ -307,8 +309,11 @@ pub fn movement(
 
     match ctrl.submersion {
         Submersion::Swimming => {
-            let surface = water_level.unwrap() - SWIM_FLOAT_DEPTH;
-            let buoyancy = ((surface - transform.translation.y) * 2.0).clamp(-2.0, 3.0);
+            // Positive while he is deeper than he floats, so buoyancy pushes
+            // him along the local up -- towards the sky on a flat level and
+            // away from the core on a planet, from the one number.
+            let sunk = depth.unwrap() - SWIM_FLOAT_DEPTH;
+            let buoyancy = (sunk * 2.0).clamp(-2.0, 3.0);
             rise += (buoyancy - rise) * 0.16;
             if jump_pressed {
                 rise = (rise + 3.8).min(6.0);
@@ -368,9 +373,12 @@ pub fn movement(
         // to it; and only a pull, so a bottom shallower than the float depth
         // still wins below and he walks along it. An underwater jump is left
         // alone while rising instead of being pulled straight back down.
-        let float_line = water_level.unwrap() - WADE_FLOAT_DEPTH;
-        transform.translation.y =
-            approach(transform.translation.y, float_line, WADE_RISE * FIXED_DT);
+        // Along his own up rather than along `+Y`. `below` is how far under
+        // the float line he is -- negative when he is over it -- and the step
+        // that closes some of that gap is the same step on a planet as on a
+        // flat level once it is taken in the direction the water pushes.
+        let below = depth.unwrap() - WADE_FLOAT_DEPTH;
+        transform.translation += up * approach(0.0, below, WADE_RISE * FIXED_DT);
     }
     let horizontal_step = (ctrl.velocity - up * ctrl.velocity.dot(up)) * FIXED_DT;
     let wanted = transform.translation + horizontal_step;
@@ -643,7 +651,7 @@ mod tests {
     #[test]
     fn standing_up_on_a_planet_is_a_swing_and_not_a_snap() {
         let mut world = world_with(
-            level::LevelData::planet(&[], &[], Vec3::ZERO, 300.0),
+            level::LevelData::planet(&[], &[], Vec3::ZERO, 300.0, None),
             Vec3::X * 300.0,
         );
         world.insert_resource(Gravity::towards(Vec3::ZERO));
@@ -901,6 +909,40 @@ mod tests {
         world.resource_mut::<InputState>().move_axis = Vec2::new(0.0, 1.0);
         tick(&mut world, 10);
         assert_eq!(player(&mut world).3, Motion::Run);
+    }
+
+    /// The same water, wrapped round a planet.
+    ///
+    /// Deep is deep whatever shape the world is: the surface he floats up to
+    /// is a radius here rather than a height, and the buoyancy that carries
+    /// him to it points away from the core rather than at the sky. Nothing in
+    /// the controller knows which of those it is doing -- it is handed a depth
+    /// and a local up -- and this is the test that says so.
+    #[test]
+    fn mario_swims_in_a_planet_sea() {
+        let sea = 300.0;
+        let mut world = world_with(
+            // No collision: he is six metres under, and what is being measured
+            // is the water holding him up rather than the seabed doing it.
+            level::LevelData::planet(&[], &[], Vec3::ZERO, sea, Some(sea)),
+            Vec3::X * (sea - 6.0),
+        );
+        world.insert_resource(Gravity::towards(Vec3::ZERO));
+        world.resource_mut::<GameState>().active = ActiveCharacter::Mario;
+        tick(&mut world, 120);
+        assert_eq!(submersion_of(&mut world), Submersion::Swimming);
+        let (position, ..) = player(&mut world);
+        let depth = sea - position.length();
+        assert!(
+            (depth - SWIM_FLOAT_DEPTH).abs() < 0.5,
+            "floating {depth} m under the surface rather than {SWIM_FLOAT_DEPTH}"
+        );
+        // And he came up along his own up rather than along the world's: a
+        // swimmer pulled towards `+Y` here would have drifted off sideways.
+        assert!(
+            position.normalize().dot(Vec3::X) > 0.999,
+            "he surfaced at {position}, which is not where he went under"
+        );
     }
 
     /// The same water, the other character. Without this the test above would

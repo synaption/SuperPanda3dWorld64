@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import check, manifest, rasters, surface
+from . import check, manifest, ocean, rasters, surface
 from .build import Planet
 from .cubesphere import face_directions
 
@@ -62,6 +62,11 @@ def cmd_build(args):
     print(f"altitude {alt.min():+.1f} m to {alt.max():+.1f} m about r={m['radius']:.0f}")
     print(f"land {100 * (alt > m['sea_level']).mean():.1f}%, "
           f"walkable triangles {100 * walk.mean():.1f}%")
+    # The sea is not built here -- it is a sphere the exporter makes from these
+    # same numbers -- but its radius is what the game measures sea level by, so
+    # a build that moves it should say so.
+    deepest = float(m["sea_level"] - alt.min())
+    print(f"sea level r={ocean.sea_radius(m):.1f} m, deepest water {deepest:.1f} m")
     return 0
 
 

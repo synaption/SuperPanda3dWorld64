@@ -39,6 +39,11 @@ enum Index {
     Planet {
         centre: Vec3,
         radius: f32,
+        /// Distance from `centre` out to the water's surface, or `None` on a
+        /// dry planet. A planet ocean is one sphere and not a list of boxes:
+        /// every basin on the world is under the same surface, so "how deep am
+        /// I" is one subtraction wherever it is asked.
+        sea: Option<f32>,
         /// One list of triangles per face cell, `face * FACE_GRID * FACE_GRID`
         /// plus the cell within the face. No floor/wall split, because on a
         /// planet that split depends on where the triangle is and cannot be
@@ -320,7 +325,13 @@ impl LevelData {
     /// Triangles with no area to speak of, because they are worse than
     /// useless: [`degenerate`] has the whole story, and the short version is
     /// that one of them is an invisible floor in the middle of the world.
-    pub fn planet(vertices: &[Vec3], indices: &[[u32; 3]], centre: Vec3, radius: f32) -> Self {
+    pub fn planet(
+        vertices: &[Vec3],
+        indices: &[[u32; 3]],
+        centre: Vec3,
+        radius: f32,
+        sea: Option<f32>,
+    ) -> Self {
         let triangles: Vec<_> = indices
             .iter()
             .filter(|tri| tri.iter().all(|&i| (i as usize) < vertices.len()))
@@ -350,6 +361,7 @@ impl LevelData {
             index: Index::Planet {
                 centre,
                 radius,
+                sea,
                 cells,
             },
         }
@@ -469,13 +481,41 @@ impl LevelData {
         }
     }
 
-    pub fn water_level(&self, x: f32, z: f32) -> Option<f32> {
+    /// How far the water's surface is from the middle of a planet, or `None`
+    /// on a world with no sea. The sea that is drawn and the sea that is swum
+    /// in are the same sphere, so the renderer asks for its radius here rather
+    /// than measuring the mesh a second time and getting a second answer.
+    pub fn sea_radius(&self) -> Option<f32> {
+        match self.index {
+            Index::Planet { sea, .. } => sea,
+            Index::Flat { .. } => None,
+        }
+    }
+
+    /// How far `point` is below the surface of the water it is in, or `None`
+    /// where there is no water over that spot at all.
+    ///
+    /// A depth rather than a height, and that is what makes one question serve
+    /// both worlds. On a flat level the surface is a `y` and being under it
+    /// means a smaller `y`; on a planet the surface is a radius and being
+    /// under it means a smaller radius. Measured as a depth, both are the same
+    /// number: how far the point would have to rise, along its own up, to
+    /// break the surface. Negative in open air, so a caller that wants "is
+    /// this wet" asks for a positive depth rather than knowing which world it
+    /// is standing on.
+    pub fn water_depth(&self, point: Vec3) -> Option<f32> {
+        if let Index::Planet { centre, sea, .. } = self.index {
+            return sea.map(|surface| surface - (point - centre).length());
+        }
         self.water_boxes
             .iter()
             .find(|water| {
-                x >= water.min_x && x <= water.max_x && z >= water.min_z && z <= water.max_z
+                point.x >= water.min_x
+                    && point.x <= water.max_x
+                    && point.z >= water.min_z
+                    && point.z <= water.max_z
             })
-            .map(|water| water.surface_y)
+            .map(|water| water.surface_y - point.y)
     }
     pub fn floor_height(&self, point: Vec3) -> Option<f32> {
         self.highest_below(point, 0.0).map(|(height, _)| height)
@@ -744,7 +784,7 @@ impl LevelData {
             // Stepping is what keeps a ray fired along the ground -- a bullet,
             // the camera's boom -- from having to open a box the size of the
             // hemisphere it crosses.
-            Index::Planet { centre, radius, cells: filed } => {
+            Index::Planet { centre, radius, cells: filed, .. } => {
                 let arc = (FACE_CELL_ANGLE * radius).max(0.001);
                 let steps = ((direction.length() / arc).ceil() as usize + 1).min(PLANET_RAY_STEPS);
                 let mut cells_here = Vec::new();
@@ -1135,8 +1175,25 @@ mod tests {
             max_z: 5.0,
             surface_y: 1.25,
         });
-        assert_eq!(data.water_level(0.0, 0.0), Some(1.25));
-        assert_eq!(data.water_level(5.0, 0.0), None);
+        assert_eq!(data.water_depth(Vec3::new(0.0, 0.25, 0.0)), Some(1.0));
+        assert_eq!(data.water_depth(Vec3::new(0.0, 3.0, 0.0)), Some(-1.75));
+        assert_eq!(data.water_depth(Vec3::new(5.0, 0.0, 0.0)), None);
+    }
+
+    /// The sea covers a whole planet at one radius, so "how deep" is the same
+    /// subtraction wherever it is asked and there is no box to be inside of.
+    #[test]
+    fn a_planet_measures_its_depth_from_the_sea_radius() {
+        let planet = LevelData::planet(&[], &[], Vec3::ZERO, 300.0, Some(300.0));
+        assert_eq!(planet.water_depth(Vec3::new(0.0, 295.0, 0.0)), Some(5.0));
+        // The same five metres under, a quarter of the way round the world --
+        // the thing a flat water box cannot say.
+        assert_eq!(planet.water_depth(Vec3::new(295.0, 0.0, 0.0)), Some(5.0));
+        // Land pokes through the sea, and that reads as a negative depth
+        // rather than as no water: there is sea here, this point is over it.
+        assert_eq!(planet.water_depth(Vec3::new(0.0, 320.0, 0.0)), Some(-20.0));
+        let dry = LevelData::planet(&[], &[], Vec3::ZERO, 300.0, None);
+        assert_eq!(dry.water_depth(Vec3::new(0.0, 295.0, 0.0)), None);
     }
 
     fn brute_floor(data: &LevelData, point: Vec3) -> Option<f32> {
@@ -1229,7 +1286,7 @@ mod tests {
                 ]);
             }
         }
-        LevelData::planet(&vertices, &indices, Vec3::ZERO, radius)
+        LevelData::planet(&vertices, &indices, Vec3::ZERO, radius, None)
     }
 
     /// The claim the whole face grid exists to support: a planet answers "what
