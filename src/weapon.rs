@@ -550,7 +550,9 @@ pub fn fire(
             let (struck, landed) = nearest_hit(origin, direction, range, &level, &enemies);
             if let Some(entity) = struck {
                 commands.entity(entity).despawn();
-                sounds.push(Sfx::Defeat);
+                // At the far end of the beam rather than at the gun: a hitscan
+                // shot kills where it lands, and that is where it is heard.
+                sounds.push_at(Sfx::Defeat, landed);
             }
             if let Some(assets) = assets {
                 spawn_tracer(&mut commands, &assets, &tuning, origin, landed);
@@ -639,7 +641,7 @@ pub fn fly(
         );
         if let Some(hit) = struck {
             commands.entity(hit).despawn();
-            sounds.push(Sfx::Defeat);
+            sounds.push_at(Sfx::Defeat, landed);
             commands.entity(entity).despawn();
             continue;
         }
@@ -740,7 +742,12 @@ mod tests {
     }
 
     fn heard(world: &mut World) -> Vec<Sfx> {
-        world.resource_mut::<SoundQueue>().drain()
+        world
+            .resource_mut::<SoundQueue>()
+            .drain()
+            .into_iter()
+            .map(|event| event.sfx)
+            .collect()
     }
 
     /// The whole point of the feature: point the pistol at something and pull

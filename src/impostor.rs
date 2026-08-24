@@ -17,8 +17,11 @@
 //! An impostor is the standard answer: past the distance where a model is a few
 //! pixels tall, replace it with a flat quad showing a picture of that model,
 //! taken from the angle you happen to be looking from. The pictures are baked
-//! ahead of time into one atlas per enemy kind -- every viewing angle across the
-//! rows, every frame of its walk cycle across the columns.
+//! ahead of time into one atlas per enemy kind -- every frame of its walk cycle
+//! across the columns, every bearing round it down the rows, and the whole
+//! block of bearings again for each height the camera might be looking down
+//! from. Two of those heights, at present: see [`Tier`] for why one is not
+//! enough and three would be paying for very little.
 //!
 //! The saving comes from the quads being *one mesh*. They are not one entity
 //! each: the whole crowd of a kind is rebuilt every frame into a single vertex
@@ -66,8 +69,8 @@ const ALPHA_CUTOFF: f32 = 0.5;
 /// What the baker wrote beside an atlas: how to read it.
 ///
 /// Deserialised rather than compiled in, so that re-baking a sheet with more
-/// angles or a longer clip is a change to two files in `assets/` rather than a
-/// change to this module.
+/// angles, another elevation or a longer clip is a change to two files in
+/// `assets/` rather than a change to this module.
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq)]
 pub struct SheetMeta {
     /// Which actor this was baked from, for the error message when it is not
@@ -75,13 +78,52 @@ pub struct SheetMeta {
     pub model: String,
     /// Pixels along one side of a cell.
     pub cell_px: u32,
-    /// Distinct viewing angles, evenly spaced around the model. One per row.
+    /// Distinct bearings round the model, evenly spaced. One per row **within a
+    /// tier**, so the atlas is `angles * tiers.len()` rows tall in all.
     pub angles: usize,
     /// Frames of the walk cycle. One per column.
     pub frames: usize,
     /// How wide and tall a cell is in world units, which is the size of the
     /// quad it gets drawn onto.
+    ///
+    /// One number for the whole sheet rather than one per tier, and that is
+    /// deliberate: the baker fits a single camera to the largest thing any tier
+    /// sees, and pays for it in margin around the tiers that see less. A
+    /// per-tier size would make every sprite in the field jump in size at the
+    /// moment the tier changed, which is the one artefact tiers can add that a
+    /// flat sheet cannot have.
     pub world_size: f32,
+    /// How fast to play the columns, in frames a second.
+    pub fps: f32,
+    /// The elevations this sheet was baked from, flattest first, one block of
+    /// `angles` rows each.
+    pub tiers: Vec<Tier>,
+}
+
+/// One elevation the model was photographed from: how far above it the bake
+/// camera stood, and where the model's origin came out in the picture.
+///
+/// Why there is more than one. A sprite is a photograph taken from a particular
+/// height, and the crowd is not always looked at from the height it was
+/// photographed at: stand on a wall above a courtyard of slimes and a sheet
+/// baked level shows a field of enemies pictured from their own eye level,
+/// under a camera forty degrees above them. Every one of them presents its
+/// flank where it should be showing the top of its head, and the quads carrying
+/// those pictures are turning edge on into the bargain. A second block of rows
+/// baked from up there answers both, and costs the runtime nothing per sprite:
+/// it is rows in an atlas and a division to find them.
+///
+/// The other half of the crowd it is for never leaves the ground at all -- or
+/// rather, never leaves *its* ground. An ant on a wall is standing on the wall,
+/// and a player facing that wall is looking straight down on the ant whatever
+/// the camera's pitch says. Which tier a sprite is drawn from is settled in the
+/// model's own frame, so the wall, the ceiling and every slope between come out
+/// of the same arithmetic the flat ground does. See [`SheetMeta::tier`].
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy, Debug, PartialEq)]
+pub struct Tier {
+    /// How far above the model the camera stood, in degrees. Zero is level with
+    /// it, ninety is straight overhead.
+    pub elevation: f32,
     /// Where the model's own origin -- the point its `Transform` puts on the
     /// ground -- sits in the cell, as a fraction of the cell's height measured
     /// up from the bottom edge.
@@ -89,22 +131,52 @@ pub struct SheetMeta {
     /// Without it a sprite is centred on the enemy's feet and the enemy appears
     /// to be buried to the waist. With it the quad is lifted so that the ground
     /// in the picture lands on the ground in the world.
+    ///
+    /// Per tier, because it is a measurement of a *picture*: the same origin
+    /// lands somewhere else in the cell when the camera photographing it is
+    /// fifty-five degrees up rather than fifteen.
     pub foot: f32,
-    /// How fast to play the columns, in frames a second.
-    pub fps: f32,
-    /// The camera's downward tilt when the sheet was baked, in degrees. Not
-    /// read at runtime -- the quads are upright whatever it was -- but recorded
-    /// because a sheet baked at one tilt and viewed from a camera at a very
-    /// different one is the reason an impostor crowd can look subtly wrong, and
-    /// a number in the file is how that gets diagnosed.
-    pub elevation: f32,
 }
+
+impl Tier {
+    /// The up axis of a quad showing this tier's picture, given the surface the
+    /// model is standing on (`standing`, its own up) and the direction the
+    /// camera lies in *along* that surface (`flat`). Both unit, perpendicular.
+    ///
+    /// **The quads are not upright.** Each lies square on to the direction its
+    /// picture was taken from -- for the flattest tier a fifteen degree lean
+    /// nobody will see, for the steepest a card laid well back towards the
+    /// ground. That is what makes a photograph a substitute for a model: it is
+    /// only undistorted on a surface facing the way the camera did.
+    ///
+    /// It is also what saves the case an upright quad gets steadily worse at.
+    /// An upright card is foreshortened by the cosine of the camera's own tilt
+    /// and vanishes altogether from straight above; this one has turned to meet
+    /// the camera by then, and what it is showing is the picture of the model's
+    /// back, which is what is actually up there to see.
+    pub fn up(&self, standing: Vec3, flat: Vec3) -> Vec3 {
+        let tilt = self.elevation.to_radians();
+        // The bake camera's own up vector, worked back out. It looked along
+        // `-(flat * cos + standing * sin)` with no roll, which leaves this. Any
+        // other axis and the picture is drawn leaning.
+        standing * tilt.cos() - flat * tilt.sin()
+    }
+}
+
+/// What a sheet with no tiers at all is read as, so that a malformed sidecar is
+/// a wrong-looking sprite rather than a division by zero. [`read_meta`] rejects
+/// one before it can get this far.
+const FLAT: Tier = Tier {
+    elevation: 0.0,
+    foot: 0.5,
+};
 
 impl SheetMeta {
     /// Columns and rows the atlas is expected to have. The layout is fixed:
-    /// **one row per angle, one column per frame.**
+    /// **one column per frame, one row per bearing, and one block of `angles`
+    /// rows per tier**, flattest tier first.
     pub fn grid(&self) -> (usize, usize) {
-        (self.frames, self.angles)
+        (self.frames, self.angles * self.tiers.len())
     }
 
     /// How big the atlas has to be for this description to be true of it.
@@ -113,21 +185,77 @@ impl SheetMeta {
         UVec2::new(cols as u32 * self.cell_px, rows as u32 * self.cell_px)
     }
 
-    /// Which cell shows a model turned to `yaw` seen from the direction
-    /// `to_camera`, `phase` seconds into its walk.
+    /// Which tier to draw a model by, given where the camera is relative to it
+    /// **in the model's own frame**.
     ///
-    /// The angle is the bearing of the camera *in the model's own frame*, so
-    /// turning the enemy and orbiting the camera pick the same picture -- which
-    /// is what makes a slime crawling away from you show you its back.
+    /// What is read off the vector is the angle it makes with the model's own
+    /// ground -- so a camera that is high but a long way off picks the flat
+    /// tier, exactly as it should: what matters is the angle it looks down at
+    /// *this* enemy, not how far up it is.
+    ///
+    /// And the model's own ground is not always the world's. An ant on a wall
+    /// is standing on the wall; a player walking up to that wall and looking
+    /// straight at the bug is looking straight down on it as far as the bug is
+    /// concerned, and wants the picture taken from above it. Reading the angle
+    /// in the model's frame gets that for nothing, and gets every slope between
+    /// flat and vertical right on the way: a bug on a forty-five degree roof
+    /// crosses to the steep tier when the camera is level with it, which is
+    /// exactly when its back comes into view.
+    ///
+    /// Nearest baked elevation rather than the nearest below, so the error is
+    /// half a gap either way instead of a whole gap in one direction. With
+    /// tiers at fifteen and fifty-five degrees the hand-over is at thirty-five,
+    /// and no sprite is ever showing a picture taken more than twenty degrees
+    /// from where it is being looked at.
+    pub fn tier(&self, local: Vec3) -> usize {
+        let ground = Vec2::new(local.x, local.z).length();
+        let elevation = local.y.atan2(ground).to_degrees();
+        let mut best = 0;
+        let mut closest = f32::MAX;
+        for (index, tier) in self.tiers.iter().enumerate() {
+            let error = (tier.elevation - elevation).abs();
+            if error < closest {
+                closest = error;
+                best = index;
+            }
+        }
+        best
+    }
+
+    /// The tier a row of the atlas was baked for. The inverse of the layout
+    /// [`Self::grid`] promises, and the cheap half of it: a division rather
+    /// than the search [`Self::tier`] does.
+    pub fn tier_at(&self, row: usize) -> Tier {
+        self.tiers
+            .get(row / self.angles.max(1))
+            .copied()
+            .unwrap_or(FLAT)
+    }
+
+    /// Which cell shows a model turned to `facing` seen from a camera lying
+    /// `to_camera` away from it, `phase` seconds into its walk.
+    ///
+    /// `to_camera` is the **whole** vector from the model to the camera rather
+    /// than a flattened one, and `facing` is the model's **whole** rotation
+    /// rather than a heading. Both together are one thing: the camera's
+    /// position in the model's own frame, whose bearing picks the row inside a
+    /// tier and whose height picks the tier.
+    ///
+    /// Measuring in the model's frame is what makes turning the enemy and
+    /// orbiting the camera pick the same picture -- which is what makes a slime
+    /// crawling away from you show you its back -- and, for a crawler, what
+    /// makes the wall it is stuck to the floor it is standing on.
     ///
     /// Rounded to the nearest angle rather than truncated, so the error is half
     /// a step either way instead of a whole step in one direction, and wrapped
     /// rather than clamped, because a bearing is a circle.
-    pub fn cell(&self, yaw: f32, to_camera: Vec3, phase: f32) -> (usize, usize) {
-        let bearing = to_camera.x.atan2(to_camera.z) - yaw;
+    pub fn cell(&self, facing: Quat, to_camera: Vec3, phase: f32) -> (usize, usize) {
+        let local = facing.inverse() * to_camera;
+        let bearing = local.x.atan2(local.z);
         let step = std::f32::consts::TAU / self.angles as f32;
         let row = (bearing / step).round() as i64;
         let row = row.rem_euclid(self.angles as i64) as usize;
+        let row = self.tier(local) * self.angles + row;
         let column = (phase * self.fps).floor() as i64;
         let column = column.rem_euclid(self.frames as i64) as usize;
         (column, row)
@@ -236,6 +364,13 @@ pub fn read_meta(root: &std::path::Path, kind: Kind) -> Result<SheetMeta, String
             meta.model,
             stem(kind)
         ));
+    }
+    // Everything downstream divides the rows up by tier, so a sheet claiming
+    // none of them describes an atlas with no rows in it. Refused here, where
+    // the failure is one line on the console and a kind that draws no far
+    // crowd, rather than left to be discovered a division at a time.
+    if meta.tiers.is_empty() {
+        return Err(format!("{} lists no elevations", path.display()));
     }
     Ok(meta)
 }
@@ -351,8 +486,15 @@ fn empty_field() -> Mesh {
 pub struct Member {
     /// Where its feet are.
     pub at: Vec3,
-    /// Which way it is facing, as a heading about the vertical.
-    pub yaw: f32,
+    /// Which way it is turned -- and, for a crawler, what it is standing on.
+    ///
+    /// The whole rotation rather than a heading about the vertical, because the
+    /// sheet was baked in the model's own frame and a bug on a wall does not
+    /// share the world's idea of which way is up. It was a heading once, taken
+    /// out of the rotation with `angle * axis.y.signum()`, which is the yaw
+    /// exactly when the rotation is a yaw and something else entirely when it
+    /// is not.
+    pub facing: Quat,
     /// How far into its walk cycle it is, in seconds.
     pub phase: f32,
 }
@@ -363,33 +505,68 @@ pub struct Member {
 /// without a renderer: this is the part that can put a sprite at the wrong
 /// height, the wrong size, or facing the wrong way.
 ///
-/// The quads turn about the vertical only, like everything else billboarded
-/// here -- see [`crate::billboard`] -- so a camera looking down at the field
-/// does not tip a thousand sprites onto their backs.
+/// The quads turn to face the camera about the model's own up -- like
+/// everything else billboarded here, see [`crate::billboard`] -- and then lie
+/// back by the elevation their picture was baked at, which is the one place a
+/// photograph of a model is undistorted. See [`Tier::up`]; that lean is what
+/// lets the crowd still read from a camera high above it.
+///
+/// **The model's own up, not the world's.** For everything walking on a floor
+/// they are the same vector and this is the billboarding it always was. For a
+/// crawler stuck to a wall or hanging from a ceiling the two have nothing to do
+/// with each other, and it is the model's that is right: the wall is the floor
+/// that bug is standing on, the picture it should be showing is the one taken
+/// from out in the room, and the surface that picture belongs on is one facing
+/// out of the wall rather than one standing up out of the ground.
 pub fn build_field(meta: &SheetMeta, eye: Vec3, crowd: &[Member], mesh: &mut Mesh) {
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(crowd.len() * 4);
     let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(crowd.len() * 4);
     let mut indices: Vec<u32> = Vec::with_capacity(crowd.len() * 6);
     let half = meta.world_size * 0.5;
     for member in crowd {
-        let mut away = eye - member.at;
-        away.y = 0.0;
-        let Some(away) = away.try_normalize() else {
-            // The camera is directly overhead, where a vertical quad is edge on
-            // and there is no bearing to pick a picture by either. Nothing
-            // useful can be drawn, and drawing nothing is the honest answer.
-            continue;
+        let to_camera = eye - member.at;
+        // Which way is up for this one: out of the floor it is walking on, the
+        // wall it is stuck to or the ceiling it is hanging from.
+        let standing = member.facing * Vec3::Y;
+        // And which way the camera lies along that surface, which is the axis
+        // the bearing is measured round and the one the quad leans along.
+        let flat = to_camera - standing * to_camera.dot(standing);
+        // Near enough along the model's own up that there is no bearing to be
+        // had: overhead of a walker, or square in front of a bug on a wall,
+        // which is not a rare way to look at a wall at all.
+        //
+        // Judged against the distance rather than against zero, and that is the
+        // whole of it. What is left after taking the `standing` component out
+        // of a vector twenty metres long is perpendicular to `standing` to
+        // within a millionth of that -- fine when the remainder is metres, and
+        // *most of the remainder* when it is microns. Normalising one of those
+        // gives an axis that is not perpendicular to `standing` at all, and the
+        // quad built on it comes out a quarter of its proper size: a wall of
+        // bugs that shrivels as you turn to face it square on.
+        let square_on = flat.length_squared() <= to_camera.length_squared() * 1e-6;
+        let flat = if square_on {
+            // Only the roll of the picture is left to settle, its subject being
+            // face on to the camera whatever is chosen. The model's own forward
+            // is the choice that agrees with the row `cell` picks in the same
+            // situation: bearing zero, the camera in front.
+            member.facing * Vec3::Z
+        } else {
+            flat.normalize()
         };
-        // Across the view, in the horizontal plane. The quad's own up is the
-        // world's up, which is what keeps it standing.
-        let right = Vec3::Y.cross(away);
-        let (uv, size) = {
-            let (column, row) = meta.cell(member.yaw, away, member.phase);
-            meta.uv(column, row)
-        };
-        // The cell's bottom edge sits `foot` of a cell-height below the origin,
-        // so that the ground in the picture meets the ground in the world.
-        let bottom = member.at - Vec3::Y * (meta.world_size * meta.foot);
+        // Across the view, in the model's own ground plane. It is the same axis
+        // whatever the tier: the quad leans back about it, so it never leaves
+        // that plane.
+        let right = standing.cross(flat);
+        let (column, row) = meta.cell(member.facing, to_camera, member.phase);
+        let (uv, size) = meta.uv(column, row);
+        // The row already chose the tier; reading it back off the row is
+        // cheaper than choosing it twice.
+        let tier = meta.tier_at(row);
+        let up = tier.up(standing, flat);
+        // The cell's bottom edge sits `foot` of a cell-height below the origin
+        // *along the quad's own up*, so that the ground in the picture meets
+        // the ground in the world however far the quad is leaning.
+        let bottom = member.at - up * (meta.world_size * tier.foot);
         let base = positions.len() as u32;
         for (corner, (u, v)) in [
             (-half, 0.0),
@@ -400,8 +577,8 @@ pub fn build_field(meta: &SheetMeta, eye: Vec3, crowd: &[Member], mesh: &mut Mes
         .into_iter()
         .zip([(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)])
         {
-            let (across, up) = corner;
-            positions.push((bottom + right * across + Vec3::Y * up).to_array());
+            let (across, height) = corner;
+            positions.push((bottom + right * across + up * height).to_array());
             uvs.push((uv + Vec2::new(u, v) * size).to_array());
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -511,14 +688,12 @@ pub fn draw(
             continue;
         };
         shadows.push((transform.translation, enemy.kind.shadow_radius()));
-        let (axis, angle) = transform.rotation.to_axis_angle();
         members.push(Member {
             at: transform.translation,
-            // The walkers are turned about the vertical and this reads their
-            // heading straight back; a crawler stuck to a wall is turned about
-            // some other axis, and the sign keeps its sprite facing the way it
-            // is going rather than the mirror of it.
-            yaw: angle * axis.y.signum(),
+            // Whole. A walker's rotation is a yaw and could be reduced to one;
+            // a crawler's carries the surface it is on as well, and that is
+            // half of what picks its picture.
+            facing: transform.rotation,
             phase: elapsed + quirk.seed(),
         });
     }
@@ -593,10 +768,33 @@ pub(crate) mod tests {
             angles: 16,
             frames: 16,
             world_size: 1.2,
-            foot: 0.15,
             fps: 12.0,
-            elevation: 15.0,
+            tiers: vec![
+                Tier {
+                    elevation: 15.0,
+                    foot: 0.15,
+                },
+                Tier {
+                    elevation: 55.0,
+                    foot: 0.3,
+                },
+            ],
         }
+    }
+
+    /// A camera `elevation` degrees above a sprite, on the `+z` side of it.
+    fn eye_at(elevation: f32) -> Vec3 {
+        let up = elevation.to_radians();
+        Vec3::new(0.0, up.sin(), up.cos()) * 30.0
+    }
+
+    /// How a crawler stuck to a surface whose normal is `up` is turned, facing
+    /// along `heading`. The same construction `enemy::orientation` uses, which
+    /// is what puts the surface into the rotation's own Y column.
+    fn stuck_to(up: Vec3, heading: Vec3) -> Quat {
+        let up = up.normalize();
+        let forward = (heading - up * heading.dot(up)).normalize();
+        Quat::from_mat3(&Mat3::from_cols(up.cross(forward), up, forward))
     }
 
     /// Facing the camera picks the front, turning away picks the back, and the
@@ -605,8 +803,8 @@ pub(crate) mod tests {
     #[test]
     fn the_cell_follows_the_angle_between_the_model_and_the_camera() {
         let meta = meta();
-        let front = meta.cell(0.0, Vec3::Z, 0.0).1;
-        let back = meta.cell(std::f32::consts::PI, Vec3::Z, 0.0).1;
+        let front = meta.cell(Quat::IDENTITY, Vec3::Z, 0.0).1;
+        let back = meta.cell(Quat::from_rotation_y(std::f32::consts::PI), Vec3::Z, 0.0).1;
         assert_eq!(front, 0, "a model facing the camera is the first row");
         assert_eq!(
             back,
@@ -614,22 +812,213 @@ pub(crate) mod tests {
             "a model facing away should be half the sheet round"
         );
         // Turning the model and orbiting the camera are the same thing.
-        let turned = meta.cell(std::f32::consts::FRAC_PI_2, Vec3::Z, 0.0).1;
-        let orbited = meta.cell(0.0, Vec3::X, 0.0).1;
+        let turned = meta
+            .cell(
+                Quat::from_rotation_y(std::f32::consts::FRAC_PI_2),
+                Vec3::Z,
+                0.0,
+            )
+            .1;
+        let orbited = meta.cell(Quat::IDENTITY, Vec3::X, 0.0).1;
         assert_eq!(turned, meta.angles - orbited, "{turned} vs {orbited}");
     }
 
     /// A bearing is a circle, so every angle has to land on a real row --
     /// including the ones that round past the end of the sheet, which is where
-    /// an index panic would live.
+    /// an index panic would live. And now that a row is a bearing *and* a tier,
+    /// every height the camera can be at has to land on one too, straight down
+    /// and straight up included.
     #[test]
     fn every_bearing_lands_on_a_row_that_exists() {
         let meta = meta();
+        let rows = meta.grid().1;
         for step in -720..=720 {
             let yaw = step as f32 * 0.05;
-            let (column, row) = meta.cell(yaw, Vec3::new(yaw.cos(), 0.0, yaw.sin()), yaw.abs());
-            assert!(row < meta.angles, "bearing {yaw} chose row {row}");
-            assert!(column < meta.frames, "phase {yaw} chose column {column}");
+            for height in [-90.0_f32, -35.0, 0.0, 15.0, 34.9, 35.1, 55.0, 89.0, 90.0] {
+                let flat = Vec2::new(yaw.cos(), yaw.sin()) * height.to_radians().cos();
+                let to_camera = Vec3::new(flat.x, height.to_radians().sin(), flat.y);
+                let (column, row) =
+                    meta.cell(Quat::from_rotation_y(yaw), to_camera, yaw.abs());
+                assert!(row < rows, "bearing {yaw} at {height} chose row {row}");
+                assert!(column < meta.frames, "phase {yaw} chose column {column}");
+            }
+        }
+    }
+
+    /// The whole point of the tiers: how far the camera is above an enemy picks
+    /// which block of rows it is drawn from, and it is the *angle* that decides
+    /// rather than the height -- a camera high in the air but a long way off is
+    /// looking at a distant enemy almost level, and wants the flat pictures.
+    #[test]
+    fn the_camera_s_height_above_an_enemy_picks_the_tier() {
+        let meta = meta();
+        for (elevation, wanted) in [
+            (0.0, 0),
+            (15.0, 0),
+            (34.0, 0),
+            (36.0, 1),
+            (55.0, 1),
+            (89.0, 1),
+        ] {
+            let tier = meta.tier(eye_at(elevation));
+            assert_eq!(
+                tier, wanted,
+                "a camera {elevation} degrees up chose tier {tier}"
+            );
+            let row = meta.cell(Quat::IDENTITY, eye_at(elevation), 0.0).1;
+            assert_eq!(
+                row / meta.angles,
+                wanted,
+                "...but its row {row} is in another tier"
+            );
+            assert_eq!(meta.tier_at(row), meta.tiers[wanted]);
+        }
+        // Far away and high up is not the same as overhead.
+        let distant = Vec3::new(0.0, 40.0, 400.0);
+        assert_eq!(meta.tier(distant), 0, "a distant camera wants flat pictures");
+    }
+
+    /// The same rule read in the model's own frame, which is what a crawler
+    /// needs: a bug on a wall is standing on the wall, so a camera out in the
+    /// room is *above* it however level the camera is, and a bug on the ceiling
+    /// looked up at from below is being looked down on.
+    ///
+    /// This is the case the world-frame version of the test above gets exactly
+    /// backwards. Every camera in it is level with the enemy, so every one of
+    /// them would have picked the flat tier and shown a wall of bugs in
+    /// profile, standing out of the wall sideways.
+    #[test]
+    fn a_crawler_s_own_surface_decides_what_is_above_it() {
+        let meta = meta();
+        // Out in the room, level with a bug on a wall whose normal is +z.
+        let wall = stuck_to(Vec3::Z, Vec3::Y);
+        let to_camera = Vec3::Z * 20.0;
+        assert_eq!(
+            meta.tier(wall.inverse() * to_camera),
+            1,
+            "a camera square in front of a bug on a wall is above it"
+        );
+        // Slid along the wall until it is edge on: back to the flat pictures.
+        let along = Vec3::new(20.0, 0.0, 0.5);
+        assert_eq!(
+            meta.tier(wall.inverse() * along),
+            0,
+            "a camera nearly in the plane of the wall sees the bug's flank"
+        );
+        // Hanging from a ceiling, looked up at from the floor.
+        let ceiling = stuck_to(Vec3::NEG_Y, Vec3::Z);
+        assert_eq!(
+            meta.tier(ceiling.inverse() * Vec3::new(0.0, -20.0, 3.0)),
+            1,
+            "a bug on the ceiling shows its back to the room below"
+        );
+        // A roof at forty-five degrees, from level with it: over the hand-over
+        // at thirty-five, so the steep pictures. This is the \"sufficiently
+        // steep surface\" case, and there is no threshold anywhere that says
+        // so -- it falls out of measuring the angle in the model's frame.
+        let roof = stuck_to(Vec3::new(0.0, 1.0, 1.0), Vec3::X);
+        assert_eq!(meta.tier(roof.inverse() * (Vec3::Z * 20.0)), 1);
+        // And a gentle one, from the same place, does not.
+        let slope = stuck_to(Vec3::new(0.0, 6.0, 1.0), Vec3::X);
+        assert_eq!(meta.tier(slope.inverse() * (Vec3::Z * 20.0)), 0);
+    }
+
+    /// A crawler's quad stands on the surface the crawler does. The sprite is a
+    /// picture of a model standing on the ground, and the ground it is standing
+    /// on here is the wall: the quad has to lie in the wall's plane rather than
+    /// the world's vertical, or a bug on a wall is drawn as a card sticking out
+    /// of it edge on.
+    #[test]
+    fn a_bug_on_a_wall_is_drawn_on_the_wall_rather_than_standing_out_of_it() {
+        let meta = meta();
+        let at = Vec3::new(2.0, 4.0, 0.0);
+        // A wall facing +z, a bug on it heading upwards, a camera out in front.
+        let facing = stuck_to(Vec3::Z, Vec3::Y);
+        let eye = at + Vec3::new(1.0, 0.5, 20.0);
+        let mut mesh = empty_field();
+        build_field(
+            &meta,
+            eye,
+            &[Member {
+                at,
+                facing,
+                phase: 0.0,
+            }],
+            &mut mesh,
+        );
+        let Some(bevy::mesh::VertexAttributeValues::Float32x3(p)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("no positions");
+        };
+        let (a, b, top) = (Vec3::from(p[0]), Vec3::from(p[1]), Vec3::from(p[3]));
+        let up = (top - a).normalize();
+        let across = (b - a).normalize();
+        let normal = across.cross(up).normalize();
+        // The steep tier, since the camera is out in the room.
+        let tier = meta.tiers[1];
+        let lean = tier.elevation.to_radians();
+        // The wall is the bug's floor, so the quad is pitched up out of the
+        // wall by the tier's elevation -- the same relationship to its own
+        // surface that a sprite on the ground has to the ground.
+        let wall = Vec3::Z;
+        assert!(
+            (up.dot(wall) - lean.cos()).abs() < 1e-3,
+            "the quad's up is {up:?}, which is not {} out of the wall",
+            tier.elevation
+        );
+        assert!(
+            up.dot(Vec3::Y).abs() < 1.0,
+            "the quad is standing up out of the world instead"
+        );
+        // So it faces mostly out of the wall, at the camera, rather than
+        // standing up out of the floor with its edge to it.
+        assert!(
+            normal.z > 0.5,
+            "the quad faces {normal:?}, which is not out of the wall"
+        );
+        // And the picture's ground line is behind the surface the bug is
+        // standing on, exactly as a sprite on the floor has its own below the
+        // floor.
+        assert!(
+            (a - at).dot(wall) < 0.0 && (b - at).dot(wall) < 0.0,
+            "the quad's bottom edge is out in front of the wall"
+        );
+    }
+
+    /// The one place the model's frame gives no bearing at all: a camera
+    /// straight out along the model's own up. Overhead of a walker, and square
+    /// in front of a bug on a wall, which is an ordinary way to look at a wall
+    /// rather than a corner case -- so it has to draw a sprite rather than
+    /// quietly drop one.
+    #[test]
+    fn a_sprite_seen_straight_down_its_own_up_is_still_drawn() {
+        let meta = meta();
+        let at = Vec3::new(1.0, 2.0, 3.0);
+        for facing in [Quat::IDENTITY, stuck_to(Vec3::Z, Vec3::Y)] {
+            let mut mesh = empty_field();
+            build_field(
+                &meta,
+                at + facing * Vec3::Y * 20.0,
+                &[Member {
+                    at,
+                    facing,
+                    phase: 0.0,
+                }],
+                &mut mesh,
+            );
+            assert_eq!(mesh.count_vertices(), 4, "the sprite was dropped");
+            let Some(bevy::mesh::VertexAttributeValues::Float32x3(p)) =
+                mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+            else {
+                panic!("no positions");
+            };
+            let (a, b, top) = (Vec3::from(p[0]), Vec3::from(p[1]), Vec3::from(p[3]));
+            let side = (top - a).length();
+            assert!(
+                (side - meta.world_size).abs() < 1e-4 && (b - a).length() > 0.0,
+                "the quad collapsed to {side} on a side"
+            );
         }
     }
 
@@ -640,7 +1029,7 @@ pub(crate) mod tests {
     fn the_walk_cycles_through_the_columns() {
         let meta = meta();
         let seen: std::collections::HashSet<usize> = (0..64)
-            .map(|step| meta.cell(0.0, Vec3::Z, step as f32 / 24.0).0)
+            .map(|step| meta.cell(Quat::IDENTITY, Vec3::Z, step as f32 / 24.0).0)
             .collect();
         assert_eq!(
             seen.len(),
@@ -676,53 +1065,77 @@ pub(crate) mod tests {
     }
 
     /// The whole point of `foot`: a sprite has to stand on the ground rather
-    /// than be centred on it. With the origin 15% up the cell, a 1.2-unit quad
-    /// reaches from 0.18 below the enemy's feet to 1.02 above them.
+    /// than be centred on it -- the enemy's origin has to land `foot` of the way
+    /// up the quad, which is where it landed in the picture.
+    ///
+    /// Measured along the quad's **own** up rather than the world's, because
+    /// the quad leans back by its tier's elevation and the world's vertical is
+    /// no longer the axis the cell is laid along. The two are the same claim:
+    /// the ground in the picture meets the ground in the world.
     #[test]
     fn a_sprite_stands_on_its_feet_rather_than_being_buried_to_the_waist() {
         let meta = meta();
-        let mut mesh = empty_field();
         let at = Vec3::new(3.0, 7.0, -2.0);
-        build_field(
-            &meta,
-            Vec3::new(3.0, 7.0, 10.0),
-            &[Member {
-                at,
-                yaw: 0.0,
-                phase: 0.0,
-            }],
-            &mut mesh,
-        );
-        let Some(bevy::mesh::VertexAttributeValues::Float32x3(positions)) =
-            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
-        else {
-            panic!("the field has no positions");
-        };
-        let low = positions.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
-        let high = positions.iter().map(|p| p[1]).fold(f32::MIN, f32::max);
-        assert!(
-            (low - (at.y - meta.world_size * meta.foot)).abs() < 1e-5,
-            "the sprite's bottom edge is at {low}, not below the feet at {}",
-            at.y
-        );
-        assert!(
-            (high - low - meta.world_size).abs() < 1e-5,
-            "the sprite is {} tall rather than {}",
-            high - low,
-            meta.world_size
-        );
+        for elevation in [0.0, 15.0, 40.0, 70.0] {
+            let mut mesh = empty_field();
+            build_field(
+                &meta,
+                at + eye_at(elevation),
+                &[Member {
+                    at,
+                    facing: Quat::IDENTITY,
+                    phase: 0.0,
+                }],
+                &mut mesh,
+            );
+            let Some(bevy::mesh::VertexAttributeValues::Float32x3(positions)) =
+                mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+            else {
+                panic!("the field has no positions");
+            };
+            // The corners run bottom left, bottom right, top right, top left.
+            let (bottom, top) = (Vec3::from(positions[0]), Vec3::from(positions[3]));
+            let tier = meta.tiers[meta.tier(eye_at(elevation))];
+            let along = top - bottom;
+            assert!(
+                (along.length() - meta.world_size).abs() < 1e-5,
+                "the sprite is {} across its cell rather than {}",
+                along.length(),
+                meta.world_size
+            );
+            let up = along.normalize();
+            let stands = (at - bottom).dot(up);
+            assert!(
+                (stands - meta.world_size * tier.foot).abs() < 1e-5,
+                "at {elevation} degrees the origin is {stands} up the quad rather \
+                 than {}",
+                meta.world_size * tier.foot
+            );
+            // And it is still the ground the sprite meets: the picture's own
+            // ground line is below the enemy's origin, never above it.
+            assert!(bottom.y < at.y, "the quad's bottom edge floats above the feet");
+        }
     }
 
-    /// A quad turns to face the camera about the vertical only, and stays
-    /// upright when the camera looks down on it from a great height.
+    /// A quad turns to face the camera about the vertical, and then lies back
+    /// by exactly the elevation its picture was taken from -- no more and no
+    /// less. Both halves matter: the turn is what shows the right side of the
+    /// enemy, the lean is what stops a photograph taken from above being
+    /// displayed on a surface that is not facing that way.
+    ///
+    /// The lean is by the *tier's* elevation rather than the camera's, so a
+    /// camera at seventy degrees looking at a sheet baked at fifty-five sees
+    /// the quad fifteen degrees off square, which costs three per cent of its
+    /// height. An upright quad at seventy degrees would have lost two thirds.
     #[test]
-    fn a_sprite_faces_the_camera_and_never_tips_over() {
+    fn a_sprite_faces_the_camera_and_leans_back_by_its_own_tier() {
         let meta = meta();
         let at = Vec3::new(-4.0, 2.0, 6.0);
         for eye in [
             Vec3::new(-4.0, 2.0, 20.0),
             Vec3::new(30.0, 3.0, 6.0),
             Vec3::new(-20.0, 60.0, -10.0),
+            at + eye_at(89.0),
         ] {
             let mut mesh = empty_field();
             build_field(
@@ -730,7 +1143,7 @@ pub(crate) mod tests {
                 eye,
                 &[Member {
                     at,
-                    yaw: 0.0,
+                    facing: Quat::IDENTITY,
                     phase: 0.0,
                 }],
                 &mut mesh,
@@ -747,15 +1160,25 @@ pub(crate) mod tests {
                 "the quad's width leans by {} with the camera at {eye:?}",
                 across.y
             );
-            // Its normal points at the camera, in the horizontal plane.
             let up = Vec3::from(p[3]) - a;
             let normal = across.cross(up).normalize();
-            let mut wanted = eye - at;
-            wanted.y = 0.0;
+            // Which way it faces, in the horizontal plane: at the camera.
+            let mut flat = eye - at;
+            flat.y = 0.0;
+            let flat = flat.normalize();
             assert!(
-                normal.dot(wanted.normalize()).abs() > 0.999,
-                "the quad faces {normal:?} rather than {:?}",
-                wanted.normalize()
+                Vec3::new(normal.x, 0.0, normal.z).normalize().dot(flat) > 0.999,
+                "the quad faces {normal:?} rather than {flat:?}"
+            );
+            // And how far it is tilted up out of that plane: the elevation the
+            // row it is showing was baked at.
+            let tier = meta.tiers[meta.tier(eye - at)];
+            let leans = normal.y.asin().to_degrees();
+            assert!(
+                (leans - tier.elevation).abs() < 1e-3,
+                "the quad lies back {leans} degrees showing a picture taken from \
+                 {} with the camera at {eye:?}",
+                tier.elevation
             );
         }
     }
@@ -768,7 +1191,7 @@ pub(crate) mod tests {
         let crowd: Vec<Member> = (0..1000)
             .map(|index| Member {
                 at: Vec3::new(index as f32 * 0.7, 0.0, (index % 37) as f32),
-                yaw: index as f32 * 0.1,
+                facing: Quat::from_rotation_y(index as f32 * 0.1),
                 phase: index as f32 * 0.03,
             })
             .collect();
@@ -809,7 +1232,10 @@ pub(crate) mod tests {
             let (size, alpha) = png_alpha(&path);
             let cell = meta.cell_px;
             let mut biggest = 0.0_f32;
-            for row in 0..meta.angles as u32 {
+            // Every row of every tier: a sheet is only as good as its worst
+            // one, and an actor that fits its camera from the side can fill it
+            // from above.
+            for row in 0..meta.grid().1 as u32 {
                 for column in 0..meta.frames as u32 {
                     let (mut low, mut high) = (UVec2::splat(cell), UVec2::ZERO);
                     for y in 0..cell {
@@ -872,6 +1298,13 @@ pub(crate) mod tests {
     /// a cell -- `foot` of a cell-height up from the bottom edge. So the lowest
     /// opaque pixel of any cell, measured down from there, is the hang.
     ///
+    /// **The flattest tier only.** Every objection below to reading a hang off
+    /// a silhouette gets worse the higher the camera goes: from fifty-five
+    /// degrees a body reaching towards the camera projects most of its own
+    /// length below the origin, and the steep rows would report an actor
+    /// hanging half a metre under a floor it is standing flat on. The flat
+    /// rows are the ones this measurement was ever meant for.
+    ///
     /// Shared with `enemy`'s placement test rather than measured twice. That
     /// test needs a number that does **not** come from [`Kind::lift`], or it
     /// merely subtracts back out whatever the placement put in and passes with
@@ -882,9 +1315,13 @@ pub(crate) mod tests {
         let path = root.join(SHEETS).join(format!("{}.png", stem(kind)));
         let (size, alpha) = png_alpha(&path);
         let cell = meta.cell_px;
-        let metres = meta.world_size / cell as f32;
+        let tier = meta.tiers[0];
+        // A cell is a picture taken from `elevation` above, which foreshortens
+        // world height by its cosine -- so a pixel of the picture is rather
+        // more than a pixel's worth of metres in the world.
+        let metres = meta.world_size / cell as f32 / tier.elevation.to_radians().cos();
         // Where the origin is, counted up from the bottom edge of a cell.
-        let origin = meta.foot * cell as f32;
+        let origin = tier.foot * cell as f32;
         let mut hangs = f32::MIN;
         for row in 0..meta.angles as u32 {
             for column in 0..meta.frames as u32 {
@@ -1019,6 +1456,49 @@ pub(crate) mod tests {
                 assert!(
                     root.join("assets").join(SHEETS).join(&file).is_file(),
                     "{SHEETS}/{file} is loaded at runtime but is not in the tree"
+                );
+            }
+        }
+    }
+
+    /// The sheets have to carry a tier for looking down at, and their tiers
+    /// have to be in the order the layout assumes.
+    ///
+    /// This is the guard on the thing a re-bake can quietly undo. Drop
+    /// `bake::ELEVATIONS` back to one entry and everything else still passes:
+    /// the atlas matches its sidecar, every cell holds an actor, the sizes
+    /// agree. The game simply goes back to showing a field of enemies
+    /// photographed from their own eye level to a camera looking down at
+    /// seventy degrees, which is a thing you have to be standing somewhere
+    /// specific to notice.
+    #[test]
+    fn the_committed_sheets_can_be_looked_down_on() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        for kind in [Kind::Slime, Kind::Ant] {
+            let meta = read_meta(&root, kind).expect("a committed sheet failed to load");
+            assert!(
+                meta.tiers.len() >= 2,
+                "{kind:?}'s sheet was baked from only {:?}, so there is no picture \
+                 of it from above -- re-bake with tools/build_assets.py --only impostors",
+                meta.tiers,
+            );
+            assert!(
+                meta.tiers.windows(2).all(|pair| pair[0].elevation < pair[1].elevation),
+                "{kind:?}'s tiers are not flattest first: {:?}",
+                meta.tiers,
+            );
+            let steepest = meta.tiers.last().expect("no tiers").elevation;
+            // The camera's own pitch reaches 43 degrees down and the ground
+            // under the crowd adds to that. A sheet whose steepest picture is
+            // flatter than the camera can look is a sheet with a blind spot.
+            assert!(
+                steepest > 45.0,
+                "{kind:?}'s steepest tier is only {steepest} degrees up"
+            );
+            for tier in &meta.tiers {
+                assert!(
+                    (0.0..1.0).contains(&tier.foot),
+                    "{kind:?}'s {tier:?} puts the origin outside its own cell"
                 );
             }
         }

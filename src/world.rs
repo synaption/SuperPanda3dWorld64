@@ -247,14 +247,17 @@ fn spawn_inhabitants(
             }
         }
     }
-    for (index, (spawns, interval, position)) in furniture.pipes().into_iter().enumerate() {
+    for (index, pipe) in furniture.pipes().into_iter().enumerate() {
         commands.spawn((
             LevelEntity,
             // The enemy pipes have their interval overwritten from the console
             // every tick; the Mario pipe keeps the one the .blend gave it.
-            pipe::WarpPipe::new(spawns, interval, index as f32),
+            pipe::WarpPipe::new(pipe.spawns, pipe.interval, index as f32),
             WorldAssetRoot(assets.load("actors/warp_pipe.glb#Scene0")),
-            Transform::from_translation(position).with_scale(Vec3::splat(0.01)),
+            // Including the scale, which used to be the literal 0.01 that
+            // `warp_pipe.glb` needs and is now whatever the pipe is drawn at
+            // in the .blend.
+            pipe.at,
         ));
     }
 }

@@ -29,3 +29,5 @@ cool centipied enemy that jumps in and out of the ground like LTTP sand worm
 pylons! should share logic with pathing.  traveling salemen problem, creeper world
 
 grid2quad system
+
+make ow into a level

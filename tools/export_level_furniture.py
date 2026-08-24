@@ -70,15 +70,57 @@ FURNITURE = "Furniture"
 ACTOR_KINDS = ("slime", "ant", "mario")
 
 #: What a pipe produces if its `spawns` property says nothing, and how long it
-#: waits between two of them -- `pipe::MARIO_INTERVAL`.
+#: waits between two of them.
 DEFAULT_SPAWNS = "mario"
 DEFAULT_INTERVAL = 12.0
+
+#: The factor the game draws each model at, which is what a placement showing
+#: that model is scaled by so the viewport tells the truth. It is a property of
+#: the model and not of the level: `warp_pipe.glb` is 307 units across because
+#: it came out of the decomp that way, and `mario.glb` is 160 tall.
+#:
+#: Only the pipe's is read back out (see `transform` below). An actor's size is
+#: measured off its own glTF by `enemy::Kind::body` and is what its collision
+#: radius is built from, so a level that scaled one would be drawing a creature
+#: at a size it does not collide at.
+DISPLAY_SCALE = {
+    "warp_pipe": 0.01,
+    "mario": 0.00667,
+    "slime": 1.0,
+    "ant": 1.0,
+}
 
 
 def stem(name):
     """`pipe.001` -> `pipe`. Blender numbers duplicates and a duplicated warp
     pipe is still a warp pipe."""
     return name.split(".")[0]
+
+
+def yaw_of(obj):
+    """The placement's turn about the vertical, in radians.
+
+    The only rotation worth carrying. Blender's vertical is Z and the game's is
+    Y, and the axis conversion takes a turn of theta about Blender's +Z to a
+    turn of theta about the game's +Y -- the same angle, which is the one piece
+    of this conversion that needs no sign flipped. Tip a placement off the
+    vertical and that part is silently dropped, which the exporter says so.
+    """
+    # Adding zero folds -0.0 onto 0.0, which is otherwise a diff on a file
+    # nobody changed.
+    return round(float(obj.matrix_world.to_euler("ZYX").z), 6) + 0.0
+
+
+def uniform_scale(obj):
+    """One number, or a stop. A placement is a thing standing somewhere, and a
+    thing squashed along one axis is a modelling change wearing a placement's
+    clothes."""
+    x, y, z = (abs(v) for v in obj.matrix_world.to_scale())
+    if max(x, y, z) - min(x, y, z) > 1e-4:
+        raise SystemExit(
+            f"{obj.name!r} is scaled {x:.4f}, {y:.4f}, {z:.4f}: a placement "
+            "can only be scaled evenly")
+    return round(x, 6)
 
 
 def to_game(vector):
@@ -151,12 +193,20 @@ def read_furniture():
         elif kind == "gravity":
             level["gravity"] = gravity(obj, at)
         elif kind == "pipe":
+            # The only placement whose whole transform is the level's to
+            # decide. A pipe is drawn and not collided with -- `world.rs` adds
+            # nothing to the collision for one -- so nothing anywhere depends
+            # on how big it is, and a pipe scaled or turned in Blender can be
+            # scaled and turned in the game.
             level["pipes"].append({
                 "spawns": actor_kind(obj, obj.get("spawns", DEFAULT_SPAWNS)),
                 "interval": float(obj.get("interval", DEFAULT_INTERVAL)),
                 "at": at,
+                "yaw": yaw_of(obj),
+                "scale": uniform_scale(obj),
             })
         elif kind in ACTOR_KINDS:
+            check_display_scale(obj, kind)
             level["actors"].append({"kind": kind, "at": at})
         else:
             unknown.append((obj.name, obj.type))
@@ -180,6 +230,27 @@ def actor_kind(obj, value):
             f"{obj.name!r} spawns {value!r}, which is not one of "
             f"{', '.join(ACTOR_KINDS)}")
     return name
+
+
+def check_display_scale(obj, kind):
+    """An actor's size is its model's, so say so rather than dropping it.
+
+    The instance is scaled to `DISPLAY_SCALE` purely so that the viewport draws
+    it at the size the game does. Rescaling it there looks like it should work
+    and cannot: `enemy::Kind::body` measures the collision radius off the model
+    the game loads, so an actor drawn at half size would still shoulder its way
+    around the level at full size. Resizing a creature means resizing the
+    creature -- `tools/resize_actor.py`, then a rebuild.
+    """
+    want = DISPLAY_SCALE.get(kind, 1.0)
+    have = uniform_scale(obj)
+    if abs(have - want) > 1e-4:
+        print(f"  {obj.name!r} is scaled {have:g}, not the {want:g} the game "
+              f"draws a {kind} at. Scale is ignored for actors: use "
+              f"tools/resize_actor.py to change how big one is")
+    if abs(yaw_of(obj)) > 1e-4:
+        print(f"  {obj.name!r} is turned {yaw_of(obj):.3f} rad, which is "
+              "ignored: an actor faces wherever its behaviour points it")
 
 
 def gravity(obj, at):

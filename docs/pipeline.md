@@ -186,6 +186,13 @@ Two things about that table are worth knowing, because both used to be traps:
   Rotating an actor shows it worst, since every sprite in the atlas then faces
   the wrong way.
 
+  A sheet is 2048x4096: sixteen frames of the walk across, sixteen bearings
+  round the actor down, and that block of bearings **twice** — once
+  photographed from fifteen degrees above the actor and once from fifty-five,
+  so that a crowd looked down on from a wall or a ledge is showing pictures
+  taken from up there rather than pictures of its own flanks. Each kind's bake
+  is about a minute.
+
 ### How big an actor is
 
 In the .blend, and nowhere else. The game measures an actor's collision radius,
@@ -349,6 +356,10 @@ cargo run --release -- bake-impostors slime
 cargo run --release -- bake-impostors ant
 ```
 
+The elevations they are baked from are `bake::ELEVATIONS`, and adding or moving
+one is a re-bake of every kind: the sidecar carries the list, so the runtime
+follows whatever was baked without a change to `impostor.rs`.
+
 The slime pack itself lives in `reference/slime-pack/`, which is not tracked.
 Its licence permits integrating it into a project and forbids redistributing
 the pack, so the derived `assets/actors/slime.glb` and `slime.blend` are what
@@ -367,10 +378,13 @@ vertices in `src/water.rs`, a field of the decomp's collision data — so moving
 a warp pipe six metres was a code change and the only way to see where it would
 end up was to run the game.
 
-It is authored in `assets/levels/<level>.blend` now. The level's own geometry is
-*linked* into that file as a backdrop to place against, so it is visible, is
-read-only, and follows a rebuild of the level it came from; nothing linked is
-exported.
+It is authored in `assets/levels/<level>.blend` now. Two things are *linked*
+into that file so that placing is done against what the game actually draws:
+the level's own geometry, as a backdrop; and each actor's model, as a
+collection each placement instances. Both are read-only, both follow a rebuild
+of the file they came from, and neither is exported — the holder collections
+are not even in the scene, so a warp pipe empty draws a warp pipe wherever it
+stands and there is still only one warp pipe in the file.
 
 `python3 tools/build_assets.py --only levels` writes the two files the game
 reads:
@@ -393,8 +407,8 @@ the game.
 | `spawn` | empty | — | where the player is put down |
 | `gravity` | empty | `mode` = `down` \| `radial`, `accel` | `Gravity::Down`, or `Gravity::Radial` about the empty's own location |
 | `water` | mesh | — | a water box: the footprint of its bounding box, with its surface at the top |
-| `pipe` | empty | `spawns` = `mario` \| `slime` \| `ant`, `interval` | a warp pipe producing that, that often |
-| `slime`, `ant`, `mario` | empty | — | one of those, standing there |
+| `pipe` | empty (instancing `Model warp_pipe`) | `spawns` = `mario` \| `slime` \| `ant`, `interval` | a warp pipe producing that, that often |
+| `slime`, `ant`, `mario` | empty (instancing `Model <kind>`) | — | one of those, standing there |
 | anything else | mesh | `drift_u`, `drift_v`, `alpha` | a drawn surface, exported to the .glb, scrolling its texture at that rate |
 
 A water box is authored as a **plane** and not a cube, because a plane is
@@ -402,6 +416,30 @@ exactly what a water box is: `LevelData::water_depth` asks whether a point is
 inside the footprint and how far under the surface it is, and never asks where
 the bottom is. So the thing to author is the footprint and the height, and
 dragging a corner of a plane says both.
+
+### Which parts of a transform are the level's
+
+Position always. Beyond that it depends on whether anything else in the game
+depends on the answer:
+
+- **A warp pipe's whole transform is the level's** — position, turn about the
+  vertical, and size. A pipe is drawn and not collided with, so nothing else
+  reads how big it is, and the `0.01` that used to be a literal in `world.rs`
+  is now simply the scale the pipe is drawn at in Blender. Resize one there and
+  it is that size in the game.
+- **An actor's is position only.** Its size is measured off its own glTF by
+  `enemy::Kind::body` and is what its collision radius is built from, so an
+  actor drawn at half size would still shoulder its way around the level at
+  full size. Its facing belongs to its behaviour, which overwrites anything the
+  level said within a tick. Both are reported by the exporter rather than
+  silently dropped; to change how big a creature is, change the creature with
+  `tools/resize_actor.py`.
+
+Each placement is scaled to `DISPLAY_SCALE` in `export_level_furniture.py`,
+which is the factor the game draws that model at — `warp_pipe.glb` is 307 units
+across because that is how it came out of the decomp, and `mario.glb` is 160
+tall. It is a property of the model, not of the level, which is why an actor
+carrying a different one is a warning.
 
 Two names are checked twice on purpose. An unknown `spawns` stops the export,
 naming the object; and `src/furniture.rs` parses the same word into an enum, so

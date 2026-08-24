@@ -17,9 +17,13 @@ What it seeds is exactly what the game did before:
   enemies, from `world::spawn_castle_inhabitants`
 - `CASTLE_SPAWN` and the level's flat gravity, from `src/world.rs`
 
-The castle's own geometry is *linked* in, not copied: it is a backdrop to place
-against and rebuilding `castle_grounds.blend` should move it, so editing it
-here should be impossible. It is excluded from the export by name.
+Two things are *linked* in rather than copied, so that placing is done against
+what the game actually draws. The castle's own geometry, as a backdrop: it is
+not authored here and rebuilding `castle_grounds.blend` should move it. And
+each actor's model, as a collection every placement of that kind instances --
+so a warp pipe empty draws a warp pipe, an ant empty draws an ant, and the file
+holds one copy of each however many are placed. Neither is exported: the model
+collections are not in the scene at all, and the exporter walks `Furniture`.
 """
 
 import sys
@@ -30,10 +34,30 @@ import numpy as np
 from mathutils import Vector
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+
+from export_level_furniture import DISPLAY_SCALE  # noqa: E402
+
 REFERENCE = ROOT / "assets" / "bevy" / "castle_grounds.blend"
 COLLISION = ROOT / "assets" / "castle_grounds" / "collision.npz"
 WATER_TEXTURE = ROOT / "assets" / "bevy" / "water.png"
 OUTPUT = ROOT / "assets" / "levels" / "castle.blend"
+
+#: The model each kind of placement shows, linked in so that what is being
+#: dragged about is the thing itself rather than a labelled box. The scale
+#: beside it is `DISPLAY_SCALE`, which is what the game draws that model at --
+#: see `export_level_furniture.py`, where the two are kept honest.
+MODELS = {
+    "warp_pipe": ROOT / "assets" / "actors" / "warp_pipe.blend",
+    "slime": ROOT / "assets" / "actors" / "slime.blend",
+    "ant": ROOT / "assets" / "actors" / "ant.blend",
+    "mario": ROOT / "assets" / "mario" / "mario.blend",
+}
+
+#: Blender's own "do not export this" collection. The actor sources keep a
+#: reference icosphere in one, and a preview that included it would be an actor
+#: standing inside a ball.
+NOT_EXPORTED = "glTF_not_exported"
 
 #: SM64 units to metres, the port's world scale. Everything read out of the
 #: decomp-derived data is in the former and everything authored here is in the
@@ -161,6 +185,66 @@ def empty(name, at, into, display="PLAIN_AXES", size=1.0):
     return obj
 
 
+def link_models():
+    """Every actor's model, linked in and ready to be instanced.
+
+    The holder collections are deliberately *not* put in the scene. A
+    collection instance draws its contents wherever the instancing empty
+    stands, so one link is enough for however many warp pipes the level ends up
+    with, and the models themselves are nowhere -- which is what stops them
+    being exported, selected, or nudged.
+
+    Linked rather than appended for the same reason the castle is: re-exporting
+    an actor should move what is being placed against, and an actor's model is
+    not authored here.
+    """
+    models = {}
+    for kind, path in MODELS.items():
+        if not path.is_file():
+            print(f"no {path}; {kind} placements will be bare empties")
+            continue
+        with bpy.data.libraries.load(str(path), link=True) as (source, target):
+            target.objects = list(source.objects)
+            target.collections = [name for name in source.collections
+                                  if name == NOT_EXPORTED]
+        hidden = {obj.name for collection in target.collections if collection
+                  for obj in collection.objects}
+        holder = bpy.data.collections.new(f"Model {kind}")
+        for obj in target.objects:
+            if obj is not None and obj.name not in hidden:
+                holder.objects.link(obj)
+        models[kind] = holder
+        print(f"linked {kind}: {len(holder.objects)} objects from {path.name}")
+    return models
+
+
+def placement(name, model, at, models, into):
+    """One thing standing somewhere, drawn as the thing it is.
+
+    A collection instance is an empty with a collection hanging off it, so
+    everything the exporter knows about empties still applies: the name says
+    what this is and the custom properties say the rest. What the model adds is
+    that you can see where the warp pipe's mouth actually comes to.
+
+    Its scale is [`DISPLAY_SCALE`], which is the factor the game draws that
+    model at -- `warp_pipe.glb` is 307 units across and a warp pipe is three
+    metres. The exporter reads it back for the placements whose size is the
+    level's business and refuses it for the ones whose size is the model's.
+    """
+    obj = empty(name, at, into, display="PLAIN_AXES", size=0.5)
+    scale = DISPLAY_SCALE.get(model, 1.0)
+    obj.scale = (scale, scale, scale)
+    holder = models.get(model)
+    if holder is None:
+        return obj
+    obj.instance_type = "COLLECTION"
+    obj.instance_collection = holder
+    # The axes stay drawn under the model, small, so an empty that has ended up
+    # inside a hill is still findable.
+    obj.empty_display_size = 0.5 / max(scale, 1e-6)
+    return obj
+
+
 def water_planes(into, material):
     """One plane per water box, laid at the surface the box's top names.
 
@@ -249,12 +333,16 @@ def main():
                     display="SINGLE_ARROW", size=6.0)
     gravity["mode"] = "down"
 
+    models = link_models()
     for spawns, interval, at in PIPES:
-        pipe = empty("pipe", at, furniture, display="CUBE", size=1.5)
+        # Every pipe shows a warp pipe. What comes out of it is a property, not
+        # a different model, which is the distinction the level editor has to
+        # make visible: three identical pipes producing three different things.
+        pipe = placement("pipe", "warp_pipe", at, models, furniture)
         pipe["spawns"] = spawns
         pipe["interval"] = interval
     for kind, at in ACTORS:
-        empty(kind, at, furniture, display="SPHERE", size=0.8)
+        placement(kind, kind, at, models, furniture)
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=str(OUTPUT), compress=True,

@@ -577,6 +577,10 @@ fn setup(
         // settings ask for rather than the window's, and `display` stretches
         // the result over the window afterwards.
         display::world_camera_target(&scene_target),
+        // The ears go where the eyes are, so what is on the left of the screen
+        // is on the left of the mix. Nothing in a build without an audio
+        // backend, which is why it is named unconditionally.
+        audio::listener(),
         Transform::from_xyz(-13.0, 10.0, 56.0)
             .looking_at(Vec3::new(-13.0, 4.0, 46.0), Vec3::Y),
         Projection::from(PerspectiveProjection {

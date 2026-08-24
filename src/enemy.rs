@@ -2294,7 +2294,7 @@ pub fn combat(
             && facing.dot(bearing) > -0.15
         {
             commands.entity(entity).despawn();
-            sounds.push(Sfx::Defeat);
+            sounds.push_at(Sfx::Defeat, transform.translation);
             continue;
         }
         let reach = radius + PLAYER_REACH;
@@ -2317,7 +2317,7 @@ pub fn combat(
         }
         if controller.velocity.y < 0.0 && here.y > bottom + (top - bottom) * STOMP_MARGIN {
             commands.entity(entity).despawn();
-            sounds.push(Sfx::Defeat);
+            sounds.push_at(Sfx::Defeat, transform.translation);
             controller.velocity.y = BOUNCE_VELOCITY;
             controller.grounded = false;
             continue;
@@ -2379,9 +2379,11 @@ pub fn ally_combat(
             ally.state.motion = Motion::Attack;
             ally.state.still_for = 0.0;
             if ally.swing_left == 0.0 && in_reach {
-                let (target, _, _) = quarry.expect("in reach of nothing");
+                let (target, at, _) = quarry.expect("in reach of nothing");
                 commands.entity(target).despawn();
-                sounds.push(Sfx::Defeat);
+                // The squad fights spread out across the field, so where one of
+                // them landed a punch is worth hearing.
+                sounds.push_at(Sfx::Defeat, at);
             }
             continue;
         }

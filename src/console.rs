@@ -239,6 +239,13 @@ pub const SPECS: &[TunableSpec] = &[
         doc: "sound effect volume",
     },
     TunableSpec {
+        name: "sfx_range",
+        low: 1.0,
+        high: 60.0,
+        step: 1.0,
+        doc: "metres a world sound carries at full volume before it fades",
+    },
+    TunableSpec {
         name: "ally_count",
         low: 0.0,
         high: 200.0,
@@ -370,6 +377,7 @@ pub struct GameTuning {
     pub mouse_sens: f32,
     pub pad_look: f32,
     pub sfx_volume: f32,
+    pub sfx_range: f32,
     pub ally_count: f32,
     pub ally_speed: f32,
     pub enemy_speed: f32,
@@ -425,6 +433,9 @@ impl Default for GameTuning {
             mouse_sens: 0.003,
             pad_look: 2.6,
             sfx_volume: 0.7,
+            // A shade under `enemy_sight`, so a slime close enough to have
+            // noticed the player is close enough to be heard undimmed.
+            sfx_range: 12.0,
             ally_count: 8.0,
             ally_speed: 7.0,
             enemy_speed: 1.8,
@@ -489,6 +500,7 @@ impl GameTuning {
             "mouse_sens" => self.mouse_sens,
             "pad_look" => self.pad_look,
             "sfx_volume" => self.sfx_volume,
+            "sfx_range" => self.sfx_range,
             "ally_count" => self.ally_count,
             "ally_speed" => self.ally_speed,
             "enemy_speed" => self.enemy_speed,
@@ -541,6 +553,7 @@ impl GameTuning {
             "mouse_sens" => self.mouse_sens = value,
             "pad_look" => self.pad_look = value,
             "sfx_volume" => self.sfx_volume = value,
+            "sfx_range" => self.sfx_range = value,
             "ally_count" => self.ally_count = value,
             "ally_speed" => self.ally_speed = value,
             "enemy_speed" => self.enemy_speed = value,

@@ -419,6 +419,31 @@ ships a sound taxonomy and no waveforms. Jump, landing, footfalls, attacks,
 taking damage, defeating an enemy, breaking the water surface, and swim strokes
 are wired. `sfx_volume` in the console sets the level.
 
+An event either carries the point in the world it happened at or it does not,
+and that is the whole of the spatial half. The player's own noises are
+unplaced — he is what the camera is pointed at, and panning his footfalls off to
+one side only makes the view feel crooked — while a kill somebody else made
+carries the position it happened at: an enemy cut down across the field, a
+Mario's punch landing, a hitscan shot hitting at the far end of its beam. Placed
+events are heard from where they happened. The ears go on the camera, so what is
+on the left of the screen is on the left of the mix, and `sfx_range` in the
+console is how far a sound carries at full volume — beyond it, half as loud each
+doubling, and once it is under about a twelfth of full it is given no voice at
+all — which is what keeps a crowd dying half a field away from being dozens of
+decoders nobody can hear.
+
+Direction and distance are carried separately, and by design. The emitter is put
+on the *bearing* to the sound at a fixed radius from the listener rather than at
+its true position, and how far away it was is carried entirely by volume. That
+is a fix for the mixer underneath: rodio gives each channel a gain of
+`1/distance²` to that ear, clamped to 1, times a term that rises with that ear's
+distance, so a sound at its true distance pans weakly a few metres out and
+towards the *wrong* side beyond about a dozen. A fixed radius and the wide ear
+gap it is tuned with hold the panning at one steady, correct shape however far
+off the sound was, and `audio::attenuation` shapes the falloff instead. Both
+halves are plain functions over a transform and a distance, so both are tested
+headless like everything else here.
+
 The tables name their `.wav` files by hand, and a test walks every name and
 asserts the file is in the repository — which is what catches a typo or a
 sample renamed out from under them. `build_windows.sh` reads the same names out
@@ -673,6 +698,23 @@ fewer things, keeping fewer entities, and properly simulating fewer of them.
   from a baked atlas rather than as a skeleton, and the whole distant crowd of
   one kind is rebuilt every frame into a *single* mesh — one draw call for a
   thousand slimes. See `impostor.rs`, and `impostor/bake.rs` for the baker.
+
+  A sprite is a photograph, so it is only right from the height it was taken
+  at. The atlas therefore holds two: bearings round the actor from fifteen
+  degrees up, and the same bearings again from fifty-five. The runtime picks by
+  the angle the camera makes with *that* enemy and lays the quad back to match,
+  which is what keeps a crowd seen from a wall or a ledge from being a field of
+  flanks foreshortened into slivers. Two rather than three because a tier
+  doubles the atlas — 32 MB a kind — and two already keeps every sprite within
+  twenty degrees of a baked picture.
+
+  Both the angle and the lean are measured in the **model's own frame**, which
+  is what makes the same two tiers serve the crawlers: an ant on a wall is
+  standing on the wall, so a player facing that wall is looking down on the ant
+  and gets the steep pictures, drawn on a quad lying in the wall rather than
+  standing out of it. Every slope between flat and vertical comes out of the
+  same arithmetic, and there is no threshold anywhere that says what counts as
+  steep.
 
   The baker runs `drawing()` — the game's own post-update chain — rather than a
   copy of it, and that is not tidiness. It was a copy once, missing the

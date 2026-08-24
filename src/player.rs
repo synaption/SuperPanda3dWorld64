@@ -641,7 +641,12 @@ mod tests {
     }
 
     fn sounds(world: &mut World) -> Vec<Sfx> {
-        world.resource_mut::<SoundQueue>().drain()
+        world
+            .resource_mut::<SoundQueue>()
+            .drain()
+            .into_iter()
+            .map(|event| event.sfx)
+            .collect()
     }
 
     /// The body eases onto the local up instead of being set to it. Two

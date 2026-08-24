@@ -31,10 +31,27 @@
 //!
 //!   * `world_size` is the camera's vertical extent. That is the quad's size.
 //!   * the camera is aimed at `focus` above the model's origin, so the origin
-//!     sits `0.5 - focus / world_size` of the way up the cell. That is `foot`.
+//!     sits `0.5 - focus * cos(elevation) / world_size` of the way up the cell.
+//!     That is `foot`; the cosine is there because a camera tilted down
+//!     foreshortens world height, and at fifty-five degrees it is the
+//!     difference between a sprite standing on the floor and one buried in it.
 //!
 //! Both fall out of the camera rather than out of the image, which is why the
 //! runtime can trust them.
+//!
+//! # Tiers
+//!
+//! The sheet is baked from more than one height -- see [`ELEVATIONS`] -- and
+//! each is a whole block of `ANGLES` rows, stacked flattest first. That is the
+//! only thing about the layout the runtime has to be told, and it is told it in
+//! the sidecar rather than here.
+//!
+//! Everything else is shared between the tiers on purpose. One survey covers
+//! all of them, one extent is fitted to the largest thing any of them saw, and
+//! the tiers differ only in where the camera stood and where the origin landed
+//! in the picture. A per-tier extent would be tighter and would make every
+//! sprite in the field change size the moment the camera crossed a tier
+//! boundary, which is much more visible than the margin it would save.
 //!
 //! The one thing that *is* measured is how big the camera has to be. A first
 //! pass renders the whole sheet at a deliberately generous extent and records
@@ -44,7 +61,7 @@
 
 use crate::{
     enemy::Kind,
-    impostor::SheetMeta,
+    impostor::{SheetMeta, Tier},
     n64::{self, N64Lighting},
 };
 use bevy::{
@@ -71,13 +88,27 @@ const CELL_PX: u32 = 128;
 const ANGLES: usize = 16;
 const FRAMES: usize = 16;
 
-/// How far the camera is tilted down towards the model, in degrees.
+/// How far the camera is tilted down towards the model, in degrees, once per
+/// tier of the sheet. Flattest first, which is the order the rows go in.
 ///
-/// The playing camera sits above the player and looks slightly down, so a sheet
-/// baked dead level would show an enemy's face where the game shows the top of
-/// its head. Fifteen degrees is roughly where the follow camera sits at the
-/// distance the swap happens.
-const ELEVATION: f32 = 15.0;
+/// Fifteen is where the follow camera sits above a distant enemy on the flat:
+/// it is above the player and looks slightly down, so a sheet baked dead level
+/// would show an enemy's face where the game shows the top of its head.
+///
+/// Fifty-five is for the case the flat tier cannot cover at all. The camera's
+/// own pitch reaches forty-three degrees down (`camera::PITCH_LIMITS`), and a
+/// player standing on anything -- a wall, a stair, the lip of a pit -- adds the
+/// drop to the crowd below on top of that, so looking down on the far field
+/// from sixty or seventy degrees is ordinary rather than exotic. Sprites are
+/// picked by nearest elevation, so these two put the hand-over at thirty-five
+/// degrees and leave nothing more than twenty degrees from a baked picture.
+///
+/// Two rather than three, and the cost is the reason: a tier is `ANGLES` more
+/// rows of atlas, so it doubles the sheet -- 2048x4096 rather than 2048x2048,
+/// 32 MB of texture a kind. That is a real bill on the machine this is aimed
+/// at, and the third tier would be buying a ten-degree improvement in the
+/// middle of a range that is already never worse than twenty.
+const ELEVATIONS: [f32; 2] = [15.0, 55.0];
 
 /// How many world units across the first pass looks, and how much room the
 /// second pass leaves around what the first one measured.
@@ -88,7 +119,16 @@ const ELEVATION: f32 = 15.0;
 /// actor bigger than it does not fail the bake -- see [`survey_fits`], which
 /// notices and looks again from further back. The second is the margin that
 /// survives into the sheet.
-const SURVEY_MARGIN: f32 = 2.6;
+///
+/// It was 2.6 when the sheet was one flat tier, and the steep one is what
+/// raised it: seen from fifty-five degrees up, an actor's *length* is in the
+/// picture's vertical as well as its horizontal, so the slime filled a camera
+/// from above that it had rattled around in from the side. That is not a
+/// failure -- the survey widened and baked correctly -- but a widening doubles
+/// the bake and measures the actor at half the resolution it could have, and
+/// paying that on every bake for ever is worse than starting from a number
+/// that fits.
+const SURVEY_MARGIN: f32 = 3.6;
 const FINAL_MARGIN: f32 = 1.06;
 
 /// How many times the survey may double its camera before giving up.
@@ -131,13 +171,18 @@ struct Bake {
     /// True once the readback for this cell has been asked for, so it is not
     /// asked for again on the next frame while the first is still in flight.
     reading: bool,
-    /// The camera's vertical extent in world units, this pass.
+    /// The camera's vertical extent in world units, this pass. One for the
+    /// whole sheet, tiers included.
     extent: f32,
-    /// How far above the model's origin the camera is aimed.
-    focus: f32,
-    /// The tightest box, in cell fractions, that held content in the survey.
-    /// `(low, high)`, y measured downward like the image.
-    seen: Option<(Vec2, Vec2)>,
+    /// How far above the model's origin the camera is aimed, per tier.
+    ///
+    /// Per tier because a tilted camera aimed at a fixed height puts the model
+    /// somewhere else in the frame: the survey aims all of them at the same
+    /// place and [`tighten`] centres each on what that tier actually saw.
+    focus: Vec<f32>,
+    /// The tightest box, in cell fractions, that held content in the survey,
+    /// per tier. `(low, high)`, y measured downward like the image.
+    seen: Vec<Option<(Vec2, Vec2)>>,
     /// How many times the survey has already been re-run from further back.
     widened: usize,
     /// The finished sheet, `cols * cell_px` by `rows * cell_px`, RGBA8.
@@ -149,14 +194,16 @@ struct Bake {
 
 impl Bake {
     fn cells(&self) -> usize {
-        ANGLES * FRAMES
+        ELEVATIONS.len() * ANGLES * FRAMES
     }
 
-    /// The angle and frame indices of the cell being rendered. Frames advance
-    /// fastest, so a row of the atlas is one angle's whole walk cycle -- which
-    /// is the layout [`SheetMeta::grid`] promises.
-    fn indices(&self) -> (usize, usize) {
-        (self.cell / FRAMES, self.cell % FRAMES)
+    /// The tier, angle and frame indices of the cell being rendered. Frames
+    /// advance fastest and tiers slowest, so a row of the atlas is one angle's
+    /// whole walk cycle and a block of `ANGLES` rows is one tier -- which is
+    /// the layout [`SheetMeta::grid`] promises.
+    fn indices(&self) -> (usize, usize, usize) {
+        let tier = self.cell / (ANGLES * FRAMES);
+        (tier, (self.cell / FRAMES) % ANGLES, self.cell % FRAMES)
     }
 }
 
@@ -235,7 +282,7 @@ fn setup(
         // leave a halo of half-alpha pixels round every sprite in the game.
         Msaa::Off,
         Tonemapping::None,
-        camera_pose(bake.extent, bake.focus, 0.0),
+        camera_pose(bake.extent, bake.focus[0], 0.0, ELEVATIONS[0]),
         RenderLayers::layer(0),
     ));
     commands.spawn((
@@ -256,14 +303,15 @@ fn setup(
 #[derive(Resource)]
 struct CellImage(Handle<Image>);
 
-/// Where the camera sits to see a model of `extent` turned to `yaw`.
+/// Where the camera sits to see a model of `extent` turned to `yaw`, from
+/// `elevation` degrees above it.
 ///
 /// The camera orbits the model rather than the model turning under a fixed
 /// camera. Both would do, and this way round the actor's own transform stays
 /// the identity, so nothing has to reason about whether a rotation applied
 /// before or after the animation.
-fn camera_pose(extent: f32, focus: f32, yaw: f32) -> Transform {
-    let tilt = ELEVATION.to_radians();
+fn camera_pose(extent: f32, focus: f32, yaw: f32, elevation: f32) -> Transform {
+    let tilt = elevation.to_radians();
     // Far enough back that the near plane is never inside the model. With an
     // orthographic projection the distance changes nothing about the picture,
     // so it can simply be generous.
@@ -328,9 +376,17 @@ fn step(
     if bake.reading {
         return;
     }
-    let (angle, frame) = bake.indices();
+    // The last cell of the final pass is collected, written and the app told to
+    // exit -- but `done` runs after this, so there is one more turn through
+    // here with `cell` one past the end. Reading a tier out of that is an index
+    // panic on the frame *after* a bake that worked, which reads as a bake that
+    // failed.
+    if bake.cell >= bake.cells() {
+        return;
+    }
+    let (tier, angle, frame) = bake.indices();
     let yaw = angle as f32 / ANGLES as f32 * std::f32::consts::TAU;
-    *view = camera_pose(bake.extent, bake.focus, yaw);
+    *view = camera_pose(bake.extent, bake.focus[tier], yaw, ELEVATIONS[tier]);
     // Sampled at the middle of each frame's slice rather than at its start, so
     // a sixteen-frame sheet of a looping clip does not show the first pose
     // twice -- once at the beginning and once at the end.
@@ -398,8 +454,8 @@ fn collect(
                     bake.extent * 2.0,
                 );
                 bake.extent *= 2.0;
-                bake.focus = bake.extent * 0.25;
-                bake.seen = None;
+                bake.focus = vec![bake.extent * 0.25; ELEVATIONS.len()];
+                bake.seen = vec![None; ELEVATIONS.len()];
             } else {
                 eprintln!(
                     "impostor bake: {:?} still fills a {:.3} unit camera after {WIDENINGS} \
@@ -444,7 +500,12 @@ fn note_bounds(bake: &mut Bake, pixels: &[u8]) {
     }
     let scale = 1.0 / CELL_PX as f32;
     let (low, high) = (low * scale, high * scale);
-    bake.seen = Some(match bake.seen {
+    // Into this tier's box and no other. The tiers are measured apart because
+    // they are aimed apart: what the final pass takes from all of them together
+    // is the one extent, and what it takes from each alone is where that tier's
+    // picture of the actor sat in the frame.
+    let tier = bake.indices().0;
+    bake.seen[tier] = Some(match bake.seen[tier] {
         Some((old_low, old_high)) => (old_low.min(low), old_high.max(high)),
         None => (low, high),
     });
@@ -465,11 +526,13 @@ fn note_bounds(bake: &mut Bake, pixels: &[u8]) {
 /// are worth keeping in mind: the *cause* was a stale [`Kind::draw_scale`], and
 /// this only makes the baker say so instead of quietly writing the crop.
 fn survey_fits(bake: &Bake) -> bool {
-    let Some((low, high)) = bake.seen else {
-        return true;
-    };
     let edge = 1.0 / CELL_PX as f32;
-    low.x > edge && low.y > edge && high.x < 1.0 - edge && high.y < 1.0 - edge
+    // Every tier, because they see different silhouettes: a long actor fits a
+    // camera easily from the side and fills the same camera from above, and a
+    // sheet is only as good as its worst tier.
+    bake.seen.iter().flatten().all(|(low, high)| {
+        low.x > edge && low.y > edge && high.x < 1.0 - edge && high.y < 1.0 - edge
+    })
 }
 
 /// Chooses the extent and focus the final pass renders at, from what the survey
@@ -479,37 +542,49 @@ fn survey_fits(bake: &Bake) -> bool {
 /// extent has to cover the wider of the two axes or the sheet clips the actor
 /// in the other one.
 fn tighten(bake: &mut Bake) {
-    let Some((low, high)) = bake.seen else {
+    if bake.seen.iter().all(Option::is_none) {
         eprintln!("impostor bake: the survey saw nothing at all; keeping the wide camera");
         return;
-    };
-    let span = high - low;
+    }
     let survey = bake.extent;
-    // Back into world units: the survey cell covered `survey` units across.
-    let wanted = span.max_element() * survey * FINAL_MARGIN;
-    // Where the content's middle sat, relative to the camera's aim point. The
-    // image's y runs downward and the world's runs up, hence the negation.
-    let middle = (low + high) * 0.5 - Vec2::splat(0.5);
-    let shift = -middle.y * survey;
-    bake.focus += shift;
+    // The extent is the largest thing *any* tier saw, so that one camera fits
+    // them all and a sprite does not change size when its tier changes.
+    let mut wanted: f32 = 0.0;
+    for (tier, elevation) in ELEVATIONS.iter().enumerate() {
+        let Some((low, high)) = bake.seen[tier] else {
+            eprintln!("impostor bake: the survey saw nothing at {elevation} degrees");
+            continue;
+        };
+        let span = high - low;
+        // Back into world units: the survey cell covered `survey` units across.
+        wanted = wanted.max(span.max_element() * survey * FINAL_MARGIN);
+        // Where this tier's content sat, relative to the camera's aim point.
+        // The image's y runs downward and the world's runs up, hence the
+        // negation -- and the cosine puts an offset measured in the picture
+        // back into the world height the camera has to be raised by, which a
+        // camera tilted `elevation` degrees down foreshortens on the way in.
+        let middle = (low + high) * 0.5 - Vec2::splat(0.5);
+        bake.focus[tier] += -middle.y * survey / elevation.to_radians().cos();
+        println!(
+            "impostor bake: at {elevation:.0} degrees the survey found {:.3} x {:.3} world \
+             units, aiming {:.3} up",
+            span.x * survey,
+            span.y * survey,
+            bake.focus[tier],
+        );
+    }
     bake.extent = wanted;
-    println!(
-        "impostor bake: survey found {:.3} x {:.3} world units; \
-         drawing at {:.3} with the camera aimed {:.3} up",
-        span.x * survey,
-        span.y * survey,
-        bake.extent,
-        bake.focus,
-    );
+    println!("impostor bake: drawing every tier at {:.3} units", bake.extent);
 }
 
 /// Copies one cell's pixels into the atlas at its place.
 fn blit(bake: &mut Bake, pixels: &[u8]) {
-    let (angle, frame) = bake.indices();
+    let (tier, angle, frame) = bake.indices();
     let stride = FRAMES as u32 * CELL_PX * 4;
+    let row = (tier * ANGLES + angle) as u32;
     for y in 0..CELL_PX {
         let from = (y * CELL_PX * 4) as usize;
-        let to = ((angle as u32 * CELL_PX + y) * stride + frame as u32 * CELL_PX * 4) as usize;
+        let to = ((row * CELL_PX + y) * stride + frame as u32 * CELL_PX * 4) as usize;
         let width = (CELL_PX * 4) as usize;
         bake.atlas[to..to + width].copy_from_slice(&pixels[from..from + width]);
     }
@@ -520,7 +595,7 @@ fn finish(bake: &Bake) {
     let root = crate::asset_path().join(super::SHEETS);
     let stem = super::stem(bake.kind);
     let width = FRAMES as u32 * CELL_PX;
-    let height = ANGLES as u32 * CELL_PX;
+    let height = (ELEVATIONS.len() * ANGLES) as u32 * CELL_PX;
     let png = root.join(format!("{stem}.png"));
     if let Err(error) = write_png(&png, width, height, &bake.atlas) {
         eprintln!("impostor bake: could not write {}: {error}", png.display());
@@ -532,14 +607,22 @@ fn finish(bake: &Bake) {
         angles: ANGLES,
         frames: FRAMES,
         world_size: bake.extent,
-        // The origin's height in the cell, from the bottom. The camera is aimed
-        // `focus` above it and covers `extent`, so it sits exactly this far up.
-        foot: 0.5 - bake.focus / bake.extent,
         // One walk cycle across the columns, at the clip's own length.
         fps: bake.clip.map_or(FRAMES as f32, |(_, duration)| {
             FRAMES as f32 / duration.max(0.001)
         }),
-        elevation: ELEVATION,
+        tiers: ELEVATIONS
+            .iter()
+            .enumerate()
+            .map(|(tier, elevation)| Tier {
+                elevation: *elevation,
+                // The origin's height in the cell, from the bottom. The camera
+                // is aimed `focus` above it and covers `extent`, and the tilt
+                // foreshortens that gap by its cosine on the way into the
+                // picture -- so it sits exactly this far up.
+                foot: 0.5 - bake.focus[tier] * elevation.to_radians().cos() / bake.extent,
+            })
+            .collect(),
     };
     let json = root.join(format!("{stem}.json"));
     match serde_json::to_string_pretty(&meta) {
@@ -619,10 +702,13 @@ pub fn run(kinds: &[Kind]) {
             // whatever hangs under the origin -- and since the survey is what
             // the final pass is sized from, a bottom edge measured wrong there
             // is a sheet with its actor's feet cut off.
-            focus: extent * 0.25,
-            seen: None,
+            focus: vec![extent * 0.25; ELEVATIONS.len()],
+            seen: vec![None; ELEVATIONS.len()],
             widened: 0,
-            atlas: vec![0; (FRAMES as u32 * CELL_PX * ANGLES as u32 * CELL_PX * 4) as usize],
+            atlas: vec![
+                0;
+                FRAMES * CELL_PX as usize * ELEVATIONS.len() * ANGLES * CELL_PX as usize * 4
+            ],
             clip: None,
             started: std::time::Instant::now(),
         })
@@ -654,7 +740,7 @@ pub fn run(kinds: &[Kind]) {
         // from here, and sent the next reader looking at the renderer.
         app.finish();
         app.cleanup();
-        let cap = ANGLES * FRAMES * (WIDENINGS + 2) * (SETTLE + 4) + 2_000;
+        let cap = ELEVATIONS.len() * ANGLES * FRAMES * (WIDENINGS + 2) * (SETTLE + 4) + 2_000;
         let mut frames = 0;
         while app.should_exit().is_none() {
             app.update();

@@ -10,6 +10,12 @@
 //! plays together. That is what SM64 itself does for a jump: a terrain sound
 //! from the ground and a voice from Mario, two samples on one event.
 //!
+//! An event also either carries the point in the world it happened at or it
+//! does not, and that is the whole of the spatial half: the player's own noises
+//! are unplaced and play flat, and everything the rest of the field makes is
+//! heard from where it was made. See [`SoundEvent`], and [`EAR_GAP`] and
+//! [`PAN_RADIUS`] for the shape of the panning and why it is that shape.
+//!
 //! The tables below and the queue are always compiled and tested. Only the
 //! playback backend is conditional -- see the `sound` feature in Cargo.toml --
 //! and where it is absent the queue is still drained, so a build without an
@@ -158,20 +164,45 @@ pub fn all_paths() -> impl Iterator<Item = &'static str> {
 /// dropping the overflow is better than replaying a backlog on return.
 const QUEUE_LIMIT: usize = 32;
 
+/// One queued event: what happened, and where.
+///
+/// The position is what makes a sound a *place* rather than a fact. A noise the
+/// player himself makes is left unplaced -- he is what the camera is pointed at,
+/// and panning his own footfalls off to one side only makes the view feel
+/// crooked -- while a noise something else in the world makes carries the point
+/// it happened at and is heard from there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SoundEvent {
+    pub sfx: Sfx,
+    /// Where in the world it happened, or `None` for the player's own noises.
+    pub at: Option<Vec3>,
+}
+
 #[derive(Resource, Default)]
 pub struct SoundQueue {
-    events: Vec<Sfx>,
+    events: Vec<SoundEvent>,
 }
 
 impl SoundQueue {
+    /// Queues one of the player's own sounds. It plays flat: full volume, no
+    /// side.
     pub fn push(&mut self, sfx: Sfx) {
+        self.queue(SoundEvent { sfx, at: None });
+    }
+
+    /// Queues a sound something in the world made, at the point it made it.
+    pub fn push_at(&mut self, sfx: Sfx, at: Vec3) {
+        self.queue(SoundEvent { sfx, at: Some(at) });
+    }
+
+    fn queue(&mut self, event: SoundEvent) {
         if self.events.len() < QUEUE_LIMIT {
-            self.events.push(sfx);
+            self.events.push(event);
         }
     }
 
     /// Empties the queue, handing back what was in it.
-    pub fn drain(&mut self) -> Vec<Sfx> {
+    pub fn drain(&mut self) -> Vec<SoundEvent> {
         std::mem::take(&mut self.events)
     }
 }
@@ -226,19 +257,102 @@ pub fn takes(character: ActiveCharacter, sfx: Sfx, rng: &mut Rng) -> Vec<&'stati
         .collect()
 }
 
+/// How far apart the listener's ears are, in metres.
+///
+/// Wider than a head, and deliberately so: it is the mixer underneath that
+/// wants it. A spatial sound reaches rodio, which gives each channel a gain of
+/// `1/distance²` to that ear -- clamped to 1 -- times a second term that *rises*
+/// with how far away that ear is. With ears a head's width apart the two
+/// distances barely differ, the second term wins, and the sound leans towards
+/// the wrong side. Ears far enough apart that the near one falls inside the
+/// clamp and the far one does not put the panning back the way round it
+/// belongs. This gap and [`PAN_RADIUS`] are chosen together to do that: a sound
+/// hard to one side comes out about three to one in favour of that side, and one
+/// dead ahead comes out even.
+pub const EAR_GAP: f32 = 2.6;
+
+/// How far from the listener a placed sound is actually put, in metres.
+///
+/// Direction and distance are carried separately. The emitter goes on the
+/// bearing to whatever made the noise but always at this fixed radius, which is
+/// what keeps the panning the same shape whether a slime died four metres away
+/// or forty; how far it was is carried entirely by [`attenuation`]. Placing the
+/// emitter at its true distance instead would hand the panning back to the
+/// `1/distance²` term above, which flattens to nothing a few metres out.
+pub const PAN_RADIUS: f32 = 0.8;
+
+/// Makes up for what the panning costs.
+///
+/// The two channel gains at [`PAN_RADIUS`] run from 0.32 apiece for a sound
+/// dead ahead to 0.60/0.21 for one hard to one side, so a placed sound is much
+/// quieter than a flat one at the same volume. This is the multiplier that puts
+/// them back on comparable footing: an on-axis sound lands about three decibels
+/// under a flat one, and the loud channel of a hard-panned sound stays just
+/// under unity at the default `sfx_volume`, which is what keeps a kill right
+/// beside the ear from clipping.
+pub const PAN_GAIN: f32 = 2.2;
+
+/// The quietest a placed sound may be and still be worth a voice. A crowd dying
+/// half a field away is dozens of samples nobody can hear, and each of them is
+/// a sink, a decoder and an entity.
+const CULL_GAIN: f32 = 0.08;
+
+/// How loud a sound `distance` metres off plays, as a fraction of the same
+/// sound at the listener.
+///
+/// Flat inside `range` and inverse-*linear* past it -- half as loud each
+/// doubling, rather than the quarter inverse-square would give. Inverse-square
+/// is the honest physics and the wrong choice here: the field is forty metres
+/// across and a slime dying at the far end of it would be four percent of one
+/// dying at your feet, which is silence with extra steps.
+pub fn attenuation(distance: f32, range: f32) -> f32 {
+    // A range of zero would divide by it, and the console can be typed into.
+    let range = range.max(0.1);
+    if distance <= range {
+        1.0
+    } else {
+        range / distance
+    }
+}
+
+/// Whether a sound that far off is worth playing at all. See [`CULL_GAIN`].
+pub fn audible(distance: f32, range: f32) -> bool {
+    attenuation(distance, range) >= CULL_GAIN
+}
+
+/// Where to put the emitter for a sound that happened at `at`: on the bearing
+/// from the listener to it, [`PAN_RADIUS`] out, in the listener's own space.
+///
+/// In the listener's space rather than the world's because the emitter is
+/// parented to the ears. A sound that outlives the frame it started on then
+/// keeps the side it started on while the player runs and turns, instead of
+/// sweeping across the stereo field as the camera leaves a point less than a
+/// metre away behind. These are one-shots of well under a second; where they
+/// came from is settled when they start.
+pub fn pan_offset(listener: &GlobalTransform, at: Vec3) -> Vec3 {
+    listener
+        .affine()
+        .inverse()
+        .transform_point3(at)
+        .normalize_or_zero()
+        * PAN_RADIUS
+}
+
 #[cfg(any(feature = "sound", windows))]
-pub use backend::{play, preload};
+pub use backend::{listener, play, preload};
 
 /// Playback against Bevy's audio device. Present only where the `bevy_audio`
 /// backend is compiled in; see the `sound` feature in Cargo.toml.
 #[cfg(any(feature = "sound", windows))]
 mod backend {
-    use super::{takes, Rng, SoundQueue, PITCH_SPREAD};
+    use super::{
+        attenuation, audible, pan_offset, takes, Rng, SoundQueue, EAR_GAP, PAN_GAIN, PITCH_SPREAD,
+    };
     use crate::{console::GameTuning, GameState};
     use bevy::{
-        audio::{PlaybackMode, Volume},
-        prelude::*,
+        audio::{PlaybackMode, SpatialListener, Volume},
         platform::collections::HashMap,
+        prelude::*,
     };
 
     /// Samples held loaded for the whole run. Loading is asynchronous, so a
@@ -258,6 +372,14 @@ mod backend {
         commands.insert_resource(SoundBank { samples });
     }
 
+    /// The ears. Goes on whatever hears the world -- the camera -- and is an
+    /// empty bundle in a build with no audio backend, so the caller names it
+    /// unconditionally. See [`EAR_GAP`] for why the ears are as far apart as
+    /// they are.
+    pub fn listener() -> impl Bundle {
+        SpatialListener::new(EAR_GAP)
+    }
+
     /// Drains the queue and spawns one despawning audio entity per layer.
     ///
     /// Runs unconditionally rather than only while the console is closed, so
@@ -269,10 +391,31 @@ mod backend {
         bank: Res<SoundBank>,
         state: Res<GameState>,
         tuning: Res<GameTuning>,
+        listener: Query<(Entity, &GlobalTransform), With<SpatialListener>>,
         mut rng: Local<Rng>,
     ) {
-        for sfx in queue.drain() {
-            for path in takes(state.active, sfx, &mut rng) {
+        let ears = listener.iter().next();
+        for event in queue.drain() {
+            // Where it is heard from, if it is heard from anywhere. An event
+            // that carries a position, in a run that has ears to hear it with,
+            // becomes an emitter hung off those ears; everything else -- the
+            // player's own noises, and every sound in a headless run, which has
+            // a queue and no camera -- plays flat.
+            let placed = match (event.at, ears) {
+                (Some(at), Some((entity, listener))) => {
+                    let distance = at.distance(listener.translation());
+                    if !audible(distance, tuning.sfx_range) {
+                        continue;
+                    }
+                    Some((
+                        entity,
+                        pan_offset(listener, at),
+                        attenuation(distance, tuning.sfx_range),
+                    ))
+                }
+                _ => None,
+            };
+            for path in takes(state.active, event.sfx, &mut rng) {
                 let Some(source) = bank.samples.get(path) else {
                     continue;
                 };
@@ -280,15 +423,30 @@ mod backend {
                 // says which scale it is on: `Linear` is the plain multiplier
                 // the old relative volume was, as against the decibel form the
                 // same type now also offers.
-                commands.spawn((
-                    AudioPlayer(source.clone()),
-                    PlaybackSettings {
-                        mode: PlaybackMode::Despawn,
-                        volume: Volume::Linear(tuning.sfx_volume),
-                        speed: 1.0 + rng.signed() * PITCH_SPREAD,
-                        ..default()
-                    },
-                ));
+                let sound = commands
+                    .spawn((
+                        AudioPlayer(source.clone()),
+                        PlaybackSettings {
+                            mode: PlaybackMode::Despawn,
+                            volume: Volume::Linear(match placed {
+                                Some((_, _, fade)) => tuning.sfx_volume * fade * PAN_GAIN,
+                                None => tuning.sfx_volume,
+                            }),
+                            speed: 1.0 + rng.signed() * PITCH_SPREAD,
+                            spatial: placed.is_some(),
+                            ..default()
+                        },
+                    ))
+                    .id();
+                if let Some((ears, offset, _)) = placed {
+                    // Parented, so the offset is read in the listener's space
+                    // and the pan holds while the camera moves under it. The
+                    // transform has to be there before the sink is built, which
+                    // is why it goes on here rather than a frame later.
+                    commands
+                        .entity(sound)
+                        .insert((Transform::from_translation(offset), ChildOf(ears)));
+                }
             }
         }
     }
@@ -298,6 +456,10 @@ mod backend {
 /// same and nothing accumulates.
 #[cfg(not(any(feature = "sound", windows)))]
 pub fn preload(_commands: &mut Commands, _assets: &AssetServer) {}
+
+/// No backend, no ears: nothing to put on the camera.
+#[cfg(not(any(feature = "sound", windows)))]
+pub fn listener() -> impl Bundle {}
 
 #[cfg(not(any(feature = "sound", windows)))]
 pub fn play(mut queue: ResMut<SoundQueue>) {
@@ -316,6 +478,74 @@ mod tests {
         }
         assert_eq!(queue.drain().len(), QUEUE_LIMIT);
         assert!(queue.drain().is_empty());
+    }
+
+    #[test]
+    fn a_placed_event_carries_the_point_it_happened_at() {
+        let mut queue = SoundQueue::default();
+        queue.push(Sfx::Jump);
+        queue.push_at(Sfx::Defeat, Vec3::new(3.0, 0.0, -9.0));
+        assert_eq!(
+            queue.drain(),
+            vec![
+                SoundEvent {
+                    sfx: Sfx::Jump,
+                    at: None
+                },
+                SoundEvent {
+                    sfx: Sfx::Defeat,
+                    at: Some(Vec3::new(3.0, 0.0, -9.0))
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sound_holds_its_volume_inside_the_range_and_halves_each_doubling_past_it() {
+        assert_eq!(attenuation(0.0, 12.0), 1.0);
+        assert_eq!(attenuation(12.0, 12.0), 1.0);
+        assert!((attenuation(24.0, 12.0) - 0.5).abs() < 1e-6);
+        assert!((attenuation(48.0, 12.0) - 0.25).abs() < 1e-6);
+        // The console can be typed into, and a range of zero divides by itself.
+        assert!(attenuation(5.0, 0.0).is_finite());
+    }
+
+    #[test]
+    fn a_sound_far_enough_off_is_not_given_a_voice_at_all() {
+        // A crowd dying across the field is dozens of samples nobody can hear.
+        assert!(audible(12.0, 12.0));
+        assert!(audible(100.0, 12.0));
+        assert!(!audible(200.0, 12.0));
+    }
+
+    #[test]
+    fn which_side_a_sound_is_heard_on_is_the_bearing_to_it() {
+        // Bevy's camera looks down -Z with +X to its right, which is the side
+        // `SpatialListener` puts the right ear on.
+        let listener = GlobalTransform::from(Transform::from_xyz(0.0, 2.0, 0.0));
+        let right = pan_offset(&listener, Vec3::new(20.0, 2.0, 0.0));
+        assert!((right.x - PAN_RADIUS).abs() < 1e-4, "{right:?}");
+        let left = pan_offset(&listener, Vec3::new(-20.0, 2.0, 0.0));
+        assert!((left.x + PAN_RADIUS).abs() < 1e-4, "{left:?}");
+
+        // Turning to face the same sound puts it dead ahead instead -- down the
+        // listener's own -Z, even in both ears.
+        let turned = GlobalTransform::from(
+            Transform::from_xyz(0.0, 2.0, 0.0).looking_at(Vec3::new(20.0, 2.0, 0.0), Vec3::Y),
+        );
+        let ahead = pan_offset(&turned, Vec3::new(20.0, 2.0, 0.0));
+        assert!(ahead.x.abs() < 1e-4 && ahead.z < 0.0, "{ahead:?}");
+
+        // Distance never reaches the offset: it is carried by volume, and the
+        // emitter sits at one fixed radius however far off the sound was.
+        for far in [4.0, 40.0, 400.0] {
+            let offset = pan_offset(&listener, Vec3::new(far, 2.0, -far));
+            assert!((offset.length() - PAN_RADIUS).abs() < 1e-4, "{offset:?}");
+        }
+
+        // A sound on top of the listener has no side, and normalising it must
+        // not hand back a NaN.
+        assert_eq!(pan_offset(&listener, Vec3::new(0.0, 2.0, 0.0)), Vec3::ZERO);
     }
 
     #[test]

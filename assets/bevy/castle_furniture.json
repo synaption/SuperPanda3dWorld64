@@ -53,7 +53,9 @@
         46.3
       ],
       "interval": 12.0,
-      "spawns": "mario"
+      "scale": 0.01,
+      "spawns": "mario",
+      "yaw": 0.0
     },
     {
       "at": [
@@ -62,7 +64,9 @@
         -39.2
       ],
       "interval": 12.0,
-      "spawns": "slime"
+      "scale": 0.01,
+      "spawns": "slime",
+      "yaw": 0.0
     },
     {
       "at": [
@@ -71,7 +75,9 @@
         -68.1
       ],
       "interval": 12.0,
-      "spawns": "ant"
+      "scale": 0.01,
+      "spawns": "ant",
+      "yaw": 0.0
     }
   ],
   "source": "assets/levels/castle.blend",

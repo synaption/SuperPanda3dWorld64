@@ -95,6 +95,17 @@ struct PipeSpec {
     spawns: Kind,
     interval: f32,
     at: [f32; 3],
+    /// Which way it is turned, about the vertical, in radians.
+    #[serde(default)]
+    yaw: f32,
+    /// How big. `warp_pipe.glb` is 307 units across and a warp pipe is three
+    /// metres, so this is 0.01 unless somebody has resized one.
+    #[serde(default = "unscaled")]
+    scale: f32,
+}
+
+fn unscaled() -> f32 {
+    1.0
 }
 
 #[derive(Deserialize, Debug, Clone, Copy)]
@@ -130,6 +141,14 @@ impl Kind {
             Kind::Ant => pipe::Spawn::Enemy(enemy::Kind::Ant),
         }
     }
+}
+
+/// One warp pipe, ready to spawn.
+#[derive(Debug, Clone, Copy)]
+pub struct Pipe {
+    pub spawns: pipe::Spawn,
+    pub interval: f32,
+    pub at: Transform,
 }
 
 /// A drawn surface: a mesh in the .glb, and what makes it move.
@@ -202,11 +221,21 @@ impl Furniture {
             .collect()
     }
 
-    /// The warp pipes: what each produces, how often, and where it stands.
-    pub fn pipes(&self) -> Vec<(pipe::Spawn, f32, Vec3)> {
+    /// The warp pipes: what each produces, how often, and how it stands.
+    pub fn pipes(&self) -> Vec<Pipe> {
         self.pipes
             .iter()
-            .map(|p| (p.spawns.spawn(), p.interval, point(p.at)))
+            .map(|p| Pipe {
+                spawns: p.spawns.spawn(),
+                interval: p.interval,
+                // The whole transform, which no other placement gets. A pipe
+                // is drawn and not collided with, so nothing depends on how
+                // big it is and the level is free to say -- which is what
+                // moves the last of its numbers out of the source.
+                at: Transform::from_translation(point(p.at))
+                    .with_rotation(Quat::from_rotation_y(p.yaw))
+                    .with_scale(Vec3::splat(p.scale)),
+            })
             .collect()
     }
 
@@ -252,12 +281,15 @@ mod tests {
         let castle = castle();
         assert!((castle.spawn() - Vec3::new(-13.28, 3.0, 46.64)).length() < 1e-3);
         let pipes = castle.pipes();
-        assert_eq!(pipes[0].0, pipe::Spawn::Mario);
-        assert!((pipes[0].2 - Vec3::new(-9.15, 2.6, 46.3)).length() < 1e-3);
-        assert!(pipes
-            .iter()
-            .any(|(spawns, _, at)| *spawns == pipe::Spawn::Enemy(enemy::Kind::Ant)
-                && (*at - Vec3::new(46.8, 5.4, -68.1)).length() < 1e-3));
+        assert_eq!(pipes[0].spawns, pipe::Spawn::Mario);
+        assert!((pipes[0].at.translation - Vec3::new(-9.15, 2.6, 46.3)).length() < 1e-3);
+        assert!(pipes.iter().any(|pipe| pipe.spawns
+            == pipe::Spawn::Enemy(enemy::Kind::Ant)
+            && (pipe.at.translation - Vec3::new(46.8, 5.4, -68.1)).length() < 1e-3));
+        // `warp_pipe.glb` is 307 units across and a warp pipe is three metres.
+        // The factor was a literal in `world.rs` until the .blend drew the
+        // pipe at it.
+        assert!((pipes[0].at.scale.x - 0.01).abs() < 1e-6);
         // The moat, from the decomp's first water box.
         let moat = castle.water_boxes()[0];
         assert!((moat.min_x - -71.29).abs() < 1e-2 && (moat.max_x - 82.53).abs() < 1e-2);
@@ -276,6 +308,36 @@ mod tests {
         .expect("that should parse");
         let box_ = backwards.water_boxes()[0];
         assert!(box_.min_x < box_.max_x && box_.min_z < box_.max_z);
+    }
+
+    /// A pipe turned and resized in Blender is turned and resized in the
+    /// game. It is the one placement that can be: nothing collides with a warp
+    /// pipe, so its size is nobody else's business.
+    #[test]
+    fn a_pipe_carries_the_turn_and_the_size_it_was_drawn_at() {
+        let level: Furniture = serde_json::from_str(
+            r#"{"level":"test","spawn":[0,0,0],"gravity":{"mode":"down"},
+                "pipes":[{"spawns":"ant","interval":8,"at":[1,2,3],
+                          "yaw":1.5707963,"scale":0.02}]}"#,
+        )
+        .expect("that should parse");
+        let pipe = level.pipes()[0];
+        assert!((pipe.at.scale - Vec3::splat(0.02)).length() < 1e-6);
+        // A quarter turn about the vertical takes the model's +Z to +X.
+        let turned = pipe.at.rotation * Vec3::Z;
+        assert!((turned - Vec3::X).length() < 1e-4, "{turned:?}");
+    }
+
+    /// An older furniture file, or one written by hand, says neither. It must
+    /// come up the size the model is rather than at nothing.
+    #[test]
+    fn a_pipe_that_says_no_size_is_left_alone() {
+        let level: Furniture = serde_json::from_str(
+            r#"{"level":"test","spawn":[0,0,0],"gravity":{"mode":"down"},
+                "pipes":[{"spawns":"ant","interval":8,"at":[0,0,0]}]}"#,
+        )
+        .expect("that should parse");
+        assert_eq!(level.pipes()[0].at.scale, Vec3::ONE);
     }
 
     /// The planet's gravity is not authored anywhere yet, but the format has
