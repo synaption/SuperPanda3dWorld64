@@ -13,12 +13,13 @@ without them was drawn two different ways at once -- the new model up close and
 the old picture of it past `enemy_draw`. Rotating an actor is the case that
 shows it worst, since every sprite in the atlas then faces the wrong way.
 
-The seven stages, in the order they have to run:
+The eight stages, in the order they have to run:
 
     mario      assets/mario/mario.glb        + mario_clips.json
     hero       assets/hero/hero.glb          + hero_clips.json
     weapons    assets/hero/*.glb             what the Hero carries
     castle     assets/bevy/castle.glb, castle.bin, water.png
+    levels     assets/bevy/*_furniture.json, *.glb   what is placed in each
     planet     assets/bevy/planet.glb        the generated planet, LOD0
     actors     assets/actors/*.glb           + a clips sidecar each
     impostors  assets/impostors/*.png, *.json
@@ -48,6 +49,11 @@ TOOLS = ROOT / "tools"
 ACTOR_DIR = ROOT / "assets" / "actors"
 WEAPON_DIR = ROOT / "assets" / "hero"
 
+# Levels with a furniture file. The planet has none yet: its ground is
+# generated rather than authored, and where its gravity points is still
+# `world::PLANET_CENTRE`.
+LEVELS = ("castle",)
+
 # What the Hero can hold. Static props rather than actors: no rig, no clips,
 # and so no adoption pass -- the export is the runtime file. Each one is
 # authored with its grip on the origin and its bore down +Z, which is what
@@ -71,7 +77,8 @@ SKELETON_ROOTS = {
     "slime": "Slime_Rig",
 }
 
-STAGES = ("mario", "hero", "weapons", "castle", "planet", "actors", "impostors")
+STAGES = ("mario", "hero", "weapons", "castle", "levels", "planet",
+          "actors", "impostors")
 
 
 def run(command):
@@ -185,6 +192,31 @@ def build_castle(_staging, _blender):
             "assets/bevy/water.png"]
 
 
+def build_levels(_staging, blender):
+    """A level's furniture: where everything in it is, as placed in Blender.
+
+    The stage the `castle` one above could not be. That stage's problem is the
+    45 materials on the level mesh, and furniture has no materials -- it is
+    empties and a waterfall -- so it comes out of a .blend like everything else
+    in this script.
+
+    The source is `assets/levels/<level>.blend`, which links the level's own
+    geometry in as a backdrop to place against and exports none of it. Water,
+    warp pipes and what each produces, the enemies standing about, the spawn
+    point and which way gravity points were all literals in the Rust until
+    this existed.
+    """
+    built = []
+    for level in LEVELS:
+        command = [sys.executable, TOOLS / "export_level_furniture.py", level]
+        if blender:
+            command.extend(["--blender", blender])
+        run(command)
+        built.extend([f"assets/bevy/{level}_furniture.json",
+                      f"assets/bevy/{level}_furniture.glb"])
+    return built
+
+
 def build_planet(_staging, _blender):
     """Adopt the generated planet from `experimental/planet_gen`.
 
@@ -262,6 +294,7 @@ BUILDERS = {
     "hero": build_hero,
     "weapons": build_weapons,
     "castle": build_castle,
+    "levels": build_levels,
     "planet": build_planet,
     "actors": build_actors,
     "impostors": bake_impostors,

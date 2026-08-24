@@ -56,9 +56,11 @@ def main():
     uvs[:, 1] = 1.0 - uvs[:, 1]
     coll_vertices = collision["vertices"].astype(np.float32) * SCALE
     coll_triangles = collision["tri_verts"].astype(np.uint32)
-    # id, min x, min z, max x, max z, surface y. The id is retained in the
-    # source format but gameplay only needs the five spatial values.
-    water_boxes = collision["water_boxes"][:, 1:].astype(np.float32) * SCALE
+    # The decomp's water boxes are deliberately not read. They are furniture
+    # now -- two planes in `assets/levels/castle.blend`, exported by
+    # `tools/export_level_furniture.py` -- so that moving the moat is
+    # something you do by dragging it. This file is the level's geometry, and
+    # geometry is the part nobody authors.
 
     objects = json.loads((ROOT / "assets/castle_grounds/collision_objects.json").read_text())
     trees = [o["pos"] for o in objects if o["preset"] == "special_bubble_tree"]
@@ -69,7 +71,6 @@ def main():
         (positions, "<f4"), (normals, "<f4"), (uvs, "<f4"),
         (colors, "<f4"), (triangles, "<u4"),
         (coll_vertices, "<f4"), (coll_triangles, "<u4"), (trees, "<f4"),
-        (water_boxes, "<f4"),
     ):
         write_vec(out, values, code)
     OUT.parent.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,316 @@
+"""A level's furniture .blend -> the two files the game reads.
+
+    python3 tools/export_level_furniture.py castle
+    python3 tools/export_level_furniture.py castle --blender /path/to/blender
+
+Furniture is everything in a level that is placed rather than modelled: where
+the player starts, which way gravity points, where the water is, where the warp
+pipes are and what comes out of each, and what is standing about when the level
+comes up. All of it used to be literals in `src/world.rs`, `src/water.rs` and
+the decomp's collision data, which meant moving a warp pipe was a code change.
+Now it is an empty in `assets/levels/<level>.blend`, and this is the step that
+carries it across.
+
+Two outputs, because the game needs the two halves at different times:
+
+    assets/bevy/<level>_furniture.json   placements, volumes and parameters
+    assets/bevy/<level>_furniture.glb    the meshes those parameters describe
+
+The JSON is small and `src/furniture.rs` embeds it with `include_str!`, the
+same way `src/level.rs` embeds `castle.bin`, so gravity and the spawn point and
+the water are known in the frame the level comes up rather than a few frames
+later. The GLB is loaded like any other asset and its surfaces are adopted as
+they arrive, which is fine: they are scenery.
+
+What the exporter recognises, by the object's name up to the first dot -- so a
+duplicate Blender called `pipe.001` is still a pipe:
+
+    empty   spawn        where the player is put down
+    empty   gravity      ["mode"] "down" or "radial"; radial uses its location
+    empty   pipe         ["spawns"] mario|slime|ant, ["interval"] seconds
+    empty   slime|ant    one of those, standing there when the level comes up
+    mesh    water        a water box: its footprint, at the height it sits
+    mesh    <anything>   a drawn surface, exported to the GLB. ["drift_u"],
+                         ["drift_v"] scroll it, ["alpha"] sets it transparent
+
+Objects in the `Reference` collection are the level's own geometry, linked in
+to place against, and are never exported. Anything unrecognised is reported and
+skipped, so a typo shows up as a warning here rather than as furniture that
+quietly is not in the game.
+
+Like `tools/blend_to_glb.py`, this file is run twice: once as a normal python3
+process that builds a Blender command line, and once inside Blender where bpy
+exists. Keeping both halves together is what stops the naming rules above and
+the command that applies them from drifting apart.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+try:
+    import bpy
+    from mathutils import Vector
+except ImportError:  # Outside Blender -- we are the launcher half.
+    bpy = None
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+PROJECT_BLENDER = os.path.join(ROOT, "blender-5.2.0-linux-x64", "blender")
+
+#: The collection that is the level. Everything else in the file -- the linked
+#: castle, a stray cube -- is scaffolding for the person placing things.
+FURNITURE = "Furniture"
+
+#: Empties whose name alone says what they are. Actors that a pipe can also
+#: produce share these names on purpose: a slime is a slime whether it walked
+#: out of a pipe or was standing there when the level came up.
+ACTOR_KINDS = ("slime", "ant", "mario")
+
+#: What a pipe produces if its `spawns` property says nothing, and how long it
+#: waits between two of them -- `pipe::MARIO_INTERVAL`.
+DEFAULT_SPAWNS = "mario"
+DEFAULT_INTERVAL = 12.0
+
+
+def stem(name):
+    """`pipe.001` -> `pipe`. Blender numbers duplicates and a duplicated warp
+    pipe is still a warp pipe."""
+    return name.split(".")[0]
+
+
+def to_game(vector):
+    """Blender's Z-up to the game's Y-up, the same turn `export_yup` makes.
+
+    The GLB half of this export is handed the conversion by the exporter and
+    the JSON half is not, so it happens here, once, against a test in
+    `src/furniture.rs` that the two halves agree about where the waterfall is.
+    """
+    return [round(float(vector.x), 4), round(float(vector.z), 4),
+            round(-float(vector.y), 4)]
+
+
+# ---------------------------------------------------------------------------
+# Inside Blender
+# ---------------------------------------------------------------------------
+
+def furniture_objects():
+    collection = bpy.data.collections.get(FURNITURE)
+    if collection is None:
+        raise SystemExit(
+            f"no {FURNITURE!r} collection: this .blend is not a level "
+            "furniture file, or the collection was renamed")
+    return sorted(collection.objects, key=lambda obj: obj.name)
+
+
+def footprint(obj):
+    """A mesh's world-space extent, as a water box.
+
+    Read off the bounding box rather than off the vertices, so a plane that has
+    been rotated flat still measures what it covers, and so the shape of the
+    mesh does not matter: what the game asks a water box is whether an (x, z)
+    is inside it and how far below the top a point is, and a bounding box
+    answers both. The height is the top, so a plane dragged to a slope puts its
+    water at the high corner rather than half way up.
+    """
+    corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    points = [to_game(corner) for corner in corners]
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    zs = [p[2] for p in points]
+    return {
+        "min_x": min(xs), "max_x": max(xs),
+        "min_z": min(zs), "max_z": max(zs),
+        "surface_y": max(ys),
+    }
+
+
+def read_furniture():
+    """Every recognised object, sorted into the placements the game reads."""
+    level = {"spawn": None, "gravity": None, "water": [], "pipes": [],
+             "actors": [], "surfaces": []}
+    meshes = []
+    unknown = []
+    for obj in furniture_objects():
+        kind = stem(obj.name)
+        at = to_game(obj.matrix_world.translation)
+        if obj.type == "MESH":
+            if kind == "water":
+                level["water"].append(footprint(obj))
+            else:
+                meshes.append(obj)
+                level["surfaces"].append(surface(obj))
+            continue
+        if obj.type != "EMPTY":
+            unknown.append((obj.name, obj.type))
+            continue
+        if kind == "spawn":
+            level["spawn"] = at
+        elif kind == "gravity":
+            level["gravity"] = gravity(obj, at)
+        elif kind == "pipe":
+            level["pipes"].append({
+                "spawns": actor_kind(obj, obj.get("spawns", DEFAULT_SPAWNS)),
+                "interval": float(obj.get("interval", DEFAULT_INTERVAL)),
+                "at": at,
+            })
+        elif kind in ACTOR_KINDS:
+            level["actors"].append({"kind": kind, "at": at})
+        else:
+            unknown.append((obj.name, obj.type))
+    for name, type_ in unknown:
+        print(f"  ignored {name!r} ({type_}): no rule for that name")
+    return level, meshes
+
+
+def actor_kind(obj, value):
+    """One of the things this game can put in a level, or a stop.
+
+    Checked here rather than left to the game, because the person who can fix
+    it is looking at Blender right now. `src/furniture.rs` refuses the same
+    word a second time -- its parse fails and the game will not start -- so a
+    hand-edited JSON cannot get past it either; this is the half that names the
+    object you have to go and rename.
+    """
+    name = str(value).strip().lower()
+    if name not in ACTOR_KINDS:
+        raise SystemExit(
+            f"{obj.name!r} spawns {value!r}, which is not one of "
+            f"{', '.join(ACTOR_KINDS)}")
+    return name
+
+
+def gravity(obj, at):
+    """Which way down is, out of one empty.
+
+    `radial` carries its location because that is the whole of it -- down is
+    towards the empty. `down` carries nothing: a flat level's gravity is `-Y`
+    wherever you are standing, so an empty that has been dragged somewhere is
+    saying nothing, and writing its position out would invite somebody to
+    believe otherwise.
+    """
+    mode = str(obj.get("mode", "down")).lower()
+    if mode not in ("down", "radial"):
+        raise SystemExit(f"{obj.name!r}: gravity mode {mode!r} is neither "
+                         "'down' nor 'radial'")
+    out = {"mode": mode}
+    if mode == "radial":
+        out["centre"] = at
+    if "accel" in obj:
+        out["accel"] = round(float(obj["accel"]), 4)
+    return out
+
+
+def surface(obj):
+    """A drawn surface's parameters. Its geometry goes in the GLB."""
+    out = {"node": obj.name}
+    drift = (float(obj.get("drift_u", 0.0)), float(obj.get("drift_v", 0.0)))
+    if drift != (0.0, 0.0):
+        out["drift"] = [round(drift[0], 6), round(drift[1], 6)]
+    if "alpha" in obj:
+        out["alpha"] = round(float(obj["alpha"]), 6)
+    return out
+
+
+def write_glb(path, meshes):
+    """The surface meshes, and nothing else, in one small GLB.
+
+    Selection-scoped like `blender/export_tiles.py`: the linked castle is in
+    the file to place against and exporting it would ship a second copy of the
+    level. Materials are left behind entirely -- `src/water.rs` owns what water
+    looks like, so that the castle's sheets and the planet's sea stay the same
+    substance, and exporting them packed `water.png` into this file a second
+    time and took it from 6 KB to 365. What comes across is position, normals
+    and UVs, which is all the game reads.
+    """
+    import addon_utils
+    addon_utils.enable("io_scene_gltf2", default_set=False, persistent=False)
+    bpy.ops.object.select_all(action="DESELECT")
+    for obj in meshes:
+        obj.select_set(True)
+    bpy.ops.export_scene.gltf(
+        filepath=path,
+        export_format="GLB",
+        use_selection=True,
+        export_yup=True,
+        export_normals=True,
+        export_texcoords=True,
+        export_materials="NONE",
+        export_cameras=False,
+        export_lights=False,
+        export_animations=False,
+        export_apply=False,
+        # Custom properties ride along as glTF extras. Nothing reads them
+        # today -- the JSON carries the parameters, because the game needs
+        # some of them before this file has finished loading -- but a surface
+        # that has lost its scroll speed somewhere is much easier to find when
+        # the .glb still says what it was.
+        export_extras=True,
+    )
+    bpy.ops.object.select_all(action="DESELECT")
+    if not os.path.isfile(path):
+        raise SystemExit(f"exporter reported success but wrote no {path}")
+    return os.path.getsize(path)
+
+
+def export_inside_blender(argv):
+    parser = argparse.ArgumentParser(prog="export_level_furniture (in Blender)")
+    parser.add_argument("--level", required=True)
+    parser.add_argument("--json", required=True)
+    parser.add_argument("--glb", required=True)
+    args = parser.parse_args(argv)
+
+    level, meshes = read_furniture()
+    if level["spawn"] is None:
+        raise SystemExit("no 'spawn' empty: the level has nowhere to start")
+    if level["gravity"] is None:
+        raise SystemExit("no 'gravity' empty: the level has no down")
+    level["level"] = args.level
+    level["source"] = f"assets/levels/{args.level}.blend"
+
+    size = write_glb(args.glb, meshes)
+    with open(args.json, "w") as out:
+        json.dump(level, out, indent=2, sort_keys=True)
+        out.write("\n")
+    print(f"wrote {args.json}: {len(level['water'])} water boxes, "
+          f"{len(level['pipes'])} pipes, {len(level['actors'])} actors, "
+          f"{len(level['surfaces'])} surfaces, gravity "
+          f"{level['gravity']['mode']}")
+    print(f"wrote {args.glb}: {len(meshes)} surface meshes, {size:,} bytes")
+
+
+# ---------------------------------------------------------------------------
+# Outside Blender -- the launcher half
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("level", help="the level to export, e.g. castle")
+    parser.add_argument("--blender", help="Blender executable")
+    args = parser.parse_args()
+
+    blend = os.path.join(ROOT, "assets", "levels", f"{args.level}.blend")
+    if not os.path.isfile(blend):
+        raise SystemExit(f"no furniture file at {blend}")
+    out = os.path.join(ROOT, "assets", "bevy")
+    blender = args.blender or os.environ.get("BLENDER") or PROJECT_BLENDER
+    command = [
+        blender, "--background", "--factory-startup", blend,
+        "--python", os.path.abspath(__file__),
+        "--",
+        "--level", args.level,
+        "--json", os.path.join(out, f"{args.level}_furniture.json"),
+        "--glb", os.path.join(out, f"{args.level}_furniture.glb"),
+    ]
+    print("+", " ".join(command), flush=True)
+    result = subprocess.run(command, cwd=ROOT)
+    return result.returncode
+
+
+if __name__ == "__main__":
+    if bpy is None:
+        sys.exit(main())
+    else:
+        export_inside_blender(sys.argv[sys.argv.index("--") + 1:])

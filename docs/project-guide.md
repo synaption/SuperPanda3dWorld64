@@ -91,6 +91,8 @@ src/
   main.rs        app setup, schedules, the scene, character switching
   world.rs       which level is up: the catalogue, the switch, the planet load
   level.rs       collision: the castle's X/Z grid and the planet's face grid
+  furniture.rs   what a level has in it, as placed in Blender: water, pipes,
+                 spawns, gravity
   gravity.rs     which way is down -- flat, or towards the middle of a planet
   player.rs      both characters' controllers, the water medium, combat state
   camera.rs      the third-person aiming camera: look, follow, boom, occlusion
@@ -196,8 +198,15 @@ one despawn rather than a list somebody has to keep up to date.
 The castle arrives as one blob, `assets/bevy/castle.bin`, embedded in the
 binary with `include_bytes!` — so the game needs neither Python nor numpy to
 start, and the level cannot go missing. It carries the render mesh, the
-collision triangles and their surface types, the water boxes and the tree
-placements. `assets/bevy/castle.glb` is the same level as textured geometry.
+collision triangles and their surface types, and the tree placements.
+`assets/bevy/castle.glb` is the same level as textured geometry.
+
+Everything *placed* in the level comes from somewhere else: `assets/levels/
+castle.blend`, by way of `assets/bevy/castle_furniture.json`, which is embedded
+the same way. Water, warp pipes and what each produces, the enemies standing
+about, the spawn point and which way gravity points were all literals in
+`world.rs` and `water.rs` until they became empties you can drag. See
+[Level furniture](pipeline.md#level-furniture) for what to call them.
 
 Static collision is partitioned into a 64×64 X/Z grid built at load time, so
 floor, wall and camera queries inspect only nearby triangles instead of all
@@ -369,10 +378,13 @@ resolves.
 
 ## Water
 
-Water is not part of the level mesh. It is the axis-aligned boxes the collision
-data carries, drawn as one flat quad at each box's height: unlit, half
-transparent at the original's 0x96 alpha, and two-sided because most of the
-time it is looked at from underneath. Each sheet's texture drifts across the
+Water is not part of the level mesh. It is axis-aligned boxes — two planes in
+`assets/levels/castle.blend`, whose footprints they are — drawn as one flat
+quad at each box's height: unlit, half transparent at the original's 0x96
+alpha, and two-sided because most of the time it is looked at from underneath.
+The castle's waterfall is a mesh in the same file, exported into
+`castle_furniture.glb` and adopted when it loads; it was fifteen literal
+vertices in `water.rs` before it was something you could reshape. Each sheet's texture drifts across the
 world at a fixed speed, and the two bodies drift in different directions so
 they do not read as one sheet.
 
@@ -500,7 +512,9 @@ isolated.
 
 Three pipes, and each produces one thing: slimes out of the one in the far
 west corner, ants out of the one in the far east, and Marios out of the
-one by the spawn on the castle path. The two enemy pipes are where they are on
+one by the spawn on the castle path. Which is which, where they stand and how
+long each waits are properties of an empty in `assets/levels/castle.blend`
+rather than numbers in the source. The two enemy pipes are where they are on
 purpose — they are somewhere to go rather than something to trip over on the
 way out of the gate.
 

@@ -53,10 +53,16 @@ assets/
   bevy/
     castle.bin                   the level, in the game's own format
     castle.glb                   the same level as renderable geometry
+    castle_furniture.json        what is placed in it: water, pipes, spawns
+    castle_furniture.glb         the surface meshes those parameters describe
     planet.glb                   the generated planet, LOD0 (34 MB, 96 tiles + sea)
     water.png                    the water sheet's texture, and the planet's sea
+  levels/
+    castle.blend                 the furniture, placed by hand. See below
   castle_grounds/
-    collision.npz                490 vertices, 879 triangles, 2 water boxes
+    collision.npz                490 vertices, 879 triangles. Its two water
+                                 boxes are no longer read; they were migrated
+                                 into castle.blend and are furniture now
     collision_objects.json       special objects, including the 26 trees
     mesh.npz                     1350 vertices, 785 triangles
     mesh_materials.json          45 material groups, 44 of them textured
@@ -147,7 +153,7 @@ require:
 python3 tools/build_assets.py
 ```
 
-Six stages, and `--only <stage>` runs just one of them:
+Eight stages, and `--only <stage>` runs just one of them:
 
 | stage | writes | from |
 | --- | --- | --- |
@@ -155,6 +161,7 @@ Six stages, and `--only <stage>` runs just one of them:
 | `hero` | `assets/hero/hero.glb` + clips | `TheHero.blend`, via `build_hero.py` |
 | `weapons` | `assets/hero/target_pistol.glb` | the weapon `.blend` files |
 | `castle` | `assets/bevy/castle.glb`, `castle.bin`, `water.png` | the committed NPZs, via `convert_level.py` |
+| `levels` | `assets/bevy/<level>_furniture.json`, `.glb` | `assets/levels/<level>.blend` |
 | `planet` | `assets/bevy/planet.glb` | `experimental/planet_gen/out/planet.glb`, copied |
 | `actors` | `assets/actors/*.glb` + a clips sidecar each | the actor `.blend` files |
 | `impostors` | `assets/impostors/*.png`, `*.json` | the actor GLBs above, rendered by the game |
@@ -350,6 +357,84 @@ anywhere, alongside the note about the Nintendo-derived assets above. The ant
 carries no pack of its own: `assets/actors/ant.blend` is the source, and where
 it came from before that is worth confirming before publishing too.
 
+## Level furniture
+
+Furniture is everything in a level that is *placed* rather than modelled: where
+the player starts, which way gravity points, where the water is, where the warp
+pipes are and what comes out of each, and who is standing about when the level
+comes up. All of it used to be literals — arrays in `src/world.rs`, fifteen
+vertices in `src/water.rs`, a field of the decomp's collision data — so moving
+a warp pipe six metres was a code change and the only way to see where it would
+end up was to run the game.
+
+It is authored in `assets/levels/<level>.blend` now. The level's own geometry is
+*linked* into that file as a backdrop to place against, so it is visible, is
+read-only, and follows a rebuild of the level it came from; nothing linked is
+exported.
+
+`python3 tools/build_assets.py --only levels` writes the two files the game
+reads:
+
+| file | how the game gets it | why |
+| --- | --- | --- |
+| `<level>_furniture.json` | `include_str!`, like `castle.bin` | gravity, the spawn point and the water have to be known in the frame the level comes up. A level whose "down" arrived three frames late is a level the player falls out of |
+| `<level>_furniture.glb` | loaded as an asset | the surface meshes. Scenery, so it can arrive when it arrives |
+
+### What to call things
+
+The object's **name** says what it is, up to the first dot — so a duplicate
+Blender called `pipe.001` is still a pipe. Its **custom properties** are the
+parameters. Anything unrecognised is reported by the exporter and skipped, so a
+typo is a warning at build time rather than furniture that quietly is not in
+the game.
+
+| name | type | properties | becomes |
+| --- | --- | --- | --- |
+| `spawn` | empty | — | where the player is put down |
+| `gravity` | empty | `mode` = `down` \| `radial`, `accel` | `Gravity::Down`, or `Gravity::Radial` about the empty's own location |
+| `water` | mesh | — | a water box: the footprint of its bounding box, with its surface at the top |
+| `pipe` | empty | `spawns` = `mario` \| `slime` \| `ant`, `interval` | a warp pipe producing that, that often |
+| `slime`, `ant`, `mario` | empty | — | one of those, standing there |
+| anything else | mesh | `drift_u`, `drift_v`, `alpha` | a drawn surface, exported to the .glb, scrolling its texture at that rate |
+
+A water box is authored as a **plane** and not a cube, because a plane is
+exactly what a water box is: `LevelData::water_depth` asks whether a point is
+inside the footprint and how far under the surface it is, and never asks where
+the bottom is. So the thing to author is the footprint and the height, and
+dragging a corner of a plane says both.
+
+Two names are checked twice on purpose. An unknown `spawns` stops the export,
+naming the object; and `src/furniture.rs` parses the same word into an enum, so
+a hand-edited JSON stops the game at startup instead. A warp pipe that silently
+produces nothing is invisible in a game where a pipe often has nothing to
+produce because it is already at its quota.
+
+### What the .blend does not decide
+
+The material. `assets/levels/castle.blend` carries a water material so that a
+plane dragged over the moat looks like the moat, and the exporter deliberately
+leaves it behind: the castle's sheets, the castle's waterfall and the planet's
+sea are meant to be the same substance, and a material authored three times in
+two file formats is three substances that drift apart. `src/water.rs` owns what
+water looks like. What crosses is position, normals and UVs.
+
+The surface meshes are also read out of the .glb as *data* rather than spawned
+as a scene, which is the same choice `world::read_geometry` makes about the
+planet and for a related reason: `n64::convert` moves every material inside a
+`WorldAssetRoot` onto the port's own pipeline, and what is wanted here is the
+geometry with `water.rs`'s material on it.
+
+### The planet has none of this yet
+
+`experimental/planet_gen/out/planet.blend` already contains the sea — it is the
+object called `ocean` — but that file is *generated*: `blender/export_tiles.py`
+clears the scene and saves over it, so a hand edit does not survive the next
+build. Sea level is a generator parameter (`sea_level` in `planet.json`) and
+moving it means rebuilding. Where the planet's gravity points is still
+`world::PLANET_CENTRE`. A `assets/levels/planet.blend` alongside the castle's
+is what would fix both, and the mechanism above already supports it — `LEVELS`
+in `build_assets.py` is the list to add to.
+
 ## Legacy migration commands
 
 The commands in this section document how the initial conversion was made.
@@ -357,6 +442,13 @@ They read from `reference/` and are no longer an approved regeneration path.
 Do not use them for current assets.
 
 ```bash
+# The castle's furniture, out of the values that used to be hard-coded. A
+# one-shot: after it has run, `assets/levels/castle.blend` is the source and
+# re-running this would replace hand edits with the literals they came from.
+# The script refuses to overwrite an existing file without `-- --overwrite`.
+blender --background --factory-startup \
+    --python tools/build_castle_furniture.py
+
 python3 tools/parse_collision.py \
     reference/Render96ex/levels/castle_grounds/areas/1/collision.inc.c \
     assets/castle_grounds/collision.npz
@@ -392,7 +484,7 @@ python3 tools/import_sounds.py
 `tools/convert_level.py` writes three files out of the committed NPZs:
 
 - `assets/bevy/castle.bin` — positions, normals, UVs, the collision triangles
-  and their surface types, the water boxes, and the tree placements, in a flat
+  and their surface types, and the tree placements, in a flat
   little-endian format the game reads with no parser. `src/level.rs` embeds it
   with `include_bytes!`, so it is a build-time input rather than a runtime
   load, and playing the game needs neither Python nor numpy.
@@ -681,6 +773,11 @@ played as written, keys and times both.
 These run inside Blender rather than against exported files:
 
 - `tools/build_castle_blend.py` — the castle grounds as a Blender scene.
+- `tools/export_level_furniture.py` — a level's furniture .blend into the JSON
+  and .glb the game reads. The `levels` stage runs this; see
+  [Level furniture](#level-furniture).
+- `tools/build_castle_furniture.py` — the one-shot that seeded
+  `assets/levels/castle.blend` from the placements that used to be hard-coded.
 - `tools/build_quad_planet.py`, `tools/build_valkyrie.py`,
   `tools/render_valkyrie.py` — scene construction and rendering for work in
   progress.

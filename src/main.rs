@@ -16,6 +16,7 @@ mod console;
 mod display;
 mod enemy;
 mod flow;
+mod furniture;
 mod gravity;
 mod impostor;
 mod input;
@@ -415,6 +416,7 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
         squad::whistle,
         squad::animate_allies,
         water::drift,
+        water::adopt_surfaces,
         water::find_ocean,
         water::drift_ocean,
         water::camera_medium,
@@ -521,7 +523,7 @@ fn setup(
         &mut materials,
         &mut load,
     );
-    let spawn = Transform::from_translation(world::CASTLE_SPAWN);
+    let spawn = Transform::from_translation(world::castle_spawn());
     commands.insert_resource(RenderPose {
         translation: spawn.translation,
         rotation: spawn.rotation,

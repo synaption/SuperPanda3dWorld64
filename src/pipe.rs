@@ -52,13 +52,12 @@ const LANDING_TRIES: usize = 8;
 /// find.
 const PROBE_HEIGHT: f32 = 2.0;
 
-/// How long the Mario pipe waits between one and the next.
-///
-/// Its own number rather than the `enemy_rate` the other two read. The Mario
-/// pipe produces company rather than enemies, and a slider labelled "enemy"
-/// dragging it too would be a surprise -- which is exactly the split
-/// `PipeTuning` in `app/main.py` draws.
-pub const MARIO_INTERVAL: f32 = 12.0;
+// How long a pipe waits between one and the next is the .blend's now -- an
+// `interval` property on the empty, read by [`crate::furniture`]. The Mario
+// pipe keeps whatever it is given there; the two enemy pipes have theirs
+// overwritten from the console's `enemy_rate` every tick, which is the split
+// `PipeTuning` in `app/main.py` drew and the reason the number was never
+// shared between them.
 
 /// What a pipe produces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

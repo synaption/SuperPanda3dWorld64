@@ -24,6 +24,7 @@ use crate::{
     console::ConsoleState,
     enemy,
     flow::FlowField,
+    furniture,
     gravity::Gravity,
     level::{self, LevelData},
     pipe, player, squad, water, weapon,
@@ -98,12 +99,18 @@ pub struct Respawn(pub Vec3);
 
 impl Default for Respawn {
     fn default() -> Self {
-        Self(CASTLE_SPAWN)
+        Self(castle_spawn())
     }
 }
 
-/// The spot on the castle path the game has always started on.
-pub const CASTLE_SPAWN: Vec3 = Vec3::new(-13.28, 3.0, 46.64);
+/// The spot on the castle path the game starts on.
+///
+/// A function and not the constant it was, because the spot is an empty called
+/// `spawn` in `assets/levels/castle.blend` now -- see [`crate::furniture`] --
+/// and a level you can edit is worth more than a `const`.
+pub fn castle_spawn() -> Vec3 {
+    furniture::castle().spawn()
+}
 
 /// The planet's collision is read out of its render mesh, which takes as many
 /// frames as Bevy needs to load 14 MB of glTF. This is that wait.
@@ -157,15 +164,24 @@ pub fn spawn(
     load: &mut LevelLoad,
 ) {
     commands.insert_resource(id);
+    // A level that has no authored surfaces must not be handed the last
+    // level's. `water::expect_surfaces` puts this back for the ones that do.
+    commands.remove_resource::<water::PendingSurfaces>();
     commands.spawn((
         LevelEntity,
         WorldAssetRoot(assets.load(format!("{}#Scene0", id.scene()))),
     ));
     match id {
         LevelId::Castle => {
+            let furniture = furniture::castle();
             let (collision, render) = level::load();
             commands.insert_resource(FlowField::new(&collision));
             water::spawn(commands, assets, meshes, materials, &collision);
+            // The drawn surfaces -- the waterfall -- are meshes in a .glb, so
+            // they arrive when it does. Everything else the furniture says is
+            // known now, which is the whole reason the placements travel as
+            // JSON and only the geometry travels as glTF.
+            water::expect_surfaces(commands, assets, &furniture);
             for position in render.trees {
                 commands.spawn((
                     LevelEntity,
@@ -181,9 +197,9 @@ pub fn spawn(
                 ));
             }
             commands.insert_resource(collision);
-            commands.insert_resource(Gravity::default());
-            commands.insert_resource(Respawn(CASTLE_SPAWN));
-            spawn_castle_inhabitants(commands, assets);
+            commands.insert_resource(furniture.gravity());
+            commands.insert_resource(Respawn(furniture.spawn()));
+            spawn_inhabitants(&furniture, commands, assets);
             load.pending = None;
         }
         LevelId::Planet => {
@@ -200,50 +216,43 @@ pub fn spawn(
     }
 }
 
-/// The slimes, the ants and the three warp pipes -- everything the castle has
-/// living on it.
+/// The enemies standing about and the warp pipes producing more of them:
+/// everything the level has living on it.
 ///
-/// Straight out of `main::setup`, unchanged apart from the marker: the point of
-/// moving it was that it had to come *down* again, not that it was wrong.
-fn spawn_castle_inhabitants(commands: &mut Commands, assets: &AssetServer) {
-    let spawns = [
-        (enemy::Kind::Slime, Vec3::new(-3., 3., 26.)),
-        (enemy::Kind::Slime, Vec3::new(-24., 3., 29.)),
-        (enemy::Kind::Slime, Vec3::new(9., 3., 34.)),
-        (enemy::Kind::Ant, Vec3::new(-29., 3., 21.)),
-        (enemy::Kind::Ant, Vec3::new(4., 3., 19.)),
-    ];
-    for (i, (kind, position)) in spawns.into_iter().enumerate() {
-        enemy::spawn(commands, assets, kind, position, i as f32);
+/// The placements were an array here until they became empties in
+/// `assets/levels/castle.blend`. What is left is what the game does with them,
+/// which was never the part worth editing.
+///
+/// The pipes are drawn but not collided with: the level's own collision is
+/// what the physics reads and nothing here adds to it, so a pipe is scenery
+/// that you can walk through and that things come out of. Every pipe's
+/// countdown runs at any distance, so a crowd is waiting when the player
+/// arrives rather than only starting to fill then.
+fn spawn_inhabitants(
+    furniture: &furniture::Furniture,
+    commands: &mut Commands,
+    assets: &AssetServer,
+) {
+    // The phase is what keeps two of anything from moving in step, and it is
+    // an index rather than a random number so a whole run stays reproducible
+    // in a test. Counted across both lists for the same reason.
+    for (phase, (kind, position)) in furniture.actors().into_iter().enumerate() {
+        let phase = phase as f32;
+        match kind {
+            pipe::Spawn::Enemy(kind) => {
+                enemy::spawn(commands, assets, kind, position, phase);
+            }
+            pipe::Spawn::Mario => {
+                squad::spawn_ally(commands, assets, position, phase);
+            }
+        }
     }
-    // The three pipes and what each produces, from `PIPE_SPAWNS` in
-    // `app/main.py`: one by the spawn on the castle path that produces company,
-    // and one in each far corner of the map that produces enemies -- so the two
-    // enemy pipes are somewhere to go rather than something to trip over on the
-    // way out of the gate. Every pipe's countdown runs at any distance, so a
-    // crowd is waiting when the player arrives rather than only starting to
-    // fill then.
-    //
-    // The pipes are drawn but not collided with: the level's own collision is
-    // what the physics reads and nothing here adds to it, so a pipe is scenery
-    // that you can walk through and that things come out of.
-    let pipes = [
-        (pipe::Spawn::Mario, Vec3::new(-9.15, 2.6, 46.3)),
-        (
-            pipe::Spawn::Enemy(enemy::Kind::Slime),
-            Vec3::new(-55.1, 5.4, -39.2),
-        ),
-        (
-            pipe::Spawn::Enemy(enemy::Kind::Ant),
-            Vec3::new(46.8, 5.4, -68.1),
-        ),
-    ];
-    for (index, (spawns, position)) in pipes.into_iter().enumerate() {
+    for (index, (spawns, interval, position)) in furniture.pipes().into_iter().enumerate() {
         commands.spawn((
             LevelEntity,
             // The enemy pipes have their interval overwritten from the console
-            // every tick; the Mario pipe keeps the one it is given.
-            pipe::WarpPipe::new(spawns, pipe::MARIO_INTERVAL, index as f32),
+            // every tick; the Mario pipe keeps the one the .blend gave it.
+            pipe::WarpPipe::new(spawns, interval, index as f32),
             WorldAssetRoot(assets.load("actors/warp_pipe.glb#Scene0")),
             Transform::from_translation(position).with_scale(Vec3::splat(0.01)),
         ));
@@ -316,7 +325,7 @@ pub fn switch(
     // level that is eighty across, and spends the next few seconds falling into
     // the void and being caught by the respawn.
     if !load.busy() {
-        put_the_player_down(CASTLE_SPAWN, Vec3::Y, &mut commands, &mut placement);
+        put_the_player_down(castle_spawn(), Vec3::Y, &mut commands, &mut placement);
     }
 }
 
@@ -844,13 +853,13 @@ mod tests {
         assert!(!app.world().resource::<LevelLoad>().busy());
         assert_eq!(*app.world().resource::<Gravity>(), Gravity::default());
         assert_eq!(app.world().resource::<LevelData>().shape(), Shape::Flat);
-        assert_eq!(app.world().resource::<Respawn>().0, CASTLE_SPAWN);
+        assert_eq!(app.world().resource::<Respawn>().0, castle_spawn());
 
         let mut players = app
             .world_mut()
             .query_filtered::<&Transform, With<player::Player>>();
         let at = players.single(app.world()).expect("no player").translation;
-        assert_eq!(at, CASTLE_SPAWN, "the player came back to the wrong place");
+        assert_eq!(at, castle_spawn(), "the player came back to the wrong place");
 
         // And the planet's scenery went with it: nothing of the level that was
         // up is left in the world.
@@ -859,6 +868,54 @@ mod tests {
         assert!(
             roots > 0,
             "the castle spawned nothing, so this proves nothing"
+        );
+    }
+
+    /// The waterfall came out of the Rust and into `assets/levels/castle.blend`,
+    /// and the entire claim of that move is that it still turns up in the game.
+    ///
+    /// Every piece of it is tested elsewhere -- the exporter's arithmetic
+    /// against the movtex strip, the JSON's parse, the drift rate -- and none
+    /// of that would notice the .glb never being asked for, the level being
+    /// named something the asset path does not match, or the meshes arriving
+    /// after the frame that looked for them. So this runs the real castle
+    /// against the real files and waits for the water to show up.
+    #[test]
+    fn the_castle_adopts_the_waterfall_it_was_given() {
+        let mut app = with_a_loader();
+        app.update();
+        assert!(
+            app.world().get_resource::<water::PendingSurfaces>().is_some(),
+            "the castle never asked for its surfaces"
+        );
+        let started = std::time::Instant::now();
+        while app.world().get_resource::<water::PendingSurfaces>().is_some() {
+            app.update();
+            assert!(
+                started.elapsed().as_secs() < 60,
+                "the furniture .glb never loaded"
+            );
+        }
+
+        // Two sheets over the water boxes, and the waterfall that arrived out
+        // of the file. The sheets are spawned in the frame the level comes up
+        // and the waterfall is not, which is the difference this whole split
+        // exists to allow.
+        let mut surfaces = app
+            .world_mut()
+            .query_filtered::<&Transform, With<water::WaterSurface>>();
+        let places: Vec<Vec3> = surfaces
+            .iter(app.world())
+            .map(|transform| transform.translation)
+            .collect();
+        assert_eq!(places.len(), 3, "expected two sheets and a waterfall");
+        // The strip's own centroid, which is where its origin was put so that
+        // Bevy sorts it against its neighbours rather than against the map
+        // origin.
+        let centroid = Vec3::new(-63.4953, 13.336, -60.0127);
+        assert!(
+            places.iter().any(|at| (*at - centroid).length() < 0.02),
+            "no surface at the waterfall: {places:?}"
         );
     }
 
@@ -911,6 +968,24 @@ mod tests {
             script.contains("src/world.rs"),
             "build_windows.sh no longer reads the level list out of this file, \
              so nothing now keeps the package and the menu in step"
+        );
+
+        // The furniture .glb is the one runtime asset whose path is composed
+        // rather than written down -- `water::expect_surfaces` builds it out of
+        // the level's name -- so the grep above cannot see it and the script
+        // has to copy it by pattern. Left out, the packaged castle has no
+        // waterfall and says nothing about it.
+        let furniture: Vec<_> = std::fs::read_dir(root.join("assets/bevy"))
+            .expect("assets/bevy has gone missing")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with("_furniture.glb"))
+            .collect();
+        assert!(!furniture.is_empty(), "no furniture .glb in the tree at all");
+        assert!(
+            script.contains("*_furniture.glb"),
+            "build_windows.sh does not copy {furniture:?}, and nothing else \
+             will: those paths are built at runtime out of the level's name"
         );
     }
 

@@ -1,0 +1,109 @@
+{
+  "actors": [
+    {
+      "at": [
+        -29.0,
+        3.0,
+        21.0
+      ],
+      "kind": "ant"
+    },
+    {
+      "at": [
+        4.0,
+        3.0,
+        19.0
+      ],
+      "kind": "ant"
+    },
+    {
+      "at": [
+        -3.0,
+        3.0,
+        26.0
+      ],
+      "kind": "slime"
+    },
+    {
+      "at": [
+        -24.0,
+        3.0,
+        29.0
+      ],
+      "kind": "slime"
+    },
+    {
+      "at": [
+        9.0,
+        3.0,
+        34.0
+      ],
+      "kind": "slime"
+    }
+  ],
+  "gravity": {
+    "mode": "down"
+  },
+  "level": "castle",
+  "pipes": [
+    {
+      "at": [
+        -9.15,
+        2.6,
+        46.3
+      ],
+      "interval": 12.0,
+      "spawns": "mario"
+    },
+    {
+      "at": [
+        -55.1,
+        5.4,
+        -39.2
+      ],
+      "interval": 12.0,
+      "spawns": "slime"
+    },
+    {
+      "at": [
+        46.8,
+        5.4,
+        -68.1
+      ],
+      "interval": 12.0,
+      "spawns": "ant"
+    }
+  ],
+  "source": "assets/levels/castle.blend",
+  "spawn": [
+    -13.28,
+    3.0,
+    46.64
+  ],
+  "surfaces": [
+    {
+      "alpha": 0.705882,
+      "drift": [
+        2.050781,
+        0.0
+      ],
+      "node": "waterfall"
+    }
+  ],
+  "water": [
+    {
+      "max_x": 82.53,
+      "max_z": -0.58,
+      "min_x": -71.29,
+      "min_z": -72.22,
+      "surface_y": -0.81
+    },
+    {
+      "max_x": 82.3,
+      "max_z": 81.37,
+      "min_x": 10.24,
+      "min_z": -0.58,
+      "surface_y": -0.81
+    }
+  ]
+}

@@ -54,6 +54,12 @@ mkdir -p \
 cp "$REPO_ROOT/target/$WINDOWS_TARGET/release/super-bevy-world-64.exe" \
     "$DIST_DIR/SuperBevyWorld64.exe"
 cp "$REPO_ROOT/assets/bevy/water.png" "$DIST_DIR/assets/bevy/"
+# A level's furniture: the meshes somebody placed in `assets/levels/<level>.blend`.
+# Named by a `format!` at runtime rather than by a literal, so the scan below
+# cannot find these the way it finds the level scenes -- and the half that is
+# JSON is compiled into the executable, so a package missing these is a
+# waterfall that is silently not there rather than a level that fails to load.
+cp "$REPO_ROOT"/assets/bevy/*_furniture.glb "$DIST_DIR/assets/bevy/"
 # The levels, read out of `world::LevelId::scene` rather than listed here, for
 # exactly the reason the weapons below are.
 #

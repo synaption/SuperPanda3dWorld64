@@ -2,10 +2,10 @@
 //!
 //! Ported from `sm64py/level.py`'s `build_water_surface`/`animate_water` and
 //! the camera medium in `app/main.py`. On the castle, water is not part of the
-//! level mesh -- it is the axis-aligned boxes the collision data carries,
-//! drawn as one flat quad at each box's height, unlit and half transparent,
-//! seen from both sides because most of the time it is looked at from
-//! underneath.
+//! level mesh -- it is the axis-aligned boxes [`crate::furniture`] reads out of
+//! `assets/levels/castle.blend`, drawn as one flat quad at each box's height,
+//! unlit and half transparent, seen from both sides because most of the time
+//! it is looked at from underneath.
 //!
 //! A planet's sea is the other way round: it is one sphere at sea level,
 //! generated with the terrain and shipped in the same glTF, so this file finds
@@ -13,12 +13,23 @@
 //! the level how deep the camera is and gets an answer without knowing which
 //! kind of world it is in.
 //!
+//! Between them sits a third kind, and the castle's waterfall is the only one
+//! so far: a surface somebody modelled, in the level's furniture .glb, with
+//! this module's material put on it as it arrives. That is what
+//! [`adopt_surfaces`] does, and it is how a body of water that is neither a
+//! box nor a sphere gets into the game without anything here knowing its
+//! shape.
+//!
 //! Every constant here is the Panda3D build's, converted from SM64 units to
 //! the port's world scale of 1/100.
 
-use crate::level::{LevelData, WaterBox};
+use crate::{
+    furniture::{self, SurfaceSpec},
+    level::{LevelData, WaterBox},
+};
 use bevy::{
     asset::RenderAssetUsages,
+    gltf::{Gltf, GltfMesh, GltfNode},
     image::{ImageAddressMode, ImageLoaderSettings, ImageSampler, ImageSamplerDescriptor},
     light::{NotShadowCaster, NotShadowReceiver},
     mesh::{Indices, PrimitiveTopology},
@@ -42,33 +53,6 @@ const UV_SCALE: f32 = 1.0 / 20.48;
 /// two bodies drift apart so they do not read as one sheet.
 const DRIFT_SPEED: f32 = 0.25;
 const DRIFT_DIRECTIONS: [Vec2; 2] = [Vec2::new(0.60, 0.80), Vec2::new(-0.80, 0.60)];
-
-/// The castle waterfall is not a collision water box. It is SM64's separate
-/// 15-vertex `MOVTEX_CASTLE_WATERFALL` mesh, whose first texture coordinate is
-/// advanced by 70/1024 of a repeat on every 30 Hz game tick.
-const WATERFALL_UV_SPEED: f32 = 70.0 * 30.0 / 1024.0;
-const WATERFALL_ALPHA: f32 = 0xb4 as f32 / 255.0;
-const WATERFALL_VERTICES: [[i16; 5]; 15] = [
-    [-4469, -800, -6413, 0, 0],
-    [-5525, 1171, -7026, 2, 0],
-    [-6292, 2028, -7463, 4, 0],
-    [-7302, 2955, -7461, 6, 0],
-    [-4883, -800, -5690, 0, 3],
-    [-5547, 1110, -6097, 2, 3],
-    [-6732, 2587, -6770, 4, 3],
-    [-7603, 3004, -7160, 6, 3],
-    [-5580, -800, -4740, 0, 6],
-    [-6205, 1068, -5347, 2, 6],
-    [-7249, 2566, -6192, 4, 6],
-    [-6895, -800, -4714, 0, 9],
-    [-7201, 1083, -5071, 2, 9],
-    [-7578, 2042, -5766, 4, 9],
-    [-8132, 2961, -6761, 6, 9],
-];
-const WATERFALL_INDICES: [u32; 51] = [
-    0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5, 2, 3, 6, 3, 7, 6, 4, 5, 9, 4, 9, 8, 5, 6, 9, 6, 10, 9, 6,
-    7, 10, 8, 9, 12, 8, 12, 11, 9, 10, 13, 9, 13, 12, 10, 7, 14, 10, 14, 13,
-];
 
 /// Sky and underwater colours, shared with the fog and the clear colour.
 pub const SKY_COLOUR: Color = Color::srgb(0.32, 0.60, 0.86);
@@ -158,36 +142,45 @@ fn quad(water: &WaterBox) -> Mesh {
     mesh
 }
 
-/// Rebuilds the exact curved waterfall strip from the original N64 movtex
-/// data. Keeping it local to its centre gives Bevy a useful transparent-sort
-/// origin, just as it does for the horizontal sheets.
-fn waterfall() -> (Mesh, Vec3) {
-    const SCALE: f32 = 0.01;
-    let origin = WATERFALL_VERTICES.iter().fold(Vec3::ZERO, |sum, vertex| {
-        sum + Vec3::new(vertex[0] as f32, vertex[1] as f32, vertex[2] as f32) * SCALE
-    }) / WATERFALL_VERTICES.len() as f32;
-    let positions: Vec<[f32; 3]> = WATERFALL_VERTICES
-        .iter()
-        .map(|vertex| {
-            (Vec3::new(vertex[0] as f32, vertex[1] as f32, vertex[2] as f32) * SCALE - origin)
-                .to_array()
+/// The water sheet's texture, asked for by both kinds of surface.
+///
+/// It tiles, and Bevy clamps by default, so the sampler has to be asked for
+/// repetition at load time rather than set on the image afterwards.
+fn water_texture(assets: &AssetServer) -> Handle<Image> {
+    assets
+        .load_builder()
+        .with_settings(|settings: &mut ImageLoaderSettings| {
+            settings.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+                address_mode_u: ImageAddressMode::Repeat,
+                address_mode_v: ImageAddressMode::Repeat,
+                ..default()
+            });
         })
-        .collect();
-    // Movtex coordinates are 6.10 fixed point; the integer offsets in the
-    // level data therefore name whole texture repeats.
-    let uvs: Vec<[f32; 2]> = WATERFALL_VERTICES
-        .iter()
-        .map(|vertex| [vertex[3] as f32, vertex[4] as f32])
-        .collect();
-    let mut mesh = Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    );
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; 15]);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
-    mesh.insert_indices(Indices::U32(WATERFALL_INDICES.to_vec()));
-    (mesh, origin)
+        .load("bevy/water.png")
+}
+
+/// What water looks like, in one place.
+///
+/// Built here and not read out of the .blend or the .glb on purpose. The
+/// castle's sheets, the castle's waterfall and the planet's sea are meant to
+/// be the same substance, and a material authored three times in two file
+/// formats is three substances that drift apart. The .blend carries a water
+/// material anyway -- so that a plane being dragged over the moat looks like
+/// the moat -- and the exporter deliberately leaves it behind.
+fn water_material(texture: Handle<Image>, alpha: f32) -> StandardMaterial {
+    StandardMaterial {
+        base_color: Color::srgba(1.0, 1.0, 1.0, alpha),
+        base_color_texture: Some(texture),
+        alpha_mode: AlphaMode::Blend,
+        // The level mesh carries baked vertex colour and the water is a flat
+        // sheet, so neither wants lighting.
+        unlit: true,
+        // Seen from underneath as well, which is most of the time while
+        // swimming.
+        double_sided: true,
+        cull_mode: None,
+        ..default()
+    }
 }
 
 /// Spawns one sheet per water box. Called from startup with the loaded level.
@@ -198,34 +191,11 @@ pub fn spawn(
     materials: &mut Assets<StandardMaterial>,
     level: &LevelData,
 ) {
-    // The sheet tiles, and Bevy clamps by default, so the sampler has to be
-    // asked for repetition at load time.
-    let texture = assets
-        .load_builder()
-        .with_settings(|settings: &mut ImageLoaderSettings| {
-            settings.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
-                address_mode_u: ImageAddressMode::Repeat,
-                address_mode_v: ImageAddressMode::Repeat,
-                ..default()
-            });
-        })
-        .load("bevy/water.png");
+    let texture = water_texture(assets);
     for (index, water) in level.water_boxes.iter().enumerate() {
         let mesh = quad(water);
         let base_uvs = uvs_of(&mesh);
-        let material = materials.add(StandardMaterial {
-            base_color: Color::srgba(1.0, 1.0, 1.0, WATER_ALPHA),
-            base_color_texture: Some(texture.clone()),
-            alpha_mode: AlphaMode::Blend,
-            // The level mesh carries baked vertex colour and the water is a
-            // flat sheet, so neither wants lighting.
-            unlit: true,
-            // Seen from underneath as well, which is most of the time while
-            // swimming.
-            double_sided: true,
-            cull_mode: None,
-            ..default()
-        });
+        let material = materials.add(water_material(texture.clone(), WATER_ALPHA));
         commands.spawn((
             WaterSurface {
                 uv_velocity: DRIFT_DIRECTIONS[index % DRIFT_DIRECTIONS.len()]
@@ -241,30 +211,145 @@ pub fn spawn(
             Transform::from_translation(centre(water)),
         ));
     }
+}
 
-    let (mesh, origin) = waterfall();
-    let base_uvs = uvs_of(&mesh);
-    let material = materials.add(StandardMaterial {
-        base_color: Color::srgba(1.0, 1.0, 1.0, WATERFALL_ALPHA),
-        base_color_texture: Some(texture),
-        alpha_mode: AlphaMode::Blend,
-        unlit: true,
-        double_sided: true,
-        cull_mode: None,
-        ..default()
+/// A level's authored surfaces, waiting on the .glb that holds their meshes.
+///
+/// Removed as soon as they have been spawned, so the system below costs one
+/// `Option<Res<_>>` miss a frame for the rest of the level.
+#[derive(Resource)]
+pub struct PendingSurfaces {
+    handle: Handle<Gltf>,
+    wanted: Vec<SurfaceSpec>,
+}
+
+/// Says which surfaces a level has and starts the file that holds them
+/// loading.
+///
+/// The parameters came out of the JSON and the geometry is in the .glb, and
+/// the split is not arbitrary: [`crate::furniture`] carries anything the game
+/// needs in the frame the level comes up, and a waterfall is not that.
+pub fn expect_surfaces(
+    commands: &mut Commands,
+    assets: &AssetServer,
+    furniture: &furniture::Furniture,
+) {
+    let wanted = furniture.surfaces().to_vec();
+    if wanted.is_empty() {
+        return;
+    }
+    commands.insert_resource(PendingSurfaces {
+        handle: assets.load(format!("bevy/{}_furniture.glb", furniture.level)),
+        wanted,
     });
-    commands.spawn((
-        WaterSurface {
-            // SM64 advances the S coordinate, not T, for this movtex.
-            uv_velocity: Vec2::new(WATERFALL_UV_SPEED, 0.0),
-            base_uvs,
-        },
-        NotShadowCaster,
-        NotShadowReceiver,
-        Mesh3d(meshes.add(mesh)),
-        MeshMaterial3d(material),
-        Transform::from_translation(origin),
-    ));
+}
+
+/// Builds each authored surface once its mesh has arrived.
+///
+/// The meshes are read out of the glTF rather than spawned as a scene, which
+/// is the same choice `world::read_geometry` makes about the planet and for a
+/// related reason: a scene's materials are Blender's, and
+/// [`crate::n64::convert`] would move them onto the port's own pipeline as
+/// scene contents. What is wanted here is the geometry with *this* module's
+/// material on it, so the file is read as data.
+#[allow(clippy::too_many_arguments)]
+pub fn adopt_surfaces(
+    mut commands: Commands,
+    pending: Option<Res<PendingSurfaces>>,
+    mut console: ResMut<crate::console::ConsoleState>,
+    assets: Res<AssetServer>,
+    gltfs: Res<Assets<Gltf>>,
+    nodes: Res<Assets<GltfNode>>,
+    gltf_meshes: Res<Assets<GltfMesh>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let Some(pending) = pending else {
+        return;
+    };
+    if !assets.is_loaded_with_dependencies(&pending.handle) {
+        return;
+    }
+    let Some(gltf) = gltfs.get(&pending.handle) else {
+        return;
+    };
+    let mut found = Vec::new();
+    for handle in roots(gltf, &nodes) {
+        collect_surfaces(&handle, Transform::IDENTITY, &nodes, &gltf_meshes, &mut found);
+    }
+    let texture = water_texture(&assets);
+    for want in &pending.wanted {
+        let Some((_, at, mesh)) = found.iter().find(|(name, _, _)| *name == want.node) else {
+            console.report(format!(
+                "the furniture .glb has no surface called {:?}",
+                want.node
+            ));
+            continue;
+        };
+        // The mesh is copied rather than shared with the glTF: `drift` writes
+        // its offset into the UVs in place, so a surface that used the loaded
+        // asset directly would come back on the next visit already drifted,
+        // and take that as its resting position.
+        let Some(mesh) = meshes.get(mesh).cloned() else {
+            continue;
+        };
+        commands.spawn((
+            crate::world::LevelEntity,
+            WaterSurface {
+                uv_velocity: Vec2::from_array(want.drift),
+                base_uvs: uvs_of(&mesh),
+            },
+            NotShadowCaster,
+            NotShadowReceiver,
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(materials.add(water_material(texture.clone(), want.alpha))),
+            *at,
+        ));
+    }
+    commands.remove_resource::<PendingSurfaces>();
+}
+
+/// The nodes nobody claims as a child, so a node under a parent is visited
+/// once rather than twice.
+fn roots(gltf: &Gltf, nodes: &Assets<GltfNode>) -> Vec<Handle<GltfNode>> {
+    let mut children = Vec::new();
+    for handle in &gltf.nodes {
+        if let Some(node) = nodes.get(handle) {
+            children.extend(node.children.iter().map(|child| child.id()));
+        }
+    }
+    gltf.nodes
+        .iter()
+        .filter(|handle| !children.contains(&handle.id()))
+        .cloned()
+        .collect()
+}
+
+/// Every named mesh under a node, with its parents' transforms applied.
+///
+/// Walked rather than looked up by name, because a surface parented to
+/// something else in the .blend has that parent's transform in its placement,
+/// and a waterfall drawn at its local offset from the world origin is a
+/// waterfall in the sea.
+fn collect_surfaces(
+    handle: &Handle<GltfNode>,
+    parent: Transform,
+    nodes: &Assets<GltfNode>,
+    gltf_meshes: &Assets<GltfMesh>,
+    into: &mut Vec<(String, Transform, Handle<Mesh>)>,
+) {
+    let Some(node) = nodes.get(handle) else {
+        return;
+    };
+    let here = parent * node.transform;
+    if let Some(mesh) = node.mesh.as_ref().and_then(|mesh| gltf_meshes.get(mesh)) {
+        if let Some(primitive) = mesh.primitives.first() {
+            into.push((node.name.clone(), here, primitive.mesh.clone()));
+        }
+    }
+    for child in &node.children {
+        collect_surfaces(child, here, nodes, gltf_meshes, into);
+    }
 }
 
 /// The planet's sea: one node of the planet's own glTF, tagged on arrival.
@@ -486,20 +571,90 @@ mod tests {
         }
     }
 
+    /// The glTF JSON chunk of an asset, so a claim about a model can be
+    /// checked without a renderer. Same trick as `enemy.rs` and
+    /// `billboard.rs`, for the same reason.
+    fn gltf(path: &str) -> serde_json::Value {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let bytes = std::fs::read(root.join(path)).expect("missing glb");
+        let length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        serde_json::from_slice(&bytes[20..20 + length]).expect("bad glb json")
+    }
+
+    /// The waterfall survived the move out of this file and into a .blend.
+    ///
+    /// It used to be fifteen literal vertices here, and the risk in placing it
+    /// in Blender instead is not that it is lost -- that would be obvious --
+    /// but that it comes back a quarter turn about X, or a hundred times too
+    /// big, or mirrored. Those are what a Z-up file exported into a Y-up game
+    /// gets wrong, and each of them still loads, still drifts and still draws.
+    ///
+    /// So the strip is checked where it is in the world, out of the .glb's own
+    /// accessor bounds and the node transform that carries them: the same box
+    /// the original movtex data described, to the centimetre it was authored
+    /// in.
     #[test]
-    fn waterfall_matches_the_original_movtex_strip() {
-        let (mesh, origin) = waterfall();
-        let Some(bevy::render::mesh::VertexAttributeValues::Float32x3(positions)) =
-            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
-        else {
-            panic!("the waterfall has no positions");
+    fn the_waterfall_came_back_from_blender_where_it_went() {
+        let gltf = gltf("bevy/castle_furniture.glb");
+        let node = gltf["nodes"]
+            .as_array()
+            .expect("no nodes")
+            .iter()
+            .find(|node| node["name"] == "waterfall")
+            .expect("the furniture .glb has no waterfall");
+        let at: Vec<f32> = node["translation"]
+            .as_array()
+            .expect("the waterfall has no translation")
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let mesh = &gltf["meshes"][node["mesh"].as_u64().unwrap() as usize];
+        let positions = mesh["primitives"][0]["attributes"]["POSITION"]
+            .as_u64()
+            .expect("no positions");
+        let bound = |which: &str| -> Vec<f32> {
+            gltf["accessors"][positions as usize][which]
+                .as_array()
+                .expect("POSITION carries no bounds")
+                .iter()
+                .enumerate()
+                .map(|(axis, v)| v.as_f64().unwrap() as f32 + at[axis])
+                .collect()
         };
-        assert_eq!(positions.len(), 15);
-        assert_eq!(mesh.indices().map(|indices| indices.len()), Some(51));
-        assert_eq!(uvs_of(&mesh).len(), 15);
-        let first = Vec3::from_array(positions[0]) + origin;
-        assert!((first - Vec3::new(-44.69, -8.0, -64.13)).length() < 1e-4);
-        assert!((WATERFALL_UV_SPEED - 2.0507813).abs() < 1e-6);
+        // `MOVTEX_CASTLE_WATERFALL`, in SM64 units at the port's scale of
+        // 1/100. Its origin sits on its own centroid so that Bevy sorts the
+        // transparent strip against its neighbours rather than against the map
+        // origin, which is why the node transform is added back in here.
+        let low = bound("min");
+        let high = bound("max");
+        for (axis, (want_low, want_high)) in
+            [(-76.03, -44.69), (-8.0, 30.04), (-74.63, -41.43)].into_iter().enumerate()
+        {
+            assert!(
+                (low[axis] - want_low).abs() < 0.01 && (high[axis] - want_high).abs() < 0.01,
+                "axis {axis}: the waterfall spans {}..{}, not {want_low}..{want_high}",
+                low[axis],
+                high[axis]
+            );
+        }
+    }
+
+    /// The scroll came across too, and it is the one parameter that has no
+    /// visible wrong answer: a waterfall that does not move looks like a
+    /// waterfall in a screenshot.
+    #[test]
+    fn the_waterfall_still_scrolls_at_the_movtex_rate() {
+        let surfaces = crate::furniture::castle();
+        let surfaces = surfaces.surfaces();
+        let fall = surfaces
+            .iter()
+            .find(|surface| surface.node == "waterfall")
+            .expect("the castle's furniture has no waterfall");
+        // SM64 advances the S coordinate of this movtex by 70/1024 of a repeat
+        // on every 30 Hz game tick, and leaves T alone.
+        assert!((fall.drift[0] - 70.0 * 30.0 / 1024.0).abs() < 1e-4);
+        assert_eq!(fall.drift[1], 0.0);
+        assert!((fall.alpha - 0xb4 as f32 / 255.0).abs() < 1e-4);
     }
 
     #[test]

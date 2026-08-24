@@ -212,19 +212,17 @@ pub fn load() -> (LevelData, RenderLevel) {
         .into_iter()
         .map(|v| Vec3::new(v[0], v[1], v[2]))
         .collect();
-    let water_boxes = r
-        .floats(5)
-        .into_iter()
-        .map(|v| WaterBox {
-            min_x: v[0].min(v[2]),
-            min_z: v[1].min(v[3]),
-            max_x: v[0].max(v[2]),
-            max_z: v[1].max(v[3]),
-            surface_y: v[4],
-        })
-        .collect();
+    // The water is not in here. It was, when it came out of the decomp's
+    // collision data along with everything else, and it is now two planes in
+    // `assets/levels/castle.blend` that somebody can drag -- see
+    // [`crate::furniture`]. The rest of this file is the level's geometry,
+    // which is not authored anywhere and is the same as it ever was.
     (
-        LevelData::new(collision_vertices, collision_triangles, water_boxes),
+        LevelData::new(
+            collision_vertices,
+            collision_triangles,
+            crate::furniture::castle().water_boxes(),
+        ),
         RenderLevel { trees },
     )
 }
