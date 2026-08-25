@@ -38,6 +38,14 @@ const PLAYER_REACH: f32 = 0.37;
 /// of 2.2 never landed. The enemies got bigger and the sword did not.
 const ATTACK_REACH: f32 = 1.9;
 
+/// How near an enemy has to be before [`combat`] will look at it at all.
+///
+/// The furthest anything in that function can reach: the widest body on the
+/// field plus the longest of the sword's swing, the player's own touch and his
+/// height, with room over the top so that the bound is obviously a bound rather
+/// than a number that has to be re-derived every time one of those changes.
+const COMBAT_REACH: f32 = 12.0;
+
 /// Up off a stomped enemy, and back off one that got a hit in.
 const BOUNCE_VELOCITY: f32 = 12.6;
 const KNOCKBACK_SPEED: f32 = 7.2;
@@ -149,6 +157,14 @@ const PROBE_DROP: f32 = 0.8;
 /// `PROBE_EYE` over this. Reaching a body's width ahead, as looks reasonable,
 /// has bugs jumping the better part of a metre up every hill on the lawn.
 const PROBE_REACH: f32 = 0.15;
+
+/// How near a goal counts as being stood on it, in world units.
+///
+/// The deadband that stops a chase overshooting its own standoff spot. Only has
+/// to be smaller than anything the eye could see and larger than the float
+/// noise in a position that is rewritten thirty times a second, and a
+/// millimetre is comfortably both.
+const ARRIVED: f32 = 1e-3;
 
 /// How fast a crawler can turn, in radians a second.
 ///
@@ -928,9 +944,22 @@ const CROWD_SIGHT: f32 = 1.0;
 /// because the simulation was no longer the expensive part.
 ///
 /// So an enemy past the swap distance keeps only itself. Its `WorldAssetRoot`
-/// is taken away and its children go with it, and it comes back the moment the
-/// enemy is near enough to be drawn as a model again. What stands in for it
-/// meanwhile is its impostor, which needs nothing but the root's own transform.
+/// is taken away, its children are despawned with it, and both come back the
+/// moment the enemy is near enough to be drawn as a model again. What stands in
+/// for it meanwhile is its impostor, which needs nothing but the root's own
+/// transform.
+///
+/// **The children have to be despawned here by hand.** Removing a
+/// `WorldAssetRoot` does not take the scene it spawned with it: the component's
+/// `on_remove` hook calls `WorldInstanceSpawner::unregister_instance`, which is
+/// documented as removing the spawner's record of the instance *without
+/// despawning any entities*. The stale `WorldInstance` left on the enemy then
+/// makes the re-insert worse rather than better -- the spawner asks for the old
+/// instance to be despawned, finds no record of it, and drops the request -- so
+/// an enemy that had walked out to `enemy_draw` and back was wearing two
+/// skeletons, and three after the next round trip. It read as every enemy on
+/// the field being doubled up, and it also meant the entity count this whole
+/// function exists to hold down never actually fell.
 ///
 /// The handle is not stored anywhere: `AssetServer::load` hands back the same
 /// handle for the same path, so rebuilding it costs a lookup rather than a load.
@@ -941,9 +970,13 @@ pub fn shed_scenes(
 ) {
     for (entity, enemy, visibility, root) in &enemies {
         match (*visibility == Visibility::Hidden, root.is_some()) {
-            // Gone far enough away to stop being a model.
+            // Gone far enough away to stop being a model. The enemy's only
+            // children are the scene the root spawned, so all of them go.
             (true, true) => {
-                commands.entity(entity).remove::<WorldAssetRoot>();
+                commands
+                    .entity(entity)
+                    .remove::<WorldAssetRoot>()
+                    .despawn_related::<Children>();
             }
             // Come near enough to be one again.
             (false, false) => {
@@ -1477,11 +1510,20 @@ pub fn spread(
             // The flow field already knows what stands between two cells, and it
             // is the same rule [`crowd_step`] walks by -- a shove that could put
             // an enemy somewhere its own next step would refuse to go is a shove
-            // that has to be refused too.
-            true => match field.clear(body.at, moved) {
-                true => moved,
-                false => body.at,
-            },
+            // that has to be refused too. Probed a body's width past where the
+            // shove lands for the same reason the step is: a press of a hundred
+            // leaning on the one at the front is the strongest thing on the
+            // field for putting a body somewhere it does not fit, and refusing
+            // it as a point is refusing it in the one place its width is what
+            // matters.
+            true => {
+                let push = moved - body.at;
+                let reach = push + push.normalize_or_zero() * body.radius;
+                match field.clear(body.at, moved) && !field.walled(body.at, body.at + reach) {
+                    true => moved,
+                    false => body.at,
+                }
+            }
             // `Vec3::Y` and not `body.up`: the branch above has already
             // sent every enemy standing on anything else away.
             false => level.resolve_walls(moved, Vec3::Y, body.radius, body.height),
@@ -1738,7 +1780,7 @@ pub fn update(
             // The cheap tier: everything it needs is one array lookup, and it
             // asks the level nothing at all.
             if *detail == Detail::Crowd {
-                crowd_step(
+                let walked = crowd_step(
                     &field,
                     &mut transform,
                     &mut aggro,
@@ -1749,8 +1791,9 @@ pub fn update(
                     elapsed,
                     dt,
                     enemy.kind.lift(),
+                    enemy.kind.body().0,
                 );
-                stand_upright(crawler, dt);
+                stand_upright(crawler, walked, dt);
                 return;
             }
             let (goal, speed) = match aggro.target {
@@ -1766,9 +1809,29 @@ pub fn update(
             let up = crawler.as_ref().map_or(Vec3::Y, |crawler| crawler.up);
             // A wander across the line it is walking, so that a group heading
             // for one place does not converge on it along one bearing.
+            //
+            // **Faded out over the last stretch, and that is not a polish
+            // detail.** `across` is taken from where it is standing *now*, so
+            // the offset swings round with the approach: cross the goal and the
+            // sideways push crosses with you. Far off that is the weave doing
+            // its job. Arrived, it is a goal that circles the spot at the weave's
+            // own width, and a thing chasing it walks a ring round its standoff
+            // point at full speed for the whole fight rather than standing in
+            // it. That is the shuffle a crowd is made of -- every enemy that has
+            // reached you orbiting, and [`spread`] shoving each one through its
+            // neighbours as it goes.
+            //
+            // Held to half of what is left to walk, so the goal always lies
+            // ahead of the thing chasing it and the approach converges. Beyond
+            // twice the weave's width that clamp never binds and this is the
+            // weave exactly as it was.
             let goal = goal.map(|goal| {
-                let across = (goal - transform.translation).cross(up).normalize_or_zero();
-                goal + across * quirk.weave(elapsed)
+                let there = goal - transform.translation;
+                let across = there.cross(up).normalize_or_zero();
+                // How far there still is to walk *along the surface*, which is
+                // the plane the offset is added in.
+                let room = (there - up * there.dot(up)).length() * 0.5;
+                goal + across * quirk.weave(elapsed).clamp(-room, room)
             });
             // `walk` and `settle` answer in contact points -- where the feet go
             // -- and the transform is the model's origin, which for these
@@ -1781,9 +1844,28 @@ pub fn update(
                 // anything too steep to walk, and follow the ground under them.
                 let mut at = transform.translation - lift;
                 if let Some(goal) = goal {
-                    let dir = tangent(goal - at, Vec3::Y);
-                    at = walk(&level, at, dir * dt * speed, enemy.kind.body().0);
-                    transform.rotation = Quat::from_rotation_y(dir.x.atan2(dir.z));
+                    let there = goal - at;
+                    let dir = tangent(there, Vec3::Y);
+                    // Never further than the goal actually is. `tangent`
+                    // answers a *direction*, so without the clamp a full step
+                    // is taken however near the goal has got -- and something
+                    // that has arrived spends every tick stepping past its spot,
+                    // turning round, and stepping past it again. That is the
+                    // shuffle a crowd holds you in: an enemy at its standoff
+                    // distance is exactly the enemy that has arrived, so the
+                    // whole ring round the player does it at once, and each one
+                    // flips its facing a full half-turn every tick doing it.
+                    //
+                    // The amble has never had this problem because [`Wander`]
+                    // stops asking once it is within [`WANDER_ARRIVE`]. A chase
+                    // has no arrival to declare -- the goal moves with what it
+                    // is chasing -- so what stands in for one is refusing to
+                    // overshoot.
+                    let step = Vec2::new(there.x, there.z).length().min(dt * speed);
+                    if step > ARRIVED {
+                        at = walk(&level, at, dir * step, enemy.kind.body().0);
+                        transform.rotation = Quat::from_rotation_y(dir.x.atan2(dir.z));
+                    }
                 }
                 transform.translation = settle(&level, at, dt) + lift;
                 return;
@@ -1837,7 +1919,11 @@ fn crowd_step(
     elapsed: f32,
     dt: f32,
     lift: f32,
-) {
+    radius: f32,
+) -> Vec3 {
+    // Which way it ended up walking, for [`stand_upright`] to keep a crawler's
+    // own heading in step with. `Vec3::ZERO` when it stood still.
+    let mut walked = Vec3::ZERO;
     let guide = field.at(transform.translation);
     // Noticing the player, without [`alert`]. The field already knows how far
     // away he is *along walkable ground*, which is a better question than the
@@ -1885,17 +1971,40 @@ fn crowd_step(
         // that meets a fence at an angle slides along it rather than standing
         // there pushing at it, and one offered the top of a wall as its next
         // step is refused it.
+        //
+        // **Asked a body's width past where the step lands, exactly as [`walk`]
+        // asks it.** Without that this tier walks a *point* around the grid,
+        // and a point stops with the wall running through the middle of it. It
+        // is worse than it sounds, because the two lengths involved are the
+        // wrong way round: the grid's cells are about 1.7 m and an ant's own
+        // radius is 2.5, so a bug whose centre is on a perfectly legal cell has
+        // most of itself inside the fence next door -- and `clear` waves
+        // through every step that stays within one cell, which at a walking
+        // pace is nearly all of them. That is the crowd walking through walls.
+        // Reaching a radius ahead asks the grid about the cell the *body* is
+        // about to occupy rather than the one its centre is about to stand on.
+        //
+        // Two questions rather than one, and they are asked at two distances:
+        // where the feet land has to be ground worth standing on, and a body's
+        // width past that only has to be free of walls. Asking for both at
+        // arm's length holds the crowd a body back from every pond and lawn
+        // edge on the map instead of from the fences.
         for candidate in [step, Vec2::new(step.x, 0.0), Vec2::new(0.0, step.y)] {
             if candidate == Vec2::ZERO {
                 continue;
             }
+            let reach = candidate + candidate.normalize_or_zero() * radius;
             let ahead = transform.translation + Vec3::new(candidate.x, 0.0, candidate.y);
-            if field.clear(transform.translation, ahead) {
+            let face = transform.translation + Vec3::new(reach.x, 0.0, reach.y);
+            if field.clear(transform.translation, ahead)
+                && !field.walled(transform.translation, face)
+            {
                 transform.translation = ahead;
                 break;
             }
         }
         transform.rotation = Quat::from_rotation_y(step.x.atan2(step.y));
+        walked = Vec3::new(towards.x, 0.0, towards.y);
     }
     // Settled onto the cell's ground at a pace rather than snapped to it, for
     // the same reason [`settle`] does: a column's answer jumps at a cell
@@ -1911,6 +2020,7 @@ fn crowd_step(
         let wanted = guide.ground + lift;
         transform.translation.y += (wanted - transform.translation.y).clamp(-drop, rise);
     }
+    walked
 }
 
 /// Puts a crawler the right way up, and is the only thing that ever rescues one
@@ -1937,15 +2047,39 @@ fn crowd_step(
 /// world is stood back up the moment you walk far enough away for it to become
 /// crowd, which is the opposite of how these usually go.
 ///
+/// It also keeps the bug's own heading pointed the way the crowd tier has been
+/// walking it, which is the other half of the same problem and the half that is
+/// visible from further away.
+///
+/// [`crowd_step`] turns a body by writing a plain yaw onto its transform, which
+/// is right for a walker and is all a walker has. A crawler's transform is built
+/// out of [`Crawler::up`] and [`Crawler::heading`] instead, and the crowd tier
+/// touched neither -- so the heading a bug carried out past the budget was the
+/// heading it came back with, however far round the field it had walked
+/// meanwhile. It showed up twice over: the tick it is promoted, [`orientation`]
+/// rebuilds its transform from that stale heading and the bug spins on the spot;
+/// and for the whole time it is out there, [`crate::impostor`] picks which
+/// picture to draw it from out of the same transform, so a bug walking one way
+/// is drawn from the bearing it was walking a minute ago.
+///
 /// Written only when it is wrong, so the far crowd is not marked changed every
-/// tick for already being upright.
-fn stand_upright(crawler: Option<Mut<Crawler>>, dt: f32) {
-    if let Some(mut crawler) = crawler {
-        if crawler.up != Vec3::Y {
-            // Rolled rather than snapped, at the same rate as any other change
-            // of surface: a bug righting itself is a bug going round a corner.
-            crawler.up = lean(crawler.up, Vec3::Y, crawler.heading, ROLL_RATE * dt);
-        }
+/// tick for already being upright and already pointed the right way.
+fn stand_upright(crawler: Option<Mut<Crawler>>, walked: Vec3, dt: f32) {
+    let Some(mut crawler) = crawler else {
+        return;
+    };
+    if crawler.up != Vec3::Y {
+        // Rolled rather than snapped, at the same rate as any other change
+        // of surface: a bug righting itself is a bug going round a corner.
+        crawler.up = lean(crawler.up, Vec3::Y, crawler.heading, ROLL_RATE * dt);
+    }
+    // Turned at a bug's own pace rather than snapped, for the same reason
+    // [`crawl_towards`] turns it at one: a heading that can change instantly is
+    // a heading that ping-pongs. Standing still leaves it alone -- something
+    // that has stopped is still facing the way it stopped facing.
+    let wanted = tangent(walked, crawler.up);
+    if wanted != Vec3::ZERO && wanted != crawler.heading {
+        crawler.heading = steer(crawler.heading, wanted, crawler.up, TURN_RATE * dt);
     }
 }
 
@@ -2274,13 +2408,26 @@ pub fn combat(
     let here = player_transform.translation;
     let facing = player_transform.rotation * Vec3::Z;
     for (entity, enemy, transform, detail) in &enemies {
-        // The crowd tier is by definition further away than the nearest two
-        // hundred, and the player's reach is two metres. Nothing out there can
-        // be touched, hit or stomped, so nothing out there is tested.
-        if *detail == Detail::Crowd {
+        let offset = transform.translation - here;
+        // The cheap rejection this loop needs, and it has to be a *distance*
+        // rather than a tier. It was `detail == Crowd`, on the grounds that the
+        // crowd tier is by definition further away than the nearest
+        // `sim_budget` enemies and the player's reach is two metres -- which
+        // held while a field was hundreds and stops holding the moment it is
+        // thousands. Pack enough of them around the player and the two
+        // hundred-and-first nearest is *standing on him*: the sword swings
+        // through it, it cannot be stomped, and it cannot hurt him either. The
+        // enemy the crowd is thickest around is the one that stops being in the
+        // fight.
+        //
+        // A cheap tier may look worse; it must not behave differently. The tier
+        // is still what the rejection is *tuned* against -- nothing outside the
+        // budget is normally within arm's length -- so in the ordinary case this
+        // rejects exactly what the old test did, for the price of a squared
+        // length that the loop was about to take anyway.
+        if *detail == Detail::Crowd && offset.length_squared() > COMBAT_REACH * COMBAT_REACH {
             continue;
         }
-        let offset = transform.translation - here;
         let horizontal = Vec3::new(offset.x, 0.0, offset.z);
         let distance_squared = horizontal.length_squared();
         let bearing = horizontal.normalize_or_zero();
@@ -3604,6 +3751,62 @@ mod tests {
         }
     }
 
+    /// An enemy that has reached the player holds still instead of shuffling
+    /// back and forth across its own standoff spot.
+    ///
+    /// The chase has no arrival to declare -- what it is walking to moves with
+    /// what it is chasing -- so [`tangent`] hands back a *direction* and the
+    /// step used to be taken at full length however near the goal had got.
+    /// Something already stood on its spot walked past it, turned round, walked
+    /// past it the other way, and did that every tick for as long as the fight
+    /// lasted. Two things gave it away, and the second is the loud one: the
+    /// position wobbles by a step, and the facing swings a full half-turn.
+    ///
+    /// Run without [`spread`], so what is under test is the walk on its own
+    /// rather than a crowd settling. One enemy, because every enemy in a ring
+    /// round the player is doing the same thing at the same time and one of them
+    /// is enough to see it.
+    #[test]
+    fn an_enemy_that_has_arrived_stands_still_instead_of_shuffling() {
+        // `update` iterates in parallel, which needs a pool to iterate on.
+        bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let (mut world, player, enemies) = field(&[Vec3::new(0.0, 0.0, 6.0)]);
+        let enemy = enemies[0];
+        world
+            .entity_mut(enemy)
+            .insert((Detail::Full, Quirk::new(1.0), Visibility::Visible));
+        world.insert_resource(Time::<Fixed>::default());
+        // Given the player directly, so the walk is under test rather than
+        // `alert`'s noticing of him.
+        world.get_mut::<Aggro>(enemy).unwrap().target = Some(player);
+        let step = world.register_system(update);
+        // Long enough to be well past the walk in and settled onto the spot.
+        for _ in 0..600 {
+            world.run_system(step).expect("no step");
+        }
+        let mut was = *world.get::<Transform>(enemy).unwrap();
+        let (mut wobble, mut swing) = (0.0_f32, 0.0_f32);
+        for _ in 0..120 {
+            world.run_system(step).expect("no step");
+            let now = *world.get::<Transform>(enemy).unwrap();
+            wobble = wobble.max(was.translation.distance(now.translation));
+            swing = swing.max(was.rotation.angle_between(now.rotation));
+            was = now;
+        }
+        // A tick of walking at the chase speed, which is the size of the
+        // overshoot and so the size of the shuffle it caused.
+        let stride = GameTuning::default().enemy_speed * crate::player::FIXED_DT;
+        assert!(
+            wobble < stride * 0.5,
+            "an arrived enemy moved {wobble:.4} m a tick, against a stride of {stride:.4}"
+        );
+        assert!(
+            swing < std::f32::consts::FRAC_PI_2,
+            "an arrived enemy swung {:.0} degrees a tick",
+            swing.to_degrees()
+        );
+    }
+
     /// And a crawler is shoved along its surface rather than off it: two bugs
     /// jostling on a wall stay on the wall.
     #[test]
@@ -4180,8 +4383,15 @@ mod tests {
                     .distance(*from)
             })
             .sum();
+        // Four metres a head rather than the five it was. The number moved when
+        // the tier started probing a body's width ahead of its feet instead of
+        // walking the grid as a point: a crowd that stops at fences and at the
+        // foot of the castle covers slightly less ground than one that walks
+        // through both, and on this field that is about five percent of it.
+        // What the assertion is for is unchanged -- a field that never moves
+        // must not pass -- and 96 enemies covering 460 m is not that.
         assert!(
-            travelled > 96.0 * 5.0,
+            travelled > 96.0 * 4.0,
             "the crowd barely moved: {travelled:.0} m between all of them"
         );
         // Nothing crossed a wall on its way out of a cell, which is the whole of
@@ -4265,6 +4475,48 @@ mod tests {
         // standing in: he is driven by the controller, not by the press.
         let mut players = world.query_filtered::<&Transform, With<Player>>();
         assert_eq!(players.single(&world).expect("no player").translation, at);
+    }
+
+    /// An enemy that walks out past `enemy_draw` and back wears exactly one
+    /// skeleton, not two.
+    ///
+    /// Removing a `WorldAssetRoot` does not despawn the scene it spawned --
+    /// its `on_remove` hook only unregisters the instance -- so [`shed_scenes`]
+    /// has to take the children itself. When it did not, every round trip past
+    /// the swap distance stacked another model on the enemy, and the field read
+    /// as being doubled up.
+    ///
+    /// The child stands in for a spawned scene rather than being one: what is
+    /// under test is that shedding empties the enemy out, and a real glTF here
+    /// would only add a loader to the test.
+    #[test]
+    fn shedding_a_model_takes_its_children_with_it() {
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default());
+        let world = app.world_mut();
+        let enemy = world
+            .spawn((
+                Enemy {
+                    kind: Kind::Slime,
+                    animation: Handle::default(),
+                },
+                Visibility::Hidden,
+                WorldAssetRoot(Handle::default()),
+            ))
+            .id();
+        world.spawn(ChildOf(enemy));
+        world
+            .run_system_once(shed_scenes)
+            .expect("shed_scenes could not run");
+        assert!(
+            world.get::<WorldAssetRoot>(enemy).is_none(),
+            "the far enemy kept its model"
+        );
+        assert!(
+            world.get::<Children>(enemy).is_none_or(|kids| kids.is_empty()),
+            "the far enemy kept the skeleton the model spawned, so the next one \
+             it is given will be its second"
+        );
     }
 
     #[test]

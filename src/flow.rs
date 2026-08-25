@@ -355,23 +355,88 @@ impl FlowField {
     /// which is the "impossibly steep" climb. Nearly a tenth of the castle's
     /// walkable edges -- 2,261 of 23,223 -- are cliffs of that kind.
     pub fn clear(&self, from: Vec3, to: Vec3) -> bool {
-        let here = self.index(from);
-        let there = self.index(to);
-        if here == there {
-            return true;
-        }
-        let (hx, hz) = ((here % WIDTH) as isize, (here / WIDTH) as isize);
-        let (tx, tz) = ((there % WIDTH) as isize, (there / WIDTH) as isize);
-        match STEPS.iter().position(|&d| d == (tx - hx, tz - hz)) {
+        self.along(from, to, |here, step, there| match step {
             Some(step) => self.passable(here, step, there),
-            // Further than a neighbour, which a step at a walking pace across a
-            // cell this size is not. Answered on what can be answered rather
-            // than waved through.
+            // Two cells that are neither the same nor neighbours, which the
+            // sampling in [`Self::along`] only leaves when the segment runs off
+            // the grid and `index` clamps both ends. Answered on what can be
+            // answered rather than waved through.
             None => {
-                self.walkable[there]
-                    && (self.ground[there] - self.ground[here]).abs() <= CLIMB
+                self.walkable[there] && (self.ground[there] - self.ground[here]).abs() <= CLIMB
             }
+        })
+    }
+
+    /// Whether anything solid stands between two points -- a fence, a wall, the
+    /// face of a step too tall to climb -- *without* asking whether the far end
+    /// is ground anybody could stand on.
+    ///
+    /// The distinction is the whole reason this exists beside [`Self::clear`],
+    /// and it is the one [`crate::enemy::walk`] already draws in the near tier:
+    /// the question "may my feet go there" and the question "is my body about
+    /// to be inside a wall" have different answers and belong at different
+    /// distances. A walker's feet are tested where they land; its body is
+    /// tested a radius further on, and out there the *height* of the ground is
+    /// no longer any of its business. Asking `clear` at arm's length instead --
+    /// which is to say asking [`CLIMB`] out there too -- held the whole crowd a
+    /// body's width back from every hummock on the lawn, and cost a fifth of
+    /// the distance the field covered.
+    ///
+    /// Two things count as a wall here, and the second is the one the castle
+    /// needed. [`Self::blocked`] is a fence: something thin standing between
+    /// two patches of good ground. A cell that is not walkable at all is the
+    /// other -- the castle's own footprint, a cliff face, the far side of the
+    /// grid -- and the survey never records an edge *into* one of those as
+    /// blocked, because both ends of a blocked edge are walkable by
+    /// construction. So the wall of the castle was, to a body probe that looked
+    /// only at fences, not there: an ant would put its centre on the last legal
+    /// cell of lawn and stand with two and a half metres of itself inside the
+    /// stonework.
+    pub fn walled(&self, from: Vec3, to: Vec3) -> bool {
+        !self.along(from, to, |here, step, there| match step {
+            Some(step) => self.blocked[here] & (1 << step) == 0 && self.walkable[there],
+            None => self.walkable[there],
+        })
+    }
+
+    /// Walks the segment from cell to cell, handing every boundary it crosses
+    /// to `edge` as `(here, which of [`STEPS`] it took, there)`, and stops at
+    /// the first one that answers false.
+    ///
+    /// Sampled at no more than half a cell, so that two consecutive samples are
+    /// always either the same cell or two neighbouring ones -- which is the only
+    /// shape [`Self::passable`] can answer, and the shape the sweep asked its
+    /// own question in. A step at a walking pace is shorter than a cell, so the
+    /// common caller pays one sample and three array reads exactly as it did
+    /// before there was a walk here at all.
+    ///
+    /// What made the walk necessary is the callers that ask about a *body*
+    /// rather than a point: [`crate::enemy::crowd_step`] probes a radius past
+    /// where its feet land, and an ant's radius is half again the width of a
+    /// cell. Looking only at the two ends of that probe is looking everywhere
+    /// except where the wall it is meant to find actually is.
+    fn along<F>(&self, from: Vec3, to: Vec3, mut edge: F) -> bool
+    where
+        F: FnMut(usize, Option<usize>, usize) -> bool,
+    {
+        let span = to - from;
+        let reach = Vec2::new(span.x, span.z).length();
+        let samples = (reach / (self.cell * 0.5)).ceil().max(1.0) as usize;
+        let mut here = self.index(from);
+        for sample in 1..=samples {
+            let there = self.index(from + span * (sample as f32 / samples as f32));
+            if there == here {
+                continue;
+            }
+            let (hx, hz) = ((here % WIDTH) as isize, (here / WIDTH) as isize);
+            let (tx, tz) = ((there % WIDTH) as isize, (there / WIDTH) as isize);
+            let step = STEPS.iter().position(|&d| d == (tx - hx, tz - hz));
+            if !edge(here, step, there) {
+                return false;
+            }
+            here = there;
         }
+        true
     }
 
     /// Advances the alarm.
@@ -557,6 +622,65 @@ mod tests {
                 .0;
             assert!((asked - field.ground[index]).abs() < 1e-4);
         }
+    }
+
+    /// A body is held out of walls its centre is welcome to stand beside.
+    ///
+    /// The two questions the tier asks are asked at two distances, and this is
+    /// the gap between them: every cell the castle stands on is unwalkable, so
+    /// [`FlowField::clear`] happily lets a body put its centre on the last cell
+    /// of lawn -- which for an ant is two and a half metres of body inside the
+    /// stonework, and reads on screen as the crowd standing in the wall.
+    /// [`FlowField::walled`] is what the step asks about the body, and it has to
+    /// see what `clear` does not.
+    #[test]
+    fn a_body_is_stopped_by_a_wall_its_centre_is_allowed_to_stand_beside() {
+        let (level, _) = crate::level::load();
+        let field = FlowField::new(&level);
+        let ant = crate::enemy::Kind::Ant.body().0;
+        // Every walkable cell with an unwalkable neighbour: the lawn's edge
+        // against the castle, the cliffs, the moat.
+        let mut edges = 0;
+        let mut caught = 0;
+        for here in 0..WIDTH * WIDTH {
+            if !field.walkable[here] {
+                continue;
+            }
+            let (hx, hz) = ((here % WIDTH) as isize, (here / WIDTH) as isize);
+            for (dx, dz) in STEPS {
+                let (tx, tz) = (hx + dx, hz + dz);
+                if !(0..WIDTH as isize).contains(&tx) || !(0..WIDTH as isize).contains(&tz) {
+                    continue;
+                }
+                let there = tz as usize * WIDTH + tx as usize;
+                if field.walkable[there] {
+                    continue;
+                }
+                // A step that stops well short of the boundary -- an eighth of a
+                // cell, which is a couple of ticks of walking -- so the centre
+                // stays in the cell it started in and `clear` has nothing to
+                // say. The body reaches on past it.
+                let at = field.origin + Vec2::new(hx as f32 + 0.5, hz as f32 + 0.5) * field.cell;
+                let at = Vec3::new(at.x, field.ground[here], at.y);
+                let towards = Vec2::new(dx as f32, dz as f32).normalize();
+                let step = Vec3::new(towards.x, 0.0, towards.y) * field.cell * 0.125;
+                edges += 1;
+                assert!(
+                    field.clear(at, at + step),
+                    "the centre was refused a step inside its own cell"
+                );
+                if field.walled(at, at + step + step.normalize() * ant) {
+                    caught += 1;
+                }
+            }
+        }
+        assert!(edges > 100, "the castle offered only {edges} edges to test");
+        assert_eq!(
+            caught, edges,
+            "{} of {edges} bodies were walked into a wall their centre was \
+             merely standing next to",
+            edges - caught
+        );
     }
 
     /// Builds a world holding the real castle and a player at `at`, sweeps it,

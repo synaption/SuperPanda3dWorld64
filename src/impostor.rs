@@ -568,17 +568,24 @@ pub fn build_field(meta: &SheetMeta, eye: Vec3, crowd: &[Member], mesh: &mut Mes
         // the ground in the world however far the quad is leaning.
         let bottom = member.at - up * (meta.world_size * tier.foot);
         let base = positions.len() as u32;
-        for (corner, (u, v)) in [
+        let corners = [
             (-half, 0.0),
             (half, 0.0),
             (half, meta.world_size),
             (-half, meta.world_size),
         ]
-        .into_iter()
-        .zip([(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)])
+        .map(|(across, height)| bottom + right * across + up * height);
+        // How much of the quad is floated in front of where the enemy is
+        // actually standing, and why any of it has to be. See `float_toward`.
+        let lean = corners
+            .iter()
+            .fold(0.0_f32, |most, corner| most.max((*corner - eye).length()));
+        let near = float_toward(eye, member.at, lean, meta.world_size * tier.foot);
+        for (corner, (u, v)) in corners
+            .into_iter()
+            .zip([(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)])
         {
-            let (across, height) = corner;
-            positions.push((bottom + right * across + up * height).to_array());
+            positions.push((eye + (corner - eye) * near).to_array());
             uvs.push((uv + Vec2::new(u, v) * size).to_array());
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -586,6 +593,63 @@ pub fn build_field(meta: &SheetMeta, eye: Vec3, crowd: &[Member], mesh: &mut Mes
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_indices(Indices::U32(indices));
+}
+
+/// How much of a card is drawn nearer than the enemy standing under it, as a
+/// multiple of how far that card hangs below the enemy's feet.
+///
+/// One: the card is pulled forward by exactly its own dip, which is the amount
+/// of it that was underground. A number rather than a tuned constant, and the
+/// sweep behind it is worth writing down -- at nothing the sprite is still cut,
+/// at four tenths its near legs still are, at eight tenths it is whole at both
+/// tiers, and past there nothing more is bought. What the extra would cost is
+/// the far crowd winning the depth test against more of what stands in front of
+/// it, so the smallest amount that works is the right one.
+const FLOAT: f32 = 1.0;
+
+/// How far in toward the eye a quad has to be pulled for the ground the enemy
+/// is standing on to stop cutting it in half, as a scale about the eye.
+///
+/// **A sprite is a plane through a point on the floor, so part of it is always
+/// under the floor.** That is not the lean and it is not the tier: the picture
+/// contains the model's near side -- the legs on the camera's side of an ant,
+/// the front of a slime -- and those parts of the model are standing on the
+/// ground a metre in front of its origin, while the card puts them a metre
+/// *below* it. The depth buffer then does exactly what it is for and hands
+/// those pixels to the lawn. On screen the enemy is sliced along the line where
+/// the card leaves the ground, and grass shows through the cut. It is worst
+/// looking down -- the card is laid back toward the floor at the steep tier, so
+/// nearly half of it is buried -- and it is what eats the legs off every ant in
+/// the field at every angle. See `a_sprite_is_drawn_clear_of_the_floor`.
+///
+/// Nothing about where the card *is* can fix that, because every plane through
+/// a point on a floor goes under the floor. What can is drawing it nearer than
+/// it stands, which is what this does.
+///
+/// **Scaled about the eye rather than translated, and that is the whole trick.**
+/// A perspective camera projects a point by its direction from the eye alone, so
+/// moving every corner along its own ray to the eye by the same *factor* leaves
+/// the picture on screen pixel for pixel identical -- same place, same size, same
+/// frame of the walk -- and changes nothing but the depth it is tested at.
+/// Translating the card toward the camera instead would swell it by the ratio of
+/// the two distances, which is a crowd that grows as it approaches the swap
+/// distance.
+///
+/// What it costs is the sprite winning the depth test against anything within
+/// [`FLOAT`] dips of it, which for a slime is about a metre and a half and for an
+/// ant about three. That is the trade, and it is the right way round: an enemy
+/// standing a little in front of a low wall reads as standing in front of it,
+/// and an enemy sawn in half by the lawn reads as a bug.
+fn float_toward(eye: Vec3, at: Vec3, furthest: f32, dip: f32) -> f32 {
+        let wanted = (at - eye).length() - dip * FLOAT;
+    // Both ends guarded. A quad with its furthest corner already at the eye has
+    // no ray to slide along, and one whose dip is deeper than the enemy is far
+    // away -- a sprite the camera is standing inside -- must not be turned
+    // inside out through it.
+    if furthest <= f32::EPSILON || wanted <= 0.0 {
+        return 1.0;
+    }
+    (wanted / furthest).min(1.0)
 }
 
 /// How far a far shadow floats off the ground it is drawn on.
@@ -788,6 +852,33 @@ pub(crate) mod tests {
         Vec3::new(0.0, up.sin(), up.cos()) * 30.0
     }
 
+    /// The quad [`build_field`] drew one member as, and the point that member's
+    /// own origin was drawn at.
+    ///
+    /// `build_field` slides every card along its rays to the eye until the floor
+    /// stops cutting it in half -- see [`float_toward`] -- which leaves the
+    /// picture on screen untouched and every length in it scaled by the same
+    /// factor. The factor is recoverable from the card's own side, and moving
+    /// the model's origin by it puts the two back in one frame: that is the
+    /// frame every claim about *where the picture sits on the model* is made in,
+    /// and the only one it has an answer in.
+    fn drawn(meta: &SheetMeta, eye: Vec3, member: Member) -> ([Vec3; 4], Vec3) {
+        let mut mesh = empty_field();
+        build_field(meta, eye, &[member], &mut mesh);
+        let Some(bevy::mesh::VertexAttributeValues::Float32x3(p)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("the field has no positions");
+        };
+        assert_eq!(p.len(), 4, "one member should be one quad");
+        let corners = [0, 1, 2, 3].map(|index| Vec3::from(p[index]));
+        // Off the card's own side rather than by recomputing what `build_field`
+        // did: a test that works the scale out the same way the code did would
+        // agree with it however wrong both were.
+        let near = (corners[3] - corners[0]).length() / meta.world_size;
+        (corners, eye + (member.at - eye) * near)
+    }
+
     /// How a crawler stuck to a surface whose normal is `up` is turned, facing
     /// along `heading`. The same construction `enemy::orientation` uses, which
     /// is what puts the surface into the rotation's own Y column.
@@ -935,23 +1026,16 @@ pub(crate) mod tests {
         // A wall facing +z, a bug on it heading upwards, a camera out in front.
         let facing = stuck_to(Vec3::Z, Vec3::Y);
         let eye = at + Vec3::new(1.0, 0.5, 20.0);
-        let mut mesh = empty_field();
-        build_field(
+        let (corners, at) = drawn(
             &meta,
             eye,
-            &[Member {
+            Member {
                 at,
                 facing,
                 phase: 0.0,
-            }],
-            &mut mesh,
+            },
         );
-        let Some(bevy::mesh::VertexAttributeValues::Float32x3(p)) =
-            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
-        else {
-            panic!("no positions");
-        };
-        let (a, b, top) = (Vec3::from(p[0]), Vec3::from(p[1]), Vec3::from(p[3]));
+        let (a, b, top) = (corners[0], corners[1], corners[3]);
         let up = (top - a).normalize();
         let across = (b - a).normalize();
         let normal = across.cross(up).normalize();
@@ -986,6 +1070,109 @@ pub(crate) mod tests {
         );
     }
 
+    /// The card is drawn clear of the floor the enemy is standing on, and the
+    /// picture on screen does not move when it is.
+    ///
+    /// Three claims, and they are the whole of [`float_toward`]:
+    ///
+    ///   * **no corner is further from the eye than the enemy is.** That is what
+    ///     stops the floor cutting the sprite in half. A card is a plane through
+    ///     a point on the ground, so some of it is always underground -- for the
+    ///     steep tier nearly half of it -- and the depth buffer hands every one
+    ///     of those pixels to the lawn. The enemy is sawn along the line where
+    ///     its card leaves the floor and grass shows through the cut.
+    ///   * **every corner is still on the ray it was on.** The card is scaled
+    ///     about the eye rather than pushed toward it, and a perspective camera
+    ///     projects a point by its direction from the eye alone -- so the sprite
+    ///     lands on exactly the pixels it did before, at exactly the size. A
+    ///     card that was *translated* toward the camera would swell by the ratio
+    ///     of the two distances, which is a crowd that grows as it walks toward
+    ///     the swap distance.
+    ///   * **it is not pulled further than it needs to be.** What the float
+    ///     costs is the sprite winning the depth test against whatever is in
+    ///     front of it, so the amount is bounded by the card's own size rather
+    ///     than by the distance to the camera.
+    ///
+    /// Checked at the steep tier and the flat one: the flat tier's card is
+    /// nearly upright and dips under the floor by most of a cell all the same,
+    /// which is the case that eats the legs off every ant in the field.
+    #[test]
+    fn a_sprite_is_drawn_clear_of_the_floor_without_moving_on_screen() {
+        let meta = meta();
+        let at = Vec3::new(3.0, 7.0, -2.0);
+        for elevation in [5.0, 15.0, 40.0, 70.0] {
+            let eye = at + eye_at(elevation);
+            let member = Member {
+                at,
+                facing: Quat::IDENTITY,
+                phase: 0.0,
+            };
+            let (corners, _) = drawn(&meta, eye, member);
+            let reach = (at - eye).length();
+            let tier = meta.tiers[meta.tier(eye_at(elevation))];
+            let dip = meta.world_size * tier.foot;
+            let deepest = corners
+                .iter()
+                .fold(0.0_f32, |most, corner| most.max((*corner - eye).length()));
+            assert!(
+                (deepest - (reach - dip)).abs() < 1e-4,
+                "at {elevation} degrees the card's deepest corner is {deepest} from \
+                 the eye rather than the {} that is one dip in front of the enemy",
+                reach - dip
+            );
+            // Where the card would have been drawn with no float at all: what
+            // the rays are compared against, and what the haul is measured from.
+            let unfloated = {
+                let to_camera = eye - at;
+                let standing = Vec3::Y;
+                let flat = (to_camera - standing * to_camera.dot(standing)).normalize();
+                let right = standing.cross(flat);
+                let up = tier.up(standing, flat);
+                let bottom = at - up * (meta.world_size * tier.foot);
+                let half = meta.world_size * 0.5;
+                [
+                    (-half, 0.0),
+                    (half, 0.0),
+                    (half, meta.world_size),
+                    (-half, meta.world_size),
+                ]
+                .map(|(across, height)| bottom + right * across + up * height)
+            };
+            for (floated, plain) in corners.into_iter().zip(unfloated) {
+                let one = (floated - eye).normalize();
+                let other = (plain - eye).normalize();
+                assert!(
+                    one.distance(other) < 1e-5,
+                    "at {elevation} degrees a corner moved off its own ray, from \
+                     {other:?} to {one:?}"
+                );
+                // Measured as how far the corner actually travelled rather than
+                // as where it ended up. A card leans toward the camera, so its
+                // top corners start in front of the enemy and are *entitled* to
+                // end up further in front still -- what has to be bounded is the
+                // move, which is what costs the sprite its occlusion.
+                // Bounded in the card's own units rather than by the distance
+                // to the camera, which is the property that matters: what the
+                // float costs is the sprite winning the depth test against
+                // whatever is within the haul of it, and that must not grow as
+                // the crowd recedes. A corner can be hauled the dip plus the
+                // card's own depth -- the deepest corner is put one dip in
+                // front, and the rest of the card follows it forward.
+                let hauled = plain.distance(floated);
+                let bound = dip * FLOAT + meta.world_size;
+                assert!(
+                    hauled <= bound,
+                    "at {elevation} degrees a corner was hauled {hauled} forward, \
+                     past the {bound} the card is deep"
+                );
+            }
+            assert!(
+                (corners[3] - corners[0]).length() > 0.0,
+                "the card collapsed"
+            );
+        }
+    }
+
     /// The one place the model's frame gives no bearing at all: a camera
     /// straight out along the model's own up. Overhead of a walker, and square
     /// in front of a bug on a wall, which is an ordinary way to look at a wall
@@ -996,28 +1183,23 @@ pub(crate) mod tests {
         let meta = meta();
         let at = Vec3::new(1.0, 2.0, 3.0);
         for facing in [Quat::IDENTITY, stuck_to(Vec3::Z, Vec3::Y)] {
-            let mut mesh = empty_field();
-            build_field(
+            let (corners, _) = drawn(
                 &meta,
                 at + facing * Vec3::Y * 20.0,
-                &[Member {
+                Member {
                     at,
                     facing,
                     phase: 0.0,
-                }],
-                &mut mesh,
+                },
             );
-            assert_eq!(mesh.count_vertices(), 4, "the sprite was dropped");
-            let Some(bevy::mesh::VertexAttributeValues::Float32x3(p)) =
-                mesh.attribute(Mesh::ATTRIBUTE_POSITION)
-            else {
-                panic!("no positions");
-            };
-            let (a, b, top) = (Vec3::from(p[0]), Vec3::from(p[1]), Vec3::from(p[3]));
-            let side = (top - a).length();
+            let (a, b, top) = (corners[0], corners[1], corners[3]);
+            // Square and not collapsed. Its side is the cell's own size less
+            // whatever `float_toward` took off, so the two sides are checked
+            // against each other rather than against `world_size`.
+            let (side, across) = ((top - a).length(), (b - a).length());
             assert!(
-                (side - meta.world_size).abs() < 1e-4 && (b - a).length() > 0.0,
-                "the quad collapsed to {side} on a side"
+                side > meta.world_size * 0.5 && (side - across).abs() < 1e-4,
+                "the quad collapsed to {side} by {across}"
             );
         }
     }
@@ -1077,43 +1259,36 @@ pub(crate) mod tests {
         let meta = meta();
         let at = Vec3::new(3.0, 7.0, -2.0);
         for elevation in [0.0, 15.0, 40.0, 70.0] {
-            let mut mesh = empty_field();
-            build_field(
+            let (corners, anchor) = drawn(
                 &meta,
                 at + eye_at(elevation),
-                &[Member {
+                Member {
                     at,
                     facing: Quat::IDENTITY,
                     phase: 0.0,
-                }],
-                &mut mesh,
+                },
             );
-            let Some(bevy::mesh::VertexAttributeValues::Float32x3(positions)) =
-                mesh.attribute(Mesh::ATTRIBUTE_POSITION)
-            else {
-                panic!("the field has no positions");
-            };
             // The corners run bottom left, bottom right, top right, top left.
-            let (bottom, top) = (Vec3::from(positions[0]), Vec3::from(positions[3]));
+            let (bottom, top) = (corners[0], corners[3]);
             let tier = meta.tiers[meta.tier(eye_at(elevation))];
             let along = top - bottom;
+            // As a fraction of the cell rather than in metres, which is the
+            // form the claim was always really in: the origin sits `foot` of
+            // the way up the picture. `float_toward` scales the picture and
+            // the origin together, so the fraction is what survives it.
+            let stands = (anchor - bottom).dot(along.normalize()) / along.length();
             assert!(
-                (along.length() - meta.world_size).abs() < 1e-5,
-                "the sprite is {} across its cell rather than {}",
-                along.length(),
-                meta.world_size
-            );
-            let up = along.normalize();
-            let stands = (at - bottom).dot(up);
-            assert!(
-                (stands - meta.world_size * tier.foot).abs() < 1e-5,
-                "at {elevation} degrees the origin is {stands} up the quad rather \
-                 than {}",
-                meta.world_size * tier.foot
+                (stands - tier.foot).abs() < 1e-5,
+                "at {elevation} degrees the origin is {stands} of the way up the \
+                 quad rather than {}",
+                tier.foot
             );
             // And it is still the ground the sprite meets: the picture's own
             // ground line is below the enemy's origin, never above it.
-            assert!(bottom.y < at.y, "the quad's bottom edge floats above the feet");
+            assert!(
+                bottom.y < anchor.y,
+                "the quad's bottom edge floats above the feet"
+            );
         }
     }
 

@@ -169,7 +169,23 @@ impl Weapon {
                 // should never be leading its target. `gun_projectile` on the
                 // console swaps it, which is how the other path stays honest
                 // rather than becoming code nobody has run.
-                shot: Some(Shot::Hitscan { range: 60.0 }),
+                //
+                // It carries as far as the world can be seen rather than the
+                // sixty metres it used to. Sixty was chosen against a field that
+                // was drawn out to about that far; the impostors changed what is
+                // on screen without changing this, and what was left was a
+                // sixty-metre gun looking at a crowd spread over a castle three
+                // times that across. The sprites out there are ordinary enemies
+                // standing on ordinary ground -- `nearest_hit` never cared how
+                // one was drawn -- so the only thing stopping them dying was the
+                // beam stopping first, silently, with a tracer that reached the
+                // ground short of what the crosshair was on.
+                //
+                // Taken from the fog rather than written down, so that the range
+                // and the distance the world fades out at cannot drift apart.
+                shot: Some(Shot::Hitscan {
+                    range: crate::water::SIGHT,
+                }),
                 interval: 0.28,
             },
         }
@@ -765,6 +781,34 @@ mod tests {
             sounds.contains(&Sfx::Shoot),
             "the gun was silent: {sounds:?}"
         );
+        assert!(sounds.contains(&Sfx::Defeat), "nothing died audibly");
+    }
+
+    /// A sprite dies like a model does.
+    ///
+    /// What an enemy past `enemy_draw` has is a `Visibility::Hidden` and, once
+    /// it is out past the simulation budget, a `Detail::Crowd` -- and neither is
+    /// a thing a shot is entitled to notice. It is the same body standing in the
+    /// same place; only the way it is drawn has changed. `enemy::combat` does
+    /// exclude the crowd tier, deliberately and on the grounds that the player's
+    /// reach is two metres, but a pistol carries sixty.
+    ///
+    /// Worth a test of its own because the mistake it guards against is a
+    /// filter nobody would think twice about adding: excluding hidden entities
+    /// from a target query reads as an optimisation right up until half the
+    /// field is bulletproof.
+    #[test]
+    fn a_shot_kills_an_enemy_that_is_being_drawn_as_a_sprite() {
+        let (mut world, enemy) = range(Weapon::Pistol, 40.0);
+        world
+            .entity_mut(enemy)
+            .insert((Visibility::Hidden, crate::enemy::Detail::Crowd));
+        pull_trigger(&mut world);
+        assert!(
+            world.get_entity(enemy).is_err(),
+            "the impostor survived being shot"
+        );
+        let sounds = heard(&mut world);
         assert!(sounds.contains(&Sfx::Defeat), "nothing died audibly");
     }
 

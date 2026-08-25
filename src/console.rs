@@ -320,7 +320,13 @@ pub const SPECS: &[TunableSpec] = &[
     TunableSpec {
         name: "enemy_limit",
         low: 0.0,
-        high: 5_000.0,
+        // A hundred thousand, which is a number to find the ceiling with rather
+        // than a number to play at: the crowd tier is what makes it even
+        // askable, and `sim_budget` still holds the fully simulated share to a
+        // couple of hundred however big this gets. The arrow keys still step by
+        // one, so reaching the top of this range is a matter of typing
+        // `enemy_limit 100000` rather than of holding a key down.
+        high: 100_000.0,
         step: 1.0,
         doc: "global live enemy cap",
     },
@@ -574,9 +580,11 @@ impl GameTuning {
 
 /// The largest crowd `crowd` will place, however big a number it is handed.
 ///
-/// A typo in a benchmark command should cost a second, not the session. Five
-/// thousand is `enemy_limit`'s own ceiling, and this is four times that.
-const CROWD_LIMIT: usize = 20_000;
+/// A typo in a benchmark command should cost a second, not the session. The
+/// same ceiling `enemy_limit` has, so that the two ways of filling a field --
+/// letting the pipes do it and placing one outright -- can reach the same size
+/// and a benchmark is not quietly capped below the cap it is testing.
+const CROWD_LIMIT: usize = 100_000;
 
 /// What a `crowd` command's kind argument may be spelled, and what it means.
 ///

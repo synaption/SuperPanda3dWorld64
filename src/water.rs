@@ -66,6 +66,14 @@ pub const UNDERWATER_COLOUR: Color = Color::srgb(0.06, 0.28, 0.36);
 const AIR_FOG: (f32, f32) = (90.0, 200.0);
 const UNDERWATER_FOG: (f32, f32) = (2.0, 42.0);
 
+/// How far anything can be seen above water: where the haze becomes total.
+///
+/// Public because a weapon's reach is a claim about the same distance. A gun
+/// that stops short of this leaves a band of the world you can see enemies in
+/// and cannot touch them in, and a gun that carries past it is one that kills
+/// things nobody can see.
+pub const SIGHT: f32 = AIR_FOG.1;
+
 /// A drawn water sheet, holding what the drift needs to move it.
 #[derive(Component)]
 pub struct WaterSurface {
