@@ -84,6 +84,42 @@ use bevy::{
 /// to mush when somebody raises the swap distance.
 const CELL_PX: u32 = 128;
 
+/// How many samples across a cell's texel the final render is taken at.
+///
+/// The camera below bakes with [`Msaa::Off`], so a cell rendered at
+/// [`CELL_PX`] rasterises every feature thinner than a texel as a dotted line:
+/// an ant's legs and antennae arrive in the sheet as broken dashes, and every
+/// gap between the dashes shows whatever is behind the sprite. Against the sky
+/// that is a pale blue stipple running the length of each leg -- the artefact
+/// that reads, in a crowd, as a blue outline round every distant enemy. It is
+/// baked in, so no amount of care at draw time removes it and it does not go
+/// away with distance.
+///
+/// Rendering at four times the width and reducing by boxes of sixteen is
+/// sixteen-sample supersampling, which is what MSAA would have given -- except
+/// that the reduction in [`blit`] ends in a threshold, so the sheet stays the
+/// cutout the rest of the pipeline needs it to be. See [`COVERAGE`].
+const SUPERSAMPLE: u32 = 4;
+
+/// Pixels along one side of the target one cell is rendered into.
+const SAMPLE_PX: u32 = CELL_PX * SUPERSAMPLE;
+
+/// How much of a texel has to be covered for that texel to be in the sprite.
+///
+/// A quarter rather than a half, and the whole point is the thin features. A
+/// leg half a texel wide covers a quarter of the texels it crosses, so a half
+/// threshold erases it just as thoroughly as the aliasing did -- and erases it
+/// everywhere, which is worse than dashes. A quarter keeps it, at the cost of
+/// growing the silhouette by rather less than a texel: the edge texels of a
+/// solid body average half coverage and were going to be kept either way.
+///
+/// It has to be a threshold rather than the coverage itself. `n64.wgsl` tests
+/// alpha against a cutoff and `n64::cutout` promotes a material to
+/// `AlphaMode::Mask` on the strength of the sheet's alpha being binary; a sheet
+/// of soft edges would be drawn in the transparent pass, sorted by quad origin,
+/// and would stipple against itself in a crowd.
+const COVERAGE: f32 = 0.25;
+
 /// Viewing angles round the model, and frames of its walk.
 const ANGLES: usize = 16;
 const FRAMES: usize = 16;
@@ -211,8 +247,8 @@ impl Bake {
 fn cell_target(images: &mut Assets<Image>) -> Handle<Image> {
     let mut image = Image::new_fill(
         Extent3d {
-            width: CELL_PX,
-            height: CELL_PX,
+            width: SAMPLE_PX,
+            height: SAMPLE_PX,
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
@@ -421,7 +457,7 @@ fn collect(
     let pixels = trigger.event().data.clone();
     commands.entity(trigger.event().entity).remove::<Readback>();
     bake.reading = false;
-    let expected = (CELL_PX * CELL_PX * 4) as usize;
+    let expected = (SAMPLE_PX * SAMPLE_PX * 4) as usize;
     if pixels.len() < expected {
         eprintln!(
             "impostor bake: short readback ({} of {expected} bytes), retrying",
@@ -485,11 +521,11 @@ fn collect(
 fn note_bounds(bake: &mut Bake, pixels: &[u8]) {
     let mut low = Vec2::splat(f32::MAX);
     let mut high = Vec2::splat(f32::MIN);
-    for y in 0..CELL_PX {
-        for x in 0..CELL_PX {
+    for y in 0..SAMPLE_PX {
+        for x in 0..SAMPLE_PX {
             // Anything more than barely transparent counts. A threshold of zero
             // would let a single stray dithered pixel decide the sheet's size.
-            if pixels[((y * CELL_PX + x) * 4 + 3) as usize] > 8 {
+            if pixels[((y * SAMPLE_PX + x) * 4 + 3) as usize] > 8 {
                 low = low.min(Vec2::new(x as f32, y as f32));
                 high = high.max(Vec2::new(x as f32 + 1.0, y as f32 + 1.0));
             }
@@ -498,7 +534,7 @@ fn note_bounds(bake: &mut Bake, pixels: &[u8]) {
     if low.x > high.x {
         return;
     }
-    let scale = 1.0 / CELL_PX as f32;
+    let scale = 1.0 / SAMPLE_PX as f32;
     let (low, high) = (low * scale, high * scale);
     // Into this tier's box and no other. The tiers are measured apart because
     // they are aimed apart: what the final pass takes from all of them together
@@ -583,11 +619,43 @@ fn blit(bake: &mut Bake, pixels: &[u8]) {
     let stride = FRAMES as u32 * CELL_PX * 4;
     let row = (tier * ANGLES + angle) as u32;
     for y in 0..CELL_PX {
-        let from = (y * CELL_PX * 4) as usize;
         let to = ((row * CELL_PX + y) * stride + frame as u32 * CELL_PX * 4) as usize;
-        let width = (CELL_PX * 4) as usize;
-        bake.atlas[to..to + width].copy_from_slice(&pixels[from..from + width]);
+        for x in 0..CELL_PX {
+            let texel = reduce(pixels, x, y);
+            let at = to + (x * 4) as usize;
+            bake.atlas[at..at + 4].copy_from_slice(&texel);
+        }
     }
+}
+
+/// One texel of the sheet, from the box of samples that covers it.
+///
+/// Two averages and a threshold. The alpha average is the coverage -- what
+/// fraction of the texel the model was actually over -- and it decides whether
+/// the texel is in the sprite at all, against [`COVERAGE`]. The colour average
+/// is weighted by that same alpha, so the transparent samples contribute
+/// nothing to it: an unweighted average would drag every edge texel towards the
+/// target's clear colour and ring the whole sprite in a dark halo, which is the
+/// exact fault the bake camera's [`Msaa::Off`] was there to avoid.
+fn reduce(pixels: &[u8], x: u32, y: u32) -> [u8; 4] {
+    let mut colour = [0.0_f32; 3];
+    let mut alpha = 0.0_f32;
+    for row in 0..SUPERSAMPLE {
+        for column in 0..SUPERSAMPLE {
+            let at = (((y * SUPERSAMPLE + row) * SAMPLE_PX + x * SUPERSAMPLE + column) * 4) as usize;
+            let weight = pixels[at + 3] as f32;
+            for channel in 0..3 {
+                colour[channel] += pixels[at + channel] as f32 * weight;
+            }
+            alpha += weight;
+        }
+    }
+    let samples = (SUPERSAMPLE * SUPERSAMPLE) as f32;
+    if alpha < COVERAGE * samples * 255.0 {
+        return [0, 0, 0, 0];
+    }
+    let out = colour.map(|channel| (channel / alpha).round().clamp(0.0, 255.0) as u8);
+    [out[0], out[1], out[2], 255]
 }
 
 /// Writes the atlas and its sidecar, and stops the app.
@@ -717,7 +785,14 @@ pub fn run(kinds: &[Kind]) {
         // Literally the game's own draw chain, not a copy of it. A sheet baked
         // through anything less is a sheet of something the game never draws --
         // see [`crate::drawing`] for what that cost the first time.
+        //
+        // Which means it needs what that chain reads, and the tuning is part of
+        // that: the draw chain asks it questions like whether shadows are being
+        // drawn at all. A missing resource is not a system that skips, it is a
+        // panic on the first frame, and the bake is the one place that runs
+        // these systems without `crate::add_game` having set the world up.
         .init_resource::<crate::impostor::ImpostorStats>()
+        .insert_resource(crate::console::GameTuning::default())
         .add_systems(PostUpdate, crate::drawing())
         .add_observer(collect);
         crate::register_world_asset_types(&mut app);
@@ -756,5 +831,92 @@ pub fn run(kinds: &[Kind]) {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cell's worth of samples, with `covered` of the sixteen under the texel
+    /// at (0, 0) painted `colour` and everything else left as the camera's
+    /// transparent clear.
+    fn samples(covered: usize, colour: [u8; 3]) -> Vec<u8> {
+        let mut pixels = vec![0u8; (SAMPLE_PX * SAMPLE_PX * 4) as usize];
+        for sample in 0..covered {
+            let (row, column) = (sample as u32 / SUPERSAMPLE, sample as u32 % SUPERSAMPLE);
+            let at = ((row * SAMPLE_PX + column) * 4) as usize;
+            pixels[at..at + 3].copy_from_slice(&colour);
+            pixels[at + 3] = 255;
+        }
+        pixels
+    }
+
+    /// The whole reason for the threshold. An ant's leg is thinner than a texel
+    /// and covers a corner of the ones it crosses; a half threshold would erase
+    /// it from the sheet as surely as the aliasing it replaced.
+    #[test]
+    fn a_texel_a_quarter_covered_is_in_the_sprite() {
+        let quarter = (SUPERSAMPLE * SUPERSAMPLE / 4) as usize;
+        assert_eq!(
+            reduce(&samples(quarter, [200, 30, 20]), 0, 0),
+            [200, 30, 20, 255],
+            "a quarter of a texel is a leg, and legs are the point",
+        );
+        assert_eq!(
+            reduce(&samples(quarter - 1, [200, 30, 20]), 0, 0),
+            [0, 0, 0, 0],
+            "and below the threshold it is nothing at all",
+        );
+    }
+
+    /// The colour of an edge texel comes from the model alone. Averaging the
+    /// clear colour in with it -- which is what an unweighted mean does -- rings
+    /// every sprite in the game with a dark halo.
+    #[test]
+    fn the_clear_colour_never_reaches_the_sheet() {
+        let (colour, covered) = ([180, 40, 30], (SUPERSAMPLE * SUPERSAMPLE / 2) as usize);
+        let texel = reduce(&samples(covered, colour), 0, 0);
+        assert_eq!(
+            [texel[0], texel[1], texel[2]],
+            colour,
+            "a half-covered texel should be the model's own colour",
+        );
+        assert_eq!(texel[3], 255, "and opaque, because the sheet is a cutout");
+    }
+
+    /// Every texel the reduction writes is one the runtime's `AlphaMode::Mask`
+    /// can decide with a single sample. See `n64::cutout`, which promotes a
+    /// material to that pass only when the sheet's alpha is binary.
+    #[test]
+    fn the_reduction_only_ever_writes_binary_alpha() {
+        for covered in 0..=(SUPERSAMPLE * SUPERSAMPLE) as usize {
+            let alpha = reduce(&samples(covered, [90, 90, 90]), 0, 0)[3];
+            assert!(
+                alpha == 0 || alpha == 255,
+                "{covered} of {} samples gave alpha {alpha}",
+                SUPERSAMPLE * SUPERSAMPLE,
+            );
+        }
+    }
+
+    /// The box a texel is reduced from is its own. Reading the wrong stride
+    /// would mirror the sheet's rows into its columns, which is a sprite that
+    /// looks nearly right and animates wrongly.
+    #[test]
+    fn a_texel_reads_the_box_it_sits_over() {
+        let mut pixels = vec![0u8; (SAMPLE_PX * SAMPLE_PX * 4) as usize];
+        // One whole box filled, at texel (3, 5) and nowhere else.
+        let (x, y) = (3u32, 5u32);
+        for row in 0..SUPERSAMPLE {
+            for column in 0..SUPERSAMPLE {
+                let at = (((y * SUPERSAMPLE + row) * SAMPLE_PX + x * SUPERSAMPLE + column) * 4)
+                    as usize;
+                pixels[at..at + 4].copy_from_slice(&[10, 20, 30, 255]);
+            }
+        }
+        assert_eq!(reduce(&pixels, x, y), [10, 20, 30, 255]);
+        assert_eq!(reduce(&pixels, y, x), [0, 0, 0, 0], "not its transpose");
+        assert_eq!(reduce(&pixels, x, y + 1), [0, 0, 0, 0]);
     }
 }

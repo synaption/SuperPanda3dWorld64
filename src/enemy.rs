@@ -758,7 +758,7 @@ pub fn spawn(
             // Parts of both of these are flat quads the original turns to face
             // the camera every frame.
             crate::billboard::BillboardActor,
-            crate::shadow::ShadowCaster::new(kind.shadow_radius()),
+            crate::shadow::ShadowCaster::new(kind.shadow_radius(), kind.body().1),
         ))
         .insert_if(Crawler::default(), || kind == Kind::Ant)
         .id()

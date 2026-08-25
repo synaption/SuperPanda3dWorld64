@@ -24,6 +24,7 @@ use bevy::{
     prelude::*,
     render::render_resource::{
         AsBindGroup, Face, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
+        TextureFormat,
     },
     shader::ShaderRef,
 };
@@ -201,31 +202,123 @@ pub fn convert(
     lighting: Res<N64Lighting>,
     mut converted: ResMut<Converted>,
     standard: Res<Assets<StandardMaterial>>,
+    images: Res<Assets<Image>>,
     mut n64: ResMut<Assets<N64Material>>,
     hierarchy: Query<&ChildOf>,
     scenes: Query<(), With<WorldAssetRoot>>,
+    all: Query<&MeshMaterial3d<StandardMaterial>>,
     surfaces: Query<
         (Entity, &MeshMaterial3d<StandardMaterial>),
         Added<MeshMaterial3d<StandardMaterial>>,
     >,
+    // Surfaces held back because their texture had not arrived. `Added` fires
+    // once and never again, so a surface skipped without this is a surface left
+    // on a `StandardMaterial` for the rest of the run.
+    mut waiting: Local<Vec<Entity>>,
 ) {
-    for (entity, handle) in &surfaces {
+    let held: Vec<Entity> = waiting.drain(..).collect();
+    let again = held
+        .into_iter()
+        .filter_map(|entity| all.get(entity).ok().map(|handle| (entity, handle)));
+    for (entity, handle) in surfaces.iter().chain(again) {
         if !in_a_scene(entity, &hierarchy, &scenes) {
             continue;
         }
         let Some(source) = standard.get(&handle.0) else {
             continue;
         };
+        let Some(alpha_mode) = drawn_as(source, &images) else {
+            waiting.push(entity);
+            continue;
+        };
         let replacement = converted
             .0
             .entry(handle.0.id())
-            .or_insert_with(|| n64.add(translate(source, &lighting)))
+            .or_insert_with(|| n64.add(translate(source, &lighting, alpha_mode)))
             .clone();
         commands
             .entity(entity)
             .remove::<MeshMaterial3d<StandardMaterial>>()
             .insert(MeshMaterial3d(replacement));
     }
+}
+
+/// Alphas at or below the first count as nothing and at or above the second as
+/// everything. Wide enough to absorb the rounding of a texture that has been
+/// through a resize, and nowhere near wide enough to swallow a sheet of glass.
+const CLEAR: u8 = 8;
+const OPAQUE: u8 = 248;
+
+/// The share of half-transparent texels a picture is allowed before it stops
+/// being a cutout and starts being something you can see through.
+const CUTOUT: f32 = 0.05;
+
+/// Which pass this material belongs in, or `None` while its texture is still
+/// loading.
+///
+/// **A glTF that says `BLEND` is not necessarily asking for blending.** The
+/// tree, the goomba's whites, the scuttlebug's lights and the warp pipe's rim
+/// all come out of Blender that way, and every one of them is a cutout: a
+/// picture whose alpha is nothing or everything and never in between, which
+/// blending draws exactly as a mask would. What the blend costs is the thing
+/// that is not free -- a blended surface writes no depth and is ordered against
+/// the other transparent things in the scene by the distance to its origin, one
+/// object at a time. So a tree standing near the moat is drawn, and then the
+/// moat is drawn over it, and a triangle of lake appears in the middle of the
+/// canopy; walk twenty metres and the two swap back. That is the trees "showing
+/// what is behind them", and it is the same defect wherever two of these
+/// overlap.
+///
+/// A mask has none of that: it goes in the opaque pass, writes depth, and is
+/// resolved per pixel by the depth buffer like everything else. It is also what
+/// the console did -- the combiner had one bit of alpha for this and the
+/// hardware could not have sorted anything anyway.
+///
+/// So the texture is asked rather than the flag believed. A material whose
+/// picture is genuinely translucent -- the castle's one such surface, which
+/// tops out at an alpha of 163 and has no solid texel anywhere in it -- is left
+/// blended, because for that one the blend is the point.
+fn drawn_as(source: &StandardMaterial, images: &Assets<Image>) -> Option<AlphaMode> {
+    if !matches!(source.alpha_mode, AlphaMode::Blend) {
+        return Some(source.alpha_mode);
+    }
+    // A blend with no texture at all is a flat tint, and its alpha is the
+    // material's own. Nothing to look at, and nothing to promote.
+    let Some(texture) = source.base_color_texture.as_ref() else {
+        return Some(source.alpha_mode);
+    };
+    let image = images.get(texture)?;
+    Some(match cutout(image) {
+        true => AlphaMode::Mask(0.5),
+        false => AlphaMode::Blend,
+    })
+}
+
+/// Is this picture's alpha only ever nothing or everything?
+///
+/// Answered on the bytes rather than by sampling, because it is asked once per
+/// glTF material -- eleven times in the whole game -- and cached in
+/// [`Converted`] afterwards. A format this cannot read says no, which leaves the
+/// material exactly as the file asked for it.
+fn cutout(image: &Image) -> bool {
+    if !matches!(
+        image.texture_descriptor.format,
+        TextureFormat::Rgba8Unorm | TextureFormat::Rgba8UnormSrgb
+    ) {
+        return false;
+    }
+    let Some(data) = image.data.as_ref() else {
+        return false;
+    };
+    let mut texels = 0usize;
+    let mut middling = 0usize;
+    for texel in data.chunks_exact(4) {
+        texels += 1;
+        if (CLEAR..OPAQUE).contains(&texel[3]) {
+            middling += 1;
+        }
+    }
+    texels > 0 && (middling as f32) < texels as f32 * CUTOUT
 }
 
 /// Is this surface part of a loaded scene, rather than something the port
@@ -256,7 +349,14 @@ fn in_a_scene(
 /// castle material -- that mesh's lighting was resolved offline and baked into
 /// its vertex colours, so lighting it a second time here would light it twice.
 /// The actors carry no such flag and are lit live.
-pub fn translate(source: &StandardMaterial, lighting: &N64Lighting) -> N64Material {
+///
+/// `alpha_mode` is passed in rather than read off the source because it is not
+/// always the source's: see [`drawn_as`].
+pub fn translate(
+    source: &StandardMaterial,
+    lighting: &N64Lighting,
+    alpha_mode: AlphaMode,
+) -> N64Material {
     let lit = if source.unlit { 0.0 } else { 1.0 };
     N64Material {
         uniform: N64Uniform {
@@ -264,13 +364,13 @@ pub fn translate(source: &StandardMaterial, lighting: &N64Lighting) -> N64Materi
             light: lighting.key.extend(lit),
             ambient: lighting.ambient.extend(0.0),
             to_light: lighting.to_light.extend(0.0),
-            alpha_cutoff: match source.alpha_mode {
+            alpha_cutoff: match alpha_mode {
                 AlphaMode::Mask(cutoff) => cutoff,
                 _ => 0.0,
             },
         },
         base_color_texture: source.base_color_texture.clone(),
-        alpha_mode: source.alpha_mode,
+        alpha_mode,
         double_sided: source.cull_mode.is_none(),
     }
 }
@@ -344,8 +444,117 @@ mod tests {
     #[test]
     fn only_unbaked_surfaces_take_light() {
         let lighting = N64Lighting::default();
-        assert_eq!(translate(&standard(false), &lighting).uniform.light.w, 1.0);
-        assert_eq!(translate(&standard(true), &lighting).uniform.light.w, 0.0);
+        assert_eq!(translate(&standard(false), &lighting, AlphaMode::Opaque).uniform.light.w, 1.0);
+        assert_eq!(translate(&standard(true), &lighting, AlphaMode::Opaque).uniform.light.w, 0.0);
+    }
+
+    /// The base-colour picture of the material called `name` in a shipped glTF,
+    /// as an `Image` the way the loader would have handed one over.
+    ///
+    /// Read straight out of the file rather than through the asset server,
+    /// which needs a render world this test does not have. The GLB layout is a
+    /// twelve-byte header and then length-tagged chunks: JSON first, then the
+    /// binary the images are packed into.
+    fn baked_picture(file: &str, name: &str) -> Image {
+        use bevy::asset::RenderAssetUsages;
+        use bevy::render::render_resource::{Extent3d, TextureDimension};
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let bytes = std::fs::read(root.join(file)).expect("missing glb");
+        let json_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes[20..20 + json_len]).expect("bad glb json");
+        let bin_at = 20 + json_len;
+        let bin_len = u32::from_le_bytes(bytes[bin_at..bin_at + 4].try_into().unwrap()) as usize;
+        let bin = &bytes[bin_at + 8..bin_at + 8 + bin_len];
+
+        let material = json["materials"]
+            .as_array()
+            .expect("no materials")
+            .iter()
+            .find(|material| material["name"] == name)
+            .unwrap_or_else(|| panic!("{file} has no material called {name}"));
+        let texture = material["pbrMetallicRoughness"]["baseColorTexture"]["index"]
+            .as_u64()
+            .expect("no base colour texture") as usize;
+        let source = json["textures"][texture]["source"].as_u64().unwrap() as usize;
+        let view = &json["images"][source]["bufferView"];
+        let view = &json["bufferViews"][view.as_u64().unwrap() as usize];
+        let from = view["byteOffset"].as_u64().unwrap_or(0) as usize;
+        let to = from + view["byteLength"].as_u64().unwrap() as usize;
+        let decoded = image::load_from_memory(&bin[from..to])
+            .expect("the packed picture is not an image")
+            .to_rgba8();
+        let (width, height) = decoded.dimensions();
+        Image::new(
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            decoded.into_raw(),
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::RENDER_WORLD,
+        )
+    }
+
+    /// The rule that decides which pass a `BLEND` material lands in, pinned
+    /// against the two pictures in the game that fall either side of it.
+    ///
+    /// The tree is why this exists. Blender writes it out as `BLEND`, which
+    /// puts it in the transparent queue -- no depth write, and ordered against
+    /// the moat one whole object at a time -- so a lake triangle lands in the
+    /// middle of its canopy and comes and goes as the camera moves. Its picture
+    /// is a cutout: a fifth of a per cent of it is neither solid nor invisible,
+    /// which is the rim left by the resize and nothing anybody authored.
+    ///
+    /// The castle's one genuinely see-through surface is the other side of the
+    /// line and has to stay where it is. Its picture has no solid texel in it
+    /// at all -- the whole thing tops out at an alpha of 163 -- and drawing it
+    /// as a mask would turn a translucent surface opaque.
+    #[test]
+    fn a_blend_whose_picture_is_a_cutout_is_drawn_as_a_mask() {
+        for (file, name) in [
+            ("actors/tree.glb", "tree_seg3_texture_0302DE28"),
+            ("actors/tree.glb", "tree_seg3_texture_0302EE28"),
+            ("actors/goomba.glb", "goomba_seg8_texture_08019530.002"),
+            ("actors/warp_pipe.glb", "warp_pipe_seg3_lights_030079E8"),
+        ] {
+            assert!(
+                cutout(&baked_picture(file, name)),
+                "{name} in {file} is a cutout and is being drawn blended, which is \
+                 a surface the depth buffer cannot order"
+            );
+        }
+        let glass = baked_picture("bevy/castle.glb", "outside_0900BC00");
+        assert!(
+            !cutout(&glass),
+            "the castle's translucent surface was taken for a cutout, which draws \
+             it solid"
+        );
+    }
+
+    /// A `BLEND` with no picture to look at keeps the pass the file asked for,
+    /// and everything that was not a blend is left alone entirely.
+    #[test]
+    fn only_a_blend_with_a_cutout_picture_changes_pass() {
+        let images = Assets::<Image>::default();
+        for mode in [
+            AlphaMode::Opaque,
+            AlphaMode::Mask(0.25),
+            AlphaMode::Blend,
+        ] {
+            let material = StandardMaterial {
+                alpha_mode: mode,
+                ..standard(false)
+            };
+            assert_eq!(
+                drawn_as(&material, &images),
+                Some(mode),
+                "a material with no base colour texture was moved to another pass"
+            );
+        }
     }
 
     /// A masked material keeps its cutoff, and everything else asks for no
@@ -357,9 +566,9 @@ mod tests {
             alpha_mode: AlphaMode::Mask(0.4),
             ..standard(false)
         };
-        assert_eq!(translate(&masked, &lighting).uniform.alpha_cutoff, 0.4);
+        assert_eq!(translate(&masked, &lighting, masked.alpha_mode).uniform.alpha_cutoff, 0.4);
         assert_eq!(
-            translate(&standard(false), &lighting).uniform.alpha_cutoff,
+            translate(&standard(false), &lighting, AlphaMode::Opaque).uniform.alpha_cutoff,
             0.0
         );
     }
@@ -529,7 +738,11 @@ mod tests {
         let material = app
             .world_mut()
             .resource_mut::<Assets<N64Material>>()
-            .add(translate(&standard(false), &N64Lighting::default()));
+            .add(translate(
+                &standard(false),
+                &N64Lighting::default(),
+                AlphaMode::Opaque,
+            ));
 
         // A plain triangle, one with its own COLOR_0 -- which is how the
         // castle's baked lighting arrives -- and one bound to a skeleton.

@@ -66,6 +66,79 @@ const FADE_STEPS: usize = 12;
 /// and the ground it sits on never argue about which is in front.
 pub const LIFT: f32 = 0.03;
 
+/// How far in front of where it lies a disc is *drawn*, as a multiple of its
+/// own radius.
+///
+/// [`LIFT`] answers a different question and only that one: two surfaces at the
+/// same height arguing about which is in front. It cannot answer this one. A
+/// disc is a flat thing laid on ground that is not flat, and on the castle's
+/// lawn the ground rises across the width of the disc by far more than three
+/// centimetres -- so the uphill half of it is *inside the hill*, and what the
+/// depth buffer draws is no shadow at all. On the slope west of the castle both
+/// kinds of disc vanish outright: the far crowd's squares are laid flat by
+/// [`crate::impostor::build_shadows`] and bury themselves on any slope, and the
+/// near ones bury themselves wherever [`place`] could not agree on a slope and
+/// fell back to level.
+///
+/// Raising the disc instead is the obvious move and the wrong one: enough lift
+/// to clear a hillside is enough lift to be seen floating on the flat, and the
+/// amount needed is a property of the ground rather than of the shadow.
+///
+/// So the disc is drawn nearer than it lies, by the same trick
+/// [`crate::impostor::float_toward`] uses on the sprites: scaled about the eye,
+/// which under a perspective projection leaves it on exactly the pixels it was
+/// on at exactly the size, and changes only the depth it is tested at.
+///
+/// One radius, because that is what the geometry asks for. A disc of radius `r`
+/// laid flat on ground leaning at an angle buries its uphill rim by `r` times
+/// the tangent of that angle, so one radius of clearance carries it up to
+/// forty-five degrees -- past anything a caster can stand on. What it costs is
+/// the disc winning the depth test against whatever stands within a radius in
+/// front of it, and [`HEADROOM`] is what keeps that from mattering.
+pub const FLOAT: f32 = 1.0;
+
+/// The share of its caster's height a disc may be brought forward by.
+///
+/// The thing standing on a disc is the one thing the disc must never be drawn
+/// in front of, and what protects a caster is how much *deeper* than the float
+/// its own body reaches. That is a question about height, not about width, and
+/// the two part company on the slime: a dome about as high as it is wide, whose
+/// disc floated by its radius is a disc floated through its face. The ant is
+/// tall and never notices. So both are asked and the smaller answer wins.
+///
+/// A quarter rather than a half, measured. A caster's advantage in depth over
+/// its own disc is its full height only with the camera directly overhead and
+/// shrinks toward nothing as the camera comes down to its level, so half was
+/// already too much from a playing camera -- it drew a dark bar across the
+/// slime. A quarter leaves the slime clean and still recovers a sixth of the
+/// shadow the hillside was eating.
+const HEADROOM: f32 = 0.25;
+
+/// How far in front of where it lies a disc of this size may be drawn.
+pub fn clearance(radius: f32, height: f32) -> f32 {
+    (radius * FLOAT).min(height * HEADROOM)
+}
+
+/// How much of the way from the eye to `at` a disc of this radius is drawn at,
+/// so that it comes forward by [`clearance`].
+///
+/// Taken from the centre and applied to the whole disc, which is what keeps the
+/// scale uniform and therefore invisible. The rim furthest from the eye -- the
+/// buried one, on a slope -- is further away than the centre, so it moves
+/// forward by more than the centre does and is the corner this is really for.
+///
+/// Guarded at both ends: a disc at the eye has no ray to slide along, and one
+/// whose radius is larger than its distance from the camera must not be turned
+/// inside out through it.
+pub fn float_toward(eye: Vec3, at: Vec3, clearance: f32) -> f32 {
+    let reach = (at - eye).length();
+    let wanted = reach - clearance;
+    if reach <= f32::EPSILON || wanted <= 0.0 {
+        return 1.0;
+    }
+    wanted / reach
+}
+
 /// Segments around the disc. The original's circle shadow is nine vertices --
 /// eight triangles in a fan -- and the reason a low number is fine here is the
 /// same reason it was fine there: the texture fades to nothing before the rim,
@@ -89,14 +162,20 @@ pub struct ShadowCaster {
     /// derived from the model: a shadow is a readability device and wants to be
     /// about as wide as the caster's feet, not as wide as its widest part.
     pub radius: f32,
+    /// How tall the thing standing on the disc is. Nothing about the disc is
+    /// drawn from it -- it is here to bound the eye-ward float, which is the
+    /// one number that decides whether correcting a buried shadow turns into a
+    /// shadow drawn over its own caster. See [`clearance`].
+    pub height: f32,
     /// How dark it is at full strength, 0 to 1.
     pub solidity: f32,
 }
 
 impl ShadowCaster {
-    pub fn new(radius: f32) -> Self {
+    pub fn new(radius: f32, height: f32) -> Self {
         Self {
             radius,
+            height,
             solidity: SOLID,
         }
     }
@@ -183,6 +262,23 @@ pub fn prepare(
                 // A shadow is a shadow, not a surface: nothing about it should
                 // change with where the sun is.
                 unlit: true,
+                // Nor with how far away it is, which is a stronger claim than
+                // it sounds and is where the ants' outline came from.
+                //
+                // Fog replaces a surface's colour with the sky's, which is
+                // right for something opaque and wrong for something you can
+                // see through: what a haze does to a shadow is make it fainter,
+                // not paler. Left on, every disc past `AIR_FOG.0` stopped being
+                // black and became a sky-coloured patch -- and because it is
+                // blended, it did not fade *into* the distance, it painted sky
+                // *over* whatever was under it. Under it, for the far crowd, is
+                // the sprite: the disc lies through the enemy's feet and the
+                // card stands through them, so the two planes cross, and the
+                // half of the disc that wins the depth test washes the legs and
+                // the bottom of the body in sky colour. That is the "odd blue
+                // outline" on the ants, which is why it was blue, and why it
+                // turned magenta the moment the sky did.
+                fog_enabled: false,
                 // Seen from below through a water sheet, or from under a floor
                 // the caster is standing on the far side of.
                 double_sided: true,
@@ -354,6 +450,8 @@ pub fn project(
     level: Res<LevelData>,
     gravity: Res<Gravity>,
     art: Res<ShadowArt>,
+    tuning: Res<crate::console::GameTuning>,
+    camera: Query<&GlobalTransform, With<Camera3d>>,
     casters: Query<(&Transform, &ShadowCaster, Option<&Visibility>), Without<Shadow>>,
     mut shadows: Query<(
         &Shadow,
@@ -362,7 +460,16 @@ pub fn project(
         &mut MeshMaterial3d<StandardMaterial>,
     )>,
 ) {
+    // No camera is not a reason to stop placing discs -- it is a reason to
+    // place them where they lie. The float is a drawing correction and only
+    // means anything once there is an eye to be drawn for.
+    let eye = camera.single().ok().map(|view| view.translation());
+    let drawn = tuning.shadows >= 0.5;
     for (shadow, mut transform, mut visibility, mut material) in &mut shadows {
+        if !drawn {
+            *visibility = Visibility::Hidden;
+            continue;
+        }
         let Ok((caster, settings, shown)) = casters.get(shadow.owner) else {
             *visibility = Visibility::Hidden;
             continue;
@@ -386,9 +493,18 @@ pub fn project(
         let drop = (here - floor).dot(up).max(0.0);
         // Lifted along the floor's normal rather than straight up, so the
         // clearance is the same all the way round the disc on a slope.
-        transform.translation = floor + slope * LIFT;
+        let lying = floor + slope * LIFT;
+        let radius = settings.radius * scale_with_drop(drop);
+        // And then drawn nearer than it lies, so the hill it is laid on cannot
+        // swallow it. Scaling about the eye is one factor on both the offset
+        // and the size, which is what leaves the disc exactly where it was on
+        // screen -- see [`FLOAT`].
+        let near = eye.map_or(1.0, |eye| {
+            float_toward(eye, lying, clearance(radius, settings.height))
+        });
+        transform.translation = eye.map_or(lying, |eye| eye + (lying - eye) * near);
         transform.rotation = Quat::from_rotation_arc(Vec3::Z, slope);
-        transform.scale = Vec3::splat(settings.radius * scale_with_drop(drop));
+        transform.scale = Vec3::splat(radius * near);
         // Assigned only when the rung actually changes. Writing the same
         // handle back would mark the component changed, and a changed material
         // component puts the disc through the render world's specialise-and-
@@ -428,6 +544,77 @@ mod tests {
             (middle - (SOLID + FAR_SOLIDITY) / 2.0).abs() < 1e-6,
             "{middle}"
         );
+    }
+
+    /// A shadow is not a surface, and fogging it as if it were is where the far
+    /// crowd's "blue outline" came from.
+    ///
+    /// Fog swaps a fragment's colour for the sky's. On something opaque that
+    /// reads as distance; on something blended it reads as sky painted over
+    /// whatever is behind, because the alpha is left alone and only the colour
+    /// moves. Every disc past `AIR_FOG.0` stopped being a black smudge and
+    /// became a pale sky-coloured one -- and the far crowd's discs lie through
+    /// their enemies' feet while the sprite cards stand through them, so the
+    /// two planes cross and the winning half of the disc washed the ants' legs
+    /// in sky. Change the sky and the outline changed with it, which is how it
+    /// was finally caught.
+    #[test]
+    fn a_shadow_is_never_fogged() {
+        let mut meshes = Assets::<Mesh>::default();
+        let mut images = Assets::<Image>::default();
+        let mut materials = Assets::<StandardMaterial>::default();
+        let art = prepare(&mut meshes, &mut images, &mut materials);
+        assert!(!art.fades.is_empty(), "a ladder with no rungs on it");
+        for rung in &art.fades {
+            let material = materials.get(rung).expect("a rung with no material");
+            assert!(
+                !material.fog_enabled,
+                "a shadow disc is being fogged, which turns it into a sky-coloured \
+                 patch painted over whatever it lands on"
+            );
+        }
+    }
+
+    /// The float must never be able to reach the thing standing on the disc.
+    ///
+    /// Both halves of the rule earn their place. The player is tall and narrow,
+    /// so his radius is what bounds him and his height never comes into it. The
+    /// slime is a dome about as high as it is wide, and *only* its height
+    /// bounds it -- taking the radius alone drew a black bar across its face
+    /// from an ordinary playing camera.
+    #[test]
+    fn a_disc_is_never_floated_far_enough_to_cover_its_own_caster() {
+        let slime = clearance(0.6, 0.6);
+        assert_eq!(slime, 0.6 * HEADROOM, "the dome should be bounded by height");
+        let player = clearance(crate::player::PLAYER_RADIUS, crate::player::PLAYER_HEIGHT);
+        assert_eq!(
+            player,
+            crate::player::PLAYER_RADIUS * FLOAT,
+            "someone tall and narrow should be bounded by radius"
+        );
+        for (radius, height) in [(0.6, 0.6), (0.42, 1.75), (0.84, 1.2), (3.0, 0.2)] {
+            assert!(
+                clearance(radius, height) < height,
+                "a caster {height} tall gets a disc drawn {} in front of it",
+                clearance(radius, height)
+            );
+        }
+    }
+
+    /// The float is a scale about the eye, so it has to survive the two cases
+    /// where there is nothing to scale: a disc at the eye, and one whose
+    /// clearance is deeper than it is far away.
+    #[test]
+    fn a_disc_is_never_turned_inside_out_through_the_camera() {
+        let eye = Vec3::new(0.0, 5.0, 0.0);
+        assert_eq!(float_toward(eye, eye, 0.5), 1.0, "no ray to slide along");
+        assert_eq!(
+            float_toward(eye, eye + Vec3::X * 0.25, 0.5),
+            1.0,
+            "a disc closer than its own clearance must be left where it is"
+        );
+        let near = float_toward(eye, eye + Vec3::X * 10.0, 1.0);
+        assert!((near - 0.9).abs() < 1e-6, "{near}");
     }
 
     /// The bug this pairing was written for, pinned against the real castle.

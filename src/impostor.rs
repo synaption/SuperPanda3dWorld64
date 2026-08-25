@@ -49,6 +49,7 @@ use crate::{
 use bevy::{
     asset::RenderAssetUsages,
     camera::visibility::NoFrustumCulling,
+    image::{ImageLoaderSettings, ImageSampler},
     ecs::{schedule::ScheduleConfigs, system::ScheduleSystem},
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
@@ -391,8 +392,13 @@ pub fn prepare(
     root: &std::path::Path,
 ) {
     let mut impostors = Impostors::default();
-    // The shadows go down first, so that when a sprite and a disc land on the
-    // same pixel the sprite is the one that was drawn second.
+    // The shadows are their own mesh because they are their own material: the
+    // discs are blended and the sprites are masked, which is also to say the
+    // discs are drawn in the transparent pass and the sprites in the opaque
+    // one. Spawn order has nothing to do with it -- the transparent pass runs
+    // second whatever this does -- so where a disc and a sprite land on the
+    // same pixel it is the depth buffer that decides, and the card is floated
+    // toward the eye by [`FLOAT`] partly so that it wins.
     let shadows = meshes.add(empty_field());
     commands.spawn((
         ImpostorField,
@@ -422,7 +428,30 @@ pub fn prepare(
                 continue;
             }
         };
-        let atlas = assets.load(format!("{SHEETS}/{}.png", stem(kind)));
+        // Nearest, and never filtered. Two reasons, and the second is the one
+        // that shows.
+        //
+        // The sheet packs sixteen angles by sixteen frames of `cell_px`
+        // squares edge to edge, with no gutter between them, so any filter
+        // wide enough to reach past a cell boundary reads the wrong animation
+        // frame or the wrong view angle. `SheetMeta::uv` insets by half a
+        // texel against that, which is enough while a sprite is magnified and
+        // nothing at all once it is not -- and an impostor is by definition
+        // the distant, minified case.
+        //
+        // And the sheet is a cutout: its alpha is binary everywhere, and it is
+        // drawn with `AlphaMode::Mask`. A linear sampler on a minified binary
+        // mask hands the cutoff a blend of four texels, so a feature thinner
+        // than the footprint -- a leg, an antenna -- crosses `ALPHA_CUTOFF`
+        // and back from one pixel to the next, and the sprite is stippled with
+        // holes that show whatever is behind it. Nearest gives the cutoff one
+        // texel to decide on, which is the decision the bake already made.
+        let atlas = assets
+            .load_builder()
+            .with_settings(|settings: &mut ImageLoaderSettings| {
+                settings.sampler = ImageSampler::nearest();
+            })
+            .load(format!("{SHEETS}/{}.png", stem(kind)));
         let material = materials.add(N64Material {
             // Unlit: the sheet was baked with the world's own lighting already
             // resolved into it, exactly as the castle's vertex colours are.
@@ -658,6 +687,10 @@ fn float_toward(eye: Vec3, at: Vec3, furthest: f32, dip: f32) -> f32 {
 /// more generous: these are laid flat rather than along the ground's own
 /// normal, so on a slope one edge of the disc sits closer to the surface than
 /// the middle does.
+///
+/// Which is only the argument about *coplanar* surfaces. Being laid flat on a
+/// hill is a bigger problem than five centimetres can answer, and the answer to
+/// it is [`crate::shadow::float_toward`] below.
 const SHADOW_LIFT: f32 = 0.05;
 
 /// Writes the far crowd's shadows into a mesh as flat discs on the ground.
@@ -673,18 +706,28 @@ const SHADOW_LIFT: f32 = 0.05;
 /// texture's fade is what makes it read as a soft round shadow, and at this
 /// distance the difference between a disc tilted onto a hillside and one laid
 /// flat on it is well under a pixel.
-pub fn build_shadows(crowd: &[(Vec3, f32)], mesh: &mut Mesh) {
+///
+/// Laid flat is also why these need the eye-ward float more than the near discs
+/// do: a square lying level on a hillside is buried by the hill, and the whole
+/// far crowd on the slope west of the castle casts nothing at all without this.
+/// The four corners take the one factor computed at the centre, so the square
+/// is scaled about the eye rather than sheared, and stays exactly where it was
+/// on screen.
+pub fn build_shadows(eye: Vec3, crowd: &[(Vec3, f32, f32)], mesh: &mut Mesh) {
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(crowd.len() * 4);
     let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(crowd.len() * 4);
     let mut indices: Vec<u32> = Vec::with_capacity(crowd.len() * 6);
-    for (at, radius) in crowd {
+    for (at, radius, height) in crowd {
         let base = positions.len() as u32;
         let centre = *at + Vec3::Y * SHADOW_LIFT;
+        let near =
+            crate::shadow::float_toward(eye, centre, crate::shadow::clearance(*radius, *height));
         for ((dx, dz), uv) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
             .into_iter()
             .zip([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)])
         {
-            positions.push((centre + Vec3::new(dx * radius, 0.0, dz * radius)).to_array());
+            let corner = centre + Vec3::new(dx * radius, 0.0, dz * radius);
+            positions.push((eye + (corner - eye) * near).to_array());
             uvs.push([uv.0, uv.1]);
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -711,10 +754,11 @@ pub fn draw(
     impostors: Option<Res<Impostors>>,
     mut stats: ResMut<ImpostorStats>,
     mut meshes: ResMut<Assets<Mesh>>,
+    tuning: Res<crate::console::GameTuning>,
     camera: Query<&GlobalTransform, With<Camera3d>>,
     crowd: Query<(&Enemy, &Transform, &Visibility, &Quirk, Option<&Children>)>,
     mut buffers: Local<Vec<(Kind, Vec<Member>)>>,
-    mut shadows: Local<Vec<(Vec3, f32)>>,
+    mut shadows: Local<Vec<(Vec3, f32, f32)>>,
 ) {
     let (Some(impostors), Ok(view)) = (impostors, camera.single()) else {
         return;
@@ -751,7 +795,13 @@ pub fn draw(
         let Some((_, members)) = buffers.iter_mut().find(|(kind, _)| *kind == enemy.kind) else {
             continue;
         };
-        shadows.push((transform.translation, enemy.kind.shadow_radius()));
+        if tuning.shadows >= 0.5 {
+            shadows.push((
+                transform.translation,
+                enemy.kind.shadow_radius(),
+                enemy.kind.body().1,
+            ));
+        }
         members.push(Member {
             at: transform.translation,
             // Whole. A walker's rotation is a yaw and could be reduced to one;
@@ -778,7 +828,7 @@ pub fn draw(
         .as_ref()
         .and_then(|handle| meshes.get_mut(handle))
     {
-        build_shadows(&shadows, mesh.into_inner());
+        build_shadows(eye, &shadows, mesh.into_inner());
     }
     for (kind, members) in buffers.iter() {
         let Some(sheet) = impostors.get(*kind) else {
@@ -1449,6 +1499,46 @@ pub(crate) mod tests {
         }
     }
 
+    /// The sheets are cutouts, and the whole sprite path is built on it.
+    ///
+    /// [`ALPHA_CUTOFF`] throws a fragment away on one comparison against one
+    /// number, and the atlas is sampled with a nearest filter so that the
+    /// number it compares is a texel the baker actually wrote. Both of those
+    /// are only safe while the sheet's alpha is essentially binary. Let the
+    /// baker start writing soft edges -- multisampling left on, a premultiply,
+    /// a resample on the way out -- and every texel around the silhouette
+    /// lands somewhere in a ramp across the cutoff, so a feature thinner than
+    /// a pixel crosses it and back from one pixel to the next and the sprite
+    /// stipples with holes that show whatever is behind it.
+    ///
+    /// The bar is not zero, because a part-transparent texel is also how an
+    /// actor that really is part transparent gets baked. As committed, the ant
+    /// has none at all and the slime has 0.29% of its solid area, in patches
+    /// rather than around its rim -- that is the jelly, not an edge. An
+    /// antialiased silhouette would put every texel of every perimeter into
+    /// the ramp, which for these sheets is nearer 4%.
+    #[test]
+    fn the_baked_sheets_are_cutouts_rather_than_soft_edged() {
+        const SOFTEST: f32 = 0.01;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        for kind in [Kind::Slime, Kind::Ant] {
+            let path = root.join(SHEETS).join(format!("{}.png", stem(kind)));
+            let (_, alpha) = png_alpha(&path);
+            let solid = alpha.iter().filter(|value| **value >= 248).count();
+            let soft = alpha
+                .iter()
+                .filter(|value| (8..248).contains(&**value))
+                .count();
+            let share = soft as f32 / solid.max(1) as f32;
+            assert!(
+                share < SOFTEST,
+                "{kind:?}'s sheet is {:.2}% part-transparent against its solid area, \
+                 so it is no longer a cutout and `AlphaMode::Mask` will stipple its \
+                 edges",
+                share * 100.0
+            );
+        }
+    }
     /// [`Kind::lift`] is a measurement of the art, so it is checked against the
     /// art rather than trusted.
     ///

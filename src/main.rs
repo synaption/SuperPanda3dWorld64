@@ -551,7 +551,7 @@ fn setup(
     //
     // It also settles which shadow: only one of the two visuals is ever shown,
     // and `project` already hides the disc of a caster nobody is drawing.
-    let shadow = shadow::ShadowCaster::new(player::PLAYER_RADIUS);
+    let shadow = shadow::ShadowCaster::new(player::PLAYER_RADIUS, player::PLAYER_HEIGHT);
     commands.spawn((
         PlayerVisual,
         ActiveCharacter::Hero,

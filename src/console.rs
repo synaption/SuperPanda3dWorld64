@@ -302,6 +302,20 @@ pub const SPECS: &[TunableSpec] = &[
         doc: "distance where enemy AI drops to 7.5 Hz",
     },
     TunableSpec {
+        name: "shadows",
+        // A flag rather than a dial, and the arrow keys step it end to end.
+        // Two draws and a mesh rebuilt every frame is not nothing at a crowd
+        // this size, but that is not really why it is here: the discs are the
+        // one thing in the scene that is blended, drawn last and laid across
+        // every enemy's feet, which makes them the first suspect whenever
+        // something is wrong with how the crowd looks. Being able to take them
+        // away for a second answers that in one keystroke.
+        low: 0.0,
+        high: 1.0,
+        step: 1.0,
+        doc: "draw the contact shadows under everything",
+    },
+    TunableSpec {
         name: "enemy_draw",
         // Down from 20, because this is now a quality dial rather than a
         // visibility one and the interesting end of it is the near end.
@@ -395,6 +409,9 @@ pub struct GameTuning {
     pub enemy_lod_near: f32,
     pub enemy_lod_far: f32,
     pub enemy_draw: f32,
+    /// Whether the contact discs are drawn at all. Off is a diagnostic rather
+    /// than a look: see the spec above.
+    pub shadows: f32,
     pub enemy_rate: f32,
     pub enemy_limit: f32,
     /// How many allies the Mario warp pipe keeps alive. Enemy pipes instead
@@ -467,6 +484,7 @@ impl Default for GameTuning {
             // impostor is for. Past here the whole far crowd is two draw calls
             // instead of two per slime and one per ant.
             enemy_draw: 25.0,
+            shadows: 1.0,
             enemy_rate: 7.0,
             enemy_limit: 20.0,
             pipe_brood: 5.0,
@@ -516,6 +534,7 @@ impl GameTuning {
             "enemy_lod_near" => self.enemy_lod_near,
             "enemy_lod_far" => self.enemy_lod_far,
             "enemy_draw" => self.enemy_draw,
+            "shadows" => self.shadows,
             "enemy_rate" => self.enemy_rate,
             "enemy_limit" => self.enemy_limit,
             "pipe_brood" => self.pipe_brood,
@@ -569,6 +588,7 @@ impl GameTuning {
             "enemy_lod_near" => self.enemy_lod_near = value,
             "enemy_lod_far" => self.enemy_lod_far = value,
             "enemy_draw" => self.enemy_draw = value,
+            "shadows" => self.shadows = value,
             "enemy_rate" => self.enemy_rate = value,
             "enemy_limit" => self.enemy_limit = value,
             "pipe_brood" => self.pipe_brood = value,

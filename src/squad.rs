@@ -405,7 +405,10 @@ pub fn spawn_ally(commands: &mut Commands, assets: &AssetServer, home: Vec3, pha
             ActiveCharacter::Mario,
             // And stand on the ground the same way, so they get the same disc
             // under them as the player.
-            crate::shadow::ShadowCaster::new(crate::player::PLAYER_RADIUS),
+            crate::shadow::ShadowCaster::new(
+                crate::player::PLAYER_RADIUS,
+                crate::player::PLAYER_HEIGHT,
+            ),
             WorldAssetRoot(assets.load("mario/mario.glb#Scene0")),
             Transform::from_translation(home).with_scale(Vec3::splat(0.00667)),
         ))
