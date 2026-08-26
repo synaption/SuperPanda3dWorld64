@@ -224,18 +224,27 @@ pub fn convert(
         if !in_a_scene(entity, &hierarchy, &scenes) {
             continue;
         }
-        let Some(source) = standard.get(&handle.0) else {
-            continue;
+        // The cache first, and the texture only if it misses. Every instance
+        // of a scene shares one `StandardMaterial`, so asking `drawn_as` before
+        // looking here read the same picture once per *entity* wearing it: the
+        // castle's fifty-odd trees and pipes between them scanned 27.6 million
+        // texels at level load to answer four questions. It is the same answer
+        // every time -- the material is the thing being classified.
+        let replacement = match converted.0.get(&handle.0.id()) {
+            Some(replacement) => replacement.clone(),
+            None => {
+                let Some(source) = standard.get(&handle.0) else {
+                    continue;
+                };
+                let Some(alpha_mode) = drawn_as(source, &images) else {
+                    waiting.push(entity);
+                    continue;
+                };
+                let replacement = n64.add(translate(source, &lighting, alpha_mode));
+                converted.0.insert(handle.0.id(), replacement.clone());
+                replacement
+            }
         };
-        let Some(alpha_mode) = drawn_as(source, &images) else {
-            waiting.push(entity);
-            continue;
-        };
-        let replacement = converted
-            .0
-            .entry(handle.0.id())
-            .or_insert_with(|| n64.add(translate(source, &lighting, alpha_mode)))
-            .clone();
         commands
             .entity(entity)
             .remove::<MeshMaterial3d<StandardMaterial>>()

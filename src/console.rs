@@ -394,6 +394,13 @@ pub struct GameTuning {
     pub cam_aim_distance: f32,
     pub cam_height: f32,
     pub cam_smooth: f32,
+    /// Radians of yaw per mouse count.
+    ///
+    /// Halved from the 0.003 it was, because a mouse reports whole counts and
+    /// this number is therefore the smallest movement the player can make: at
+    /// 0.003 that was a fifth of a degree, three pixels of crosshair at 1080p,
+    /// and there was no way to aim between two of them. `mouse_sens 0.003`
+    /// puts the old speed back for anyone who wants it.
     pub mouse_sens: f32,
     pub pad_look: f32,
     pub sfx_volume: f32,
@@ -453,7 +460,7 @@ impl Default for GameTuning {
             cam_aim_distance: 5.7,
             cam_height: 1.35,
             cam_smooth: 0.24,
-            mouse_sens: 0.003,
+            mouse_sens: 0.0015,
             pad_look: 2.6,
             sfx_volume: 0.7,
             // A shade under `enemy_sight`, so a slime close enough to have

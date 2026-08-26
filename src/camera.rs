@@ -46,6 +46,23 @@ pub struct FollowCamera {
     /// latency, and the prototype avoids it the other way round, by running its
     /// camera filter four times faster on foot than in flight.
     pub view: Quat,
+    /// The point the boom hangs off, easing onto the player's own.
+    ///
+    /// The smoothing lives here rather than on the camera's position, and that
+    /// is the difference between a camera that follows and one that swings.
+    /// Lerping the *camera* towards where it wanted to be was fine only while
+    /// it was also pointed at the player: turning the view moves the wanted
+    /// position the whole width of the orbit, and a camera crawling after that
+    /// at [`GameTuning::cam_smooth`] a frame is a camera the player slides
+    /// across the screen of on every mouse movement and slides back on when it
+    /// stops. Smoothing the focus filters the only thing that ever needed
+    /// filtering -- the player's own steps and bumps -- and leaves the camera
+    /// rigid about it, so the boom, the picture and the crosshair never
+    /// disagree.
+    ///
+    /// `None` until the first frame places it, so the camera arrives already
+    /// framed rather than flying in from the origin.
+    pub focus: Option<Vec3>,
 }
 
 impl Default for FollowCamera {
@@ -60,6 +77,7 @@ impl Default for FollowCamera {
             clearance: 1.0,
             frame: Quat::IDENTITY,
             view: Quat::IDENTITY,
+            focus: None,
         }
     }
 }
@@ -75,6 +93,38 @@ const WALL_GAP: f32 = 0.3;
 /// The rate the boom is allowed back out at once a wall stops blocking it,
 /// as a fraction of the remaining gap per sixtieth of a second.
 const REOPEN_RATE: f32 = 0.08;
+
+/// How far the boom sits above the focus, as a fraction of its own length.
+///
+/// A slope rather than the flat 0.8 units it was, and the difference is the
+/// whole of the aim-down-sights drift. A fixed rise is a *changing angle* as
+/// the boom shortens: 4.8 degrees below the horizon at [`GameTuning::cam_distance`]
+/// and 8.0 at `cam_aim_distance`, so raising the weapon walked the crosshair
+/// three degrees down the screen over the couple of hundred milliseconds the
+/// distance took to ease -- a metre of drop at twenty metres, arriving after
+/// the shot was lined up. Held as a fraction, the angle is the same at every
+/// distance and the zoom moves the camera without moving the aim.
+///
+/// The number is what the old offset worked out to at the default distance, so
+/// nothing about the framing changes where the camera normally sits.
+const BOOM_RISE: f32 = 0.8 / 9.5;
+
+/// What the look sensitivity is multiplied by while the weapon is up.
+///
+/// A mouse reports whole counts, so the smallest turn a player can ask for is
+/// one count -- [`GameTuning::mouse_sens`] radians -- and nothing smaller
+/// exists at any frame rate, resolution or DPI. That is the floor on how
+/// finely anything can be aimed. At the default it is 0.086 degrees, which at
+/// this game's sixty-degree field of view over a 1080-tall picture is about a
+/// pixel and a half of crosshair.
+///
+/// Halved while aiming, because the two things the stick is being asked to do
+/// are different jobs with opposite wants: turning round wants a whole circle
+/// in a hand's width, and landing the shot on an ant at thirty metres wants
+/// the smallest step to be smaller than the ant. Sensitivity that suits one
+/// cannot suit the other, and which of them the player is doing is already
+/// known -- they are holding the aim button.
+const AIM_SENSITIVITY: f32 = 0.5;
 
 /// How fast the view's idea of up chases the ground's, per second.
 ///
@@ -154,8 +204,11 @@ pub fn update(
     // more so than the same wobble in pitch. Which is why `up` is not read
     // again below this line.
     let view_up = follow.view * Vec3::Y;
-    follow.yaw -= input.look_mouse.x * tuning.mouse_sens;
-    follow.pitch = (follow.pitch - input.look_mouse.y * tuning.mouse_sens * 0.8333)
+    // `input.aim` rather than `state.aiming`, which is this system's own
+    // output and is not written until further down.
+    let sensitivity = tuning.mouse_sens * if input.aim { AIM_SENSITIVITY } else { 1.0 };
+    follow.yaw -= input.look_mouse.x * sensitivity;
+    follow.pitch = (follow.pitch - input.look_mouse.y * sensitivity * 0.8333)
         .clamp(PITCH_LIMITS.0, PITCH_LIMITS.1);
     // The stick is a rate rather than a displacement, so it is scaled by the
     // frame's length where the mouse is not.
@@ -183,10 +236,17 @@ pub fn update(
     };
     let smoothing = blend(tuning.cam_smooth, time.delta_secs());
     follow.distance += (desired_distance - follow.distance) * blend(0.16, time.delta_secs());
-    let focus = player.translation + view_up * tuning.cam_height;
+    // The focus eases; the camera does not. On the first frame there is
+    // nothing to ease from, so it starts where it belongs.
+    let standing = player.translation + view_up * tuning.cam_height;
+    let focus = match follow.focus {
+        Some(previous) => previous.lerp(standing, smoothing),
+        None => standing,
+    };
+    follow.focus = Some(focus);
     let orbit =
         follow.view * Quat::from_rotation_y(follow.yaw) * Quat::from_rotation_x(follow.pitch);
-    let boom = orbit * Vec3::new(0.0, 0.8, follow.distance);
+    let boom = orbit * Vec3::new(0.0, BOOM_RISE * follow.distance, follow.distance);
 
     // How much of the boom is free this frame, measured along the boom rather
     // than as a position, so it can be compared with the last frame's answer.
@@ -207,9 +267,28 @@ pub fn update(
     } else {
         follow.clearance + (reach - follow.clearance) * blend(REOPEN_RATE, time.delta_secs())
     };
-    let wanted = focus + boom * follow.clearance;
-    camera.translation = camera.translation.lerp(wanted, smoothing);
-    camera.look_at(focus, view_up);
+    camera.translation = focus + boom * follow.clearance;
+    // **Aimed along the boom, not at the focus.** With the camera placed
+    // rigidly at `focus + boom * clearance` the two are the same direction
+    // anyway, and saying it this way makes it stay that way: nothing about
+    // where the camera has got to can reach the rotation, and `aim::drive`
+    // takes the shot's direction straight off the rotation. What used to reach
+    // the crosshair, back when the camera was lerped into place and pointed at
+    // the focus from wherever it had got to:
+    //
+    // * Stopping. The camera trailed the player by roughly its speed times the
+    //   smoothing, glided that distance forward over the next tenth of a
+    //   second, and swung the aim through the whole of it on the way. That is
+    //   the "camera settling" -- it was not the position anyone was watching,
+    //   it was the crosshair.
+    // * Walking onto a slope. The focus rides the player, so the ground's
+    //   height goes into it; with the camera lagging, a step up or down tilted
+    //   the line between the two and moved the shot.
+    //
+    // Both are gone, and the smoothing they came from now lives on the focus,
+    // where it costs the player a little drift off centre and costs the aim
+    // nothing at all.
+    camera.look_to(-boom, view_up);
 }
 
 #[cfg(test)]
@@ -316,6 +395,155 @@ mod tests {
             let up = view_up(&mut world);
             assert!((up - Vec3::Y).length() < 1e-5, "the horizon tilted: {up}");
         }
+    }
+
+    /// A flat level with the player standing on it, which is what the two aim
+    /// tests below want: gravity is `+Y` everywhere, so the view frame never
+    /// moves and the only thing that could turn the camera is the camera.
+    fn flat_world(at: Vec3) -> World {
+        let mut world = planet_world(Vec3::Y * PLANET);
+        world.insert_resource(Gravity::default());
+        world.resource_mut::<RenderPose>().translation = at;
+        let mut query = world.query::<&mut FollowCamera>();
+        let mut follow = query.single_mut(&mut world).unwrap();
+        follow.frame = Quat::IDENTITY;
+        follow.view = Quat::IDENTITY;
+        world
+    }
+
+    /// Where the shot goes. `aim::drive` takes it straight off the camera's
+    /// rotation, so this is the crosshair.
+    fn aim(world: &mut World) -> Vec3 {
+        let mut query = world.query_filtered::<&Transform, With<FollowCamera>>();
+        Vec3::from(query.single(world).unwrap().forward())
+    }
+
+    /// The crosshair belongs to the player's look input and to nothing else.
+    ///
+    /// Everything moved here is something that used to reach it through the
+    /// camera's positional lag, because the camera was pointed *at the focus*
+    /// from wherever it had got to rather than along the boom. Walking moved
+    /// it, stopping moved it, and a step up onto a slope moved it -- all of
+    /// them by the same mechanism, and all of them while the player was holding
+    /// the mouse still.
+    #[test]
+    fn nothing_but_the_look_input_moves_the_aim() {
+        let mut world = flat_world(Vec3::new(0.0, 3.0, 0.0));
+        frames(&mut world, 120);
+        let settled = aim(&mut world);
+        for (what, moved) in [
+            ("walking", Vec3::new(0.0, 3.0, 4.0)),
+            ("stopping", Vec3::new(0.0, 3.0, 4.0)),
+            ("stepping onto a slope", Vec3::new(0.0, 3.6, 4.0)),
+            ("walking off a ledge", Vec3::new(0.0, 1.2, 4.0)),
+        ] {
+            world.resource_mut::<RenderPose>().translation = moved;
+            frames(&mut world, 1);
+            let now = aim(&mut world);
+            assert!(
+                now.angle_between(settled) < 1e-4,
+                "{what} moved the crosshair by {} rad",
+                now.angle_between(settled),
+            );
+        }
+    }
+
+    /// Turning the view does not throw the player around the screen.
+    ///
+    /// The regression this exists for: pointing the camera along the boom while
+    /// still *lerping* it into place made the rotation instant and the position
+    /// lagging, so a mouse movement swung the wanted position the whole width
+    /// of the orbit and the camera crawled after it at `cam_smooth` a frame.
+    /// The player slid off centre on every turn and slid back when it stopped,
+    /// which reads as the camera being jumpy. Placed rigidly about a focus that
+    /// does the easing instead, the picture and the boom agree on every frame,
+    /// turning or not.
+    #[test]
+    fn turning_the_view_keeps_the_player_centred() {
+        let mut world = flat_world(Vec3::new(0.0, 3.0, 0.0));
+        frames(&mut world, 120);
+        for frame in 0..60 {
+            // A brisk mouse turn, held. In radians of yaw a frame rather than
+            // mouse units, because a mouse unit is `mouse_sens` of a radian and
+            // the point here is the turn rate: a twentieth of a radian a frame
+            // is three a second, a flick rather than a tracking shot.
+            let sensitivity = world.resource::<GameTuning>().mouse_sens;
+            world.resource_mut::<InputState>().look_mouse = Vec2::new(0.05 / sensitivity, 0.0);
+            frames(&mut world, 1);
+            let focus = world.resource::<RenderPose>().translation
+                + Vec3::Y * world.resource::<GameTuning>().cam_height;
+            let mut query = world.query_filtered::<&Transform, With<FollowCamera>>();
+            let camera = query.single(&world).unwrap();
+            let to_player = (focus - camera.translation).normalize();
+            let off = to_player.angle_between(Vec3::from(camera.forward()));
+            // A thousandth of a radian is a twentieth of a degree, and about
+            // three times the round-off `f32` accumulates over a minute of
+            // yaw. The bug this catches was worth a tenth of a radian.
+            assert!(
+                off < 1e-3,
+                "frame {frame} of turning put the player {off} rad off centre"
+            );
+        }
+    }
+
+    /// And raising the weapon does not either.
+    ///
+    /// The boom shortens from `cam_distance` to `cam_aim_distance` over a few
+    /// tenths of a second. While its rise was a fixed 0.8 units that shortening
+    /// was a three-degree pitch down, eased in under the player exactly as the
+    /// shot was being lined up. See [`BOOM_RISE`].
+    #[test]
+    fn aiming_down_the_sights_does_not_tilt_the_aim() {
+        let mut world = flat_world(Vec3::new(0.0, 3.0, 0.0));
+        frames(&mut world, 120);
+        let hip = aim(&mut world);
+        world.resource_mut::<InputState>().aim = true;
+        // Every frame of the zoom, not just the end of it: a drift that eases
+        // in and eases back out again is still a drift to shoot through.
+        for frame in 0..90 {
+            frames(&mut world, 1);
+            let now = aim(&mut world);
+            assert!(
+                now.angle_between(hip) < 1e-4,
+                "frame {frame} of aiming in tilted the view by {} rad",
+                now.angle_between(hip),
+            );
+        }
+        let mut query = world.query::<&FollowCamera>();
+        let distance = query.single(&world).unwrap().distance;
+        let tuning = world.resource::<GameTuning>();
+        assert!(
+            (distance - tuning.cam_aim_distance).abs() < 0.1,
+            "the boom never actually came in: {distance}",
+        );
+    }
+
+    /// Holding the aim button makes every mouse count go half as far.
+    ///
+    /// The floor on precision is one mouse count, so this is the only lever
+    /// that moves it without slowing the player down while they are just
+    /// turning round. See [`AIM_SENSITIVITY`].
+    #[test]
+    fn aiming_halves_what_a_mouse_count_is_worth() {
+        let turn = |aiming: bool| {
+            let mut world = flat_world(Vec3::new(0.0, 3.0, 0.0));
+            frames(&mut world, 120);
+            let before = aim(&mut world);
+            {
+                let mut input = world.resource_mut::<InputState>();
+                input.aim = aiming;
+                input.look_mouse = Vec2::new(20.0, 0.0);
+            }
+            frames(&mut world, 1);
+            aim(&mut world).angle_between(before)
+        };
+        let hip = turn(false);
+        let aimed = turn(true);
+        assert!(hip > 0.01, "twenty counts should turn the view: {hip} rad");
+        assert!(
+            (aimed - hip * AIM_SENSITIVITY).abs() < 1e-4,
+            "aiming turned {aimed} rad where half of {hip} was wanted"
+        );
     }
 
     /// One sixtieth of a second is the rate the tuning numbers were chosen at,

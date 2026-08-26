@@ -735,9 +735,22 @@ fn update_fps(
     let entities = diagnostics
         .get(&EntityCountDiagnosticsPlugin::ENTITY_COUNT)
         .and_then(|count| count.value());
+    // The worst of the last 120 frames -- two seconds of them at sixty, half a
+    // second at two hundred and forty. A stutter is by definition not in the
+    // smoothed number: it is one frame in a hundred costing ten times the rest,
+    // which an average buries and this reports. Read it while doing the thing
+    // that hitches and it says how big the hitch was and, by how long it takes
+    // to clear, roughly when.
+    let worst = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .map(|frame_time| frame_time.values().fold(0.0_f64, |most, ms| most.max(*ms)))
+        .filter(|worst| *worst > 0.0);
     **readout = match (fps, frame_time) {
         (Some(fps), Some(frame_time)) => {
             let mut line = format!("{fps:.0} fps · {frame_time:.1} ms");
+            if let Some(worst) = worst {
+                line.push_str(&format!(" · worst {worst:.1} ms"));
+            }
             if let Some(entities) = entities {
                 line.push_str(&format!(
                     " · {} enemies ({} sprite / {} skinned{}) · {entities:.0} entities",
