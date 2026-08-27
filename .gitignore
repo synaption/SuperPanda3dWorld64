@@ -13,6 +13,11 @@
 /assets/**/*.tmp
 /assets/**/*.bak
 
+# What tools/build_assets.py last built, and out of what. Machine-local by
+# definition -- a clone that has never built an asset is supposed to arrive
+# without one and rebuild everything the first time.
+/.build_assets.json
+
 # Rust / Cargo. The crate lives at the repository root, so this is the game's
 # own build tree. Cargo.lock IS tracked -- this is a binary, not a library, and
 # a reproducible build is worth more here than floating dependency versions.

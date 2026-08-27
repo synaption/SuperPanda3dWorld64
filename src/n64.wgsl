@@ -15,6 +15,15 @@
 // breaks along the edges of the model's own facets instead of flowing smoothly
 // over them.
 //
+// `N64_PER_PIXEL_LIGHT` is the other half of the display option that lets you
+// see that for yourself. With it set, the same key, ambient and direction are
+// resolved per fragment instead: the normal crosses to the fragment stage and
+// the cosine is taken there, so the facets round off and the model is shaded
+// the way a machine with a per-pixel pipeline would have shaded it. It is one
+// shader with two pipelines rather than one pipeline with a branch -- what
+// crosses the stage boundary differs, so the console's path pays nothing for
+// the option existing. `n64.rs` decides which, per material.
+//
 // The vertex stage is Bevy's own `mesh.wgsl` with the lighting folded in, so
 // skinning is done the same way the standard material does it -- every actor in
 // this game is a skinned mesh and the castle is the only thing that is not.
@@ -67,14 +76,32 @@ struct N64Material {
 // What the vertex stage hands the fragment stage.
 //
 // Deliberately not `forward_io::VertexOutput`: that one carries a world normal
-// across for the fragment stage to light with, and here the lighting is already
-// done. The world position is still carried because the fog needs the distance
-// from the camera.
+// across for the fragment stage to light with, and in the vertex-lit pipeline
+// the lighting is already done. The world position is still carried because the
+// fog needs the distance from the camera.
+//
+// The per-pixel pipeline is the case that does need the normal, and it is the
+// only one that carries it -- an interpolator the console's path would spend on
+// a value it never reads.
 struct N64VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) world_position: vec4<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
+#ifdef N64_PER_PIXEL_LIGHT
+    @location(3) world_normal: vec3<f32>,
+#endif
+}
+
+// `ambient + key * cos`, the one lighting equation this game has, wherever it
+// is being evaluated. `normal` is expected normalised; a surface that takes no
+// light keeps its own colour and never reaches here.
+fn n64_shade(normal: vec3<f32>) -> vec3<f32> {
+    // Unclamped on purpose: the RSP's combiner saturated the same way, and
+    // letting the term pass 1.0 is what puts a highlight on a surface facing
+    // the light.
+    let lambert = max(dot(normal, material.to_light.xyz), 0.0);
+    return material.ambient.rgb + material.light.rgb * lambert;
 }
 
 @vertex
@@ -113,34 +140,59 @@ fn vertex(vertex: Vertex) -> N64VertexOutput {
     tint = tint * vertex.color;
 #endif
 
-    // One diffuse light and one ambient, summed at the vertex. Unclamped on
-    // purpose: the RSP's combiner saturated the same way, and letting the term
-    // pass 1.0 is what puts a highlight on a surface facing the light.
-    var shade = vec3<f32>(1.0, 1.0, 1.0);
+    // The normal, in world space, however this mesh is posed. Wanted by both
+    // pipelines: one lights with it here and the other sends it across.
 #ifdef VERTEX_NORMALS
-    if material.light.a > 0.0 {
 #ifdef SKINNED
-        let world_normal = skinning::skin_normals(world_from_local, vertex.normal);
+    let world_normal = skinning::skin_normals(world_from_local, vertex.normal);
 #else
-        let world_normal = mesh_functions::mesh_normal_local_to_world(
-            vertex.normal,
-            vertex.instance_index,
-        );
+    let world_normal = mesh_functions::mesh_normal_local_to_world(
+        vertex.normal,
+        vertex.instance_index,
+    );
 #endif
-        let lambert = max(dot(normalize(world_normal), material.to_light.xyz), 0.0);
-        shade = material.ambient.rgb + material.light.rgb * lambert;
-    }
+#else
+    // A mesh with no normals cannot be lit by either pipeline. Zero rather
+    // than a made-up direction, because zero is what the fragment stage tests
+    // for -- see the length check down there.
+    let world_normal = vec3<f32>(0.0, 0.0, 0.0);
 #endif
 
+#ifdef N64_PER_PIXEL_LIGHT
+    // Nothing is resolved here: the colour handed across is the surface's own,
+    // and the light is taken against the interpolated normal per fragment.
+    out.world_normal = world_normal;
+    out.color = tint;
+#else
+    // One diffuse light and one ambient, summed at the vertex, and the last
+    // this pipeline thinks about lighting.
+    var shade = vec3<f32>(1.0, 1.0, 1.0);
+    if material.light.a > 0.0 && dot(world_normal, world_normal) > 0.0 {
+        shade = n64_shade(normalize(world_normal));
+    }
     out.color = vec4<f32>(tint.rgb * shade, tint.a);
+#endif
     return out;
 }
 
 @fragment
 fn fragment(in: N64VertexOutput) -> @location(0) vec4<f32> {
+    var tint = in.color;
+
+#ifdef N64_PER_PIXEL_LIGHT
+    // Gouraud interpolation carried a *colour* across; this carries the normal
+    // and lights here, so the shading follows the interpolated surface instead
+    // of the triangle's three corners. The length test is the mesh-has-no-
+    // normals case: interpolating zeroes gives a zero vector, and normalizing
+    // one of those is a NaN across the whole triangle.
+    if material.light.a > 0.0 && dot(in.world_normal, in.world_normal) > 0.0 {
+        tint = vec4<f32>(tint.rgb * n64_shade(normalize(in.world_normal)), tint.a);
+    }
+#endif
+
     // The interpolated vertex colour modulated by the texture: the combiner
     // step, and the last thing the console did before the blender.
-    var color = in.color * textureSample(base_color_texture, base_color_sampler, in.uv);
+    var color = tint * textureSample(base_color_texture, base_color_sampler, in.uv);
 
     if material.alpha_cutoff > 0.0 && color.a < material.alpha_cutoff {
         discard;

@@ -193,6 +193,37 @@ Two things about that table are worth knowing, because both used to be traps:
   taken from up there rather than pictures of its own flanks. Each kind's bake
   is about a minute.
 
+### It only builds what changed
+
+A stage is a list of *units* — one actor, one weapon, one impostor sheet — and
+a unit that nothing has changed under is skipped. `build_assets.py` records the
+SHA-256 of every file each unit read and every file it wrote in
+`.build_assets.json` at the repository root (machine-local, and gitignored),
+and runs a unit again when any of them differs, is missing, or was never
+recorded. A full build from cold is about two and a half minutes here; one with
+nothing to do is a fifth of a second.
+
+Content rather than timestamps, which is what makes the chain work. The Blender
+exports are reproducible, so re-exporting an unedited actor writes the same
+bytes back — and an impostor sheet is stamped against the actor **.glb** it was
+baked from, so editing a `.blend` in a way that does not change the export costs
+one export and no bake at all. Editing one that does re-exports the actor and
+then re-bakes that actor's sheet and no other, because the units run in order
+and the sheet's stamp is taken after the export it depends on has landed.
+
+An impostor unit is also stamped against the sources that decide how a sheet is
+drawn — `main::drawing` and what it runs, listed as `RENDER_SOURCES` in the
+script — since the baker runs the game's own draw chain and a change there is a
+change to what comes out of the camera. That list is a judgment call rather than
+"the whole binary", which would rebake every sheet after an edit to the player's
+jump. If a rendering change ever does slip past it:
+
+```bash
+python3 tools/build_assets.py --force          # build it all regardless
+```
+
+and then add whatever was missing to `RENDER_SOURCES`.
+
 ### How big an actor is
 
 In the .blend, and nowhere else. The game measures an actor's collision radius,

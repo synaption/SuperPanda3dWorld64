@@ -4,6 +4,7 @@
     python3 tools/build_assets.py
     python3 tools/build_assets.py --blender /path/to/blender
     python3 tools/build_assets.py --only actors --only impostors
+    python3 tools/build_assets.py --force
 
 One entry point, because the pipeline's failure mode is a step that gets
 skipped rather than a step that goes wrong. The impostor sheets are the reason
@@ -33,21 +34,58 @@ sources for reference rather than exported.
 
 Every runtime asset here also has a committed Blender source. Run
 `python3 tools/build_blender_sources.py --check` to audit that invariant.
+
+# What actually runs
+
+A stage is a list of *units* -- one actor, one weapon, one impostor sheet --
+and a unit is skipped when nothing it is built from has changed since the last
+time it was built. Each one records the SHA-256 of every file it read and every
+file it wrote into `.build_assets.json` at the repository root, and runs again
+when any of those differs, is missing, or was never recorded at all.
+
+Content and not timestamps, which is what makes the chain work: the Blender
+exports are reproducible, so re-exporting an unedited actor writes the same
+bytes back and the impostor sheet baked from it correctly stays skipped.
+Touching a .blend is therefore free, and editing one costs only what actually
+depends on it.
+
+`--force` runs everything anyway. Reach for it if you suspect the stamps are
+lying -- and if they were, that is a bug in the input list here rather than
+something to work around twice.
+
+The full pipeline is dominated by the impostor bake: on this machine it is
+about 2m45s of a 3m40s run, and everything else together is under forty
+seconds. So the thing worth getting right is not rebaking sheets whose
+actor did not move, which is why an impostor unit lists both the actor's .glb
+and the sources that decide how it is drawn.
 """
 
 import argparse
+from dataclasses import dataclass
+import hashlib
+import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from typing import Callable
 
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools"
+SRC = ROOT / "src"
 ACTOR_DIR = ROOT / "assets" / "actors"
 WEAPON_DIR = ROOT / "assets" / "hero"
+IMPOSTOR_DIR = ROOT / "assets" / "impostors"
+
+# Where the stamps live. At the root rather than under `assets/`, because it is
+# not an asset: it says nothing about the game and everything about this
+# machine's last run, and a clone that has never built anything is supposed to
+# arrive without one.
+STAMPS = ROOT / ".build_assets.json"
 
 # Levels with a furniture file. The planet has none yet: its ground is
 # generated rather than authored, and where its gravity points is still
@@ -76,6 +114,27 @@ SKELETON_ROOTS = {
     "ant": "Armature",
     "slime": "Slime_Rig",
 }
+
+# What a sheet is a picture of, beyond the actor itself: the chain that draws
+# it. `main::drawing` is run by the baker verbatim -- that is the whole point of
+# it being a named chain -- so a change to any of these is a change to what
+# comes out of the camera, and the sheet has to be baked again even though no
+# .blend was touched.
+#
+# A judgment call, and deliberately a short list rather than "the binary":
+# stamping the executable would rebake every sheet after an edit to the player's
+# jump. If a rendering change ever does slip past this list, `--force` is the
+# answer and the list is what to fix.
+RENDER_SOURCES = (
+    SRC / "impostor" / "bake.rs",   # the baker itself
+    SRC / "impostor.rs",            # the sheet's material and its sidecar
+    SRC / "billboard.rs",           # the first third of `main::drawing`
+    SRC / "n64.rs",                 # the last third, and the lighting
+    SRC / "n64.wgsl",               # what that material compiles to
+    SRC / "enemy.rs",               # which clip is baked, and from which model
+    SRC / "main.rs",                # `drawing` itself
+    SRC / "console.rs",             # `GameTuning`, which the draw chain reads
+)
 
 STAGES = ("mario", "hero", "weapons", "castle", "levels", "planet",
           "actors", "impostors")
@@ -119,6 +178,32 @@ def staged(staging, source, name):
     return copy
 
 
+# ---------------------------------------------------------------------------
+# The units
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Unit:
+    """One thing that gets built, and everything that decides whether it has to.
+
+    `inputs` and `outputs` are both stamped, and for different reasons. Inputs
+    catch the ordinary case -- a .blend was edited, so rebuild. Outputs catch
+    the rest: an asset deleted, reverted by git, or written over by hand is one
+    this script would otherwise cheerfully report as up to date.
+    """
+
+    name: str
+    build: Callable
+    inputs: tuple = ()
+    outputs: tuple = ()
+    # Anything that changes the output without being a file: the list a loop
+    # runs over, the flags a tool is given.
+    config: str = ""
+    # Whether Blender's version is part of what this unit is built from. Two
+    # Blenders do not write the same .glb, and the stamp has to know it.
+    blender: bool = False
+
+
 def build_mario(staging, blender):
     """Mario takes the same armature-wrapper normalisation as the actors."""
     raw = staging / "mario-raw.glb"
@@ -129,7 +214,23 @@ def build_mario(staging, blender):
     adopt(raw, out, sidecar)
     os.replace(out, ROOT / "assets/mario/mario.glb")
     os.replace(sidecar, ROOT / "assets/mario/mario_clips.json")
-    return ["assets/mario/mario.glb"]
+
+
+def plan_mario():
+    return [Unit(
+        name="mario",
+        build=build_mario,
+        # The sidecar is an input as well as a thing this rewrites: `adopt`
+        # resyncs the frame counts in the copy it is handed and keeps
+        # everything else, so a hand-edited `start_frame` is an edit that has
+        # to be picked up.
+        inputs=(ROOT / "assets/mario/mario.blend",
+                ROOT / "assets/mario/mario_clips.json",
+                TOOLS / "blend_to_glb.py",
+                TOOLS / "adopt_blender_export.py"),
+        outputs=(ROOT / "assets/mario/mario.glb",),
+        blender=True,
+    )]
 
 
 def build_hero(staging, blender):
@@ -144,10 +245,29 @@ def build_hero(staging, blender):
     run(command)
     os.replace(out, ROOT / "assets/hero/hero.glb")
     os.replace(sidecar, ROOT / "assets/hero/hero_clips.json")
-    return ["assets/hero/hero.glb"]
 
 
-def build_weapons(staging, blender):
+def plan_hero():
+    return [Unit(
+        name="hero",
+        build=build_hero,
+        # Four tools rather than one: build_hero.py is a driver, and the export,
+        # the adoption, the aim rig and the root-motion lock each live in their
+        # own file. See that script's docstring for what each does.
+        inputs=(ROOT / "assets/hero/TheHero.blend",
+                ROOT / "assets/hero/hero_clips.json",
+                TOOLS / "build_hero.py",
+                TOOLS / "export_hero_gltf.py",
+                TOOLS / "adopt_blender_export.py",
+                TOOLS / "aim_rig.py",
+                TOOLS / "lock_root_motion.py",
+                TOOLS / "blend_to_glb.py"),
+        outputs=(ROOT / "assets/hero/hero.glb",),
+        blender=True,
+    )]
+
+
+def plan_weapons():
     """The Hero's weapons: a plain mesh export each, straight to the runtime file.
 
     No adoption pass and no sidecar. A weapon has no skeleton to normalise and
@@ -156,17 +276,22 @@ def build_weapons(staging, blender):
     barrel, `GRIP` where the hand takes hold -- survive the export as ordinary
     childless nodes, which is how the runtime finds them.
     """
-    built = []
+    units = []
     for weapon in WEAPONS:
         blend = WEAPON_DIR / f"{weapon}.blend"
-        if not blend.is_file():
-            raise SystemExit(f"missing Blender source: {blend}")
-        raw = staging / f"{weapon}.glb"
-        blend_to_glb(blend, raw, blender)
         runtime = WEAPON_DIR / f"{weapon}.glb"
-        os.replace(raw, runtime)
-        built.append(str(runtime.relative_to(ROOT)))
-    return built
+
+        def build(staging, blender, blend=blend, runtime=runtime, weapon=weapon):
+            if not blend.is_file():
+                raise SystemExit(f"missing Blender source: {blend}")
+            raw = staging / f"{weapon}.glb"
+            blend_to_glb(blend, raw, blender)
+            os.replace(raw, runtime)
+
+        units.append(Unit(name=f"weapons:{weapon}", build=build,
+                          inputs=(blend, TOOLS / "blend_to_glb.py"),
+                          outputs=(runtime,), blender=True))
+    return units
 
 
 def build_castle(_staging, _blender):
@@ -188,11 +313,32 @@ def build_castle(_staging, _blender):
     looking at and editing by hand; it is not a source this can build from.
     """
     run([sys.executable, TOOLS / "convert_level.py"])
-    return ["assets/bevy/castle.glb", "assets/bevy/castle.bin",
-            "assets/bevy/water.png"]
 
 
-def build_levels(_staging, blender):
+def plan_castle():
+    grounds = ROOT / "assets" / "castle_grounds"
+    return [Unit(
+        name="castle",
+        build=build_castle,
+        # The water texture is the one input that lives in `reference/`, which
+        # is not in the repository. Stamped all the same: absent is a state
+        # like any other here, and a run made with the pack present is not the
+        # same run as one made without it.
+        inputs=(grounds / "mesh.npz",
+                grounds / "collision.npz",
+                grounds / "collision_objects.json",
+                grounds / "mesh_materials.json",
+                ROOT / "reference/RENDER96-HD-TEXTURE-PACK/gfx/textures/"
+                       "segment2/segment2.11C58.rgba16.png",
+                TOOLS / "convert_level.py",
+                TOOLS / "glb.py"),
+        outputs=(ROOT / "assets/bevy/castle.glb",
+                 ROOT / "assets/bevy/castle.bin",
+                 ROOT / "assets/bevy/water.png"),
+    )]
+
+
+def plan_levels():
     """A level's furniture: where everything in it is, as placed in Blender.
 
     The stage the `castle` one above could not be. That stage's problem is the
@@ -206,15 +352,25 @@ def build_levels(_staging, blender):
     point and which way gravity points were all literals in the Rust until
     this existed.
     """
-    built = []
+    units = []
     for level in LEVELS:
-        command = [sys.executable, TOOLS / "export_level_furniture.py", level]
-        if blender:
-            command.extend(["--blender", blender])
-        run(command)
-        built.extend([f"assets/bevy/{level}_furniture.json",
-                      f"assets/bevy/{level}_furniture.glb"])
-    return built
+        def build(_staging, blender, level=level):
+            command = [sys.executable, TOOLS / "export_level_furniture.py", level]
+            if blender:
+                command.extend(["--blender", blender])
+            run(command)
+
+        # The .blend links the level mesh and the actors in as a backdrop, and
+        # exports none of them: what comes out is the empties and the
+        # waterfall, so the libraries are not inputs to stamp.
+        units.append(Unit(
+            name=f"levels:{level}", build=build,
+            inputs=(ROOT / f"assets/levels/{level}.blend",
+                    TOOLS / "export_level_furniture.py"),
+            outputs=(ROOT / f"assets/bevy/{level}_furniture.json",
+                     ROOT / f"assets/bevy/{level}_furniture.glb"),
+            blender=True))
+    return units
 
 
 def build_planet(_staging, _blender):
@@ -242,63 +398,216 @@ def build_planet(_staging, _blender):
         raise SystemExit(
             f"missing generated planet: {source}\n"
             "run planetgen's build and export first; see its readme")
-    target = ROOT / "assets/bevy/planet.glb"
-    shutil.copy2(source, target)
-    return [str(target.relative_to(ROOT))]
+    shutil.copy2(source, ROOT / "assets/bevy/planet.glb")
 
 
-def build_actors(staging, blender):
-    built = []
+def plan_planet():
+    return [Unit(
+        name="planet",
+        build=build_planet,
+        inputs=(ROOT / "experimental/planet_gen/out/planet.glb",),
+        outputs=(ROOT / "assets/bevy/planet.glb",),
+    )]
+
+
+def plan_actors():
+    units = []
     for actor, sidecar_name in ACTORS.items():
         blend = ACTOR_DIR / f"{actor}.blend"
-        if not blend.is_file():
-            raise SystemExit(f"missing Blender source: {blend}")
-
-        raw = staging / f"{actor}-raw.glb"
-        blend_to_glb(blend, raw, blender)
-
         runtime = ACTOR_DIR / f"{actor}.glb"
-        if sidecar_name:
-            sidecar = staged(staging, ACTOR_DIR / sidecar_name, sidecar_name)
-            out = staging / f"{actor}.glb"
-            adopt(raw, out, sidecar, SKELETON_ROOTS.get(actor))
-            os.replace(out, runtime)
-            os.replace(sidecar, ACTOR_DIR / sidecar_name)
-        else:
-            os.replace(raw, runtime)
-        built.append(str(runtime.relative_to(ROOT)))
-    return built
+        sidecar = ACTOR_DIR / sidecar_name if sidecar_name else None
+
+        def build(staging, blender, actor=actor, blend=blend, runtime=runtime,
+                  sidecar_name=sidecar_name):
+            if not blend.is_file():
+                raise SystemExit(f"missing Blender source: {blend}")
+            raw = staging / f"{actor}-raw.glb"
+            blend_to_glb(blend, raw, blender)
+            if sidecar_name:
+                copy = staged(staging, ACTOR_DIR / sidecar_name, sidecar_name)
+                out = staging / f"{actor}.glb"
+                adopt(raw, out, copy, SKELETON_ROOTS.get(actor))
+                os.replace(out, runtime)
+                os.replace(copy, ACTOR_DIR / sidecar_name)
+            else:
+                os.replace(raw, runtime)
+
+        inputs = [blend, TOOLS / "blend_to_glb.py"]
+        if sidecar:
+            inputs.extend([sidecar, TOOLS / "adopt_blender_export.py"])
+        units.append(Unit(
+            name=f"actors:{actor}", build=build,
+            inputs=tuple(inputs), outputs=(runtime,),
+            # The skeleton root is a flag handed to the adoption pass, so it
+            # belongs to what this was built from as much as the .blend does.
+            config=repr(SKELETON_ROOTS.get(actor)),
+            blender=True))
+    return units
 
 
-def bake_impostors(_staging, _blender):
+def sheet_kinds():
+    """The actors with an impostor sheet, read out of `enemy::KINDS`.
+
+    Read rather than listed, and the difference matters. `bake-impostors` with
+    no arguments does every kind that has a sheet, which is what kept that list
+    in `enemy::Kind` where it belongs; baking them one at a time so that an
+    unchanged one can be skipped means knowing the list here, and a copy of it
+    in this file is a copy that rots -- a new enemy would silently never get a
+    sheet, which is the exact failure this whole script exists to prevent.
+
+    So it is parsed from the Rust. If the parse ever comes back empty -- the
+    declaration reformatted, moved, renamed -- the caller bakes the whole lot in
+    one go, which is slower and always right.
+    """
+    try:
+        source = (SRC / "enemy.rs").read_text()
+    except OSError:
+        return []
+    match = re.search(r"pub const KINDS:\s*\[Kind;\s*\d+\]\s*=\s*\[([^\]]*)\]",
+                      source)
+    if not match:
+        return []
+    return [name.lower() for name in re.findall(r"Kind::(\w+)", match.group(1))]
+
+
+def bake(kinds):
     """Re-render the far crowd's sprite atlases from the actors just built.
-
-    Named no kinds, the baker does every enemy that has a sheet, which keeps
-    the list of them in `enemy::Kind` where it belongs rather than copied here
-    where it would rot.
 
     Expect the PNGs to come back very slightly different every time even when
     nothing changed -- a few dozen pixels of a four-million-pixel sheet, none
     of them off by more than a step or two. It is a GPU render, not a
     calculation, so it is not bit-reproducible the way the exports above are.
+    That is exactly why the stamp is taken over what a sheet was baked *from*
+    and not over the sheet: comparing the sheets themselves would rebake all of
+    them, for ever, on the strength of that handful of pixels.
     """
-    run(["cargo", "run", "--release", "--", "bake-impostors"])
-    return sorted(
-        str(path.relative_to(ROOT))
-        for path in (ROOT / "assets" / "impostors").glob("*.png")
-    )
+    run(["cargo", "run", "--release", "--", "bake-impostors", *kinds])
 
 
-BUILDERS = {
-    "mario": build_mario,
-    "hero": build_hero,
-    "weapons": build_weapons,
-    "castle": build_castle,
-    "levels": build_levels,
-    "planet": build_planet,
-    "actors": build_actors,
-    "impostors": bake_impostors,
+def plan_impostors():
+    kinds = sheet_kinds()
+    if not kinds:
+        # The list could not be read, so fall back to what this always did:
+        # every sheet, every time, named by nobody.
+        return [Unit(name="impostors",
+                     build=lambda _staging, _blender: bake([]),
+                     inputs=tuple(ACTOR_DIR.glob("*.glb")) + RENDER_SOURCES,
+                     outputs=tuple(sorted(IMPOSTOR_DIR.glob("*.png"))))]
+    units = []
+    for kind in kinds:
+        # `Kind::model` and `impostor::stem` agree that both are the kind's own
+        # name in lower case, which is what makes one string enough here.
+        units.append(Unit(
+            name=f"impostors:{kind}",
+            build=lambda _staging, _blender, kind=kind: bake([kind]),
+            inputs=(ACTOR_DIR / f"{kind}.glb",) + RENDER_SOURCES,
+            outputs=(IMPOSTOR_DIR / f"{kind}.png",
+                     IMPOSTOR_DIR / f"{kind}.json")))
+    return units
+
+
+PLANS = {
+    "mario": plan_mario,
+    "hero": plan_hero,
+    "weapons": plan_weapons,
+    "castle": plan_castle,
+    "levels": plan_levels,
+    "planet": plan_planet,
+    "actors": plan_actors,
+    "impostors": plan_impostors,
 }
+
+
+# ---------------------------------------------------------------------------
+# Stamps
+# ---------------------------------------------------------------------------
+
+def digest(path):
+    """A file's SHA-256, or None where there is no such file.
+
+    Missing is a value rather than an error: `reference/` is not in the
+    repository, so the castle's water texture is legitimately absent on most
+    machines -- and a build made without it is still not the same build as one
+    made with it.
+    """
+    sha = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                sha.update(block)
+    except OSError:
+        return None
+    return sha.hexdigest()
+
+
+def fingerprint(unit, blender_version):
+    def digests(paths):
+        return {str(Path(path).relative_to(ROOT)): digest(path) for path in paths}
+
+    return {
+        "config": unit.config,
+        "blender": blender_version if unit.blender else "",
+        "inputs": digests(unit.inputs),
+        "outputs": digests(unit.outputs),
+    }
+
+
+def why(unit, recorded, current):
+    """Why this unit has to be built, in a few words, or None if it does not."""
+    if recorded is None:
+        return "never built"
+    if recorded.get("config") != current["config"]:
+        return "built differently now"
+    if recorded.get("blender") != current["blender"]:
+        return f"Blender {recorded.get('blender') or '?'} -> {current['blender']}"
+    for role in ("inputs", "outputs"):
+        was, now = recorded.get(role) or {}, current[role]
+        if was.keys() != now.keys():
+            return f"its {role} are not the ones it was built from"
+        for path, stamp in was.items():
+            if now[path] == stamp:
+                continue
+            if now[path] is None:
+                return f"{path} is gone"
+            if stamp is None:
+                return f"{path} is here now"
+            return f"{path} changed"
+    return None
+
+
+def read_stamps():
+    try:
+        stamps = json.loads(STAMPS.read_text())
+    except (OSError, ValueError):
+        return {}
+    # A stamp file from a version that recorded something else means nothing
+    # here, and guessing at it is how a build gets wrongly skipped.
+    if stamps.get("version") != 1:
+        return {}
+    return stamps.get("units") or {}
+
+
+def write_stamps(units):
+    STAMPS.write_text(json.dumps({"version": 1, "units": units},
+                                 indent=1, sort_keys=True) + "\n")
+
+
+def blender_version(explicit):
+    """What `resolve_blender` would pick, as a string for the stamps.
+
+    Asked once and only when something actually needs Blender, and it costs a
+    `--version` apiece -- under a tenth of a second. Never fatal: a machine
+    with no Blender still has stages that do not want one, and the failure
+    belongs to the unit that tries to use it rather than to this.
+    """
+    sys.path.insert(0, str(TOOLS))
+    try:
+        from blend_to_glb import resolve_blender
+        path, version = resolve_blender(explicit)
+    except (ImportError, SystemExit):
+        return "unknown"
+    return "%s %s" % (os.path.basename(path),
+                      ".".join(map(str, version or ["?"])))
 
 
 def main(argv=None):
@@ -309,20 +618,47 @@ def main(argv=None):
     parser.add_argument("--only", action="append", choices=STAGES, metavar="STAGE",
                         help=f"run just this stage ({', '.join(STAGES)}); "
                              "repeatable, and order is fixed regardless")
+    parser.add_argument("--force", action="store_true",
+                        help="build every wanted unit, stamps or no stamps")
     args = parser.parse_args(argv)
 
     # Fixed order rather than the order they were asked for: `impostors` bakes
     # the actor GLBs, so running it first would bake the previous ones.
     wanted = [stage for stage in STAGES if not args.only or stage in args.only]
+    units = [unit for stage in wanted for unit in PLANS[stage]()]
 
-    built = []
+    # `kept` is every stamp there is, including the units this run was not
+    # asked for: `--only actors` must not throw away what it knows about the
+    # rest. `--force` only stops them being *read*, never overwritten.
+    kept = read_stamps()
+    version = (blender_version(args.blender)
+               if any(unit.blender for unit in units) else "")
+
+    built, skipped = [], []
     with tempfile.TemporaryDirectory(prefix="mario-assets-") as temp:
         staging = Path(temp)
-        for stage in wanted:
-            print(f"\n=== {stage} ===", flush=True)
-            built.extend(BUILDERS[stage](staging, args.blender))
+        for unit in units:
+            recorded = None if args.force else kept.get(unit.name)
+            reason = "asked for" if args.force else why(unit, recorded,
+                                                       fingerprint(unit, version))
+            if reason is None:
+                skipped.append(unit.name)
+                continue
+            print(f"\n=== {unit.name} === ({reason})", flush=True)
+            unit.build(staging, args.blender)
+            # Stamped from what is on disk *after* the build, not before: the
+            # clip sidecars are inputs this rewrites in place, and the sheets
+            # are outputs no two bakes agree on to the byte.
+            kept[unit.name] = fingerprint(unit, version)
+            # Written as each unit lands, so an interrupted run keeps the work
+            # it finished. Half a pipeline is a normal thing to come back to.
+            write_stamps(kept)
+            built.extend(str(Path(path).relative_to(ROOT))
+                         for path in unit.outputs)
 
-    print("\nbuilt:")
+    if skipped:
+        print(f"\nunchanged, skipped: {', '.join(skipped)}")
+    print("\nbuilt:" if built else "\nbuilt nothing; everything was up to date")
     for path in built:
         print(f"  {path}")
     return 0

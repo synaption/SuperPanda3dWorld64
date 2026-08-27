@@ -44,7 +44,7 @@ pub mod bake;
 
 use crate::{
     enemy::{Enemy, Kind, Quirk},
-    n64::{N64Material, N64Uniform},
+    n64::{N64Material, N64Uniform, Shading},
 };
 use bevy::{
     asset::RenderAssetUsages,
@@ -65,6 +65,14 @@ const SHEETS: &str = "impostors";
 /// other and drawn back to front, which is a sort of the whole crowd every
 /// frame and a guarantee that none of them batch. Masked quads are opaque
 /// geometry, drawn in any order, with the depth buffer settling overlaps.
+///
+/// A see-through kind gives up the second half of that and keeps the first. Its
+/// field is still the one mesh and the one draw -- nothing is sorted, because
+/// there is nothing to sort a single object against itself -- so what it loses
+/// is the depth buffer settling one of its sprites against another, which falls
+/// back to the order the quads were gathered in. Two of the same creature in
+/// the same colours overlapping in the wrong order is a difference you cannot
+/// see; it is worth saying that it is there.
 const ALPHA_CUTOFF: f32 = 0.5;
 
 /// What the baker wrote beside an atlas: how to read it.
@@ -452,18 +460,44 @@ pub fn prepare(
                 settings.sampler = ImageSampler::nearest();
             })
             .load(format!("{SHEETS}/{}.png", stem(kind)));
+        // How solid this kind is drawn, which for the slime is not solid at
+        // all. The same number [`crate::n64::soften`] writes onto the near
+        // model, so nothing changes opacity as it crosses the swap distance.
+        //
+        // A tint here rather than a see-through body baked into the sheet, and
+        // the sheet is the reason: everything about it -- the nearest sampler,
+        // the cutoff, `the_baked_sheets_are_cutouts_rather_than_soft_edged` --
+        // rests on its alpha being nothing or everything, and a baked-in fade
+        // fills it with middling alpha that the cutoff rounds back to solid and
+        // the sampler stipples at every edge. Baked flat and tinted at draw is
+        // the same picture with none of that.
+        let opacity = kind.opacity();
         let material = materials.add(N64Material {
             // Unlit: the sheet was baked with the world's own lighting already
             // resolved into it, exactly as the castle's vertex colours are.
             // Lighting it a second time would darken every distant enemy.
-            uniform: N64Uniform::unlit(ALPHA_CUTOFF),
+            //
+            // The cutoff is kept even where the sprite is blended, which is not
+            // the contradiction it reads as: it is what throws away the clear
+            // margin round the picture rather than blending it, so the
+            // silhouette stays as hard as the bake made it. What survives is
+            // the body, at `opacity` -- well clear of `ALPHA_CUTOFF`.
+            uniform: N64Uniform::unlit(ALPHA_CUTOFF).faded(opacity),
             base_color_texture: Some(atlas),
-            alpha_mode: AlphaMode::Mask(ALPHA_CUTOFF),
+            alpha_mode: match opacity < 1.0 {
+                true => AlphaMode::Blend,
+                false => AlphaMode::Mask(ALPHA_CUTOFF),
+            },
             // A quad turned to face the camera is always seen from its front,
             // so there is no back to draw -- but the crawlers hang off walls and
             // ceilings, and one of those seen from underneath is the case that
             // would otherwise vanish.
             double_sided: true,
+            // Never read: an unlit surface is drawn by the same pipeline
+            // whichever way the player has the lighting set, which is what
+            // `N64MaterialKey` pins. The sheets keep the console's answer so
+            // the field says what it means rather than nothing.
+            shading: Shading::Vertex,
         });
         let mesh = meshes.add(empty_field());
         let sheet = Sheet {
@@ -795,12 +829,10 @@ pub fn draw(
         let Some((_, members)) = buffers.iter_mut().find(|(kind, _)| *kind == enemy.kind) else {
             continue;
         };
-        if tuning.shadows >= 0.5 {
-            shadows.push((
-                transform.translation,
-                enemy.kind.shadow_radius(),
-                enemy.kind.body().1,
-            ));
+        // Skipped entirely for a kind that has no disc near to, so the far
+        // crowd does not grow one at the swap distance.
+        if let Some(radius) = enemy.kind.shadow_radius().filter(|_| tuning.shadows >= 0.5) {
+            shadows.push((transform.translation, radius, enemy.kind.body().1));
         }
         members.push(Member {
             at: transform.translation,
@@ -1495,6 +1527,28 @@ pub(crate) mod tests {
                 "{kind:?}'s fullest cell reaches only {:.0}% of the cell, so the \
                  sheet was sized against something other than the actor in it",
                 biggest * 100.0
+            );
+        }
+    }
+
+    /// A see-through kind has to stay above the cutoff, or the discard takes
+    /// the entire far crowd with it.
+    ///
+    /// The two are wired together and it is not obvious from either end: the
+    /// tint multiplies the sheet, so a kind drawn at an opacity below
+    /// [`ALPHA_CUTOFF`] has every one of its texels fall under the discard and
+    /// is drawn as nothing at all. Nothing about that failure says what caused
+    /// it -- the crowd is simply not there, exactly as it is when a sheet is
+    /// missing -- so it is worth catching where the number is set rather than
+    /// in a bug report about an empty castle.
+    #[test]
+    fn a_see_through_kind_is_still_solid_enough_to_survive_the_cutoff() {
+        for kind in [Kind::Slime, Kind::Ant] {
+            assert!(
+                kind.opacity() > ALPHA_CUTOFF,
+                "{kind:?} is drawn at {:.2}, under the {ALPHA_CUTOFF} cutoff, so \
+                 every sprite of it is discarded and the far crowd is empty",
+                kind.opacity()
             );
         }
     }

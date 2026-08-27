@@ -167,6 +167,21 @@ const ELEVATIONS: [f32; 2] = [15.0, 55.0];
 const SURVEY_MARGIN: f32 = 3.6;
 const FINAL_MARGIN: f32 = 1.06;
 
+/// How much room a *seeded* survey leaves round the size the last bake fitted.
+///
+/// [`SURVEY_MARGIN`] is only the cold-start number now: where a sheet already
+/// exists, its sidecar records the extent the previous bake fitted onto this
+/// actor and the height it aimed at, and the survey starts from those instead.
+/// Forty per cent of slack in every direction is far more than an edit to a
+/// model moves it, and an edit that does move it further is not a failure --
+/// the widening below still catches it, exactly as it does from a cold start.
+///
+/// The ant is why this exists. It fits in six units, `SURVEY_MARGIN` is 3.6,
+/// so every single bake of it surveyed, found the actor filling the camera,
+/// threw the whole pass away and surveyed again from 7.2 -- a wasted third of
+/// the bake, paid every time, for a number the sheet beside it already knew.
+const SURVEY_SEED: f32 = 1.4;
+
 /// How many times the survey may double its camera before giving up.
 ///
 /// Bounded because the alternative to a wrong sheet is a bake that never
@@ -327,6 +342,14 @@ fn setup(
         // `billboard::two_sided` never makes the quads double-sided, and a
         // billboard seen from its back face is culled away entirely.
         crate::billboard::BillboardActor,
+        // Deliberately *not* `n64::Translucent`, which the game does spawn
+        // these with. A sheet is drawn with `AlphaMode::Mask`, and the whole
+        // arrangement rests on its alpha being nothing or everything: baking a
+        // see-through body would fill the sheet with middling alpha, which the
+        // cutoff rounds back to solid and the nearest sampler stipples at every
+        // edge -- `the_baked_sheets_are_cutouts_rather_than_soft_edged` fails on exactly that. So the
+        // far crowd is opaque, and pays for it at a range where an actor is a
+        // few pixels tall.
         crate::WorldAssetRoot(assets.load(format!("{}#Scene0", model(bake.kind)))),
         // Unscaled, exactly as the game spawns one, so the world units this
         // camera measures are the game's world units. A sheet baked at any other
@@ -734,11 +757,61 @@ fn done(bake: Res<Bake>, mut exit: MessageWriter<AppExit>) {
     }
 }
 
+/// Where to stand the survey camera before it has seen anything.
+///
+/// Returns the extent to survey at and the height to aim each tier at, taken
+/// from the sheet already on disk where there is one: `world_size` is the
+/// extent the last bake fitted, and `foot` inverts back to the height it
+/// aimed at, since `finish` derives one from the other by
+/// `foot = 0.5 - focus * cos(elevation) / extent`.
+///
+/// Read back rather than written down because it is a measurement of the
+/// *model*, and the model is a file somebody edits. A constant here would be a
+/// number to keep in step with `assets/actors/`, which is precisely the thing
+/// the survey exists to avoid having.
+///
+/// Falls back to [`SURVEY_MARGIN`] whenever the sidecar cannot be trusted to
+/// mean what this needs it to: no sheet yet, a sheet from a bake with a
+/// different set of [`ELEVATIONS`], or a `world_size` that is not a size. The
+/// fallback is a slower bake and never a wrong one -- and a seed that turns out
+/// too tight is caught by [`survey_fits`] and widened, the same as a cold start
+/// that is too tight.
+fn seed(kind: Kind) -> (f32, Vec<f32>) {
+    let cold = (SURVEY_MARGIN, vec![SURVEY_MARGIN * 0.25; ELEVATIONS.len()]);
+    let Ok(meta) = super::read_meta(&crate::asset_path(), kind) else {
+        return cold;
+    };
+    if !meta.world_size.is_finite()
+        || meta.world_size <= 0.0
+        || meta.tiers.len() != ELEVATIONS.len()
+        || !meta
+            .tiers
+            .iter()
+            .zip(ELEVATIONS)
+            .all(|(tier, elevation)| (tier.elevation - elevation).abs() < 0.5)
+    {
+        return cold;
+    }
+    let focus = meta
+        .tiers
+        .iter()
+        .map(|tier| {
+            (0.5 - tier.foot) * meta.world_size / tier.elevation.to_radians().cos()
+        })
+        .collect();
+    let extent = meta.world_size * SURVEY_SEED;
+    println!(
+        "impostor bake: the sheet on disk was fitted at {:.3} units; surveying from {extent:.3}",
+        meta.world_size,
+    );
+    (extent, focus)
+}
+
 /// Runs a bake for each named kind and returns when they are written.
 pub fn run(kinds: &[Kind]) {
     for &kind in kinds {
         println!("impostor bake: {kind:?} -- surveying");
-        let extent = SURVEY_MARGIN;
+        let (extent, focus) = seed(kind);
         let mut app = App::new();
         app.add_plugins(
             DefaultPlugins
@@ -764,13 +837,14 @@ pub fn run(kinds: &[Kind]) {
             settle: SETTLE,
             reading: false,
             extent,
-            // A quarter of the way up rather than half, so the survey sees well
-            // *below* the model's origin as well as above it. Aiming at the
-            // middle puts the cell's bottom edge exactly on y = 0, which clips
-            // whatever hangs under the origin -- and since the survey is what
-            // the final pass is sized from, a bottom edge measured wrong there
-            // is a sheet with its actor's feet cut off.
-            focus: vec![extent * 0.25; ELEVATIONS.len()],
+            // Cold, a quarter of the way up rather than half, so the survey
+            // sees well *below* the model's origin as well as above it. Aiming
+            // at the middle puts the cell's bottom edge exactly on y = 0, which
+            // clips whatever hangs under the origin -- and since the survey is
+            // what the final pass is sized from, a bottom edge measured wrong
+            // there is a sheet with its actor's feet cut off. Warm, it is
+            // whatever the last bake aimed at; see `seed`.
+            focus,
             seen: vec![None; ELEVATIONS.len()],
             widened: 0,
             atlas: vec![

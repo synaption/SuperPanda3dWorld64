@@ -1356,6 +1356,8 @@ mod tests {
             .init_resource::<input::InputState>()
             .init_resource::<menu::MenuState>()
             .init_resource::<display::DisplaySettings>()
+            // The display page's lighting row writes into it.
+            .init_resource::<n64::N64Lighting>()
             // The menu's level page asks for levels, and reads which one is up.
             .init_resource::<world::LevelId>()
             .init_resource::<world::LevelLoad>()

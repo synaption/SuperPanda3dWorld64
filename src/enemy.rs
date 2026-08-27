@@ -386,6 +386,23 @@ impl Kind {
         }
     }
 
+    /// How solid this actor is drawn, as a share of its own opacity.
+    ///
+    /// The slime is jelly, and jelly you cannot see into is a painted ball. A
+    /// fifth of the way to clear is enough to read as one -- it is the eyes
+    /// showing faintly through the far side of the body that says the material
+    /// has a depth, and past this the creature starts to disappear into
+    /// whatever it is standing in front of.
+    ///
+    /// [`crate::n64::soften`] leaves the eyes themselves alone, so what fades
+    /// is the body and only the body.
+    pub fn opacity(self) -> f32 {
+        match self {
+            Self::Slime => 0.8,
+            Self::Ant => 1.0,
+        }
+    }
+
     /// Which of the model's glTF animations is the one it walks on.
     ///
     /// The decomp actors these replaced had exactly one clip each, so an index
@@ -460,13 +477,33 @@ impl Kind {
         sizes()[self as usize]
     }
 
-    /// How wide a shadow it casts.
+    /// How wide a shadow it casts, or `None` for an actor that is drawn
+    /// without one.
     ///
-    /// Narrower than the collision cylinder, which is deliberately generous so
-    /// that walking near one of these counts as touching it. A shadow drawn at
-    /// that width would stick out well past the model and read as a puddle.
-    pub fn shadow_radius(self) -> f32 {
-        self.body().0 * 0.7
+    /// The ant's is narrower than its collision cylinder, which is deliberately
+    /// generous so that walking near one of these counts as touching it. A
+    /// shadow drawn at that width would stick out well past the model and read
+    /// as a puddle. What is left is about the spread of six feet under a body
+    /// held clear of the ground, which is what a blob shadow is for.
+    ///
+    /// The slime is drawn with no disc at all. It has no feet and nothing held
+    /// clear: it is a dome resting on the lawn, and everything a disc under one
+    /// can do is wrong. Inside its own radius it is hidden by the body from
+    /// every angle a camera can reach -- which is what "the blobs have no
+    /// shadow" looked like when it did have one. Wide enough to be seen past
+    /// the body, it is a dark ring round a creature that is already touching
+    /// the floor, and reads as the slime hovering over its own stain. So it
+    /// gets nothing, and what grounds it is the contact itself.
+    ///
+    /// `None` rather than a zero radius so that both places that draw these --
+    /// the disc under the near model and the square baked into the far crowd's
+    /// mesh by [`crate::impostor::build_shadows`] -- have to say what they do
+    /// about it, and cannot disagree.
+    pub fn shadow_radius(self) -> Option<f32> {
+        match self {
+            Self::Slime => None,
+            Self::Ant => Some(self.body().0 * 0.7),
+        }
     }
 }
 
@@ -736,7 +773,7 @@ pub fn spawn(
     position: Vec3,
     phase: f32,
 ) -> Entity {
-    commands
+    let enemy = commands
         .spawn((
             Enemy {
                 kind,
@@ -758,10 +795,20 @@ pub fn spawn(
             // Parts of both of these are flat quads the original turns to face
             // the camera every frame.
             crate::billboard::BillboardActor,
-            crate::shadow::ShadowCaster::new(kind.shadow_radius(), kind.body().1),
         ))
         .insert_if(Crawler::default(), || kind == Kind::Ant)
-        .id()
+        .insert_if(crate::n64::Translucent(kind.opacity()), || {
+            kind.opacity() < 1.0
+        })
+        .id();
+    // Nothing at all for a kind that is drawn without one: no component, so no
+    // disc is ever attached and nothing has to be hidden afterwards.
+    if let Some(radius) = kind.shadow_radius() {
+        commands
+            .entity(enemy)
+            .insert(crate::shadow::ShadowCaster::new(radius, kind.body().1));
+    }
+    enemy
 }
 
 /// Where a benchmark crowd is centred, how far out it spreads, and the height
@@ -3452,6 +3499,35 @@ mod tests {
     /// insist on, for every pair of kinds that can chase each other. Measured
     /// against the *widest* actor there is rather than against a particular one,
     /// because the next re-export is allowed to change which that is.
+    /// A kind with no disc is spawned without the component that draws one,
+    /// and a kind with one still gets it.
+    ///
+    /// Through `spawn` rather than by asking `shadow_radius` twice, because
+    /// what a slime must not have is the *component*: `attach` finds its
+    /// casters by querying for it, so anything carrying one gets a disc no
+    /// matter what radius it was built from.
+    #[test]
+    fn only_the_kinds_that_cast_a_shadow_carry_a_caster() {
+        let mut app = App::new();
+        app.add_plugins(AssetPlugin::default())
+            // `spawn` asks the server for a clip, which it will not hand out
+            // for a type nothing has registered.
+            .init_asset::<AnimationClip>();
+        for (kind, wanted) in [(Kind::Slime, false), (Kind::Ant, true)] {
+            let world = app.world_mut();
+            let enemy = world
+                .run_system_once(move |mut commands: Commands, assets: Res<AssetServer>| {
+                    spawn(&mut commands, &assets, kind, Vec3::ZERO, 0.0)
+                })
+                .expect("spawn could not run");
+            assert_eq!(
+                world.get::<crate::shadow::ShadowCaster>(enemy).is_some(),
+                wanted,
+                "{kind:?} came out of `spawn` with its shadow the wrong way round"
+            );
+        }
+    }
+
     #[test]
     fn nothing_walks_to_a_spot_it_would_be_shoved_out_of() {
         let widest = KINDS

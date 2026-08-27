@@ -38,6 +38,50 @@ use std::collections::HashMap;
 /// log nobody has a console open to read.
 const SHADER: &str = "embedded://super_bevy_world_64/n64.wgsl";
 
+/// The shader def that moves the lighting from the vertex stage to the
+/// fragment stage. Set per pipeline by [`N64Material::specialize`] from the
+/// material's own [`Shading`].
+const PER_PIXEL_DEF: &str = "N64_PER_PIXEL_LIGHT";
+
+/// Where the one diffuse light is resolved.
+///
+/// [`Shading::Vertex`] is the console's own answer and the one everything else
+/// in this module is written around: the cosine is taken once per vertex and
+/// Gouraud interpolated, so the shading breaks along the facets of geometry
+/// this coarse. [`Shading::Pixel`] takes the same terms and the same light and
+/// resolves them per fragment instead, which is what every renderer since has
+/// done -- the models round off and the faceting goes.
+///
+/// It is a display option rather than a look this game commits to, because the
+/// difference is the whole point of the port and is worth being able to see
+/// both halves of. It is not a second lighting model: swapping it changes
+/// *where* `ambient + key * cos` is evaluated and nothing about what it is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Shading {
+    #[default]
+    Vertex,
+    Pixel,
+}
+
+impl Shading {
+    /// What the menu row calls it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Shading::Vertex => "Per vertex",
+            Shading::Pixel => "Per pixel",
+        }
+    }
+
+    /// The other one. With two modes there is no direction to step in: left
+    /// and right on the row both land on the one you are not looking at.
+    pub fn other(self) -> Self {
+        match self {
+            Shading::Vertex => Shading::Pixel,
+            Shading::Pixel => Shading::Vertex,
+        }
+    }
+}
+
 /// The light every surface in the world is lit by.
 ///
 /// One key and one ambient, which is what a `GEO_NODE_LIGHT` gave the RSP.
@@ -53,6 +97,12 @@ pub struct N64Lighting {
     pub to_light: Vec3,
     pub key: Vec3,
     pub ambient: Vec3,
+    /// Where these three terms are resolved. Lives here rather than beside the
+    /// render scale in [`crate::display`] because it travels the same road the
+    /// terms themselves do: into every material's uniform and pipeline through
+    /// [`translate`] and [`relight`], which already exist to carry a changed
+    /// light out to a world full of surfaces.
+    pub shading: Shading,
 }
 
 impl Default for N64Lighting {
@@ -67,6 +117,9 @@ impl Default for N64Lighting {
             // rather than merely its own colour.
             key: Vec3::new(0.68, 0.66, 0.58),
             ambient: Vec3::new(0.42, 0.44, 0.50),
+            // The console's answer is what the game starts as. Anything else
+            // is something the player asked for.
+            shading: Shading::Vertex,
         }
     }
 }
@@ -93,6 +146,17 @@ impl N64Uniform {
     /// impostor sheets, which are pictures of lit models and would be lit twice
     /// over otherwise -- the same reason the castle's own vertex colours are
     /// left alone.
+    /// The same surface drawn see-through, at `opacity`.
+    ///
+    /// The tint multiplies the texture in the shader, so an alpha put here is
+    /// an alpha on every texel of the picture -- which is how a sheet baked
+    /// solid is drawn as something you can see through without touching the
+    /// sheet. See [`crate::impostor`], which is the one caller.
+    pub fn faded(mut self, opacity: f32) -> Self {
+        self.base_color.w = opacity;
+        self
+    }
+
     pub fn unlit(alpha_cutoff: f32) -> Self {
         Self {
             base_color: Vec4::ONE,
@@ -120,6 +184,12 @@ pub struct N64Material {
     /// see -- the reasoning is in [`crate::billboard::two_sided`], which is
     /// where the flag is set before the swap below reads it.
     pub double_sided: bool,
+    /// Where this surface's light is worked out. Copied off [`N64Lighting`]
+    /// when the material is made and rewritten by [`relight`] when the player
+    /// changes it, the same way the light terms themselves are -- except that
+    /// this one is a *pipeline* difference rather than a uniform, which is why
+    /// it appears in the key below as well.
+    pub shading: Shading,
 }
 
 /// Everything about a material that changes the *pipeline* rather than the
@@ -128,12 +198,19 @@ pub struct N64Material {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct N64MaterialKey {
     double_sided: bool,
+    per_pixel: bool,
 }
 
 impl From<&N64Material> for N64MaterialKey {
     fn from(material: &N64Material) -> Self {
         Self {
             double_sided: material.double_sided,
+            // A surface that takes no light at all is the same pipeline either
+            // way, so it is pinned to one of them: without this the impostor
+            // sheets and the whole castle would be compiled a second time on
+            // the first frame after the setting is changed, to draw exactly
+            // the picture they already were.
+            per_pixel: material.shading == Shading::Pixel && material.uniform.light.w > 0.0,
         }
     }
 }
@@ -174,6 +251,17 @@ impl Material for N64Material {
         } else {
             Some(Face::Back)
         };
+        // A shader def rather than a branch on a uniform, because the two modes
+        // are not the same shader with a flag in it: the vertex one hands the
+        // fragment stage a finished colour and the pixel one hands it a normal.
+        // Compiled this way, the console's path carries no interpolator it does
+        // not use and no test it cannot fail.
+        if key.bind_group_data.per_pixel {
+            descriptor.vertex.shader_defs.push(PER_PIXEL_DEF.into());
+            if let Some(fragment) = descriptor.fragment.as_mut() {
+                fragment.shader_defs.push(PER_PIXEL_DEF.into());
+            }
+        }
         Ok(())
     }
 }
@@ -184,6 +272,76 @@ impl Material for N64Material {
 /// triangles.
 #[derive(Resource, Default)]
 pub struct Converted(HashMap<AssetId<StandardMaterial>, Handle<N64Material>>);
+
+/// An actor drawn see-through, at this much of its own opacity.
+///
+/// Carried by the thing the port spawns rather than by the surfaces it ends up
+/// wearing: the model arrives a frame or more after the spawn, and what is
+/// inside it is whatever the glTF happened to contain. [`soften`] walks down
+/// from here.
+#[derive(Component)]
+pub struct Translucent(pub f32);
+
+/// Fades the surfaces of a [`Translucent`] actor before [`convert`] reads them.
+///
+/// Written onto the standard material, the same way and for the same reason as
+/// [`crate::billboard::two_sided`]: every instance of a scene shares one, so
+/// one write does the whole crowd, and the swap below then carries it across
+/// without being told about any of this.
+pub fn soften(
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    hierarchy: Query<&ChildOf>,
+    actors: Query<&Translucent>,
+    surfaces: Query<
+        (Entity, &MeshMaterial3d<StandardMaterial>),
+        Added<MeshMaterial3d<StandardMaterial>>,
+    >,
+) {
+    for (entity, handle) in &surfaces {
+        let Some(opacity) = translucency(entity, &hierarchy, &actors) else {
+            continue;
+        };
+        let Some(mut material) = materials.get_mut(&handle.0) else {
+            continue;
+        };
+        // A cutout is left alone. Its alpha is a stencil rather than a depth of
+        // material -- the slime's eyes are two eyes painted on a sheet of
+        // nothing -- and fading a stencil does not make the shape see-through,
+        // it eats the shape inwards from the edge where the mask was soft, and
+        // at this port's cutoff it would take the eyes away entirely.
+        if matches!(material.alpha_mode, AlphaMode::Mask(_)) {
+            continue;
+        }
+        material.base_color.set_alpha(opacity);
+        material.alpha_mode = AlphaMode::Blend;
+        // And back to being drawn from one side, whatever `two_sided` decided.
+        // That flag is a guess made on behalf of flat quads, which cannot be
+        // seen from behind; on a closed body it costs nothing while the body is
+        // opaque, and the moment it is not, the inside of the far half of the
+        // model is blended over the near half in whatever order the triangles
+        // happen to be in.
+        material.double_sided = false;
+        material.cull_mode = Some(Face::Back);
+    }
+}
+
+/// How see-through the actor this surface belongs to is, if it is one at all.
+///
+/// The same walk up to an ancestor as [`in_a_scene`], asking a different
+/// question of it.
+fn translucency(
+    entity: Entity,
+    hierarchy: &Query<&ChildOf>,
+    actors: &Query<&Translucent>,
+) -> Option<f32> {
+    let mut ancestor = entity;
+    loop {
+        if let Ok(Translucent(opacity)) = actors.get(ancestor) {
+            return Some(*opacity);
+        }
+        ancestor = hierarchy.get(ancestor).ok()?.parent();
+    }
+}
 
 /// Moves everything arriving out of a glTF onto [`N64Material`].
 ///
@@ -291,6 +449,15 @@ fn drawn_as(source: &StandardMaterial, images: &Assets<Image>) -> Option<AlphaMo
     if !matches!(source.alpha_mode, AlphaMode::Blend) {
         return Some(source.alpha_mode);
     }
+    // A tint that is itself see-through settles it without looking at the
+    // picture. The rule below is about pictures whose *alpha* is a shape, and
+    // the alpha of one of these is beside the point: [`soften`] writes a
+    // translucent tint onto a material whose texture is solid everywhere, and
+    // asking `cutout` about that texture gets the answer for a surface nobody
+    // is drawing.
+    if source.base_color.alpha() < 1.0 {
+        return Some(AlphaMode::Blend);
+    }
     // A blend with no texture at all is a flat tint, and its alpha is the
     // material's own. Nothing to look at, and nothing to promote.
     let Some(texture) = source.base_color_texture.as_ref() else {
@@ -381,6 +548,7 @@ pub fn translate(
         base_color_texture: source.base_color_texture.clone(),
         alpha_mode,
         double_sided: source.cull_mode.is_none(),
+        shading: lighting.shading,
     }
 }
 
@@ -405,6 +573,11 @@ pub fn relight(lighting: Res<N64Lighting>, mut materials: ResMut<Assets<N64Mater
         material.uniform.light = lighting.key.extend(lit);
         material.uniform.ambient = lighting.ambient.extend(0.0);
         material.uniform.to_light = lighting.to_light.extend(0.0);
+        // Changing this changes the pipeline the surface is drawn with, not
+        // just its uniform. Writing it through `get_mut` is what makes that
+        // happen: the material asset counts as changed, and Bevy re-specialises
+        // every entity wearing it on the next frame.
+        material.shading = lighting.shading;
     }
 }
 
@@ -432,7 +605,7 @@ impl Plugin for N64Plugin {
 /// and every scuttlebug's eyes would be culled from half the angles they are looked
 /// at from.
 pub fn systems() -> ScheduleConfigs<ScheduleSystem> {
-    (convert, relight).chain()
+    (soften, convert, relight).chain()
 }
 
 #[cfg(test)]
@@ -455,6 +628,65 @@ mod tests {
         let lighting = N64Lighting::default();
         assert_eq!(translate(&standard(false), &lighting, AlphaMode::Opaque).uniform.light.w, 1.0);
         assert_eq!(translate(&standard(true), &lighting, AlphaMode::Opaque).uniform.light.w, 0.0);
+    }
+
+    /// The display option reaches the *pipeline*, not just the uniform, and
+    /// only for surfaces the choice can be seen on.
+    ///
+    /// The pinning of unlit surfaces is the half worth a test: they are drawn
+    /// by the same shader either way, and letting the key differ would compile
+    /// the castle and every impostor sheet a second time -- a hitch, on the
+    /// frame the player is looking at the menu row that caused it, for no
+    /// change to a single pixel.
+    #[test]
+    fn only_surfaces_that_take_light_change_pipeline_with_the_setting() {
+        let per_pixel = N64Lighting {
+            shading: Shading::Pixel,
+            ..N64Lighting::default()
+        };
+        let vertex = N64Lighting::default();
+        let key = |material: &N64Material| N64MaterialKey::from(material).per_pixel;
+
+        assert!(!key(&translate(&standard(false), &vertex, AlphaMode::Opaque)));
+        assert!(key(&translate(&standard(false), &per_pixel, AlphaMode::Opaque)));
+        assert!(
+            !key(&translate(&standard(true), &per_pixel, AlphaMode::Opaque)),
+            "a surface whose colour is already baked was given a second pipeline \
+             to draw the same picture with"
+        );
+    }
+
+    /// A changed setting has to reach the materials that already exist, which
+    /// is every surface in a level that is already up. [`relight`] is what
+    /// carries it, and it is also what marks the assets changed so Bevy
+    /// re-specialises the meshes wearing them.
+    #[test]
+    fn changing_the_setting_relights_the_world_already_drawn() {
+        // An app rather than a bare world and one run of the system: `relight`
+        // deliberately does nothing on the frame the resource *arrives*, so
+        // proving it acts on a change means there being an earlier frame for
+        // the change to be against.
+        let mut app = App::new();
+        app.init_resource::<Assets<N64Material>>()
+            .init_resource::<N64Lighting>()
+            .add_systems(Update, relight);
+        let handle = app
+            .world_mut()
+            .resource_mut::<Assets<N64Material>>()
+            .add(translate(
+                &standard(false),
+                &N64Lighting::default(),
+                AlphaMode::Opaque,
+            ));
+        app.update();
+
+        app.world_mut().resource_mut::<N64Lighting>().shading = Shading::Pixel;
+        app.update();
+
+        let materials = app.world().resource::<Assets<N64Material>>();
+        let material = materials.get(&handle).expect("the material went missing");
+        assert_eq!(material.shading, Shading::Pixel);
+        assert!(N64MaterialKey::from(material).per_pixel);
     }
 
     /// The base-colour picture of the material called `name` in a shipped glTF,
@@ -542,6 +774,67 @@ mod tests {
             "the castle's translucent surface was taken for a cutout, which draws \
              it solid"
         );
+    }
+
+    /// [`soften`] writes a see-through tint onto a material whose picture is
+    /// solid, so the rule that classifies a blend has to ask the tint first.
+    /// Asking the picture would promote it to a mask, and a mask draws it
+    /// exactly as solid as it was before.
+    #[test]
+    fn a_see_through_tint_is_blended_whatever_its_picture_says() {
+        let mut images = Assets::<Image>::default();
+        let picture = images.add(baked_picture("actors/slime.glb", "Slime_Detailed"));
+        let mut material = StandardMaterial {
+            alpha_mode: AlphaMode::Blend,
+            base_color_texture: Some(picture),
+            ..standard(false)
+        };
+        assert_eq!(
+            drawn_as(&material, &images),
+            Some(AlphaMode::Mask(0.5)),
+            "the slime's own picture is solid, so untinted it belongs in the \
+             opaque pass -- if it does not, this test is no longer testing the \
+             case it was written for"
+        );
+        material.base_color.set_alpha(0.8);
+        assert_eq!(
+            drawn_as(&material, &images),
+            Some(AlphaMode::Blend),
+            "a see-through actor was moved into the opaque pass, which draws it solid"
+        );
+    }
+
+    /// What [`soften`] leans on in the art. It fades everything on the actor
+    /// that is not a cutout, which fades the slime's body and leaves its eyes
+    /// to be seen through it -- and that is only true while the eyes are the
+    /// cutout and the body is not. A re-export that wrote the eyes out as a
+    /// plain blend would fade them along with the body.
+    #[test]
+    fn the_slimes_eyes_are_the_cutout_and_its_body_is_not() {
+        let modes = alpha_modes("actors/slime.glb");
+        assert_eq!(modes.get("Slime_Eyes").map(String::as_str), Some("MASK"));
+        assert_eq!(modes.get("Slime_Detailed").map(String::as_str), Some("OPAQUE"));
+    }
+
+    /// The alpha mode each material in a glTF was written out with, defaulting
+    /// the way the format does when the file leaves it out.
+    fn alpha_modes(file: &str) -> std::collections::HashMap<String, String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let bytes = std::fs::read(root.join(file)).expect("missing glb");
+        let json_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes[20..20 + json_len]).expect("bad glb json");
+        json["materials"]
+            .as_array()
+            .expect("no materials")
+            .iter()
+            .map(|material| {
+                (
+                    material["name"].as_str().unwrap_or_default().to_owned(),
+                    material["alphaMode"].as_str().unwrap_or("OPAQUE").to_owned(),
+                )
+            })
+            .collect()
     }
 
     /// A `BLEND` with no picture to look at keeps the pass the file asked for,
@@ -681,6 +974,12 @@ mod tests {
     /// Bevy compiles a separate pipeline per combination of vertex attributes,
     /// so a mistake behind `#ifdef SKINNED` -- the branch every actor in this
     /// game takes and the castle does not -- would go unseen with only one.
+    ///
+    /// Each of them is drawn twice, once per [`Shading`], because the two are
+    /// separate pipelines built from separate preprocessed source. The
+    /// per-pixel one is the half a player only reaches through a menu row, so
+    /// without this a mistake behind `#ifdef N64_PER_PIXEL_LIGHT` would ship
+    /// and turn the world black for whoever tried the option.
     #[test]
     fn the_shader_compiles_on_a_real_renderer() {
         use bevy::{
@@ -744,14 +1043,17 @@ mod tests {
             | TextureUsages::RENDER_ATTACHMENT;
         let target = app.world_mut().resource_mut::<Assets<Image>>().add(target);
 
-        let material = app
-            .world_mut()
-            .resource_mut::<Assets<N64Material>>()
-            .add(translate(
-                &standard(false),
-                &N64Lighting::default(),
-                AlphaMode::Opaque,
-            ));
+        let materials: Vec<_> = [Shading::Vertex, Shading::Pixel]
+            .map(|shading| {
+                let lighting = N64Lighting {
+                    shading,
+                    ..N64Lighting::default()
+                };
+                app.world_mut()
+                    .resource_mut::<Assets<N64Material>>()
+                    .add(translate(&standard(false), &lighting, AlphaMode::Opaque))
+            })
+            .to_vec();
 
         // A plain triangle, one with its own COLOR_0 -- which is how the
         // castle's baked lighting arrives -- and one bound to a skeleton.
@@ -777,22 +1079,24 @@ mod tests {
 
         let world = app.world_mut();
         let joint = world.spawn(Transform::default()).id();
-        for mesh in [plain, coloured] {
+        for material in &materials {
+            for mesh in [&plain, &coloured] {
+                world.spawn((
+                    Mesh3d(mesh.clone()),
+                    MeshMaterial3d(material.clone()),
+                    Transform::from_xyz(0.0, 0.0, 0.0),
+                ));
+            }
             world.spawn((
-                Mesh3d(mesh),
+                Mesh3d(skinned.clone()),
                 MeshMaterial3d(material.clone()),
-                Transform::from_xyz(0.0, 0.0, 0.0),
+                SkinnedMesh {
+                    inverse_bindposes: bindposes.clone(),
+                    joints: vec![joint],
+                },
+                Transform::default(),
             ));
         }
-        world.spawn((
-            Mesh3d(skinned),
-            MeshMaterial3d(material.clone()),
-            SkinnedMesh {
-                inverse_bindposes: bindposes,
-                joints: vec![joint],
-            },
-            Transform::default(),
-        ));
         world.spawn((
             Camera3d::default(),
             RenderTarget::Image(target.into()),
@@ -848,9 +1152,9 @@ mod tests {
             "the shader did not compile:\n{broken:#?}"
         );
         assert!(
-            built >= 3,
-            "only {built} of this material's pipelines were built, so at least one \
-             of the three vertex layouts above never reached the shader"
+            built >= 6,
+            "only {built} of this material's pipelines were built, and there are six \
+             to build: three vertex layouts, each lit per vertex and per pixel"
         );
     }
 

@@ -25,6 +25,7 @@
 use crate::{
     console::ConsoleState,
     display::{self, DisplaySettings, SceneTarget},
+    n64::N64Lighting,
     world::{LevelId, LevelLoad, LoadLevel},
 };
 use bevy::{
@@ -56,7 +57,7 @@ pub enum Page {
 
 /// One line of a page.
 ///
-/// The value rows ([`Item::RenderScale`], [`Item::WindowMode`]) are also
+/// The value rows ([`Item::RenderScale`], [`Item::Lighting`], [`Item::WindowMode`]) are also
 /// choosable: Enter on them steps the value forward, which is what a player who
 /// never tries the arrow keys will do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -71,6 +72,9 @@ enum Item {
     Level(LevelId),
     Display,
     RenderScale,
+    /// Where the world's one light is resolved: at the vertices, the way the
+    /// console did it, or at every pixel. See [`crate::n64::Shading`].
+    Lighting,
     WindowMode,
     Back,
 }
@@ -97,7 +101,12 @@ impl Page {
             Page::Root => &[Item::Resume, Item::Levels, Item::Options, Item::Quit],
             Page::Levels => &LEVEL_ROWS,
             Page::Options => &[Item::Display, Item::Back],
-            Page::Display => &[Item::RenderScale, Item::WindowMode, Item::Back],
+            Page::Display => &[
+                Item::RenderScale,
+                Item::Lighting,
+                Item::WindowMode,
+                Item::Back,
+            ],
         }
     }
 
@@ -356,6 +365,7 @@ pub fn input(
     console: Res<ConsoleState>,
     mut menu: ResMut<MenuState>,
     mut settings: ResMut<DisplaySettings>,
+    mut lighting: ResMut<N64Lighting>,
     level: Res<LevelId>,
     mut load: ResMut<LevelLoad>,
     mut levels: MessageWriter<LoadLevel>,
@@ -435,7 +445,13 @@ pub fn input(
         }
         let step = i32::from(press.right) - i32::from(press.left);
         if step != 0 {
-            adjust(menu.selected(), step, &mut settings, &mut windows);
+            adjust(
+                menu.selected(),
+                step,
+                &mut settings,
+                &mut lighting,
+                &mut windows,
+            );
         }
         if press.select || clicked {
             match menu.selected() {
@@ -458,7 +474,7 @@ pub fn input(
                 },
                 // A value row chosen rather than nudged steps forward, and
                 // wraps, so Enter alone can reach every setting.
-                value => adjust(value, 1, &mut settings, &mut windows),
+                value => adjust(value, 1, &mut settings, &mut lighting, &mut windows),
             }
         }
     }
@@ -493,10 +509,17 @@ fn adjust(
     item: Item,
     step: i32,
     settings: &mut DisplaySettings,
+    lighting: &mut N64Lighting,
     windows: &mut Query<&mut Window, With<PrimaryWindow>>,
 ) {
     match item {
         Item::RenderScale => settings.step_scale(step),
+        // Two modes, so the step's direction has nowhere to point: either way
+        // round the row is a swap, exactly as the window mode below is. The
+        // write is what `n64::relight` watches for, and it carries the change
+        // out to every material on the next frame -- while the menu is still
+        // up, so the world behind it changes as the row does.
+        Item::Lighting => lighting.shading = lighting.shading.other(),
         Item::WindowMode => {
             if let Ok(mut window) = windows.single_mut() {
                 window.mode = display::other_mode(window.mode);
@@ -515,6 +538,7 @@ fn adjust(
 pub fn draw(
     menu: Res<MenuState>,
     settings: Res<DisplaySettings>,
+    lighting: Res<N64Lighting>,
     level: Res<LevelId>,
     load: Res<LevelLoad>,
     target: Res<SceneTarget>,
@@ -600,6 +624,10 @@ pub fn draw(
                 rendered.x,
                 rendered.y
             ),
+            Item::Lighting => format!(
+                "Lighting               < {} >",
+                lighting.shading.label()
+            ),
             Item::WindowMode => format!(
                 "Window mode            < {} >",
                 if windowed { "Windowed" } else { "Fullscreen" }
@@ -640,6 +668,7 @@ mod tests {
         world.init_resource::<ConsoleState>();
         world.init_resource::<MenuState>();
         world.init_resource::<DisplaySettings>();
+        world.init_resource::<N64Lighting>();
         world.init_resource::<LevelId>();
         world.init_resource::<LevelLoad>();
         world.init_resource::<Messages<LoadLevel>>();
@@ -724,6 +753,42 @@ mod tests {
         let menu = world.resource::<MenuState>();
         assert!(menu.open);
         assert_eq!(menu.selected(), Item::RenderScale);
+    }
+
+    /// The row this option is reached by: down one from the render scale, and
+    /// left or right swaps the mode either way round.
+    #[test]
+    fn the_display_page_swaps_the_lighting_either_way_round() {
+        use crate::n64::Shading;
+
+        let mut world = paused();
+        assert_eq!(
+            world.resource::<N64Lighting>().shading,
+            Shading::Vertex,
+            "the game starts on the console's own answer"
+        );
+
+        press(&mut world, KeyCode::Escape);
+        press(&mut world, KeyCode::ArrowDown);
+        press(&mut world, KeyCode::ArrowDown);
+        press(&mut world, KeyCode::Enter);
+        press(&mut world, KeyCode::Enter);
+        press(&mut world, KeyCode::ArrowDown);
+        assert_eq!(world.resource::<MenuState>().selected(), Item::Lighting);
+
+        press(&mut world, KeyCode::ArrowRight);
+        assert_eq!(world.resource::<N64Lighting>().shading, Shading::Pixel);
+        // Two modes and no order to them, so the other direction is the way
+        // back rather than a step further on.
+        press(&mut world, KeyCode::ArrowLeft);
+        assert_eq!(world.resource::<N64Lighting>().shading, Shading::Vertex);
+        // And Enter alone reaches it, for a player who never tries the arrows.
+        press(&mut world, KeyCode::Enter);
+        assert_eq!(world.resource::<N64Lighting>().shading, Shading::Pixel);
+        assert!(
+            world.resource::<MenuState>().open,
+            "changing a value is not choosing to leave the menu"
+        );
     }
 
     /// Escape unwinds one page per press rather than shutting the menu from

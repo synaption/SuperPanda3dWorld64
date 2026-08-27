@@ -31,3 +31,8 @@ pylons! should share logic with pathing.  traveling salemen problem, creeper wor
 grid2quad system
 
 make ow into a level
+
+enemies need to attack mario's too
+
+
+day night cycle
