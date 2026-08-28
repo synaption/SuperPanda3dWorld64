@@ -1641,7 +1641,25 @@ pub fn alert(
         // A crowd-tier enemy keeps whatever it was chasing when it was last in
         // the near tier, and is not given a new target here. Losing one by
         // walking away would break the rule that aggro is never given up.
+        //
+        // A target that has *died* is a different matter, and it is the one
+        // thing this loop still owes the cheap tier. `crowd_step` acquires only
+        // while the slot is empty and has no way to ask whether what is in it
+        // still exists, so a stale entity sat there forever: the enemy chased a
+        // corpse at chase speed, could never notice anything else, and -- worse
+        // than either -- answered `rouse_crowd` as something that has seen the
+        // player, which holds the field's alarm on for the entire crowd from
+        // the first Mario that goes down. Emptying the slot is all that is
+        // needed; the flow field is this tier's eyes, and it re-notices through
+        // that on the next tick exactly as it did the first time.
         if !detailed(detail) {
+            if aggro.target.is_some_and(|held| everyone.get(held).is_err()) {
+                aggro.target = None;
+                aggro.commitment = 0.0;
+                aggro.contender = None;
+                aggro.rivalry = 0.0;
+                aggro.at = transform.translation;
+            }
             continue;
         }
         let Some(verdict) = decided(entity) else {
@@ -4788,6 +4806,109 @@ mod tests {
         world.despawn(slime);
         world.run_system_once(alert).expect("alert could not run");
         assert_eq!(world.get::<Aggro>(mario).unwrap().target, None);
+    }
+
+    /// And what it loses it replaces, out of the same pass: a Mario that has
+    /// just flattened the slime it was fighting takes the next one within sight
+    /// on the tick the first one goes, rather than standing over the spot until
+    /// something walks into it.
+    ///
+    /// The re-acquire runs through `Hunt::seize` rather than through the
+    /// margin, and that is the point of asserting it here. An emptied slot is
+    /// an *acquire*, not a switch, so nothing has to out-earn the corpse -- the
+    /// second slime is taken whole, at whatever range it is at, in one tick.
+    #[test]
+    fn a_mario_takes_the_next_enemy_when_the_one_it_was_fighting_dies() {
+        let mut world = World::new();
+        world.init_resource::<Threats>();
+        world.insert_resource(GameTuning::default());
+        let mario = world
+            .spawn((
+                Ally::new(Vec3::ZERO, 0.0),
+                Side::Friendly,
+                Aggro::default(),
+                Transform::default(),
+            ))
+            .id();
+        let mut slime = |x: f32| {
+            world
+                .spawn((
+                    Enemy {
+                        kind: Kind::Slime,
+                        animation: Handle::default(),
+                    },
+                    Side::Hostile,
+                    Aggro::default(),
+                    Transform::from_xyz(x, 0., 0.),
+                ))
+                .id()
+        };
+        let near = slime(2.);
+        let far = slime(6.);
+        world.run_system_once(alert).expect("alert could not run");
+        assert_eq!(
+            world.get::<Aggro>(mario).unwrap().target,
+            Some(near),
+            "the nearer of the two is what it notices first"
+        );
+        world.despawn(near);
+        world.run_system_once(alert).expect("alert could not run");
+        let aggro = world.get::<Aggro>(mario).unwrap();
+        assert_eq!(aggro.target, Some(far), "stood over the corpse");
+        // And it is walking to the new one rather than to where the old one
+        // fell: `at` is what the movement step reads, and a stale one is a
+        // Mario jogging to an empty patch of lawn.
+        assert_eq!(aggro.at, Vec3::new(6., 0., 0.));
+    }
+
+    /// The cheap tier loses a dead target too, which is the one thing `alert`
+    /// still does for it.
+    ///
+    /// `crowd_step` only ever fills an *empty* slot and cannot ask whether what
+    /// is in it still exists, so without this a crowd-tier enemy whose Mario
+    /// was killed held a despawned entity for the rest of the level: it never
+    /// noticed anything again, and it answered `rouse_crowd` as something that
+    /// has seen the player, which pins the flow field's alarm on for the whole
+    /// crowd.
+    #[test]
+    fn a_crowd_tier_enemy_lets_go_of_a_target_that_has_died() {
+        let mut world = World::new();
+        world.init_resource::<Threats>();
+        world.insert_resource(GameTuning::default());
+        let mario = world
+            .spawn((
+                Ally::new(Vec3::ZERO, 0.0),
+                Side::Friendly,
+                Aggro::default(),
+                Transform::default(),
+            ))
+            .id();
+        let slime = world
+            .spawn((
+                Enemy {
+                    kind: Kind::Slime,
+                    animation: Handle::default(),
+                },
+                Side::Hostile,
+                Detail::Crowd,
+                Aggro {
+                    target: Some(mario),
+                    ..Aggro::default()
+                },
+                Transform::from_xyz(3., 0., 0.),
+            ))
+            .id();
+        // Still there, so nothing is taken off it: aggro is not a leash, and a
+        // crowd enemy is not re-pointed by this system.
+        world.run_system_once(alert).expect("alert could not run");
+        assert_eq!(world.get::<Aggro>(slime).unwrap().target, Some(mario));
+        world.despawn(mario);
+        world.run_system_once(alert).expect("alert could not run");
+        assert_eq!(
+            world.get::<Aggro>(slime).unwrap().target,
+            None,
+            "chasing a corpse"
+        );
     }
 
     /// A step at `height`: ground to the west of the origin, a face rising at

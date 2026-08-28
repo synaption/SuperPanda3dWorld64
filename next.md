@@ -44,3 +44,5 @@ ctrl+c/ctrl+v in ingame console
 pop in
 
 marios stuck in corner, need to be smart enough not to get stuck, pathing?  
+
+Normal maps for imposters
