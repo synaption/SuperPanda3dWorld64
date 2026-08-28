@@ -15,6 +15,7 @@ mod camera;
 mod console;
 mod display;
 mod enemy;
+mod energy;
 mod flow;
 mod frame_chart;
 mod furniture;
@@ -556,7 +557,13 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
         // Nested rather than three more entries in the tuple: Bevy's system
         // tuples stop at twenty, and a nested one that chains itself keeps the
         // order exactly as it reads.
-        (controls, update_hud, health::draw_player_bar).chain(),
+        (
+            controls,
+            update_hud,
+            health::draw_player_bar,
+            energy::draw_player_bar,
+        )
+            .chain(),
     )
         .chain()
         .run_if(console::is_closed)
@@ -675,6 +682,9 @@ fn setup(
         // hearts this used to be: what threatens him is a crowd's worth of
         // small hits rather than any one enemy. See [`health`].
         health::Health::new(health::PLAYER_HEALTH),
+        // The other pool: what the booster burns and the gun taxes. Only the
+        // player carries one -- see [`energy`].
+        energy::Energy::new(),
         // He does not notice anything -- that is what the player is for -- but
         // he is very much noticeable, and a side is what makes him so.
         enemy::Side::Friendly,
@@ -808,6 +818,8 @@ fn setup(
     // The player's bar and the pool of floating ones. Built once here rather
     // than per creature -- see `health::UNIT_BARS`.
     health::spawn(&mut commands);
+    // Under it, and pinned to the corner the health bar is stacked on top of.
+    energy::spawn(&mut commands);
     commands.spawn(console::panel_bundle());
     commands.spawn(console::tuning_tray_bundle());
     menu::spawn(&mut commands);
@@ -1106,6 +1118,66 @@ mod tests {
             count, wanted,
             "the field holds {count} Marios, not {wanted}"
         );
+    }
+
+    /// The jetpack is metered, end to end.
+    ///
+    /// The unit tests in [`energy`] prove the arithmetic; this proves the
+    /// *wiring* -- that the component is on the player the game spawns, that
+    /// `player::movement` finds it through its own query, and that the bar
+    /// empties over five seconds of the real fixed step rather than five
+    /// seconds of a number a test made up. A booster that flew forever would
+    /// pass every test in `energy` and still be wrong here.
+    ///
+    /// It also holds the booster down through the whole lockout, which is what
+    /// a player who has just fallen out of the sky actually does. That is the
+    /// case a lockout is easiest to get wrong in: the refill has to run under a
+    /// held key, or the game hangs on a bar that never comes back.
+    #[test]
+    fn the_jetpack_burns_the_energy_bar_and_letting_go_brings_it_back() {
+        let mut app = headless();
+        // Wider steps than the sixteen milliseconds the rest of these use:
+        // this test is about durations rather than frames, and it has fifteen
+        // seconds of them to get through.
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_millis(100),
+        ));
+        app.update();
+        let mut players = app.world_mut().query_filtered::<Entity, With<Player>>();
+        let hero = players
+            .iter(app.world())
+            .next()
+            .expect("no player in the world");
+        let bar = |app: &App| *app.world().get::<energy::Energy>(hero).unwrap();
+        assert_eq!(bar(&app).level, 1.0, "he did not start with a full bar");
+        // Off the ground and then the booster held down and *kept* down: five
+        // seconds of flight, then three more of holding a dead key through the
+        // lockout, landing partway through and skating on it. Every one of
+        // those is a thing that would ordinarily park the refill, and none of
+        // them may while the lockout is on.
+        for frame in 0..80 {
+            {
+                let mut input = app.world_mut().resource_mut::<input::InputState>();
+                input.jump = frame == 0;
+                input.boost = true;
+            }
+            app.update();
+        }
+        let held = bar(&app);
+        assert!(held.drained(), "the booster never ran dry");
+        assert!(
+            held.level > 0.0,
+            "the refill was parked by the held key and the lockout could never end"
+        );
+        assert!(held.level < 1.0, "three seconds cannot have filled it");
+        // Let go and wait out the rest. The bar coming back full is what ends
+        // the lockout, so one assertion covers both.
+        for _ in 0..40 {
+            app.world_mut().resource_mut::<input::InputState>().boost = false;
+            app.update();
+        }
+        assert_eq!(bar(&app).level, 1.0, "and it never came back");
+        assert!(!bar(&app).drained(), "a full bar was still locked out");
     }
 
     /// The crowd benchmark: the real game, a real GPU, no window, and a field

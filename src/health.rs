@@ -206,7 +206,18 @@ const UNIT_BARS: usize = 96;
 const BAR_RANGE: f32 = 45.0;
 
 /// The player's bar, in window pixels.
-const PLAYER_BAR: Vec2 = Vec2::new(260.0, 20.0);
+pub const PLAYER_BAR: Vec2 = Vec2::new(260.0, 20.0);
+
+/// How far the corner's stack of player bars sits from the window's edges, and
+/// how much daylight there is between two of them.
+///
+/// Shared with [`crate::energy`] rather than written twice, because the two
+/// bars are one stack: the energy bar is pinned to the margin and this one is
+/// pushed up over it by exactly the height of the bar below plus the gap. Two
+/// copies of the number is two chances for a redesign to leave them overlapping
+/// or floating apart.
+pub const HUD_MARGIN: f32 = 16.0;
+pub const BAR_GAP: f32 = 6.0;
 
 /// What a unit bar is drawn in at full strength: the dark ground behind the
 /// fill, and the hard edge around it.
@@ -252,17 +263,29 @@ const MARIO_HEAD: f32 = 1.25;
 
 /// The colour a pool of this fullness is drawn in.
 ///
-/// Green through amber to red, and stepped rather than interpolated: three
-/// colours is what a console-era bar had, and a continuous ramp spends most of
-/// its range on shades nobody can name. The steps also mean the bar *changes*
-/// at a threshold, which is the moment worth noticing.
+/// Stepped rather than interpolated: three colours is what a console-era bar
+/// had, and a continuous ramp spends most of its range on shades nobody can
+/// name. The steps also mean the bar *changes* at a threshold, which is the
+/// moment worth noticing.
+///
+/// **All three are red now.** It used to run green through amber to red, which
+/// is the arcade convention and was fine while there was one bar on the screen.
+/// There are two: [`crate::energy`] sits underneath and it is the green one, so
+/// a health bar that started green would have the corner showing two green bars
+/// at full and asking the player which was which in the half-second he has to
+/// look. Health owns red, energy owns green, and neither ever wears the other's
+/// colour at any fullness.
+///
+/// The ramp survives the move -- light red at full, deepening twice on the way
+/// down -- because the thresholds are the useful part and losing them would
+/// leave the width as the only thing the bar says.
 fn fill_colour(fraction: f32) -> Color {
     if fraction > 0.55 {
-        Color::srgb(0.30, 0.85, 0.35)
+        Color::srgb(0.98, 0.55, 0.52)
     } else if fraction > 0.25 {
-        Color::srgb(0.95, 0.78, 0.20)
+        Color::srgb(0.93, 0.32, 0.28)
     } else {
-        Color::srgb(0.90, 0.25, 0.22)
+        Color::srgb(0.80, 0.10, 0.10)
     }
 }
 
@@ -276,8 +299,11 @@ pub fn spawn(commands: &mut Commands) {
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
-                left: Val::Px(16.0),
-                bottom: Val::Px(16.0),
+                left: Val::Px(HUD_MARGIN),
+                // Above the energy bar rather than at the margin itself: see
+                // [`HUD_MARGIN`], and [`crate::energy::spawn`] for the bar that
+                // is down there instead.
+                bottom: Val::Px(HUD_MARGIN + crate::energy::ENERGY_BAR.y + BAR_GAP),
                 width: Val::Px(PLAYER_BAR.x),
                 height: Val::Px(PLAYER_BAR.y),
                 border: UiRect::all(Val::Px(2.0)),

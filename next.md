@@ -45,4 +45,8 @@ pop in
 
 marios stuck in corner, need to be smart enough not to get stuck, pathing?  
 
-Normal maps for imposters
+
+Planet gen topology needs to be walkable and flat enough to farm.  
+
+
+clone technology?

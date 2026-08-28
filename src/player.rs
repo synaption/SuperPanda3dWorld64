@@ -244,8 +244,19 @@ pub fn movement(
         ),
         With<Player>,
     >,
+    mut energy: Query<&mut crate::energy::Energy, With<Player>>,
     camera: Query<&Transform, (With<Camera3d>, Without<Player>)>,
 ) {
+    // A query of its own rather than another column on the one below, so that
+    // a player assembled without an `Energy` -- in a test, or at a spawn site
+    // that has not been taught about the bar yet -- still moves. Every use of
+    // it below reads as "the booster is free if there is nothing metering it",
+    // which is exactly how flight worked before `energy` existed.
+    let mut energy = energy.single_mut().ok();
+    // Once a step, and before anything spends any: see `energy::Energy::advance`.
+    if let Some(energy) = energy.as_deref_mut() {
+        energy.advance(FIXED_DT);
+    }
     let Ok((mut transform, mut previous, mut ctrl, mut health)) = player.single_mut() else {
         return;
     };
@@ -286,6 +297,14 @@ pub fn movement(
     }
     let boost = input_state.boost && state.active == ActiveCharacter::Hero;
     let skate = boost && ctrl.grounded && !ctrl.submersion.in_water();
+    if skate {
+        // The skate is free, but it is not free *and* charging: holding the
+        // booster down on the ground parks the refill for as long as it is
+        // held. See `energy::Energy::stall`.
+        if let Some(energy) = energy.as_deref_mut() {
+            energy.stall(FIXED_DT);
+        }
+    }
     let speed = match ctrl.submersion {
         Submersion::Swimming => tuning.mario_swim,
         Submersion::Wading => tuning.hero_wade,
@@ -349,11 +368,24 @@ pub fn movement(
             }
         }
     }
+    // Whether the booster is actually lifting him this step, which is not the
+    // same question as whether the key is down. `thrust` takes the step's slice
+    // out of the bar and stamps its hold, and the `false` it gives back on an
+    // empty bar is the booster cutting out mid-air: he falls on this same step
+    // and is *posed* falling too, further down, rather than holding a flight
+    // pose over a drop. Short-circuiting is what keeps the bar unspent while he
+    // is grounded or in water.
+    let thrusting = boost
+        && !ctrl.grounded
+        && !ctrl.submersion.in_water()
+        && energy
+            .as_deref_mut()
+            .is_none_or(|energy| energy.thrust(FIXED_DT));
     // Water supplies its own vertical motion either way -- buoyancy for a
     // swimmer, the pull toward the surface below for a wader -- so gravity and
     // the Hero's booster do not operate until the capsule leaves the box.
     if !ctrl.submersion.in_water() {
-        if boost && !ctrl.grounded {
+        if thrusting {
             rise = (rise + tuning.jet_thrust).min(tuning.jet_rise);
         } else if !ctrl.grounded {
             // The original stepped a flat -1.2 onto the speed every frame at
@@ -554,7 +586,7 @@ pub fn movement(
             }
         } else if ctrl.submersion.swimming() {
             Motion::Swim
-        } else if boost {
+        } else if thrusting {
             Motion::Fly
         } else if rise > 0.0 {
             Motion::Jump

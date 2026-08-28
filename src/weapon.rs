@@ -510,6 +510,7 @@ pub fn fire(
     mut threats: ResMut<crate::enemy::Threats>,
     muzzles: Query<&GlobalTransform, With<Muzzle>>,
     player: Query<(Entity, &Transform), With<Player>>,
+    mut energy: Query<&mut crate::energy::Energy, With<Player>>,
     enemies: Targets,
 ) {
     loadout.cooldown = (loadout.cooldown - FIXED_DT).max(0.0);
@@ -519,6 +520,18 @@ pub fn fire(
     };
     // The edge is only this system's to take while a ranged weapon is out.
     if !InputState::take(&mut input.attack) || loadout.cooldown > 0.0 {
+        return;
+    }
+    // The gun runs off the booster's bar, so it is out of service for as long
+    // as the booster is: a bar run to nothing locks both until it is full
+    // again. Checked *after* the edge is taken rather than before, so the press
+    // is spent on nothing instead of sitting in the latch and going off by
+    // itself the instant the bar comes back.
+    let mut energy = energy.single_mut().ok();
+    if energy
+        .as_deref()
+        .is_some_and(crate::energy::Energy::drained)
+    {
         return;
     }
     // The muzzle is a node of the weapon's own scene, so before that scene has
@@ -535,6 +548,14 @@ pub fn fire(
     let (origin, direction) = lay(from, &aim);
     loadout.cooldown = spec.interval;
     sounds.push(Sfx::Shoot);
+    // The gun's tax on the other pool. A hundredth is nearly nothing; the
+    // second of held refill it comes with is the point, and is what puts the
+    // gun and the booster on one bar rather than two. See `energy::Energy::shoot`.
+    // A player without an `Energy` -- the tests below spawn one -- pays nothing
+    // and is never locked out, which is how the gun worked before the bar.
+    if let Some(energy) = energy.as_deref_mut() {
+        energy.shoot();
+    }
 
     match as_fired(shot, &tuning) {
         Shot::Projectile { speed, range } => {
@@ -769,7 +790,14 @@ mod tests {
         // scene has loaded, so the body is centred on that to be shot at.
         let (_, height) = Kind::Slime.body();
         world.insert_resource(Aim::at(Vec3::Z, Vec3::new(0.0, 1.2, ahead)));
-        world.spawn((Player, Transform::from_xyz(0.0, 0.0, 0.0)));
+        // With a full bar, because the gun runs off it: an `Energy` here means
+        // the tests below exercise the same path the game does, tax and all,
+        // rather than the fail-open one a player without the component takes.
+        world.spawn((
+            Player,
+            Transform::from_xyz(0.0, 0.0, 0.0),
+            crate::energy::Energy::new(),
+        ));
         let enemy = world
             .spawn((
                 Enemy {
@@ -795,6 +823,52 @@ mod tests {
             .into_iter()
             .map(|event| event.sfx)
             .collect()
+    }
+
+    /// A drained energy bar takes the gun with it.
+    ///
+    /// The pistol and the booster are one resource, so the lockout that grounds
+    /// him disarms him too, and the press that finds a dead gun is *spent*
+    /// rather than latched: a shot queued through five seconds of lockout would
+    /// go off on its own the instant the bar came back, at whatever the player
+    /// happened to be pointing at by then.
+    #[test]
+    fn a_drained_bar_takes_the_gun_out_of_service() {
+        let (mut world, enemy) = range(Weapon::Pistol, 8.0);
+        let hero = world
+            .query_filtered::<Entity, With<Player>>()
+            .single(&world)
+            .expect("no player on the range");
+        // Flown to nothing, which is the only way into a lockout.
+        {
+            let mut energy = world.get_mut::<crate::energy::Energy>(hero).unwrap();
+            while energy.thrust(crate::player::FIXED_DT) {}
+            assert!(energy.drained());
+        }
+        pull_trigger(&mut world);
+        assert!(
+            world.get_entity(enemy).is_ok(),
+            "a locked-out gun killed something"
+        );
+        let sounds = heard(&mut world);
+        assert!(sounds.is_empty(), "a locked-out gun was heard: {sounds:?}");
+        assert!(
+            !world.resource::<InputState>().attack,
+            "the press was latched rather than spent, and will fire itself later"
+        );
+        // Full again, and the gun is back with it.
+        world.get_mut::<crate::energy::Energy>(hero).unwrap().level = 1.0;
+        for _ in 0..2 {
+            world
+                .get_mut::<crate::energy::Energy>(hero)
+                .unwrap()
+                .advance(crate::player::FIXED_DT);
+        }
+        pull_trigger(&mut world);
+        assert!(
+            world.get_entity(enemy).is_err(),
+            "the gun never came back off the lockout"
+        );
     }
 
     /// The whole point of the feature: point the pistol at something and pull
