@@ -633,7 +633,10 @@ fn tighten(bake: &mut Bake) {
         );
     }
     bake.extent = wanted;
-    println!("impostor bake: drawing every tier at {:.3} units", bake.extent);
+    println!(
+        "impostor bake: drawing every tier at {:.3} units",
+        bake.extent
+    );
 }
 
 /// Copies one cell's pixels into the atlas at its place.
@@ -665,7 +668,8 @@ fn reduce(pixels: &[u8], x: u32, y: u32) -> [u8; 4] {
     let mut alpha = 0.0_f32;
     for row in 0..SUPERSAMPLE {
         for column in 0..SUPERSAMPLE {
-            let at = (((y * SUPERSAMPLE + row) * SAMPLE_PX + x * SUPERSAMPLE + column) * 4) as usize;
+            let at =
+                (((y * SUPERSAMPLE + row) * SAMPLE_PX + x * SUPERSAMPLE + column) * 4) as usize;
             let weight = pixels[at + 3] as f32;
             for channel in 0..3 {
                 colour[channel] += pixels[at + channel] as f32 * weight;
@@ -795,9 +799,7 @@ fn seed(kind: Kind) -> (f32, Vec<f32>) {
     let focus = meta
         .tiers
         .iter()
-        .map(|tier| {
-            (0.5 - tier.foot) * meta.world_size / tier.elevation.to_radians().cos()
-        })
+        .map(|tier| (0.5 - tier.foot) * meta.world_size / tier.elevation.to_radians().cos())
         .collect();
     let extent = meta.world_size * SURVEY_SEED;
     println!(
@@ -984,8 +986,8 @@ mod tests {
         let (x, y) = (3u32, 5u32);
         for row in 0..SUPERSAMPLE {
             for column in 0..SUPERSAMPLE {
-                let at = (((y * SUPERSAMPLE + row) * SAMPLE_PX + x * SUPERSAMPLE + column) * 4)
-                    as usize;
+                let at =
+                    (((y * SUPERSAMPLE + row) * SAMPLE_PX + x * SUPERSAMPLE + column) * 4) as usize;
                 pixels[at..at + 4].copy_from_slice(&[10, 20, 30, 255]);
             }
         }

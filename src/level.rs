@@ -607,9 +607,9 @@ impl LevelData {
     /// column is exactly the thing a sphere does not have.
     pub fn ground_below(&self, from: Vec3, up: Vec3) -> Option<(Vec3, Vec3)> {
         match self.index {
-            Index::Flat { .. } => self.highest_below(from, 0.0).map(|(height, normal)| {
-                (Vec3::new(from.x, height, from.z), normal)
-            }),
+            Index::Flat { .. } => self
+                .highest_below(from, 0.0)
+                .map(|(height, normal)| (Vec3::new(from.x, height, from.z), normal)),
             Index::Planet { .. } => {
                 let start = from + up * GROUND_SKIN;
                 self.surface_hit(start, from - up * PLANET_REACH)
@@ -782,7 +782,12 @@ impl LevelData {
             // Stepping is what keeps a ray fired along the ground -- a bullet,
             // the camera's boom -- from having to open a box the size of the
             // hemisphere it crosses.
-            Index::Planet { centre, radius, cells: filed, .. } => {
+            Index::Planet {
+                centre,
+                radius,
+                cells: filed,
+                ..
+            } => {
                 let arc = (FACE_CELL_ANGLE * radius).max(0.001);
                 let steps = ((direction.length() / arc).ceil() as usize + 1).min(PLANET_RAY_STEPS);
                 let mut cells_here = Vec::new();
@@ -1276,7 +1281,11 @@ mod tests {
         let at = |ring: usize, segment: usize| (ring * (segments + 1) + segment) as u32;
         for ring in 0..rings {
             for segment in 0..segments {
-                indices.push([at(ring, segment), at(ring + 1, segment), at(ring, segment + 1)]);
+                indices.push([
+                    at(ring, segment),
+                    at(ring + 1, segment),
+                    at(ring, segment + 1),
+                ]);
                 indices.push([
                     at(ring, segment + 1),
                     at(ring + 1, segment),
@@ -1352,7 +1361,12 @@ mod tests {
     fn a_planet_pushes_a_capsule_out_of_its_own_walls() {
         let radius = 300.0;
         let planet = ball(radius);
-        for up in [Vec3::Y, Vec3::NEG_Y, Vec3::X, Vec3::new(1., 1., 1.).normalize()] {
+        for up in [
+            Vec3::Y,
+            Vec3::NEG_Y,
+            Vec3::X,
+            Vec3::new(1., 1., 1.).normalize(),
+        ] {
             // Half a metre under the surface: the sphere's own facets are the
             // wall here, and the capsule has to come back out along the local
             // horizontal.

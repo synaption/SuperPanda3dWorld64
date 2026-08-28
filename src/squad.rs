@@ -642,7 +642,11 @@ pub fn move_allies(
 pub fn animate_allies(
     animations: Res<CharacterAnimations>,
     allies: Query<&Ally>,
-    mut players: Query<(&AllyAnimationRoot, &mut AnimationPlayer, &mut AnimationTransitions)>,
+    mut players: Query<(
+        &AllyAnimationRoot,
+        &mut AnimationPlayer,
+        &mut AnimationTransitions,
+    )>,
 ) {
     if !animations.ready(ActiveCharacter::Mario) {
         return;
@@ -918,10 +922,7 @@ mod tests {
         let allies: Vec<Entity> = (0..4)
             .map(|index| {
                 world
-                    .spawn((
-                        Ally::new(Vec3::ZERO, index as f32),
-                        Transform::default(),
-                    ))
+                    .spawn((Ally::new(Vec3::ZERO, index as f32), Transform::default()))
                     .id()
             })
             .collect();
@@ -933,7 +934,14 @@ mod tests {
             world.run_system_once(update_goals).expect("no run");
             allies
                 .iter()
-                .map(|ally| world.get::<Ally>(*ally).expect("gone").goal.expect("no goal").0)
+                .map(|ally| {
+                    world
+                        .get::<Ally>(*ally)
+                        .expect("gone")
+                        .goal
+                        .expect("no goal")
+                        .0
+                })
                 .collect()
         };
         let facing_one_way = goals(&mut world);
@@ -965,7 +973,9 @@ mod tests {
     fn disbanding_clears_both_lists() {
         let mut squad = Squad::default();
         squad.members.push(Entity::from_raw_u32(1).unwrap());
-        squad.sent.push((Entity::from_raw_u32(2).unwrap(), Vec2::ZERO, true));
+        squad
+            .sent
+            .push((Entity::from_raw_u32(2).unwrap(), Vec2::ZERO, true));
         assert_eq!(squad.disband(), 2);
         assert!(squad.members.is_empty() && squad.sent.is_empty());
     }
@@ -1040,8 +1050,12 @@ mod tests {
         // Unrecruited, it stays near where it was left rather than walking to
         // the leader.
         for _ in 0..30 {
-            world.run_system_once(update_goals).expect("update_goals could not run");
-            world.run_system_once(move_allies).expect("move_allies could not run");
+            world
+                .run_system_once(update_goals)
+                .expect("update_goals could not run");
+            world
+                .run_system_once(move_allies)
+                .expect("move_allies could not run");
         }
         let wandered = world.get::<Transform>(ally).unwrap().translation;
         assert!(
@@ -1051,8 +1065,12 @@ mod tests {
 
         world.resource_mut::<Squad>().recruit(&[ally]);
         for _ in 0..90 {
-            world.run_system_once(update_goals).expect("update_goals could not run");
-            world.run_system_once(move_allies).expect("move_allies could not run");
+            world
+                .run_system_once(update_goals)
+                .expect("update_goals could not run");
+            world
+                .run_system_once(move_allies)
+                .expect("move_allies could not run");
         }
         let arrived = world.get::<Transform>(ally).unwrap().translation;
         let flat = Vec2::new(arrived.x - leader.x, arrived.z - leader.z).length();
@@ -1098,7 +1116,9 @@ mod tests {
         let mut clips = Vec::new();
         let mut walked = 0;
         for _ in 0..300 {
-            world.run_system_once(move_allies).expect("move_allies could not run");
+            world
+                .run_system_once(move_allies)
+                .expect("move_allies could not run");
             let ally = world.get::<Ally>(ally).unwrap();
             if ally.state.motion == crate::player::Motion::Run {
                 walked += 1;
@@ -1143,8 +1163,12 @@ mod tests {
         assert_eq!(world.resource_mut::<Squad>().send(target), 1);
 
         for _ in 0..150 {
-            world.run_system_once(update_goals).expect("update_goals could not run");
-            world.run_system_once(move_allies).expect("move_allies could not run");
+            world
+                .run_system_once(update_goals)
+                .expect("update_goals could not run");
+            world
+                .run_system_once(move_allies)
+                .expect("move_allies could not run");
         }
         let squad = world.resource::<Squad>();
         assert_eq!(squad.marching(), 0, "never reported arriving");
@@ -1156,8 +1180,12 @@ mod tests {
         );
         // Held: an order is not a suggestion, so it does not wander home.
         for _ in 0..90 {
-            world.run_system_once(update_goals).expect("update_goals could not run");
-            world.run_system_once(move_allies).expect("move_allies could not run");
+            world
+                .run_system_once(update_goals)
+                .expect("update_goals could not run");
+            world
+                .run_system_once(move_allies)
+                .expect("move_allies could not run");
         }
         let later = world.get::<Transform>(ally).unwrap().translation;
         assert!(

@@ -283,9 +283,10 @@ mod tests {
         let pipes = castle.pipes();
         assert_eq!(pipes[0].spawns, pipe::Spawn::Mario);
         assert!((pipes[0].at.translation - Vec3::new(-9.15, 2.6, 46.3)).length() < 1e-3);
-        assert!(pipes.iter().any(|pipe| pipe.spawns
-            == pipe::Spawn::Enemy(enemy::Kind::Ant)
-            && (pipe.at.translation - Vec3::new(46.8, 5.4, -68.1)).length() < 1e-3));
+        assert!(pipes
+            .iter()
+            .any(|pipe| pipe.spawns == pipe::Spawn::Enemy(enemy::Kind::Ant)
+                && (pipe.at.translation - Vec3::new(46.8, 5.4, -68.1)).length() < 1e-3));
         // `warp_pipe.glb` is 307 units across and a warp pipe is three metres.
         // The factor was a literal in `world.rs` until the .blend drew the
         // pipe at it.

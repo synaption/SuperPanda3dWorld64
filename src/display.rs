@@ -18,6 +18,8 @@
 //! the internal image follows the window's aspect ratio exactly, so the stretch
 //! is uniform and a circle stays a circle.
 
+use std::time::{Duration, Instant};
+
 use bevy::{
     camera::{ImageRenderTarget, RenderTarget},
     image::ImageSampler,
@@ -26,7 +28,7 @@ use bevy::{
         render_resource::{Extent3d, TextureFormat, TextureUsages},
         view::Msaa,
     },
-    window::{MonitorSelection, PrimaryWindow, WindowMode},
+    window::{MonitorSelection, PresentMode, PrimaryWindow, WindowMode},
 };
 
 /// Fails the build if the UI ever stops being drawn.
@@ -45,6 +47,32 @@ const _: fn() = || {
 /// How many physical pixels each world pixel occupies in each axis.
 pub const SCALES: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
+/// The frame rates the cap offers, in Hz. Zero is no cap at all.
+///
+/// A list rather than a dial because the useful values are a panel's refresh
+/// rate and its halves, not a continuum -- and the one to pick is the panel's
+/// own rate a few frames short. On a variable-refresh display that is the whole
+/// point: inside the panel's range the display follows the game, and above it
+/// the game is drawing frames that are torn in half and thrown away.
+pub const FRAME_CAPS: [u32; 7] = [0, 30, 60, 90, 120, 144, 240];
+
+/// The cap a fresh game starts at: none.
+///
+/// Off rather than a guess, because the right value is a fact about the screen
+/// the game is being played on and this has no way to know it -- and because
+/// there is no settings file, so a wrong guess would be one the player had to
+/// correct on every launch.
+const DEFAULT_FRAME_CAP: usize = 0;
+
+/// How long [`cap_frames`] spins rather than sleeps at the end of a frame.
+///
+/// `sleep` promises "at least", never "exactly", and the overshoot is enough to
+/// miss a 120 Hz frame even with the millisecond timer resolution `main` asks
+/// Windows for. So the bulk of the wait is slept and the last of it is spun,
+/// which is what a frame pacer is: a sleep that stops early and a spin that
+/// finishes the job.
+const SPIN: Duration = Duration::from_micros(1000);
+
 /// The scale a fresh game starts at: none at all.
 ///
 /// Full resolution is what the game did before this module existed, so it is
@@ -58,12 +86,15 @@ pub struct DisplaySettings {
     /// Index into [`SCALES`], never out of range: the menu wraps rather than
     /// walking off either end.
     pub scale: usize,
+    /// Index into [`FRAME_CAPS`], the same way.
+    pub frame_cap: usize,
 }
 
 impl Default for DisplaySettings {
     fn default() -> Self {
         Self {
             scale: DEFAULT_SCALE,
+            frame_cap: DEFAULT_FRAME_CAP,
         }
     }
 }
@@ -78,6 +109,17 @@ impl DisplaySettings {
     pub fn step_scale(&mut self, direction: i32) {
         let count = SCALES.len() as i32;
         self.scale = (((self.scale as i32 + direction) % count + count) % count) as usize;
+    }
+
+    /// The cap in Hz, or `None` for no cap.
+    pub fn frame_cap_hz(&self) -> Option<u32> {
+        Some(FRAME_CAPS[self.frame_cap]).filter(|hz| *hz > 0)
+    }
+
+    /// Steps through [`FRAME_CAPS`] and wraps, exactly as `step_scale` does.
+    pub fn step_frame_cap(&mut self, direction: i32) {
+        let count = FRAME_CAPS.len() as i32;
+        self.frame_cap = (((self.frame_cap as i32 + direction) % count + count) % count) as usize;
     }
 }
 
@@ -238,6 +280,128 @@ pub fn is_windowed(mode: WindowMode) -> bool {
     matches!(mode, WindowMode::Windowed)
 }
 
+/// How long the last frame was held back, so the frame chart can take it off.
+///
+/// A frame that slept is not a frame that computed, and a chart that cannot
+/// tell the difference reports a capped game as a slow one -- which is the
+/// exact confusion this whole investigation started with. [`cap_frames`] runs
+/// after `frame_chart::finish` so the chart never sees the wait at all; this is
+/// for the phase probes, which bracket the whole of `Main` and would.
+#[derive(Resource, Default)]
+pub struct FramePacing {
+    pub slept: Duration,
+}
+
+/// When the frame now ending is allowed to end, given the deadline the last one
+/// left behind.
+///
+/// Split out from [`cap_frames`] because it is the whole of the pacing policy
+/// and none of the waiting: a wall-clock test of the system around it can only
+/// assert loose bounds and flakes under a loaded machine, while this can be
+/// asked about a late frame, an early one and a first one exactly.
+fn deadline(due: Option<Instant>, now: Instant, period: Duration) -> Instant {
+    match due {
+        // The normal case, and the mild overrun with it: a deadline already
+        // gone by is still the right thing to measure the next one from, so a
+        // frame that ran long is followed by a short one rather than by a full
+        // period stacked on top of the overrun.
+        Some(at) if now < at + period => at,
+        // No deadline, or more than a whole frame past one -- the first capped
+        // frame, a level load, a window drag, the cap having just changed. This
+        // frame ends now and the next is measured from it. Waiting here would
+        // be holding back a frame nothing was waiting for, and repaying a debt
+        // by stalling is how a hitch becomes two.
+        _ => now,
+    }
+}
+
+/// Holds the frame back to the rate the player asked for.
+///
+/// Runs at the end of `Last`, after the frame chart has stopped its clock, so
+/// the wait is not counted as work. The deadline is carried forward rather than
+/// recomputed from "now" each frame: pacing from the end of the previous frame
+/// is what keeps a run of slightly-long frames from drifting the rate down, and
+/// the resync below is what stops a run of *very* long ones from being repaid
+/// as a burst of uncapped frames.
+pub fn cap_frames(
+    settings: Res<DisplaySettings>,
+    tuning: Res<crate::console::GameTuning>,
+    mut pacing: ResMut<FramePacing>,
+    mut due: Local<Option<Instant>>,
+) {
+    pacing.slept = Duration::ZERO;
+    let Some(hz) = settings.frame_cap_hz() else {
+        // Forgotten rather than kept, so turning the cap back on paces from
+        // the frame that turned it on rather than from a deadline set minutes
+        // ago and long since passed.
+        *due = None;
+        return;
+    };
+    let period = Duration::from_secs_f64(1.0 / f64::from(hz));
+    let now = Instant::now();
+    let target = deadline(*due, now, period);
+    if target > now {
+        let wait = target - now;
+        // `frame_spin` holds the whole wait rather than the last millisecond
+        // of it. See its entry in the console's table: it is there to tell one
+        // cause of the post-pacing stall from the other, not to be left on.
+        if wait > SPIN && tuning.frame_spin < 0.5 {
+            std::thread::sleep(wait - SPIN);
+        }
+        while Instant::now() < target {
+            std::hint::spin_loop();
+        }
+        pacing.slept = Instant::now().saturating_duration_since(now);
+    }
+    *due = Some(target + period);
+}
+
+/// Whether a fresh window waits for the display.
+///
+/// Off. The display this is played on is variable-refresh, so it follows the
+/// frame rate rather than the frame rate having to wait for it -- the wait buys
+/// no smoothness there and costs the whole of what it waits for. Measured on
+/// this game: with the wait in place 13.4% of frames took a stall of about
+/// fifteen milliseconds in `PostUpdate`, against 0.35% without it. The render
+/// schedule's present block sits on the same task pool the main world's
+/// parallel systems run on, so a main-world system that wants a worker thread
+/// queues behind a thread parked on the display.
+///
+/// A fixed display wants it back on, and the pause menu's Display page is where
+/// that is done. It is a named constant rather than a literal in `main` so this
+/// paragraph has somewhere to live and the menu's test has something to read.
+pub const DEFAULT_PRESENT_MODE: PresentMode = PresentMode::AutoNoVsync;
+
+/// Whether the window waits for the display before it shows a frame.
+///
+/// Asked of the mode rather than tracked separately, so the menu row and the
+/// window can never disagree about what is on: there is one answer and the
+/// window holds it.
+pub fn is_vsync(mode: PresentMode) -> bool {
+    matches!(
+        mode,
+        PresentMode::AutoVsync | PresentMode::Fifo | PresentMode::FifoRelaxed
+    )
+}
+
+/// The other of the two present modes this game offers.
+///
+/// Off is not a performance setting and is not offered as one. The game is
+/// drawn at whatever rate the display runs at and the simulation is fixed-step
+/// underneath that, so uncapping it buys no smoothness -- it buys a torn
+/// picture and a hot GPU. What it is for is telling the two halves of a slow
+/// frame apart: with the wait in place, the present block sits on the shared
+/// task pool and any main-world system that wants a worker thread queues behind
+/// it, so the frame chart reads a stall that is really the display setting the
+/// pace. Turning this off is how you find out which one a tall bar was.
+pub fn other_present_mode(mode: PresentMode) -> PresentMode {
+    if is_vsync(mode) {
+        PresentMode::AutoNoVsync
+    } else {
+        PresentMode::AutoVsync
+    }
+}
+
 /// The other of the two window modes this game has. Borderless rather than
 /// exclusive fullscreen, for the reason `main` gives where it asks for it.
 pub fn other_mode(mode: WindowMode) -> WindowMode {
@@ -251,6 +415,108 @@ pub fn other_mode(mode: WindowMode) -> WindowMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cap steps through the list and wraps, and `Off` is a real entry in
+    /// it rather than a state beside it.
+    #[test]
+    fn the_frame_cap_wraps_through_its_choices() {
+        let mut settings = DisplaySettings::default();
+        assert_eq!(settings.frame_cap_hz(), None, "a fresh game is uncapped");
+
+        settings.step_frame_cap(1);
+        assert_eq!(settings.frame_cap_hz(), Some(FRAME_CAPS[1]));
+
+        settings.step_frame_cap(-1);
+        assert_eq!(settings.frame_cap_hz(), None);
+        // Off the near end and round to the far one, the way the scale does.
+        settings.step_frame_cap(-1);
+        assert_eq!(settings.frame_cap_hz(), Some(*FRAME_CAPS.last().unwrap()));
+        settings.step_frame_cap(1);
+        assert_eq!(settings.frame_cap_hz(), None);
+    }
+
+    /// The pacing policy, asked about each case it exists for.
+    ///
+    /// No clock and no sleeping, so it says the same thing on a loaded machine
+    /// as an idle one -- see [`deadline`] for why that is worth splitting out.
+    #[test]
+    fn the_frame_cap_decides_when_a_frame_may_end() {
+        let period = Duration::from_secs_f64(1.0 / 60.0);
+        let now = Instant::now();
+
+        assert_eq!(
+            deadline(None, now, period),
+            now,
+            "the first capped frame has nothing to wait for and must not wait"
+        );
+
+        let ahead = now + period / 2;
+        assert_eq!(
+            deadline(Some(ahead), now, period),
+            ahead,
+            "a deadline still to come is the one to wait for"
+        );
+
+        // Overran, but by less than a frame: the deadline stands, so the next
+        // frame is short rather than the rate slipping by the overrun.
+        let just_missed = now - period / 2;
+        assert_eq!(
+            deadline(Some(just_missed), now, period),
+            just_missed,
+            "a deadline just missed is still what the next frame is measured from"
+        );
+
+        // Overran by more than a frame. Keeping this deadline would mean
+        // running flat out to repay it, which is a stutter answered with a
+        // burst. It is written off instead.
+        let long_gone = now - period * 4;
+        assert_eq!(
+            deadline(Some(long_gone), now, period),
+            now,
+            "a deadline long past is abandoned rather than caught up on"
+        );
+    }
+
+    /// And the system around it really does sleep, and says how long for.
+    ///
+    /// Driven through a `Schedule` rather than `run_system_once`, and that is
+    /// the point rather than a detail: the deadline lives in a `Local`, which
+    /// belongs to the system *instance*. `run_system_once` builds a fresh one
+    /// per call, so every frame would look like the first and the pacer would
+    /// never appear to pace.
+    ///
+    /// The assertion allows for the machine having taken a whole frame between
+    /// the two runs on its own -- in which case there was correctly nothing to
+    /// wait for. Asserting a duration instead would be asserting that the test
+    /// machine was idle, which is not something a test can know.
+    #[test]
+    fn the_frame_cap_sleeps_and_reports_it() {
+        let slowest = *FRAME_CAPS.iter().filter(|hz| **hz > 0).min().unwrap();
+        let period = Duration::from_secs_f64(1.0 / f64::from(slowest));
+        let mut world = World::new();
+        world.insert_resource(DisplaySettings {
+            frame_cap: FRAME_CAPS.iter().position(|hz| *hz == slowest).unwrap(),
+            ..default()
+        });
+        world.init_resource::<FramePacing>();
+        // The pacer asks the console whether it should spin rather than sleep.
+        world.init_resource::<crate::console::GameTuning>();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(cap_frames);
+
+        // The first sets the deadline; the second is the one held to it.
+        schedule.run(&mut world);
+        let between = Instant::now();
+        schedule.run(&mut world);
+        let gap = between.elapsed();
+
+        let slept = world.resource::<FramePacing>().slept;
+        assert!(
+            slept > Duration::ZERO || gap >= period,
+            "the second frame neither slept nor had a reason not to: it took \
+             {gap:?} against a {period:?} period"
+        );
+    }
 
     #[test]
     fn scale_steps_wrap_in_both_directions() {
@@ -290,7 +556,13 @@ mod tests {
         world.init_resource::<Assets<Image>>();
         let handle = create_target(&mut world.resource_mut::<Assets<Image>>());
         world.insert_resource(SceneTarget(handle.clone()));
-        world.insert_resource(DisplaySettings { scale: 1 });
+        // Spread from the default rather than written out: what this test is
+        // about is the render scale, and a field added beside it should not be
+        // a compile error here.
+        world.insert_resource(DisplaySettings {
+            scale: 1,
+            ..default()
+        });
         world.spawn((
             Window {
                 resolution: WindowResolution::new(1600, 900),
@@ -323,11 +595,23 @@ mod tests {
         // Nothing changed, so nothing is touched: a resize costs a texture
         // rebuild, and doing one every frame would be worse than the setting
         // is worth.
-        let before = world.resource::<Assets<Image>>().get(&handle).unwrap().data.as_ref().map(Vec::len);
+        let before = world
+            .resource::<Assets<Image>>()
+            .get(&handle)
+            .unwrap()
+            .data
+            .as_ref()
+            .map(Vec::len);
         world.run_system_once(resize).unwrap();
         assert_eq!(
             before,
-            world.resource::<Assets<Image>>().get(&handle).unwrap().data.as_ref().map(Vec::len)
+            world
+                .resource::<Assets<Image>>()
+                .get(&handle)
+                .unwrap()
+                .data
+                .as_ref()
+                .map(Vec::len)
         );
     }
 

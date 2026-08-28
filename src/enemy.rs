@@ -317,8 +317,8 @@ fn measure(model: &str) -> Option<Size> {
     // actually drawn. Skinned meshes are taken flat wherever they are found --
     // including ones hung under a node this walk never reaches, since being
     // reachable is not what decides whether their vertices count.
-    let mut stack: Vec<(usize, Mat4)> = json["scenes"][json["scene"].as_u64().unwrap_or(0) as usize]
-        ["nodes"]
+    let mut stack: Vec<(usize, Mat4)> = json["scenes"]
+        [json["scene"].as_u64().unwrap_or(0) as usize]["nodes"]
         .as_array()?
         .iter()
         .filter_map(|node| Some((node.as_u64()? as usize, Mat4::IDENTITY)))
@@ -363,8 +363,11 @@ fn measure(model: &str) -> Option<Size> {
 fn node_matrix(node: &serde_json::Value) -> Mat4 {
     let numbers = |key: &str, count: usize| -> Option<Vec<f32>> {
         let list = node[key].as_array()?;
-        (list.len() == count)
-            .then(|| list.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect())
+        (list.len() == count).then(|| {
+            list.iter()
+                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                .collect()
+        })
     };
     if let Some(cells) = numbers("matrix", 16) {
         return Mat4::from_cols_slice(&cells);
@@ -372,8 +375,8 @@ fn node_matrix(node: &serde_json::Value) -> Mat4 {
     let translation = numbers("translation", 3).map_or(Vec3::ZERO, |v| Vec3::new(v[0], v[1], v[2]));
     // glTF writes a quaternion x, y, z, w -- the same order `Quat::from_xyzw`
     // takes, and not the order `Quat::from_array` documents itself with.
-    let rotation = numbers("rotation", 4)
-        .map_or(Quat::IDENTITY, |v| Quat::from_xyzw(v[0], v[1], v[2], v[3]));
+    let rotation =
+        numbers("rotation", 4).map_or(Quat::IDENTITY, |v| Quat::from_xyzw(v[0], v[1], v[2], v[3]));
     let scale = numbers("scale", 3).map_or(Vec3::ONE, |v| Vec3::new(v[0], v[1], v[2]));
     Mat4::from_scale_rotation_translation(scale, rotation, translation)
 }
@@ -2007,8 +2010,11 @@ fn crowd_step(
     } else {
         let goal = wander.goal(transform.translation, dt);
         goal.map_or(Vec2::ZERO, |goal| {
-            Vec2::new(goal.x - transform.translation.x, goal.z - transform.translation.z)
-                .normalize_or_zero()
+            Vec2::new(
+                goal.x - transform.translation.x,
+                goal.z - transform.translation.z,
+            )
+            .normalize_or_zero()
         })
     };
     if towards != Vec2::ZERO {
@@ -2753,7 +2759,9 @@ mod tests {
     /// `tools/measure_actor_hang.py` is the independent instrument, and it reads
     /// the posed mesh rather than the bind pose.
     fn hang_in_model(kind: Kind) -> f32 {
-        measure(kind.model()).expect("a shipped actor could not be measured").lift
+        measure(kind.model())
+            .expect("a shipped actor could not be measured")
+            .lift
     }
 
     /// That the game can measure both actors, and that what it measures is a
@@ -2784,8 +2792,10 @@ mod tests {
     fn an_actor_is_the_size_it_was_authored_at() {
         for kind in KINDS {
             let size = measure(kind.model()).unwrap_or_else(|| {
-                panic!("{kind:?}'s model could not be measured, so the game would \
-                        silently use {UNMEASURED:?}")
+                panic!(
+                    "{kind:?}'s model could not be measured, so the game would \
+                        silently use {UNMEASURED:?}"
+                )
             });
             assert!(
                 (0.05..20.0).contains(&size.radius) && (0.05..20.0).contains(&size.height),
@@ -3691,7 +3701,10 @@ mod tests {
                 let now = world.get::<Transform>(*enemy).expect("gone").translation;
                 most.max(was.distance(now))
             });
-        assert!(moved < 0.01, "a settled cheap tier was still shuffling {moved}");
+        assert!(
+            moved < 0.01,
+            "a settled cheap tier was still shuffling {moved}"
+        );
     }
 
     /// A press of cheap-tier bodies expanding across the castle never pushes one
@@ -3722,7 +3735,8 @@ mod tests {
         let enemies: Vec<Entity> = (0..300)
             .map(|index| {
                 let angle = index as f32 * crate::squad::GOLDEN_ANGLE;
-                let at = courtyard + Vec3::new(angle.sin(), 0., angle.cos()) * (index as f32 * 0.004);
+                let at =
+                    courtyard + Vec3::new(angle.sin(), 0., angle.cos()) * (index as f32 * 0.004);
                 world
                     .spawn((
                         Enemy {
@@ -3753,9 +3767,7 @@ mod tests {
                     let level = world.resource::<LevelData>();
                     let hit = level
                         .surface_hit(from, from + moved)
-                        .is_some_and(|(_, normal)| {
-                            normal.y.abs() <= crate::level::GROUND_NORMAL_Y
-                        });
+                        .is_some_and(|(_, normal)| normal.y.abs() <= crate::level::GROUND_NORMAL_Y);
                     // Only what left a cell, for the reason
                     // [`a_crowd_walks_the_castle_without_walking_through_it`]
                     // gives at length: a grid cannot record a fence that does
@@ -4436,9 +4448,7 @@ mod tests {
                     let from = was[index] + knee;
                     let crossed = level
                         .surface_hit(from, from + moved)
-                        .is_some_and(|(_, normal)| {
-                            normal.y.abs() <= crate::level::GROUND_NORMAL_Y
-                        });
+                        .is_some_and(|(_, normal)| normal.y.abs() <= crate::level::GROUND_NORMAL_Y);
                     if crossed {
                         let field = world.resource::<crate::flow::FlowField>();
                         through.push((was[index], now, field.same_cell(was[index], now)));
@@ -4503,7 +4513,10 @@ mod tests {
                 world.get::<Transform>(*enemy).expect("gone").translation.y - from.y
             })
             .fold(f32::MIN, f32::max);
-        assert!(worst < 10.0, "something climbed {worst:.1} m in thirty seconds");
+        assert!(
+            worst < 10.0,
+            "something climbed {worst:.1} m in thirty seconds"
+        );
     }
 
     /// The Marios were held out of nothing at all: `move_allies` walks each one
@@ -4589,7 +4602,9 @@ mod tests {
             "the far enemy kept its model"
         );
         assert!(
-            world.get::<Children>(enemy).is_none_or(|kids| kids.is_empty()),
+            world
+                .get::<Children>(enemy)
+                .is_none_or(|kids| kids.is_empty()),
             "the far enemy kept the skeleton the model spawned, so the next one \
              it is given will be its second"
         );

@@ -256,8 +256,7 @@ pub fn movement(
     // The trigger belongs to whichever weapon is out. With a gun in hand the
     // edge is left for `weapon::fire` to take, so one press either swings or
     // shoots and never does both.
-    let attack_pressed =
-        !loadout.equipped.is_ranged() && InputState::take(&mut input_state.attack);
+    let attack_pressed = !loadout.equipped.is_ranged() && InputState::take(&mut input_state.attack);
     let input = input_state.move_axis;
     // `forward`/`right` hand back a `Direction3d` rather than a `Vec3`: a
     // vector the type system knows is unit length. Flattening one onto the
@@ -624,7 +623,9 @@ mod tests {
 
     fn tick(world: &mut World, ticks: usize) {
         for _ in 0..ticks {
-            world.run_system_once(movement).expect("movement could not run");
+            world
+                .run_system_once(movement)
+                .expect("movement could not run");
         }
     }
 
@@ -975,7 +976,10 @@ mod tests {
             before.y,
             after.y
         );
-        assert!(velocity.y > 0.0, "the underwater jump lost its upward speed");
+        assert!(
+            velocity.y > 0.0,
+            "the underwater jump lost its upward speed"
+        );
         assert!(!grounded, "the underwater jump stayed grounded");
     }
 

@@ -57,7 +57,8 @@ pub enum Page {
 
 /// One line of a page.
 ///
-/// The value rows ([`Item::RenderScale`], [`Item::Lighting`], [`Item::WindowMode`]) are also
+/// The value rows ([`Item::RenderScale`], [`Item::Lighting`], [`Item::WindowMode`],
+/// [`Item::VSync`], [`Item::FrameCap`]) are also
 /// choosable: Enter on them steps the value forward, which is what a player who
 /// never tries the arrow keys will do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -76,6 +77,13 @@ enum Item {
     /// console did it, or at every pixel. See [`crate::n64::Shading`].
     Lighting,
     WindowMode,
+    /// Whether the frame waits for the display before it is shown. A
+    /// diagnostic as much as a preference -- see [`display::other_present_mode`]
+    /// for what turning it off is actually for.
+    VSync,
+    /// A ceiling on how many frames a second are drawn. See
+    /// [`display::FRAME_CAPS`] for why it is a list of rates rather than a dial.
+    FrameCap,
     Back,
 }
 
@@ -105,6 +113,8 @@ impl Page {
                 Item::RenderScale,
                 Item::Lighting,
                 Item::WindowMode,
+                Item::VSync,
+                Item::FrameCap,
                 Item::Back,
             ],
         }
@@ -525,6 +535,17 @@ fn adjust(
                 window.mode = display::other_mode(window.mode);
             }
         }
+        // Written straight onto the window, the way the mode above is, rather
+        // than mirrored into a setting first. The render world watches this
+        // field and rebuilds the surface configuration when it changes, so a
+        // second copy of the answer would be a second thing to keep in step for
+        // no gain.
+        Item::VSync => {
+            if let Ok(mut window) = windows.single_mut() {
+                window.present_mode = display::other_present_mode(window.present_mode);
+            }
+        }
+        Item::FrameCap => settings.step_frame_cap(step),
         _ => {}
     }
 }
@@ -546,7 +567,10 @@ pub fn draw(
     windows: Query<&Window, With<PrimaryWindow>>,
     mut root: Query<&mut Visibility, With<MenuRoot>>,
     mut title: Query<&mut Text, (With<MenuTitle>, Without<MenuRow>, Without<MenuHint>)>,
-    mut hint: Query<(&mut Text, &mut TextColor), (With<MenuHint>, Without<MenuRow>, Without<MenuTitle>)>,
+    mut hint: Query<
+        (&mut Text, &mut TextColor),
+        (With<MenuHint>, Without<MenuRow>, Without<MenuTitle>),
+    >,
     mut rows: Query<(&MenuRow, &mut Text, &mut TextColor), (Without<MenuTitle>, Without<MenuHint>)>,
 ) {
     if let Ok(mut visibility) = root.single_mut() {
@@ -580,6 +604,10 @@ pub fn draw(
         .single()
         .map(|window| display::is_windowed(window.mode))
         .unwrap_or(false);
+    let waits_for_the_display = windows
+        .single()
+        .map(|window| display::is_vsync(window.present_mode))
+        .unwrap_or(true);
 
     if let Ok((mut text, mut colour)) = hint.single_mut() {
         match load.trouble() {
@@ -609,11 +637,7 @@ pub fn draw(
             Item::Levels => "Level".to_string(),
             // A tick beside the one being played, because a list of levels with
             // nothing marked is a list that does not say where you are.
-            Item::Level(id) => format!(
-                "{} {}",
-                if *id == *level { "*" } else { " " },
-                id.name()
-            ),
+            Item::Level(id) => format!("{} {}", if *id == *level { "*" } else { " " }, id.name()),
             Item::Options => "Options".to_string(),
             Item::Quit => "Quit".to_string(),
             Item::Display => "Display".to_string(),
@@ -624,13 +648,21 @@ pub fn draw(
                 rendered.x,
                 rendered.y
             ),
-            Item::Lighting => format!(
-                "Lighting               < {} >",
-                lighting.shading.label()
-            ),
+            Item::Lighting => format!("Lighting               < {} >", lighting.shading.label()),
             Item::WindowMode => format!(
                 "Window mode            < {} >",
                 if windowed { "Windowed" } else { "Fullscreen" }
+            ),
+            Item::VSync => format!(
+                "V-sync                 < {} >",
+                if waits_for_the_display { "On" } else { "Off" }
+            ),
+            Item::FrameCap => format!(
+                "Frame cap              < {} >",
+                match settings.frame_cap_hz() {
+                    Some(hz) => format!("{hz} fps"),
+                    None => "Off".to_string(),
+                }
             ),
             Item::Back => "Back".to_string(),
         };
@@ -791,6 +823,52 @@ mod tests {
         );
     }
 
+    /// Two rows below the lighting: the display waits for the frame, or does
+    /// not, and either arrow is the swap.
+    #[test]
+    fn the_display_page_turns_the_vsync_off_and_back_on() {
+        let mut world = paused();
+
+        press(&mut world, KeyCode::Escape);
+        press(&mut world, KeyCode::ArrowDown);
+        press(&mut world, KeyCode::ArrowDown);
+        press(&mut world, KeyCode::Enter);
+        press(&mut world, KeyCode::Enter);
+        press(&mut world, KeyCode::ArrowDown);
+        press(&mut world, KeyCode::ArrowDown);
+        press(&mut world, KeyCode::ArrowDown);
+        assert_eq!(world.resource::<MenuState>().selected(), Item::VSync);
+
+        // The window is what holds the answer, so that is what is asked --
+        // and what it starts at is whatever spawned it, which in this test is
+        // a plain `Window::default()` rather than the one `main` builds. So
+        // the row is tested against where it began rather than against a
+        // remembered default: what is under test is that it swaps, both ways,
+        // by either arrow.
+        let mode = |world: &mut World| {
+            world
+                .query_filtered::<&Window, With<PrimaryWindow>>()
+                .single(world)
+                .map(|window| window.present_mode)
+                .expect("no primary window")
+        };
+        let began = display::is_vsync(mode(&mut world));
+
+        press(&mut world, KeyCode::ArrowRight);
+        assert_eq!(display::is_vsync(mode(&mut world)), !began);
+        // Two modes and no order to them, so the other direction is the way
+        // back rather than a step further on.
+        press(&mut world, KeyCode::ArrowLeft);
+        assert_eq!(display::is_vsync(mode(&mut world)), began);
+        // And Enter alone reaches it, for a player who never tries the arrows.
+        press(&mut world, KeyCode::Enter);
+        assert_eq!(display::is_vsync(mode(&mut world)), !began);
+        assert!(
+            world.resource::<MenuState>().open,
+            "changing a value is not choosing to leave the menu"
+        );
+    }
+
     /// Escape unwinds one page per press rather than shutting the menu from
     /// wherever it happens to be.
     #[test]
@@ -944,7 +1022,10 @@ mod tests {
         world.insert_resource(LevelId::Planet);
         world.run_system_once(input).expect("the menu did not run");
         let menu = world.resource::<MenuState>();
-        assert!(!menu.open, "the menu stayed up over a level that had arrived");
+        assert!(
+            !menu.open,
+            "the menu stayed up over a level that had arrived"
+        );
         assert_eq!(menu.loading(), None);
         assert_eq!(cursor(&mut world).grab_mode, CursorGrabMode::Locked);
     }
@@ -965,7 +1046,10 @@ mod tests {
         press(&mut world, KeyCode::ArrowDown);
         press(&mut world, KeyCode::Enter);
         world.resource_mut::<LevelLoad>().pending = Some(LevelId::Planet);
-        assert_eq!(world.resource::<MenuState>().loading(), Some(LevelId::Planet));
+        assert_eq!(
+            world.resource::<MenuState>().loading(),
+            Some(LevelId::Planet)
+        );
 
         // The load gives up and the castle stays where it was.
         {

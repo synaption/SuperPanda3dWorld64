@@ -714,8 +714,20 @@ mod tests {
     #[test]
     fn only_unbaked_surfaces_take_light() {
         let lighting = N64Lighting::default();
-        assert_eq!(translate(&standard(false), &lighting, AlphaMode::Opaque).uniform.light.w, 1.0);
-        assert_eq!(translate(&standard(true), &lighting, AlphaMode::Opaque).uniform.light.w, 0.0);
+        assert_eq!(
+            translate(&standard(false), &lighting, AlphaMode::Opaque)
+                .uniform
+                .light
+                .w,
+            1.0
+        );
+        assert_eq!(
+            translate(&standard(true), &lighting, AlphaMode::Opaque)
+                .uniform
+                .light
+                .w,
+            0.0
+        );
     }
 
     /// The display option reaches the *pipeline*, not just the uniform, and
@@ -735,8 +747,16 @@ mod tests {
         let vertex = N64Lighting::default();
         let key = |material: &N64Material| N64MaterialKey::from(material).per_pixel;
 
-        assert!(!key(&translate(&standard(false), &vertex, AlphaMode::Opaque)));
-        assert!(key(&translate(&standard(false), &per_pixel, AlphaMode::Opaque)));
+        assert!(!key(&translate(
+            &standard(false),
+            &vertex,
+            AlphaMode::Opaque
+        )));
+        assert!(key(&translate(
+            &standard(false),
+            &per_pixel,
+            AlphaMode::Opaque
+        )));
         assert!(
             !key(&translate(&standard(true), &per_pixel, AlphaMode::Opaque)),
             "a surface whose colour is already baked was given a second pipeline \
@@ -901,7 +921,10 @@ mod tests {
     fn the_slimes_eyes_are_the_cutout_and_its_body_is_not() {
         let modes = alpha_modes("actors/slime.glb");
         assert_eq!(modes.get("Slime_Eyes").map(String::as_str), Some("MASK"));
-        assert_eq!(modes.get("Slime_Detailed").map(String::as_str), Some("OPAQUE"));
+        assert_eq!(
+            modes.get("Slime_Detailed").map(String::as_str),
+            Some("OPAQUE")
+        );
     }
 
     /// The alpha mode each material in a glTF was written out with, defaulting
@@ -919,7 +942,10 @@ mod tests {
             .map(|material| {
                 (
                     material["name"].as_str().unwrap_or_default().to_owned(),
-                    material["alphaMode"].as_str().unwrap_or("OPAQUE").to_owned(),
+                    material["alphaMode"]
+                        .as_str()
+                        .unwrap_or("OPAQUE")
+                        .to_owned(),
                 )
             })
             .collect()
@@ -930,11 +956,7 @@ mod tests {
     #[test]
     fn only_a_blend_with_a_cutout_picture_changes_pass() {
         let images = Assets::<Image>::default();
-        for mode in [
-            AlphaMode::Opaque,
-            AlphaMode::Mask(0.25),
-            AlphaMode::Blend,
-        ] {
+        for mode in [AlphaMode::Opaque, AlphaMode::Mask(0.25), AlphaMode::Blend] {
             let material = StandardMaterial {
                 alpha_mode: mode,
                 ..standard(false)
@@ -956,9 +978,16 @@ mod tests {
             alpha_mode: AlphaMode::Mask(0.4),
             ..standard(false)
         };
-        assert_eq!(translate(&masked, &lighting, masked.alpha_mode).uniform.alpha_cutoff, 0.4);
         assert_eq!(
-            translate(&standard(false), &lighting, AlphaMode::Opaque).uniform.alpha_cutoff,
+            translate(&masked, &lighting, masked.alpha_mode)
+                .uniform
+                .alpha_cutoff,
+            0.4
+        );
+        assert_eq!(
+            translate(&standard(false), &lighting, AlphaMode::Opaque)
+                .uniform
+                .alpha_cutoff,
             0.0
         );
     }

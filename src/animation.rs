@@ -16,9 +16,7 @@ use crate::{
     player::{Controller, Motion},
     ActiveCharacter,
 };
-use bevy::{
-    animation::RepeatAnimation, gltf::Gltf, platform::collections::HashMap, prelude::*,
-};
+use bevy::{animation::RepeatAnimation, gltf::Gltf, platform::collections::HashMap, prelude::*};
 
 // -- the Hero's clips, verbatim out of Blender ------------------------------
 const IDLE: &str = "Idle ";
@@ -115,7 +113,9 @@ pub struct AnimationOwner(pub ActiveCharacter);
 /// graphs however many enemies are alive, because `AssetServer::load` hands
 /// back the same handle for the same path.
 #[derive(Resource, Default)]
-pub struct EnemyGraphs(HashMap<AssetId<AnimationClip>, (Handle<AnimationGraph>, AnimationNodeIndex)>);
+pub struct EnemyGraphs(
+    HashMap<AssetId<AnimationClip>, (Handle<AnimationGraph>, AnimationNodeIndex)>,
+);
 
 impl EnemyGraphs {
     fn get_or_add(
@@ -463,15 +463,13 @@ pub fn claim_players(
             if let Ok(enemy) = enemies.get(ancestor) {
                 let (graph, node) = enemy_graphs.get_or_add(&enemy.animation, &mut graphs);
                 player.play(node).repeat();
-                commands
-                    .entity(entity)
-                    .insert((
-                        crate::enemy::EnemyAnimationRoot {
-                            owner: ancestor,
-                            clip: node,
-                        },
-                        AnimationGraphHandle(graph),
-                    ));
+                commands.entity(entity).insert((
+                    crate::enemy::EnemyAnimationRoot {
+                        owner: ancestor,
+                        clip: node,
+                    },
+                    AnimationGraphHandle(graph),
+                ));
                 break;
             }
             if let Ok(character) = characters.get(ancestor) {
@@ -540,7 +538,11 @@ pub fn update(
     mut state: ResMut<PlayerAnimation>,
     game: Res<crate::GameState>,
     mut players: Query<
-        (&AnimationOwner, &mut AnimationPlayer, &mut AnimationTransitions),
+        (
+            &AnimationOwner,
+            &mut AnimationPlayer,
+            &mut AnimationTransitions,
+        ),
         Without<AllyAnimationRoot>,
     >,
 ) {

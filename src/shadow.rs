@@ -585,7 +585,11 @@ mod tests {
     #[test]
     fn a_disc_is_never_floated_far_enough_to_cover_its_own_caster() {
         let slime = clearance(0.6, 0.6);
-        assert_eq!(slime, 0.6 * HEADROOM, "the dome should be bounded by height");
+        assert_eq!(
+            slime,
+            0.6 * HEADROOM,
+            "the dome should be bounded by height"
+        );
         let player = clearance(crate::player::PLAYER_RADIUS, crate::player::PLAYER_HEIGHT);
         assert_eq!(
             player,
@@ -632,8 +636,7 @@ mod tests {
         let mut worst = 1.0_f32;
         let mut at = Vec3::ZERO;
         for (here, _) in walkable(&level) {
-            let (_, up) =
-                place(&level, here, Vec3::Y).expect("a floor was found and then lost");
+            let (_, up) = place(&level, here, Vec3::Y).expect("a floor was found and then lost");
             if up.y < worst {
                 worst = up.y;
                 at = here;
@@ -660,7 +663,10 @@ mod tests {
                 "a caster standing at {here:?} casts no shadow at all"
             );
         }
-        assert!(standing > 10_000, "the sweep only found {standing} places to stand");
+        assert!(
+            standing > 10_000,
+            "the sweep only found {standing} places to stand"
+        );
     }
 
     /// Every place on the castle a caster could be standing, as the position
@@ -803,5 +809,4 @@ mod tests {
             "a caster asking for {faint} was drawn at {drawn}"
         );
     }
-
 }

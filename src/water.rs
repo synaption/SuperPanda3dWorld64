@@ -23,11 +23,11 @@
 //! Every constant here is the Panda3D build's, converted from SM64 units to
 //! the port's world scale of 1/100.
 
+use crate::n64::N64Lighting;
 use crate::{
     furniture::{self, SurfaceSpec},
     level::{LevelData, WaterBox},
 };
-use crate::n64::N64Lighting;
 use bevy::{
     asset::RenderAssetUsages,
     gltf::{Gltf, GltfMesh, GltfNode},
@@ -297,7 +297,13 @@ pub fn adopt_surfaces(
     };
     let mut found = Vec::new();
     for handle in roots(gltf, &nodes) {
-        collect_surfaces(&handle, Transform::IDENTITY, &nodes, &gltf_meshes, &mut found);
+        collect_surfaces(
+            &handle,
+            Transform::IDENTITY,
+            &nodes,
+            &gltf_meshes,
+            &mut found,
+        );
     }
     let texture = water_texture(&assets);
     for want in &pending.wanted {
@@ -433,11 +439,15 @@ pub fn drift_ocean(
 ) {
     // Radians a second that put the surface at the same metres a second the
     // castle's sheets drift at, whatever size the planet turns out to be.
-    let Some(spin) = level.sea_radius().map(|radius| DRIFT_SPEED / radius.max(1.0)) else {
+    let Some(spin) = level
+        .sea_radius()
+        .map(|radius| DRIFT_SPEED / radius.max(1.0))
+    else {
         return;
     };
     for mut transform in &mut sea {
-        transform.rotation = Quat::from_axis_angle(OCEAN_AXIS.normalize(), spin * time.elapsed_secs());
+        transform.rotation =
+            Quat::from_axis_angle(OCEAN_AXIS.normalize(), spin * time.elapsed_secs());
     }
 }
 
@@ -538,12 +548,8 @@ pub fn dim(
             // texture sample and not a colour anybody picked. The alpha is the
             // sheet's own -- each water box was given its own in the .blend --
             // and is read back off rather than written from a constant.
-            material.base_color = Color::linear_rgba(
-                level.x,
-                level.y,
-                level.z,
-                material.base_color.alpha(),
-            );
+            material.base_color =
+                Color::linear_rgba(level.x, level.y, level.z, material.base_color.alpha());
         }
     }
 }
@@ -687,8 +693,9 @@ mod tests {
         // origin, which is why the node transform is added back in here.
         let low = bound("min");
         let high = bound("max");
-        for (axis, (want_low, want_high)) in
-            [(-76.03, -44.69), (-8.0, 30.04), (-74.63, -41.43)].into_iter().enumerate()
+        for (axis, (want_low, want_high)) in [(-76.03, -44.69), (-8.0, 30.04), (-74.63, -41.43)]
+            .into_iter()
+            .enumerate()
         {
             assert!(
                 (low[axis] - want_low).abs() < 0.01 && (high[axis] - want_high).abs() < 0.01,

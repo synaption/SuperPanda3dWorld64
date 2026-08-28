@@ -316,6 +316,19 @@ pub const SPECS: &[TunableSpec] = &[
         doc: "draw the contact shadows under everything",
     },
     TunableSpec {
+        name: "frame_spin",
+        // A diagnostic, and a narrow one: it asks whether the stall that
+        // follows a paced frame is the cost of waking *this* thread or the cost
+        // of waking the task pool's. Spinning keeps the main thread hot and
+        // leaves the workers just as cold, so if the stall goes away it was
+        // this thread, and if it stays it was theirs. Costs a whole core while
+        // it is on, which is why it is not how the cap paces by default.
+        low: 0.0,
+        high: 1.0,
+        step: 1.0,
+        doc: "frame cap spins instead of sleeping (burns a core)",
+    },
+    TunableSpec {
         name: "enemy_draw",
         // Down from 20, because this is now a quality dial rather than a
         // visibility one and the interesting end of it is the near end.
@@ -433,6 +446,9 @@ pub struct GameTuning {
     /// Whether the contact discs are drawn at all. Off is a diagnostic rather
     /// than a look: see the spec above.
     pub shadows: f32,
+    /// Whether the frame cap busy-waits rather than sleeping. Diagnostic; see
+    /// the spec above.
+    pub frame_spin: f32,
     pub enemy_rate: f32,
     pub enemy_limit: f32,
     /// How many allies the Mario warp pipe keeps alive. Enemy pipes instead
@@ -514,6 +530,7 @@ impl Default for GameTuning {
             // instead of two per slime and one per ant.
             enemy_draw: 25.0,
             shadows: 1.0,
+            frame_spin: 0.0,
             enemy_rate: 7.0,
             enemy_limit: 20.0,
             pipe_brood: 5.0,
@@ -572,6 +589,7 @@ impl GameTuning {
             "enemy_lod_far" => self.enemy_lod_far,
             "enemy_draw" => self.enemy_draw,
             "shadows" => self.shadows,
+            "frame_spin" => self.frame_spin,
             "enemy_rate" => self.enemy_rate,
             "enemy_limit" => self.enemy_limit,
             "pipe_brood" => self.pipe_brood,
@@ -628,6 +646,7 @@ impl GameTuning {
             "enemy_lod_far" => self.enemy_lod_far = value,
             "enemy_draw" => self.enemy_draw = value,
             "shadows" => self.shadows = value,
+            "frame_spin" => self.frame_spin = value,
             "enemy_rate" => self.enemy_rate = value,
             "enemy_limit" => self.enemy_limit = value,
             "pipe_brood" => self.pipe_brood = value,

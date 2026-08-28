@@ -16,6 +16,7 @@ mod console;
 mod display;
 mod enemy;
 mod flow;
+mod frame_chart;
 mod furniture;
 mod gravity;
 mod impostor;
@@ -28,12 +29,14 @@ mod player;
 mod shadow;
 mod shot;
 mod sky;
+mod spike;
 mod squad;
 mod water;
 mod weapon;
 mod world;
 
 use bevy::{
+    app::{TaskPoolOptions, TaskPoolPlugin},
     core_pipeline::tonemapping::Tonemapping,
     diagnostic::{DiagnosticsStore, EntityCountDiagnosticsPlugin, FrameTimeDiagnosticsPlugin},
     ecs::{schedule::ScheduleConfigs, system::ScheduleSystem},
@@ -142,8 +145,88 @@ fn register_world_asset_types(app: &mut App) {
         .register_type::<AnimationPlayer>();
 }
 
+/// How many threads Bevy's task pools are allowed.
+///
+/// Bevy's default gives the compute pool every core left over after the IO and
+/// async-compute pools have taken theirs, which on a 24-thread machine is
+/// sixteen workers. For a field of some fifteen hundred entities that is not
+/// parallelism, it is sixteen threads each given a few microseconds of work --
+/// and, on the evidence, sixteen threads that go cold whenever the frame rate
+/// is paced and are slow to come back. The measurement that points here is a
+/// worker thread's span around `propagate_parent_transforms`: 63.8 ms for a
+/// system whose mean is 0.31 ms, on the frame after an idle gap. Measured on a
+/// 24-thread hybrid CPU with the frame cap on, spikes over 8 ms fell from
+/// roughly one frame in 140 at sixteen threads to one in 3778 at four.
+///
+/// A cap rather than a count: `percent` still takes what is left after the
+/// other two pools, so a small machine gets fewer than this and only a large
+/// one is held back to it. `COMPUTE_THREADS` overrides it for measuring:
+///
+///   COMPUTE_THREADS=8 ./SuperBevyWorld64.exe
+const COMPUTE_THREADS: usize = 4;
+
+fn task_pool_options() -> TaskPoolOptions {
+    let mut options = TaskPoolOptions::default();
+    options.compute.max_threads = compute_thread_cap(env_compute_threads().as_deref());
+    options
+}
+
+fn env_compute_threads() -> Option<String> {
+    std::env::var("COMPUTE_THREADS").ok()
+}
+
+/// Anything that is not a positive number -- unset, blank, zero, a typo --
+/// leaves the shipped cap in place rather than sizing the pool by accident.
+fn compute_thread_cap(request: Option<&str>) -> usize {
+    request
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or(COMPUTE_THREADS)
+}
+
+/// Asks Windows for a millisecond of timer resolution instead of the default
+/// fifteen and a half.
+///
+/// Windows rounds a thread's wake-up to the system timer tick, which is 15.625
+/// ms unless somebody asks for better, and Bevy's task pool parks its workers
+/// when there is nothing to run. So a frame that has to wake a parked worker --
+/// which is any frame with a parallel system in it, and `PostUpdate` has
+/// several -- can pay a whole tick for the wake. It is visible in this game's
+/// own frame chart as a tight cluster of stalls at 15.0 to 15.4 ms, just under
+/// the tick, and it is the residue left after the present block was taken out
+/// of the way: with vsync off the rate falls to a third of a percent of frames,
+/// but the ones that remain are all still that same fifteen milliseconds.
+///
+/// Nothing in the stack asks on this game's behalf -- not winit, not
+/// `bevy_winit`, not `bevy_tasks` -- so it is asked for here. Since Windows 10
+/// 2004 the request applies to the calling process rather than the whole
+/// machine, and it is released when the process ends, which is why there is no
+/// matching `timeEndPeriod`: there is nowhere to put one that a crash would not
+/// skip anyway.
+#[cfg(target_os = "windows")]
+fn ask_windows_for_a_sharper_clock() {
+    // Declared by hand rather than by taking on the `windows` crate, which is
+    // a large dependency to add for one symbol out of winmm.
+    #[link(name = "winmm")]
+    extern "system" {
+        fn timeBeginPeriod(period: u32) -> u32;
+    }
+    // SAFETY: `timeBeginPeriod` takes a plain integer and touches nothing this
+    // program owns. One is the smallest period the call accepts, and a refusal
+    // is reported in the return rather than by doing something else, so there
+    // is nothing to check: the game runs either way, a little jerkier if the
+    // request was turned down.
+    unsafe {
+        timeBeginPeriod(1);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ask_windows_for_a_sharper_clock() {}
+
 fn main() {
     log_panics_to_a_file();
+    ask_windows_for_a_sharper_clock();
     // The impostor baker runs inside the game rather than beside it, so that
     // the sprites it draws are lit by the same material the skinned models are.
     // `cargo run --release -- bake-impostors [slime|ant]`.
@@ -192,27 +275,30 @@ fn main() {
     }
     let mut app = App::new();
     app.add_plugins(
-            DefaultPlugins
-                .set(WindowPlugin {
-                    primary_window: Some(Window {
-                        title: "Super Bevy World 64".into(),
-                        // Borderless rather than exclusive fullscreen: it takes
-                        // the monitor's own resolution and refresh rate instead
-                        // of asking for a mode switch, so alt-tabbing away and
-                        // back does not black the screen while the display
-                        // renegotiates. F11 goes back to a window.
-                        mode: WindowMode::BorderlessFullscreen(MonitorSelection::Current),
-                        // The size the window takes when F11 leaves fullscreen.
-                        resolution: WindowResolution::new(1280, 720),
-                        present_mode: bevy::window::PresentMode::AutoVsync,
-                        ..default()
-                    }),
-                    ..default()
-                })
-                .set(AssetPlugin {
-                    file_path: asset_path().to_string_lossy().into_owned(),
+        DefaultPlugins
+            .set(TaskPoolPlugin {
+                task_pool_options: task_pool_options(),
+            })
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "Super Bevy World 64".into(),
+                    // Borderless rather than exclusive fullscreen: it takes
+                    // the monitor's own resolution and refresh rate instead
+                    // of asking for a mode switch, so alt-tabbing away and
+                    // back does not black the screen while the display
+                    // renegotiates. F11 goes back to a window.
+                    mode: WindowMode::BorderlessFullscreen(MonitorSelection::Current),
+                    // The size the window takes when F11 leaves fullscreen.
+                    resolution: WindowResolution::new(1280, 720),
+                    present_mode: display::DEFAULT_PRESENT_MODE,
                     ..default()
                 }),
+                ..default()
+            })
+            .set(AssetPlugin {
+                file_path: asset_path().to_string_lossy().into_owned(),
+                ..default()
+            }),
     );
     add_game(&mut app);
     app.add_systems(PreUpdate, input_pipeline()).run();
@@ -234,7 +320,8 @@ pub fn add_game(app: &mut App) {
     // The whole world is drawn by this one material, so it goes on directly
     // after the plugins it is built out of.
     app.add_plugins(n64::N64Plugin)
-        .add_plugins(FrameTimeDiagnosticsPlugin::default())
+        // Enough raw history for the chart's four-second window at 240 Hz.
+        .add_plugins(FrameTimeDiagnosticsPlugin::new(960))
         // The other half of the benchmark readout: an enemy is a whole scene of
         // entities rather than one, and that multiplier is what the crowd work
         // is trying to bring down.
@@ -269,8 +356,10 @@ pub fn game_resources(app: &mut App) {
         .init_resource::<squad::Whistle>()
         .init_resource::<menu::MenuState>()
         .init_resource::<display::DisplaySettings>()
+        .init_resource::<display::FramePacing>()
         .init_resource::<sky::Sky>()
         .init_resource::<impostor::ImpostorStats>()
+        .init_resource::<frame_chart::CalculationTimes>()
         .init_resource::<weapon::Loadout>()
         .init_resource::<aim::Aim>()
         // Which level is up, which one is on its way, where the player starts
@@ -290,7 +379,14 @@ pub fn game_resources(app: &mut App) {
 /// The input pipeline is not here: it reads real devices, and the headless
 /// callers have none.
 pub fn game_systems(app: &mut App) {
-    app.add_systems(Startup, (setup, weapon::load_shot_assets))
+    app.add_plugins(spike::plugin);
+    app.add_plugins(spike::harness);
+    app.add_systems(First, frame_chart::begin)
+        .add_systems(Last, frame_chart::finish)
+        // After the chart has stopped its clock, so a frame held back to the
+        // player's cap is not drawn as a frame that took that long to think.
+        .add_systems(Last, display::cap_frames.after(frame_chart::finish))
+        .add_systems(Startup, (setup, weapon::load_shot_assets))
         .add_systems(FixedUpdate, simulation())
         .add_systems(Update, presentation())
         .add_systems(Update, overlay())
@@ -477,6 +573,7 @@ fn overlay() -> ScheduleConfigs<ScheduleSystem> {
         // to avoid.
         toggle_fullscreen,
         update_fps,
+        frame_chart::update,
     )
         .chain()
 }
@@ -597,8 +694,7 @@ fn setup(
         // is on the left of the mix. Nothing in a build without an audio
         // backend, which is why it is named unconditionally.
         audio::listener(),
-        Transform::from_xyz(-13.0, 10.0, 56.0)
-            .looking_at(Vec3::new(-13.0, 4.0, 46.0), Vec3::Y),
+        Transform::from_xyz(-13.0, 10.0, 56.0).looking_at(Vec3::new(-13.0, 4.0, 46.0), Vec3::Y),
         Projection::from(PerspectiveProjection {
             fov: 60_f32.to_radians(),
             near: 0.05,
@@ -678,6 +774,7 @@ fn setup(
             ..default()
         },
     ));
+    frame_chart::spawn(&mut commands);
     commands.spawn(console::panel_bundle());
     commands.spawn(console::tuning_tray_bundle());
     menu::spawn(&mut commands);
@@ -844,9 +941,7 @@ fn update_hud(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bevy::{
-        asset::AssetPlugin, ecs::schedule::Schedule, world_serialization::WorldAsset,
-    };
+    use bevy::{asset::AssetPlugin, ecs::schedule::Schedule, world_serialization::WorldAsset};
     use enemy::Enemy;
 
     /// Initialises a schedule the way the game does at startup.
@@ -919,8 +1014,7 @@ mod tests {
             // Sixteen milliseconds a frame is a 60 Hz session.
             .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
                 std::time::Duration::from_millis(16),
-            ))
-            ;
+            ));
         // The same resources and the same schedules the real game gets. Listed
         // in one place rather than two, because the copy that used to live here
         // fell behind the real one and every schedule test failed at once.
@@ -1064,14 +1158,21 @@ mod tests {
             // of the box the cull never fires at all and everything downstream
             // of it, including stopping a culled enemy's animation, is dead
             // code on this map.
-            if let Ok(budget) = std::env::var("CROWD_SIM").ok().map_or(Err(()), |v| v.parse::<f32>().map_err(|_| ())) {
-                app.world_mut().resource_mut::<console::GameTuning>().sim_budget = budget;
+            if let Ok(budget) = std::env::var("CROWD_SIM")
+                .ok()
+                .map_or(Err(()), |v| v.parse::<f32>().map_err(|_| ()))
+            {
+                app.world_mut()
+                    .resource_mut::<console::GameTuning>()
+                    .sim_budget = budget;
             }
             let draw = std::env::var("CROWD_DRAW")
                 .ok()
                 .and_then(|value| value.parse::<f32>().ok());
             if let Some(draw) = draw {
-                app.world_mut().resource_mut::<console::GameTuning>().enemy_draw = draw;
+                app.world_mut()
+                    .resource_mut::<console::GameTuning>()
+                    .enemy_draw = draw;
             }
             {
                 let mut tuning = app.world_mut().resource::<console::GameTuning>().clone();
@@ -1215,7 +1316,9 @@ mod tests {
         let mut apex: f32 = 0.0;
         for _ in 0..1800 {
             app.update();
-            let mut brood = app.world_mut().query_filtered::<&Transform, With<pipe::Brood>>();
+            let mut brood = app
+                .world_mut()
+                .query_filtered::<&Transform, With<pipe::Brood>>();
             for transform in brood.iter(app.world()) {
                 let here = transform.translation;
                 let mouth = mouths
@@ -1293,7 +1396,9 @@ mod tests {
         app.update();
 
         let target = app.world().resource::<SceneTarget>().0.clone();
-        let mut world = app.world_mut().query::<(&Camera, &RenderTarget, &Camera3d)>();
+        let mut world = app
+            .world_mut()
+            .query::<(&Camera, &RenderTarget, &Camera3d)>();
         let (world_order, world_target) = world
             .single(app.world())
             .map(|(camera, target, _)| (camera.order, target.clone()))
@@ -1304,7 +1409,9 @@ mod tests {
             "the world camera draws into the render target"
         );
 
-        let mut presentation = app.world_mut().query::<(&Camera, &RenderTarget, &Camera2d)>();
+        let mut presentation = app
+            .world_mut()
+            .query::<(&Camera, &RenderTarget, &Camera2d)>();
         let (presentation_order, presentation_target) = presentation
             .single(app.world())
             .map(|(camera, target, _)| (camera.order, target.clone()))
@@ -1360,6 +1467,17 @@ mod tests {
     /// Bevy can prove the ordering exists rather than the test having to catch
     /// a race in the act: ambiguity detection fails the schedule build when two
     /// systems share access with no order between them.
+    #[test]
+    fn the_compute_pool_keeps_its_cap_unless_the_environment_names_one() {
+        assert_eq!(compute_thread_cap(None), COMPUTE_THREADS);
+        assert_eq!(compute_thread_cap(Some("8")), 8);
+        assert_eq!(compute_thread_cap(Some(" 2 ")), 2);
+        // A pool of no threads would never run a system, so these fall back.
+        assert_eq!(compute_thread_cap(Some("0")), COMPUTE_THREADS);
+        assert_eq!(compute_thread_cap(Some("")), COMPUTE_THREADS);
+        assert_eq!(compute_thread_cap(Some("lots")), COMPUTE_THREADS);
+    }
+
     #[test]
     fn keys_are_read_after_bevy_refills_them() {
         use bevy::ecs::schedule::{LogLevel, ScheduleBuildSettings};

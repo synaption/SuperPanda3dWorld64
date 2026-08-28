@@ -519,7 +519,14 @@ fn read_geometry(
         if children.contains(&handle.id()) {
             continue;
         }
-        read_node(handle, Transform::IDENTITY, nodes, gltf_meshes, meshes, &mut geometry)?;
+        read_node(
+            handle,
+            Transform::IDENTITY,
+            nodes,
+            gltf_meshes,
+            meshes,
+            &mut geometry,
+        )?;
     }
     Some(geometry)
 }
@@ -758,7 +765,10 @@ mod tests {
             "the sea came out at r={sea} m round a planet of r={radius} m"
         );
         let depth = level.water_depth(start).unwrap();
-        assert!(depth < 0.0, "the player was put down {depth} m under the sea");
+        assert!(
+            depth < 0.0,
+            "the player was put down {depth} m under the sea"
+        );
         assert!(
             depth > -10.0,
             "the player was put down {} m above the water, which is a hillside \
@@ -790,7 +800,9 @@ mod tests {
 
         // Now play. Forward for two seconds of fixed steps, which at 30 Hz and
         // 16 ms a frame is sixty frames' worth.
-        app.world_mut().resource_mut::<crate::input::InputState>().move_axis = Vec2::new(0.0, 1.0);
+        app.world_mut()
+            .resource_mut::<crate::input::InputState>()
+            .move_axis = Vec2::new(0.0, 1.0);
         for _ in 0..120 {
             app.update();
         }
@@ -862,11 +874,17 @@ mod tests {
             .world_mut()
             .query_filtered::<&Transform, With<player::Player>>();
         let at = players.single(app.world()).expect("no player").translation;
-        assert_eq!(at, castle_spawn(), "the player came back to the wrong place");
+        assert_eq!(
+            at,
+            castle_spawn(),
+            "the player came back to the wrong place"
+        );
 
         // And the planet's scenery went with it: nothing of the level that was
         // up is left in the world.
-        let mut left = app.world_mut().query_filtered::<Entity, With<LevelEntity>>();
+        let mut left = app
+            .world_mut()
+            .query_filtered::<Entity, With<LevelEntity>>();
         let roots = left.iter(app.world()).count();
         assert!(
             roots > 0,
@@ -888,11 +906,17 @@ mod tests {
         let mut app = with_a_loader();
         app.update();
         assert!(
-            app.world().get_resource::<water::PendingSurfaces>().is_some(),
+            app.world()
+                .get_resource::<water::PendingSurfaces>()
+                .is_some(),
             "the castle never asked for its surfaces"
         );
         let started = std::time::Instant::now();
-        while app.world().get_resource::<water::PendingSurfaces>().is_some() {
+        while app
+            .world()
+            .get_resource::<water::PendingSurfaces>()
+            .is_some()
+        {
             app.update();
             assert!(
                 started.elapsed().as_secs() < 60,
@@ -951,8 +975,8 @@ mod tests {
         // so what has to hold is that the grep still finds each one. A level
         // whose path was built up out of pieces would satisfy every other
         // assertion here and ship nothing.
-        let source = std::fs::read_to_string(root.join("src/world.rs"))
-            .expect("this file has gone missing");
+        let source =
+            std::fs::read_to_string(root.join("src/world.rs")).expect("this file has gone missing");
         let quoted: Vec<&str> = source
             .split('"')
             .skip(1)
@@ -984,7 +1008,10 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| name.ends_with("_furniture.glb"))
             .collect();
-        assert!(!furniture.is_empty(), "no furniture .glb in the tree at all");
+        assert!(
+            !furniture.is_empty(),
+            "no furniture .glb in the tree at all"
+        );
         assert!(
             script.contains("*_furniture.glb"),
             "build_windows.sh does not copy {furniture:?}, and nothing else \
@@ -1051,7 +1078,11 @@ mod tests {
         let at = |ring: usize, segment: usize| (ring * (segments + 1) + segment) as u32;
         for ring in 0..rings {
             for segment in 0..segments {
-                indices.push([at(ring, segment), at(ring + 1, segment), at(ring, segment + 1)]);
+                indices.push([
+                    at(ring, segment),
+                    at(ring + 1, segment),
+                    at(ring, segment + 1),
+                ]);
                 indices.push([
                     at(ring, segment + 1),
                     at(ring + 1, segment),

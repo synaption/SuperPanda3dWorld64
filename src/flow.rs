@@ -361,9 +361,7 @@ impl FlowField {
             // sampling in [`Self::along`] only leaves when the segment runs off
             // the grid and `index` clamps both ends. Answered on what can be
             // answered rather than waved through.
-            None => {
-                self.walkable[there] && (self.ground[there] - self.ground[here]).abs() <= CLIMB
-            }
+            None => self.walkable[there] && (self.ground[there] - self.ground[here]).abs() <= CLIMB,
         })
     }
 
@@ -676,7 +674,8 @@ mod tests {
         }
         assert!(edges > 100, "the castle offered only {edges} edges to test");
         assert_eq!(
-            caught, edges,
+            caught,
+            edges,
             "{} of {edges} bodies were walked into a wall their centre was \
              merely standing next to",
             edges - caught
@@ -892,8 +891,14 @@ mod tests {
         let start = std::time::Instant::now();
         let field = FlowField::new(&level);
         let took = start.elapsed();
-        let barred: usize = field.blocked.iter().map(|bits| bits.count_ones() as usize).sum();
-        println!("survey took {took:?}; {barred} blocked edge-ends, {} cells touch one",
-            field.blocked.iter().filter(|bits| **bits != 0).count());
+        let barred: usize = field
+            .blocked
+            .iter()
+            .map(|bits| bits.count_ones() as usize)
+            .sum();
+        println!(
+            "survey took {took:?}; {barred} blocked edge-ends, {} cells touch one",
+            field.blocked.iter().filter(|bits| **bits != 0).count()
+        );
     }
 }

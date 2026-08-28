@@ -410,7 +410,6 @@ const RAMP: [(f32, Look); 8] = [
     ),
 ];
 
-
 /// The clock, and what was last pushed out of it.
 ///
 /// The hour itself lives here rather than in [`GameTuning`] because it is
@@ -570,12 +569,8 @@ fn dome() -> Mesh {
             let around = segment as f32 / DOME_SEGMENTS as f32 * std::f32::consts::TAU;
             let (sin_around, cos_around) = around.sin_cos();
             positions.push(
-                [
-                    sin_polar * cos_around,
-                    cos_polar,
-                    sin_polar * sin_around,
-                ]
-                .map(|axis| axis * DOME_RADIUS),
+                [sin_polar * cos_around, cos_polar, sin_polar * sin_around]
+                    .map(|axis| axis * DOME_RADIUS),
             );
         }
     }
@@ -646,11 +641,14 @@ fn stars() -> Mesh {
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
-    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colours)
-        .with_inserted_indices(Indices::U32(indices))
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colours)
+    .with_inserted_indices(Indices::U32(indices))
 }
 
 /// Whatever the sun and the moon and the stars are drawn with, generated rather
@@ -1265,7 +1263,8 @@ mod tests {
         let mut octants = [0usize; 8];
         for corner in positions.iter().step_by(4) {
             let at = Vec3::from_array(*corner);
-            let octant = (at.x > 0.0) as usize | ((at.y > 0.0) as usize) << 1 | ((at.z > 0.0) as usize) << 2;
+            let octant =
+                (at.x > 0.0) as usize | ((at.y > 0.0) as usize) << 1 | ((at.z > 0.0) as usize) << 2;
             octants[octant] += 1;
         }
         for (octant, count) in octants.iter().enumerate() {
@@ -1302,7 +1301,9 @@ mod tests {
             panic!("the dome is not indexed");
         };
         assert_eq!(indices.len() as u32, DOME_RINGS * DOME_SEGMENTS * 6);
-        assert!(indices.iter().all(|index| (*index as usize) < positions.len()));
+        assert!(indices
+            .iter()
+            .all(|index| (*index as usize) < positions.len()));
     }
 
     /// The dome is drawn beyond where the haze is total, so a fogged one is a
@@ -1444,7 +1445,11 @@ mod tests {
         for _ in 0..120 {
             sky.hours += HOURS * 0.5 / day_length;
             sky.hours = sky.hours.rem_euclid(HOURS);
-            assert!((0.0..HOURS).contains(&sky.hours), "the clock read {}", sky.hours);
+            assert!(
+                (0.0..HOURS).contains(&sky.hours),
+                "the clock read {}",
+                sky.hours
+            );
         }
     }
 }

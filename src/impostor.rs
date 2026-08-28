@@ -49,8 +49,8 @@ use crate::{
 use bevy::{
     asset::RenderAssetUsages,
     camera::visibility::NoFrustumCulling,
-    image::{ImageLoaderSettings, ImageSampler},
     ecs::{schedule::ScheduleConfigs, system::ScheduleSystem},
+    image::{ImageLoaderSettings, ImageSampler},
     mesh::{Indices, PrimitiveTopology},
     prelude::*,
 };
@@ -644,9 +644,10 @@ pub fn build_field(meta: &SheetMeta, eye: Vec3, crowd: &[Member], mesh: &mut Mes
             .iter()
             .fold(0.0_f32, |most, corner| most.max((*corner - eye).length()));
         let near = float_toward(eye, member.at, lean, meta.world_size * tier.foot);
-        for (corner, (u, v)) in corners
-            .into_iter()
-            .zip([(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)])
+        for (corner, (u, v)) in
+            corners
+                .into_iter()
+                .zip([(0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)])
         {
             positions.push((eye + (corner - eye) * near).to_array());
             uvs.push((uv + Vec2::new(u, v) * size).to_array());
@@ -704,7 +705,7 @@ const FLOAT: f32 = 1.0;
 /// standing a little in front of a low wall reads as standing in front of it,
 /// and an enemy sawn in half by the lawn reads as a bug.
 fn float_toward(eye: Vec3, at: Vec3, furthest: f32, dip: f32) -> f32 {
-        let wanted = (at - eye).length() - dip * FLOAT;
+    let wanted = (at - eye).length() - dip * FLOAT;
     // Both ends guarded. A quad with its furthest corner already at the eye has
     // no ray to slide along, and one whose dip is deeper than the enemy is far
     // away -- a sprite the camera is standing inside -- must not be turned
@@ -977,7 +978,9 @@ pub(crate) mod tests {
     fn the_cell_follows_the_angle_between_the_model_and_the_camera() {
         let meta = meta();
         let front = meta.cell(Quat::IDENTITY, Vec3::Z, 0.0).1;
-        let back = meta.cell(Quat::from_rotation_y(std::f32::consts::PI), Vec3::Z, 0.0).1;
+        let back = meta
+            .cell(Quat::from_rotation_y(std::f32::consts::PI), Vec3::Z, 0.0)
+            .1;
         assert_eq!(front, 0, "a model facing the camera is the first row");
         assert_eq!(
             back,
@@ -1010,8 +1013,7 @@ pub(crate) mod tests {
             for height in [-90.0_f32, -35.0, 0.0, 15.0, 34.9, 35.1, 55.0, 89.0, 90.0] {
                 let flat = Vec2::new(yaw.cos(), yaw.sin()) * height.to_radians().cos();
                 let to_camera = Vec3::new(flat.x, height.to_radians().sin(), flat.y);
-                let (column, row) =
-                    meta.cell(Quat::from_rotation_y(yaw), to_camera, yaw.abs());
+                let (column, row) = meta.cell(Quat::from_rotation_y(yaw), to_camera, yaw.abs());
                 assert!(row < rows, "bearing {yaw} at {height} chose row {row}");
                 assert!(column < meta.frames, "phase {yaw} chose column {column}");
             }
@@ -1048,7 +1050,11 @@ pub(crate) mod tests {
         }
         // Far away and high up is not the same as overhead.
         let distant = Vec3::new(0.0, 40.0, 400.0);
-        assert_eq!(meta.tier(distant), 0, "a distant camera wants flat pictures");
+        assert_eq!(
+            meta.tier(distant),
+            0,
+            "a distant camera wants flat pictures"
+        );
     }
 
     /// The same rule read in the model's own frame, which is what a crawler
@@ -1802,7 +1808,9 @@ pub(crate) mod tests {
                 meta.tiers,
             );
             assert!(
-                meta.tiers.windows(2).all(|pair| pair[0].elevation < pair[1].elevation),
+                meta.tiers
+                    .windows(2)
+                    .all(|pair| pair[0].elevation < pair[1].elevation),
                 "{kind:?}'s tiers are not flattest first: {:?}",
                 meta.tiers,
             );

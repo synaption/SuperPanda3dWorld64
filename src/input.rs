@@ -150,10 +150,7 @@ pub fn gather(
         let button = |kind| pad.pressed(kind);
         let just = |kind| pad.just_pressed(kind);
 
-        let stick = Vec2::new(
-            axis(GamepadAxis::LeftStickX),
-            axis(GamepadAxis::LeftStickY),
-        );
+        let stick = Vec2::new(axis(GamepadAxis::LeftStickX), axis(GamepadAxis::LeftStickY));
         let stick = if stick == Vec2::ZERO {
             // The d-pad stands in for the stick when the stick is centred, at
             // full deflection: it is the same control the arrow keys are, and
