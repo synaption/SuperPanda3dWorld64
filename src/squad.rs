@@ -147,6 +147,13 @@ pub struct Ally {
     /// a Mario in the middle of one stands still to throw it, which is this
     /// module's business.
     pub swing_left: f32,
+    /// How long it still cannot be hurt for, which is what stops a Mario
+    /// standing in a crowd losing all twenty points in a third of a second.
+    ///
+    /// The player's equivalent lives on [`crate::player::Controller`] and does
+    /// the same job for the same reason. Written down by
+    /// [`crate::enemy::maul`] and counted off by it.
+    pub hurt_left: f32,
 }
 
 impl Ally {
@@ -161,6 +168,7 @@ impl Ally {
             velocity: Vec3::ZERO,
             state: AnimationState::default(),
             swing_left: 0.0,
+            hurt_left: 0.0,
         };
         ally.amble_somewhere_else();
         ally
@@ -400,6 +408,10 @@ pub fn spawn_ally(commands: &mut Commands, assets: &AssetServer, home: Vec3, pha
             // A Mario is on the player's side, and goes for what it notices on
             // the other one exactly as an enemy goes for him.
             crate::enemy::Side::Friendly,
+            // And can be worn down like one. Twenty points is seven ant touches
+            // -- long enough that a Mario sent at something wins or loses on
+            // whether the rest of the squad went with it.
+            crate::health::Health::new(crate::health::MARIO_HEALTH),
             crate::enemy::Aggro::default(),
             // Allies animate off the same tables the playable Mario does.
             ActiveCharacter::Mario,

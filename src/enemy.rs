@@ -13,6 +13,7 @@
 use crate::{
     audio::{Sfx, SoundQueue},
     console::{ConsoleState, CrowdKind, GameTuning, Request},
+    health::{self, Health},
     level::LevelData,
     player::{Controller, Motion, Player, FIXED_DT, PLAYER_HEIGHT},
     squad::Ally,
@@ -27,6 +28,15 @@ const STOMP_MARGIN: f32 = 0.6;
 /// of touching an enemy, which is not the same as the radius he is pushed out
 /// of walls with.
 const PLAYER_REACH: f32 = 0.37;
+
+/// How much past its own body an enemy counts as touching a Mario from.
+///
+/// [`spread`] holds two bodies apart at the sum of their radii, so an enemy and
+/// the Mario it is fighting are *exactly* at the distance a bare radius test
+/// calls a miss, and whether any given tick lands is down to the last bit of a
+/// float. This is the slack that makes standing against something mean standing
+/// against it.
+const TOUCH_MARGIN: f32 = 0.25;
 
 /// How far a swing reaches past the body it is aimed at. Wider than a touch on
 /// purpose: the Hero swings a sword, and a weapon that only hits what is already
@@ -406,6 +416,32 @@ impl Kind {
         }
     }
 
+    /// How much punishment one of these takes before it goes down.
+    ///
+    /// A slime dies to anything that reaches it -- a player's blow, a Mario's,
+    /// a bullet -- and an ant survives a Mario's first punch and not his
+    /// second. See [`crate::health`] for why those two facts are the whole of
+    /// what these numbers are chosen for.
+    pub fn health(self) -> i32 {
+        match self {
+            Self::Slime => crate::health::SLIME_HEALTH,
+            Self::Ant => crate::health::ANT_HEALTH,
+        }
+    }
+
+    /// What touching one of these costs whatever it touched.
+    ///
+    /// Contact damage rather than an attack, because that is how these fight:
+    /// neither actor has a strike clip and neither one aims at anything. What
+    /// stops it being a hundred points a second is the invulnerability window
+    /// on the far side -- see [`INVULNERABLE_SECONDS`].
+    pub fn damage(self) -> i32 {
+        match self {
+            Self::Slime => crate::health::SLIME_DAMAGE,
+            Self::Ant => crate::health::ANT_DAMAGE,
+        }
+    }
+
     /// Which of the model's glTF animations is the one it walks on.
     ///
     /// The decomp actors these replaced had exactly one clip each, so an index
@@ -536,13 +572,28 @@ pub enum Side {
     Friendly,
 }
 
-/// What an enemy has noticed, which is the whole of whether it is coming for
-/// you or ambling about.
+/// What a creature has noticed, which is the whole of whether it is coming for
+/// you or ambling about -- and, once it is coming for something, which of the
+/// several things worth coming for it has settled on.
 ///
 /// Aggro is never lost by walking away. Once an enemy has seen you it comes
 /// until it dies or something else takes its attention, which is why the target
 /// is kept as *who* rather than as a flag: a second thing worth chasing is a
 /// change of target rather than a special case.
+///
+/// **Acquiring is instant and switching is not**, and that asymmetry is the
+/// whole design. A creature with nothing to chase takes the first thing it
+/// notices, and the alarm chain in [`alert`] hands the same answer to its whole
+/// neighbourhood on the tick it happens -- walking into the middle of a crowd
+/// has to be one mistake rather than a series of small ones. But a creature
+/// already in a fight is not re-pointed by anything; a rival has to *out-earn*
+/// what it is already fighting, over seconds, and beat it by a margin.
+///
+/// Without that second half the two are the same mechanism and the field is
+/// unusable: the chain is a flood fill, so one Mario landing a punch re-seeds
+/// every enemy within earshot of every enemy within earshot of it, and the
+/// whole crowd swaps ends every time anybody does anything. Attention that can
+/// be *divided* has to accumulate.
 #[derive(Component)]
 pub struct Aggro {
     /// Who it is after, or `None` while nothing has its attention.
@@ -566,6 +617,22 @@ pub struct Aggro {
     /// entities while it does. [`alert`] has already found the target once and
     /// fills this in as it writes [`Self::at`].
     pub room: f32,
+    /// How much attention [`Self::target`] has earned, and is holding the fight
+    /// with. Meaningless in absolute terms -- see `GameTuning::threat_near`;
+    /// what it is for is being compared against [`Self::rivalry`].
+    pub commitment: f32,
+    /// The one rival being tracked, and what it has earned so far.
+    ///
+    /// **One slot, not a table.** Two hundred creatures are appraised in full
+    /// every tick and a per-target score for each of them is a per-tick
+    /// allocation this module has spent real effort not having -- see
+    /// [`Noticing`]. One slot is enough because the decay does the pruning: a
+    /// rival that stops earning shrinks out of the slot on its own, and the
+    /// next claimant takes it as soon as its own credit is the larger of the
+    /// two. What it costs is that a creature cannot track a slow third
+    /// contender behind a fast second one, which in a fight nobody can see.
+    pub contender: Option<Entity>,
+    pub rivalry: f32,
 }
 
 impl Default for Aggro {
@@ -577,7 +644,46 @@ impl Default for Aggro {
             // and the safest thing to assume for anything that sets a target
             // without going through `alert`.
             room: crate::player::PLAYER_RADIUS,
+            commitment: 0.0,
+            contender: None,
+            rivalry: 0.0,
         }
+    }
+}
+
+/// Something one side just did to the other, waiting to be noticed.
+///
+/// Queued rather than resolved where it happens, because the systems that kill
+/// things are not the system that decides who is angry about it: a punch lands
+/// in [`ally_combat`], a stomp in [`combat`] and a bullet in
+/// [`crate::weapon::fly`], and all three want the same sentence written into
+/// [`alert`]'s pass over the field. Sending it as an act rather than as an aggro
+/// write is also what keeps the tier split honest -- who *witnessed* it is a
+/// question about the near tier, and the killer does not know the answer.
+#[derive(Clone, Copy)]
+pub struct Threat {
+    /// Who did it, which is what the witnesses turn on.
+    pub by: Entity,
+    /// Where it happened. Deliberately the *victim's* position rather than the
+    /// killer's: what draws a crowd is where the body fell, and a Mario firing
+    /// from behind you is not standing where the noise came from.
+    pub at: Vec3,
+}
+
+/// The acts waiting to be noticed this tick.
+///
+/// Drained by [`alert`], which runs after everything that fills it except
+/// [`crate::weapon::fly`] -- a bullet's kill is a tick late, which is a
+/// thirtieth of a second nobody can see.
+#[derive(Resource, Default)]
+pub struct Threats {
+    acts: Vec<Threat>,
+}
+
+impl Threats {
+    /// Records a kill for whoever is near enough to have seen it.
+    pub fn kill(&mut self, by: Entity, at: Vec3) {
+        self.acts.push(Threat { by, at });
     }
 }
 
@@ -782,6 +888,12 @@ pub fn spawn(
                 kind,
                 animation: assets.load(format!("{}#Animation{}", kind.model(), kind.clip())),
             },
+            // Its pool, sized by what it is. Every place that lands a blow on
+            // one of these goes through `health::strike`, which treats an
+            // enemy built without this component as one that dies to the first
+            // hit -- so this line is what makes a kind's toughness real rather
+            // than what makes it killable.
+            crate::health::Health::new(kind.health()),
             Side::Hostile,
             Aggro::default(),
             Quirk::new(phase),
@@ -1144,6 +1256,103 @@ fn detailed(detail: Option<&Detail>) -> bool {
     detail != Some(&Detail::Crowd)
 }
 
+/// How many ticks apart one creature's appraisals of the field are.
+///
+/// A creature already in a fight looks up every sixth tick -- a fifth of a
+/// second -- rather than every one. Two reasons, and the cheap one is not the
+/// important one.
+///
+/// The cheap one: appraising means a nearest-not-my-side search, which the old
+/// code skipped outright for anything that already had a target -- so in a
+/// settled fight, where nearly everything has one, it did almost none of them.
+/// Re-appraising is new work in exactly that case, and the stagger is what
+/// keeps it to a sixth of the near tier a tick. The *peak* is unchanged either
+/// way: a field where nothing has noticed anything yet searched with every
+/// creature then and searches with every creature now.
+///
+/// The important one: a crowd that asks the question on the same tick answers
+/// it on the same tick. Even with the margin doing its job, a row of ants whose
+/// scores all cross at once still turns as one body, which is the look this is
+/// here to avoid. The offset comes off `Entity::index`, which is sequential
+/// across a brood out of one pipe -- so the phases spread evenly, for free, and
+/// without a component or a random number anywhere.
+///
+/// It gates the *decision*, not just the looking, and that distinction is the
+/// whole value of it. Attention arrives synchronously -- a kill is one event
+/// credited to every witness on the same tick -- so a line of ants at much the
+/// same range from the same Mario cross the margin on the same kill however
+/// carefully the scores were accumulated. Staggering only the appraisal leaves
+/// them turning in lockstep anyway; staggering the switch is what actually
+/// spreads it out. That was not a prediction, it was a test asserting a crowd
+/// would split and reporting that all eight of them turned on tick 16.
+///
+/// Acquiring from nothing is deliberately *not* staggered: a creature with no
+/// target looks every tick, exactly as it always did, so nothing about walking
+/// into a crowd got slower.
+const ATTENTION_SPAN: u32 = 6;
+
+/// The least attention a live target may be holding a fight with.
+///
+/// Without it a target that has walked out of sight decays to nothing, and then
+/// the next creature to wander past takes the fight on its first credit -- the
+/// chaotic switch this is all built to prevent, arrived at from underneath.
+/// The floor means stealing a fight always costs a rival some seconds of
+/// out-earning, even when the incumbent is long gone.
+const COMMITMENT_FLOOR: f32 = 1.0;
+
+/// One creature's attention as [`alert`] works on it: read out of its [`Aggro`],
+/// argued over by everything below, and written back at the end.
+///
+/// A flat array of these rather than the components themselves, because the
+/// alarm reaches sideways -- what one creature notices is credited to its
+/// neighbours -- and a query cannot be held open at two rows at once.
+#[derive(Clone, Copy)]
+struct Hunt {
+    entity: Entity,
+    at: Vec3,
+    side: Side,
+    target: Option<Entity>,
+    commitment: f32,
+    contender: Option<Entity>,
+    rivalry: f32,
+    /// Whether this one both looks at the field and acts on what it holds, this
+    /// tick. See [`ATTENTION_SPAN`].
+    appraising: bool,
+}
+
+impl Hunt {
+    /// Takes `who` outright, for `amount`.
+    ///
+    /// What acquiring from nothing does, and the only path that moves a target
+    /// without going through the margin. See [`Aggro`] for why those are two
+    /// different things.
+    fn seize(&mut self, who: Entity, amount: f32) {
+        self.target = Some(who);
+        self.commitment = amount.max(COMMITMENT_FLOOR);
+        self.contender = None;
+        self.rivalry = 0.0;
+    }
+
+    /// Puts `amount` of attention on `who`, wherever it belongs.
+    ///
+    /// A claimant that is neither the target nor the tracked rival takes the
+    /// rival slot only once its own credit beats what is already in there, so
+    /// the slot belongs to whoever has earned the most rather than to whoever
+    /// acted last. That is the same rule the switch uses, one level down -- and
+    /// with the decay above it, a rival that stops earning shrinks out of the
+    /// slot on its own and lets the next one in.
+    fn credit(&mut self, who: Entity, amount: f32) {
+        if self.target == Some(who) {
+            self.commitment += amount;
+        } else if self.contender == Some(who) {
+            self.rivalry += amount;
+        } else if amount > self.rivalry {
+            self.contender = Some(who);
+            self.rivalry = amount;
+        }
+    }
+}
+
 /// The working set [`alert`] keeps between ticks: the two crowds it sorts, the
 /// two grids it buckets them into, and the buffers the flood fill walks.
 ///
@@ -1154,16 +1363,18 @@ fn detailed(detail: Option<&Detail>) -> bool {
 #[derive(Default)]
 pub struct Noticing {
     crowd: Vec<(Entity, Vec3, Side)>,
-    hunting: Vec<(Entity, Vec3, Side, Option<Entity>)>,
+    hunting: Vec<Hunt>,
     seen: Neighbourhood,
     earshot_grid: Neighbourhood,
     nearby: Vec<usize>,
-    seeds: Vec<(usize, Entity)>,
     shouting: Vec<usize>,
-    decided: Vec<(Entity, Option<Entity>)>,
+    decided: Vec<Hunt>,
+    /// Which slice of the field appraises on this tick. See [`ATTENTION_SPAN`].
+    tick: u32,
 }
 
-/// Who has noticed whom, and who has been told about it.
+/// Who has noticed whom, who has been told about it, and who has earned enough
+/// of somebody's attention to take it off whoever had it.
 ///
 /// One rule for both sides. A creature with nothing to chase looks for the
 /// nearest creature not on its side within `enemy_sight`; the moment it finds
@@ -1173,15 +1384,29 @@ pub struct Noticing {
 /// once, which is what makes walking into the middle of one a mistake rather
 /// than a series of separate small ones.
 ///
-/// Only creatures that took the alarm this tick pass it on. One already in a
-/// fight is not shouting about it forever, or the alarm would creep across the
-/// whole field through whatever incidental pairs drift within earshot.
+/// A creature that is *already* fighting something is not in that chain, and
+/// that is the difference between this and what it replaced. It hears the same
+/// shouts and sees the same neighbours, but they arrive as attention rather
+/// than as orders: three sources feed it -- who is nearest, what the
+/// neighbourhood is shouting about, and who has just killed something in front
+/// of it -- and all three decay. Only when one rival is holding `threat_switch`
+/// times what the current fight is holding does anything actually turn. So a
+/// squad of Marios wading into the fight you are in pulls the enemies off you
+/// over a couple of seconds, in ones and twos, rather than all at once on the
+/// tick of the first punch.
+///
+/// Only creatures that took the alarm this tick pass it on, plus the ones that
+/// just switched. One already in a fight is not shouting about it forever, or
+/// the alarm would creep across the whole field through whatever incidental
+/// pairs drift within earshot.
 ///
 /// Nothing is ever given up on except by dying: aggro is not a leash, and an
-/// enemy that has seen you comes until it or you are gone. What it does lose is
-/// a target that has been despawned, which is not giving up but having won.
+/// enemy that has seen you comes until it or you are gone, or until something
+/// else has earned it. What it does lose outright is a target that has been
+/// despawned, which is not giving up but having won.
 pub fn alert(
     tuning: Res<GameTuning>,
+    mut threats: ResMut<Threats>,
     everyone: Creatures,
     mut hunters: Hunters,
     mut scratch: Local<Noticing>,
@@ -1192,10 +1417,11 @@ pub fn alert(
         seen,
         earshot_grid,
         nearby,
-        seeds,
         shouting,
         decided,
+        tick,
     } = &mut *scratch;
+    *tick = tick.wrapping_add(1);
     // Only the tier being simulated in full takes part. Everything this system
     // does is quadratic-ish in the crowd it is handed -- two spatial grids and a
     // flood fill -- so handing it two hundred rather than two thousand is most
@@ -1208,30 +1434,74 @@ pub fn alert(
             .filter(|(_, _, _, detail, _)| detailed(*detail))
             .map(|(entity, transform, side, _, _)| (entity, transform.translation, *side)),
     );
+    // Everyone who does the noticing, with last tick's attention aged. The
+    // decay is what keeps a fight current rather than settling it on whoever
+    // got there first: a Mario that stops killing stops being interesting.
+    let keep = (1.0 - tuning.threat_decay * FIXED_DT).clamp(0.0, 1.0);
     hunting.clear();
     hunting.extend(
         hunters
             .iter()
             .filter(|(_, _, _, _, detail)| detailed(*detail))
             .map(|(entity, transform, side, aggro, _)| {
-                let target = aggro
-                    .target
-                    // A target that is no longer in the world is no target. This
-                    // is how a Mario that has just flattened a slime goes
-                    // looking for the next one rather than standing over the
-                    // spot.
-                    .filter(|target| everyone.get(*target).is_ok());
-                (entity, transform.translation, *side, target)
+                // Something no longer in the world is no longer anything. This
+                // is how a Mario that has just flattened a slime goes looking
+                // for the next one rather than standing over the spot.
+                let live = |who: Option<Entity>| who.filter(|who| everyone.get(*who).is_ok());
+                let target = live(aggro.target);
+                let contender = live(aggro.contender);
+                Hunt {
+                    entity,
+                    at: transform.translation,
+                    side: *side,
+                    target,
+                    commitment: match target {
+                        Some(_) => (aggro.commitment * keep).max(COMMITMENT_FLOOR),
+                        None => 0.0,
+                    },
+                    contender,
+                    rivalry: match contender {
+                        Some(_) => aggro.rivalry * keep,
+                        None => 0.0,
+                    },
+                    // `Entity::index` is an `EntityIndex`; the raw number the
+                    // phase comes off is one call further in.
+                    appraising: target.is_none()
+                        || entity.index().index().wrapping_add(*tick) % ATTENTION_SPAN == 0,
+                }
             }),
     );
-    // Who can see something to go for. These are the seeds of the chain, and
-    // the only ones that shout.
+
     let sight = tuning.enemy_sight;
+    let earshot = tuning.enemy_alert;
     seen.fill(crowd.iter().map(|(_, at, _)| *at), sight);
-    seeds.clear();
-    for (index, &(_, at, side, target)) in hunting.iter().enumerate() {
-        if target.is_some() {
+    earshot_grid.fill(hunting.iter().map(|hunt| hunt.at), earshot);
+    shouting.clear();
+
+    // What each creature can see for itself. A creature with nothing to chase
+    // takes the nearest outright and shouts; one already in a fight only scores
+    // what it sees, and only on its own tick -- see [`ATTENTION_SPAN`].
+    for (index, hunt) in hunting.iter_mut().enumerate() {
+        let Hunt {
+            at,
+            side,
+            target,
+            appraising,
+            ..
+        } = *hunt;
+        if !appraising {
             continue;
+        }
+        // The fight it is already in keeps earning while it is still in front
+        // of it. Without this the score is only ever "who is nearest" and the
+        // margin buys a delay rather than a decision: something that already
+        // has a creature's attention *and* is standing on it has to be harder
+        // to pull it away from than something that has only the second.
+        if let Some((_, held, _, _, _)) = target.and_then(|held| everyone.get(held).ok()) {
+            let range = at.distance(held.translation);
+            if range < sight {
+                hunt.commitment += tuning.threat_near * (1.0 - range / sight);
+            }
         }
         seen.near(at, nearby);
         let quarry = nearby
@@ -1241,50 +1511,131 @@ pub fn alert(
             .map(|(entity, theirs, _)| (entity, at.distance_squared(theirs)))
             .filter(|(_, range)| *range < sight * sight)
             .min_by(|(_, a), (_, b)| a.total_cmp(b));
-        if let Some((quarry, _)) = quarry {
-            seeds.push((index, quarry));
+        let Some((quarry, range)) = quarry else {
+            continue;
+        };
+        // Already credited just above, as the fight it is in.
+        if Some(quarry) == target {
+            continue;
+        }
+        let pressing = tuning.threat_near * (1.0 - range.sqrt() / sight);
+        match target {
+            None => {
+                hunt.seize(quarry, pressing);
+                shouting.push(index);
+            }
+            Some(_) => hunt.credit(quarry, pressing),
         }
     }
-    shouting.clear();
-    for &(index, quarry) in seeds.iter() {
-        hunting[index].3 = Some(quarry);
-        shouting.push(index);
-    }
-    // And the chain: everything on the same side within earshot of a shout
-    // takes the same target and shouts in its turn.
-    let earshot = tuning.enemy_alert;
-    earshot_grid.fill(hunting.iter().map(|(_, at, _, _)| *at), earshot);
-    while let Some(index) = shouting.pop() {
-        let (_, from, side, target) = hunting[index];
-        earshot_grid.near(from, nearby);
+
+    // And what has just been done in front of it. A kill is the one source loud
+    // enough to take a fight off somebody who is standing right there: it is
+    // worth about a second of proximity, so it takes three or four of them in
+    // the same corner to turn a crowd -- which is exactly the moment a squad of
+    // Marios ought to become the more pressing problem.
+    for act in threats.acts.iter() {
+        let Ok((_, _, done_by, _, _)) = everyone.get(act.by) else {
+            continue;
+        };
+        earshot_grid.near(act.at, nearby);
         for &other in nearby.iter() {
-            let (_, theirs, their_side, their_target) = hunting[other];
-            if their_target.is_some()
-                || their_side != side
-                || theirs.distance_squared(from) >= earshot * earshot
-            {
+            let Hunt {
+                at, side, target, ..
+            } = hunting[other];
+            // Its own side's kills are good news.
+            if side == *done_by {
                 continue;
             }
-            hunting[other].3 = target;
-            shouting.push(other);
+            let range = at.distance(act.at);
+            if range >= earshot {
+                continue;
+            }
+            let weight = tuning.threat_kill * (1.0 - range / earshot);
+            match target {
+                None => {
+                    hunting[other].seize(act.by, weight);
+                    shouting.push(other);
+                }
+                Some(_) => hunting[other].credit(act.by, weight),
+            }
         }
     }
+    threats.acts.clear();
+
+    // The switch itself, and the only place a fight changes hands. Everything
+    // above this only moves numbers around.
+    let margin = tuning.threat_switch.max(1.0);
+    for (index, hunt) in hunting.iter_mut().enumerate() {
+        let Some(contender) = hunt.contender else {
+            continue;
+        };
+        // On its own tick, which is what keeps a crowd from turning as one
+        // body when one kill pushes all of them over the line at once.
+        if !hunt.appraising || hunt.rivalry <= hunt.commitment * margin {
+            continue;
+        }
+        hunt.seize(contender, hunt.rivalry);
+        // And it says so, which is what spreads a swap through a crowd
+        // *gradually*: its neighbours are told about the Mario rather than
+        // handed it, so they turn a second or two later, in ones and twos, and
+        // only if it goes on earning.
+        shouting.push(index);
+    }
+
+    // The chain: everything on the same side within earshot of a shout hears
+    // what the shouter is fighting. What it does about that is the whole of the
+    // difference between acquiring and switching.
+    while let Some(index) = shouting.pop() {
+        let Hunt {
+            at: from,
+            side,
+            target,
+            ..
+        } = hunting[index];
+        let Some(target) = target else {
+            continue;
+        };
+        earshot_grid.near(from, nearby);
+        for &other in nearby.iter() {
+            if other == index {
+                continue;
+            }
+            let Hunt {
+                at,
+                side: theirs,
+                target: held,
+                ..
+            } = hunting[other];
+            if theirs != side || at.distance_squared(from) >= earshot * earshot {
+                continue;
+            }
+            match held {
+                // Nothing to lose: it takes the alarm whole and passes it on,
+                // which is the cascade this chain has always been.
+                None => {
+                    hunting[other].seize(target, tuning.threat_shout);
+                    shouting.push(other);
+                }
+                // Already in a fight: it hears about this one and goes back to
+                // its own. Re-pointing it here is what used to let one punch
+                // swing a whole field round.
+                Some(_) => hunting[other].credit(target, tuning.threat_shout),
+            }
+        }
+    }
+
     // Written back by entity rather than by position in the iteration, which is
     // not a thing to bet a fight on. Sorted and searched rather than hashed:
     // this is looked up once per hunter and built once per tick, and a `HashMap`
     // is a SipHash of every key on both sides of that.
     decided.clear();
-    decided.extend(
-        hunting
-            .iter()
-            .map(|(entity, _, _, target)| (*entity, *target)),
-    );
-    decided.sort_unstable_by_key(|(entity, _)| *entity);
+    decided.extend(hunting.iter().copied());
+    decided.sort_unstable_by_key(|hunt| hunt.entity);
     let decided = |entity: Entity| {
         decided
-            .binary_search_by_key(&entity, |(entity, _)| *entity)
+            .binary_search_by_key(&entity, |hunt| hunt.entity)
             .ok()
-            .and_then(|found| decided[found].1)
+            .map(|found| decided[found])
     };
     for (entity, transform, _, mut aggro, detail) in &mut hunters {
         // A crowd-tier enemy keeps whatever it was chasing when it was last in
@@ -1293,13 +1644,16 @@ pub fn alert(
         if !detailed(detail) {
             continue;
         }
-        let target = decided(entity);
-        if aggro.target != target {
-            aggro.target = target;
-        }
+        let Some(verdict) = decided(entity) else {
+            continue;
+        };
+        aggro.target = verdict.target;
+        aggro.commitment = verdict.commitment;
+        aggro.contender = verdict.contender;
+        aggro.rivalry = verdict.rivalry;
         // Where that target is now, and how wide, for the movement step to
         // walk towards the edge of rather than into.
-        match target.and_then(|target| everyone.get(target).ok()) {
+        match verdict.target.and_then(|target| everyone.get(target).ok()) {
             Some((_, seen, _, _, kind)) => {
                 aggro.at = seen.translation;
                 aggro.room = kind.map_or(crate::player::PLAYER_RADIUS, |it| it.kind.body().0);
@@ -2441,10 +2795,11 @@ fn crawl(level: &LevelData, position: Vec3, up: Vec3, step: Vec3) -> Option<(Vec
 pub fn combat(
     mut commands: Commands,
     mut sounds: ResMut<SoundQueue>,
-    mut player: Query<(&Transform, &mut Controller), With<Player>>,
-    enemies: Query<(Entity, &Enemy, &Transform, &Detail), Without<Player>>,
+    mut threats: ResMut<Threats>,
+    mut player: Query<(Entity, &Transform, &mut Controller, &mut Health), With<Player>>,
+    mut enemies: Query<(Entity, &Enemy, &Transform, &Detail, Option<&mut Health>), Without<Player>>,
 ) {
-    let Ok((player_transform, mut controller)) = player.single_mut() else {
+    let Ok((hero, player_transform, mut controller, mut hero_health)) = player.single_mut() else {
         return;
     };
     // The cooldown gates the whole resolution rather than only the damage.
@@ -2460,7 +2815,7 @@ pub fn combat(
     }
     let here = player_transform.translation;
     let facing = player_transform.rotation * Vec3::Z;
-    for (entity, enemy, transform, detail) in &enemies {
+    for (entity, enemy, transform, detail, mut health) in &mut enemies {
         let offset = transform.translation - here;
         // The cheap rejection this loop needs, and it has to be a *distance*
         // rather than a tier. It was `detail == Crowd`, on the grounds that the
@@ -2493,8 +2848,20 @@ pub fn combat(
             && distance_squared < swing * swing
             && facing.dot(bearing) > -0.15
         {
-            commands.entity(entity).despawn();
-            sounds.push_at(Sfx::Defeat, transform.translation);
+            // A swing that does not finish it leaves it standing and angry: the
+            // threat is filed either way, because what a crowd reacts to is
+            // being hit rather than one of them dying.
+            let felled = health::strike(health.as_deref_mut(), health::PLAYER_DAMAGE);
+            if felled {
+                commands.entity(entity).despawn();
+                sounds.push_at(Sfx::Defeat, transform.translation);
+            } else {
+                sounds.push_at(Sfx::Hurt, transform.translation);
+            }
+            // Everything near enough to have seen that gets angrier at him for
+            // it, which is the other half of why a squad can pull a fight off
+            // him: he is on the same ledger they are.
+            threats.kill(hero, transform.translation);
             continue;
         }
         let reach = radius + PLAYER_REACH;
@@ -2516,8 +2883,18 @@ pub fn combat(
             continue;
         }
         if controller.velocity.y < 0.0 && here.y > bottom + (top - bottom) * STOMP_MARGIN {
-            commands.entity(entity).despawn();
-            sounds.push_at(Sfx::Defeat, transform.translation);
+            // Coming down on one costs it the same as swinging at it. The
+            // bounce is unconditional, and that is deliberate: a stomp that
+            // failed to kill and did not bounce would drop him onto a live
+            // enemy that immediately hurts him, which reads as the stomp
+            // having done nothing at all.
+            if health::strike(health.as_deref_mut(), health::PLAYER_DAMAGE) {
+                commands.entity(entity).despawn();
+                sounds.push_at(Sfx::Defeat, transform.translation);
+            } else {
+                sounds.push_at(Sfx::Hurt, transform.translation);
+            }
+            threats.kill(hero, transform.translation);
             controller.velocity.y = BOUNCE_VELOCITY;
             controller.grounded = false;
             continue;
@@ -2525,7 +2902,9 @@ pub fn combat(
         controller.velocity = -bearing * KNOCKBACK_SPEED + Vec3::Y * KNOCKBACK_RISE;
         controller.grounded = false;
         controller.invulnerable_left = INVULNERABLE_SECONDS;
-        controller.health = controller.health.saturating_sub(1);
+        // What it costs him depends on what touched him, which is the only
+        // thing that makes one kind of enemy more dangerous than another.
+        hero_health.hurt(enemy.kind.damage());
         sounds.push(Sfx::Hurt);
         // One hit a tick: walking into a cluster of them costs one heart, not
         // one per enemy in the cluster.
@@ -2558,15 +2937,16 @@ const MARIO_REACH: f32 = 1.3;
 pub fn ally_combat(
     mut commands: Commands,
     mut sounds: ResMut<SoundQueue>,
-    mut allies: Query<(&mut Ally, &Transform, &Aggro)>,
-    enemies: Query<(&Transform, &Enemy), Without<Ally>>,
+    mut threats: ResMut<Threats>,
+    mut allies: Query<(Entity, &mut Ally, &Transform, &Aggro)>,
+    mut enemies: Query<(&Transform, &Enemy, Option<&mut Health>), Without<Ally>>,
 ) {
-    for (mut ally, transform, aggro) in &mut allies {
+    for (mario, mut ally, transform, aggro) in &mut allies {
         let quarry = aggro.target.and_then(|target| {
             enemies
                 .get(target)
                 .ok()
-                .map(|(at, enemy)| (target, at.translation, enemy.kind.body().0))
+                .map(|(at, enemy, _)| (target, at.translation, enemy.kind.body().0))
         });
         let in_reach = quarry.is_some_and(|(_, at, radius)| {
             let apart = at - transform.translation;
@@ -2580,10 +2960,27 @@ pub fn ally_combat(
             ally.state.still_for = 0.0;
             if ally.swing_left == 0.0 && in_reach {
                 let (target, at, _) = quarry.expect("in reach of nothing");
-                commands.entity(target).despawn();
-                // The squad fights spread out across the field, so where one of
-                // them landed a punch is worth hearing.
-                sounds.push_at(Sfx::Defeat, at);
+                // A Mario's fist is worth half what the player's sword is, so
+                // an ant takes two of them and is hitting back in between. That
+                // gap is what a squad is *for*: alone a Mario trades with an
+                // ant, and four of them do not.
+                let health = enemies
+                    .get_mut(target)
+                    .ok()
+                    .and_then(|(_, _, health)| health);
+                if health::strike(health.map(Mut::into_inner), health::MARIO_DAMAGE) {
+                    commands.entity(target).despawn();
+                    // The squad fights spread out across the field, so where one
+                    // of them landed a punch is worth hearing.
+                    sounds.push_at(Sfx::Defeat, at);
+                } else {
+                    sounds.push_at(Sfx::Hurt, at);
+                }
+                // And worth *noticing*: this is the act the whole attention
+                // model is built around. A Mario hitting things in the middle
+                // of a crowd is how that crowd comes to be fighting Marios
+                // rather than the player, over the next second or two.
+                threats.kill(mario, at);
             }
             continue;
         }
@@ -2594,6 +2991,76 @@ pub fn ally_combat(
             ally.state.combo ^= 1;
             ally.state.motion = Motion::Attack;
             ally.state.still_for = 0.0;
+        }
+    }
+}
+
+/// The other half of a squad fight: an enemy stood over a Mario wears it down.
+///
+/// Before hit points a Mario was invincible and an enemy that reached one
+/// simply stood in it, which made sending the squad at anything a decision with
+/// no cost -- twenty Marios cleared a nest as reliably as one did, slower. What
+/// makes an order worth thinking about is that the thing being ordered can be
+/// lost.
+///
+/// **An enemy only hurts what it is actually fighting.** The loop is over
+/// enemies rather than over allies, and it does nothing at all for one whose
+/// [`Aggro::target`] is not an ally -- which is a single archetype check for
+/// every enemy chasing the player, and no distance work whatever for the
+/// thousands chasing nothing. Resolving this the other way round, as a sweep of
+/// the field around each Mario, is the same answer for a great deal more work,
+/// and it would also hurt a Mario that an ambling slime happened to bump into
+/// on its way somewhere else.
+///
+/// The cooldown sits on the *victim*, exactly as the player's does, so what it
+/// limits is how fast a Mario can be worn down rather than how fast any one
+/// enemy swings. Standing in the middle of six ants is dangerous because they
+/// take turns, not because they all land at once.
+pub fn maul(
+    mut commands: Commands,
+    mut sounds: ResMut<SoundQueue>,
+    mut threats: ResMut<Threats>,
+    mut allies: Query<(&mut Ally, &Transform, &mut Health), Without<Enemy>>,
+    enemies: Query<(Entity, &Enemy, &Transform, &Aggro), Without<Ally>>,
+) {
+    // Every Mario's window shortens once a tick whether or not anything is near
+    // it, which is what makes the window a window rather than a thing that only
+    // expires when it is next tested.
+    for (mut ally, _, _) in &mut allies {
+        ally.hurt_left = (ally.hurt_left - FIXED_DT).max(0.0);
+    }
+    for (enemy, body, transform, aggro) in &enemies {
+        let Some(target) = aggro.target else {
+            continue;
+        };
+        let Ok((mut ally, at, mut health)) = allies.get_mut(target) else {
+            continue;
+        };
+        if ally.hurt_left > 0.0 {
+            continue;
+        }
+        // From the enemy's surface to the Mario's, in the horizontal plane, the
+        // same way every other reach in this module is measured. Reusing
+        // `MARIO_REACH` would be wrong in the one case it matters: the Mario is
+        // the thing being reached *for* here, so what has to cover the gap is
+        // the enemy's own body plus a fist's worth.
+        let apart = at.translation - transform.translation;
+        let reach = body.kind.body().0 + crate::player::PLAYER_RADIUS + TOUCH_MARGIN;
+        if Vec3::new(apart.x, 0.0, apart.z).length_squared() > reach * reach {
+            continue;
+        }
+        ally.hurt_left = INVULNERABLE_SECONDS;
+        if health.hurt(body.kind.damage()) {
+            // `despawn` takes the actor scene hanging under it with it, which
+            // is the same thing `squad::maintain_population` relies on when the
+            // console thins the crowd.
+            commands.entity(target).despawn();
+            sounds.push_at(Sfx::Defeat, at.translation);
+            // A Mario going down is an act like any other, and the enemy that
+            // did it is what the rest of the squad comes for.
+            threats.kill(enemy, at.translation);
+        } else {
+            sounds.push_at(Sfx::Hurt, at.translation);
         }
     }
 }
@@ -3383,6 +3850,7 @@ mod tests {
     /// world that can be shoved in is a world that has one.
     fn lawn_world() -> World {
         let mut world = World::new();
+        world.init_resource::<Threats>();
         let level = lawn();
         world.insert_resource(crate::flow::FlowField::new(&level));
         world.insert_resource(level);
@@ -3472,6 +3940,158 @@ mod tests {
             world.get::<Aggro>(enemies[0]).unwrap().at,
             away,
             "it is still walking to where he used to be"
+        );
+    }
+
+    /// A line of slimes that have all committed to the player, and a Mario
+    /// standing among them about to make a nuisance of itself.
+    ///
+    /// The Mario is spawned *after* the first pass on purpose: it is the fight
+    /// already in progress that the attention model is about, and a Mario that
+    /// was there from the start would just be the nearest thing to some of them.
+    ///
+    /// `alert` is **registered** rather than run with `run_system_once`, and
+    /// that is load-bearing rather than tidiness. `run_system_once` builds a
+    /// fresh system every call, so its `Local<Noticing>` -- which is where the
+    /// tick counter the stagger phases off lives -- resets to zero every time.
+    /// Run that way the whole field is frozen on one phase, one enemy in six
+    /// ever appraises at all, and the rest sit on their first target forever.
+    fn quarrel(
+        count: usize,
+    ) -> (
+        World,
+        bevy::ecs::system::SystemId,
+        Entity,
+        Entity,
+        Vec<Entity>,
+    ) {
+        let spots: Vec<Vec3> = (0..count)
+            .map(|which| Vec3::new(2.0 + which as f32 * 0.6, 0.0, 0.0))
+            .collect();
+        let (mut world, player, enemies) = field(&spots);
+        let notice = world.register_system(alert);
+        world.run_system(notice).expect("alert could not run");
+        for enemy in &enemies {
+            assert_eq!(
+                aggro(&mut world, *enemy),
+                Some(player),
+                "the line was supposed to start out fighting the player"
+            );
+        }
+        let mario = world
+            .spawn((
+                Ally::new(Vec3::ZERO, 0.0),
+                Side::Friendly,
+                Aggro::default(),
+                Transform::from_xyz(2.0 + count as f32 * 0.3, 0.0, 0.8),
+            ))
+            .id();
+        (world, notice, player, mario, enemies)
+    }
+
+    /// Runs `ticks` of noticing, with the Mario killing something where it
+    /// stands every `every` ticks. `every` of zero means it kills nothing and
+    /// is only standing there.
+    fn brawl(
+        world: &mut World,
+        notice: bevy::ecs::system::SystemId,
+        mario: Entity,
+        ticks: usize,
+        every: usize,
+    ) {
+        let at = world.get::<Transform>(mario).unwrap().translation;
+        for tick in 0..ticks {
+            if every > 0 && tick % every == 0 {
+                world.resource_mut::<Threats>().kill(mario, at);
+            }
+            world.run_system(notice).expect("alert could not run");
+        }
+    }
+
+    /// The whole point. A Mario killing something in the middle of a fight does
+    /// not take that fight over on the tick of the punch -- which is exactly
+    /// what the old chain did, because a shout re-pointed whoever heard it
+    /// whether or not they were busy.
+    #[test]
+    fn one_marios_kill_does_not_turn_the_fight_round() {
+        let (mut world, notice, player, mario, enemies) = quarrel(4);
+        brawl(&mut world, notice, mario, 12, 12);
+        for enemy in &enemies {
+            assert_eq!(
+                aggro(&mut world, *enemy),
+                Some(player),
+                "one kill was enough to take the fight off the player"
+            );
+        }
+    }
+
+    /// Standing there is not enough either, however close it is standing. A
+    /// Mario that never does anything is worth less than the fight already in
+    /// progress, which is what the margin is for.
+    #[test]
+    fn a_mario_that_only_stands_about_never_takes_the_fight() {
+        let (mut world, notice, player, mario, enemies) = quarrel(4);
+        brawl(&mut world, notice, mario, 150, 0);
+        for enemy in &enemies {
+            assert_eq!(
+                aggro(&mut world, *enemy),
+                Some(player),
+                "it stole the fight by loitering"
+            );
+        }
+    }
+
+    /// And the other half: a Mario that keeps killing does get the fight, in a
+    /// second or two rather than never. A model that only ever refuses to
+    /// switch is not attention, it is a latch with extra steps.
+    #[test]
+    fn a_mario_that_keeps_killing_takes_the_fight_off_the_player() {
+        let (mut world, notice, _, mario, enemies) = quarrel(4);
+        brawl(&mut world, notice, mario, 60, 8);
+        for enemy in &enemies {
+            assert_eq!(
+                aggro(&mut world, *enemy),
+                Some(mario),
+                "it went on fighting the player through a massacre"
+            );
+        }
+    }
+
+    /// And it takes it a few at a time. This is the one that says the fight
+    /// looks like a crowd changing its mind rather than a switch being thrown:
+    /// with one Mario killing the same things at the same range, the line still
+    /// turns on different ticks.
+    ///
+    /// It is also the test that caught the switch being unstaggered. Attention
+    /// arrives synchronously -- one kill is credited to every witness on the
+    /// same tick -- so scores that were accumulated gradually still *cross*
+    /// together, and eight enemies turned as one on tick 16. See
+    /// [`ATTENTION_SPAN`].
+    #[test]
+    fn a_crowd_does_not_all_turn_on_the_same_tick() {
+        let (mut world, notice, _, mario, enemies) = quarrel(8);
+        let at = world.get::<Transform>(mario).unwrap().translation;
+        let mut turned: Vec<Option<usize>> = vec![None; enemies.len()];
+        for tick in 0..90 {
+            if tick % 8 == 0 {
+                world.resource_mut::<Threats>().kill(mario, at);
+            }
+            world.run_system(notice).expect("alert could not run");
+            for (which, enemy) in enemies.iter().enumerate() {
+                if turned[which].is_none() && aggro(&mut world, *enemy) == Some(mario) {
+                    turned[which] = Some(tick);
+                }
+            }
+        }
+        let when: Vec<usize> = turned
+            .iter()
+            .map(|turned| turned.expect("one of the line never turned at all"))
+            .collect();
+        let first = when.iter().min().unwrap();
+        let last = when.iter().max().unwrap();
+        assert!(
+            last > first,
+            "the whole line turned on tick {first}, which is the stampede this is here to stop"
         );
     }
 
@@ -3955,28 +4575,43 @@ mod tests {
     /// A Mario and a slime, stood within arm's reach of each other, with the
     /// Mario having noticed it.
     fn duel(apart: f32) -> (World, Entity, Entity) {
+        duel_with(Kind::Slime, apart)
+    }
+
+    /// The same, against whichever kind the test is about. Both sides carry
+    /// their real hit points, so what these run is the arithmetic the game
+    /// runs rather than `health::strike`'s no-component fallback.
+    fn duel_with(kind: Kind, apart: f32) -> (World, Entity, Entity) {
         let mut world = World::new();
+        world.init_resource::<Threats>();
         world.insert_resource(SoundQueue::default());
         let mario = world
             .spawn((
                 Ally::new(Vec3::ZERO, 0.0),
                 Side::Friendly,
                 Aggro::default(),
+                Health::new(health::MARIO_HEALTH),
                 Transform::default(),
             ))
             .id();
-        let slime = world
+        let foe = world
             .spawn((
                 Enemy {
-                    kind: Kind::Slime,
+                    kind,
                     animation: Handle::default(),
                 },
                 Side::Hostile,
+                Health::new(kind.health()),
                 Transform::from_xyz(apart, 0., 0.),
             ))
             .id();
-        world.get_mut::<Aggro>(mario).unwrap().target = Some(slime);
-        (world, mario, slime)
+        world.get_mut::<Aggro>(mario).unwrap().target = Some(foe);
+        (world, mario, foe)
+    }
+
+    /// How many ticks a Mario's whole punch takes, wind-up included.
+    fn a_full_punch() -> usize {
+        (MARIO_SWING / FIXED_DT).ceil() as usize + 1
     }
 
     fn swing(world: &mut World, ticks: usize) {
@@ -4002,7 +4637,7 @@ mod tests {
             world.get::<Ally>(mario).unwrap().state.motion,
             Motion::Attack
         );
-        swing(&mut world, (MARIO_SWING / FIXED_DT).ceil() as usize + 1);
+        swing(&mut world, a_full_punch());
         assert!(
             world.get_entity(slime).is_err(),
             "the punch landed on nothing"
@@ -4017,10 +4652,95 @@ mod tests {
         let (mut world, _, slime) = duel(1.0);
         swing(&mut world, 1);
         world.get_mut::<Transform>(slime).unwrap().translation.x = MARIO_REACH + 3.0;
-        swing(&mut world, (MARIO_SWING / FIXED_DT).ceil() as usize + 1);
+        swing(&mut world, a_full_punch());
         assert!(
             world.get_entity(slime).is_ok(),
             "the punch followed it across the lawn"
+        );
+    }
+
+    /// A Mario is worth half the player's blow, so an ant survives the first
+    /// punch and not the second.
+    ///
+    /// This is the whole reason the two tables in [`crate::health`] are the
+    /// numbers they are: a lone Mario has to *trade* with an ant rather than
+    /// delete it, which is what makes sending one somewhere a decision.
+    #[test]
+    fn an_ant_takes_two_of_a_marios_punches() {
+        let (mut world, _, ant) = duel_with(Kind::Ant, 1.0);
+        swing(&mut world, a_full_punch());
+        assert!(
+            world.get_entity(ant).is_ok(),
+            "one punch should not fell an ant"
+        );
+        assert_eq!(
+            world.get::<Health>(ant).unwrap().current,
+            health::ANT_HEALTH - health::MARIO_DAMAGE,
+            "the punch landed for the wrong number"
+        );
+        swing(&mut world, a_full_punch());
+        assert!(
+            world.get_entity(ant).is_err(),
+            "the second punch left it standing"
+        );
+    }
+
+    /// And the other way round: what the ant does back.
+    ///
+    /// Twenty points against three a touch is seven touches, spaced a whole
+    /// invulnerability window apart -- so this is several seconds of standing
+    /// against one rather than an instant loss, and a Mario that walks away
+    /// keeps what it has left.
+    #[test]
+    fn an_ant_stood_against_a_mario_wears_it_down() {
+        let (mut world, mario, ant) = duel_with(Kind::Ant, 1.0);
+        // The ant is the one doing the noticing here.
+        world.get_mut::<Aggro>(mario).unwrap().target = None;
+        world.entity_mut(ant).insert(Aggro {
+            target: Some(mario),
+            ..Aggro::default()
+        });
+        let maul_once = |world: &mut World| {
+            world.run_system_once(maul).expect("maul could not run");
+        };
+        maul_once(&mut world);
+        assert_eq!(
+            world.get::<Health>(mario).unwrap().current,
+            health::MARIO_HEALTH - health::ANT_DAMAGE,
+            "the first touch cost the wrong number"
+        );
+        // Ten more ticks is a third of a second, and the window is a whole one.
+        for _ in 0..10 {
+            maul_once(&mut world);
+        }
+        assert_eq!(
+            world.get::<Health>(mario).unwrap().current,
+            health::MARIO_HEALTH - health::ANT_DAMAGE,
+            "hit again inside its own invulnerability window"
+        );
+        // Long enough for all seven touches, and then some.
+        for _ in 0..300 {
+            maul_once(&mut world);
+        }
+        assert!(
+            world.get_entity(mario).is_err(),
+            "a Mario stood against an ant for ten seconds lived through it"
+        );
+    }
+
+    /// An enemy chasing the player walks through the Marios on the way without
+    /// touching them, because what it hurts is what it is fighting.
+    #[test]
+    fn an_enemy_does_not_maul_a_mario_it_is_not_fighting() {
+        let (mut world, mario, ant) = duel_with(Kind::Ant, 0.5);
+        world.get_mut::<Aggro>(mario).unwrap().target = None;
+        // Aggro'd on nothing at all, stood right on top of one.
+        world.entity_mut(ant).insert(Aggro::default());
+        world.run_system_once(maul).expect("maul could not run");
+        assert_eq!(
+            world.get::<Health>(mario).unwrap().current,
+            health::MARIO_HEALTH,
+            "hurt by something that had not noticed it"
         );
     }
 
@@ -4039,6 +4759,7 @@ mod tests {
     #[test]
     fn a_mario_and_a_slime_notice_each_other() {
         let mut world = World::new();
+        world.init_resource::<Threats>();
         world.insert_resource(GameTuning::default());
         let mario = world
             .spawn((
@@ -4197,16 +4918,27 @@ mod tests {
     /// A player, and one enemy standing on his toes.
     fn world(player_y: f32, velocity: Vec3) -> (World, Entity) {
         let mut world = World::new();
+        world.init_resource::<Threats>();
         world.insert_resource(SoundQueue::default());
         let mut controller = Controller::default();
         controller.velocity = velocity;
-        world.spawn((Player, Transform::from_xyz(0.0, player_y, 0.0), controller));
+        world.spawn((
+            Player,
+            Transform::from_xyz(0.0, player_y, 0.0),
+            controller,
+            Health::new(health::PLAYER_HEALTH),
+        ));
         let enemy = world
             .spawn((
                 Enemy {
                     kind: Kind::Slime,
                     animation: Handle::default(),
                 },
+                // Given hit points here rather than left off, so these tests
+                // run the same path the game does: `health::strike` treats a
+                // target without them as one that dies to anything, which would
+                // make the stomp test pass for the wrong reason.
+                Health::new(Kind::Slime.health()),
                 Transform::from_xyz(0.5, 0.0, 0.0),
             ))
             .id();
@@ -4214,23 +4946,68 @@ mod tests {
     }
 
     /// Velocity, health and immunity: everything these tests read.
-    fn controller(world: &mut World) -> (Vec3, u8, f32) {
-        let mut query = world.query_filtered::<&Controller, With<Player>>();
-        let ctrl = query.single(world).unwrap();
-        (ctrl.velocity, ctrl.health, ctrl.invulnerable_left)
+    fn controller(world: &mut World) -> (Vec3, i32, f32) {
+        let mut query = world.query_filtered::<(&Controller, &Health), With<Player>>();
+        let (ctrl, health) = query.single(world).unwrap();
+        (ctrl.velocity, health.current, ctrl.invulnerable_left)
     }
 
-    /// Walking into one costs a heart and throws the player clear.
+    /// What the player is left with after one touch from a slime.
+    const AFTER_A_SLIME: i32 = health::PLAYER_HEALTH - health::SLIME_DAMAGE;
+
+    /// Walking into one costs its damage and throws the player clear.
     #[test]
     fn touching_an_enemy_hurts_and_knocks_the_player_back() {
         let (mut world, enemy) = world(0.0, Vec3::ZERO);
         world.run_system_once(combat).expect("combat could not run");
         assert!(world.get_entity(enemy).is_ok(), "the enemy died on contact");
         let (velocity, health, immune) = controller(&mut world);
-        assert_eq!(health, 2);
+        assert_eq!(health, AFTER_A_SLIME, "a slime is worth two points");
         assert!(velocity.x < 0.0, "not thrown away from it: {velocity:?}");
         assert!(velocity.y > 0.0);
         assert_eq!(immune, INVULNERABLE_SECONDS);
+    }
+
+    /// A swing spends the player's damage against the pool rather than
+    /// despawning what it reaches.
+    ///
+    /// Everything the game actually ships dies to one of his blows -- ten
+    /// against an ant's ten is the toughest trade on the field -- so the only
+    /// way to see the arithmetic happen at all is against something tougher
+    /// than anything placed. That is what this builds: it is a test of the
+    /// mechanism, and the numbers it is normally run with are the two tables in
+    /// [`crate::health`].
+    #[test]
+    fn a_swing_spends_damage_rather_than_deleting_what_it_hits() {
+        let (mut world, enemy) = world(0.0, Vec3::ZERO);
+        // Three of his swings' worth, and mid-swing so the blow lands.
+        let tough = health::PLAYER_DAMAGE * 3;
+        world.entity_mut(enemy).insert(Health::new(tough));
+        world
+            .query_filtered::<&mut Controller, With<Player>>()
+            .single_mut(&mut world)
+            .unwrap()
+            .attack_left = 0.2;
+        world.run_system_once(combat).expect("combat could not run");
+        assert!(
+            world.get_entity(enemy).is_ok(),
+            "one swing emptied a pool three swings deep"
+        );
+        assert_eq!(
+            world.get::<Health>(enemy).unwrap().current,
+            tough - health::PLAYER_DAMAGE,
+            "the swing landed for the wrong number"
+        );
+        // And the last of the three finishes it.
+        for _ in 0..2 {
+            world
+                .query_filtered::<&mut Controller, With<Player>>()
+                .single_mut(&mut world)
+                .unwrap()
+                .attack_left = 0.2;
+            world.run_system_once(combat).expect("combat could not run");
+        }
+        assert!(world.get_entity(enemy).is_err(), "it survived three swings");
     }
 
     /// The reported bug, at its root. A player thrown into the air by a hit
@@ -4255,7 +5032,11 @@ mod tests {
             world.get_entity(enemy).is_ok(),
             "the enemy stomped itself on a player who did nothing"
         );
-        assert_eq!(controller(&mut world).1, 2, "hit again while immune");
+        assert_eq!(
+            controller(&mut world).1,
+            AFTER_A_SLIME,
+            "hit again while immune"
+        );
     }
 
     /// Coming down on one deliberately still defeats it. Without this the
@@ -4267,7 +5048,11 @@ mod tests {
         assert!(world.get_entity(enemy).is_err(), "the stomp did nothing");
         let (velocity, health, _) = controller(&mut world);
         assert_eq!(velocity.y, BOUNCE_VELOCITY);
-        assert_eq!(health, 3, "a stomp is not supposed to hurt");
+        assert_eq!(
+            health,
+            health::PLAYER_HEALTH,
+            "a stomp is not supposed to hurt"
+        );
     }
 
     /// An ant hanging from a ceiling reaches down out of it, and the
@@ -4286,7 +5071,7 @@ mod tests {
         assert!(world.get_entity(enemy).is_ok(), "it was somehow stomped");
         assert_eq!(
             controller(&mut world).1,
-            2,
+            AFTER_A_SLIME,
             "hung out of reach of the player"
         );
     }
@@ -4297,7 +5082,11 @@ mod tests {
         let (mut world, enemy) = world(4.0, Vec3::ZERO);
         world.run_system_once(combat).expect("combat could not run");
         assert!(world.get_entity(enemy).is_ok());
-        assert_eq!(controller(&mut world).1, 3, "hurt from a storey up");
+        assert_eq!(
+            controller(&mut world).1,
+            health::PLAYER_HEALTH,
+            "hurt from a storey up"
+        );
     }
 
     /// An ant that has been under the world is stood back up by the

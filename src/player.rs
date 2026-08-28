@@ -174,7 +174,6 @@ pub struct Controller {
     pub motion: Motion,
     pub attack_left: f32,
     pub invulnerable_left: f32,
-    pub health: u8,
     pub submersion: Submersion,
     /// Distance run since the last footfall, and seconds since the last swim
     /// stroke. Both only drive audio cadence.
@@ -196,7 +195,6 @@ impl Default for Controller {
             motion: Motion::Fall,
             attack_left: 0.0,
             invulnerable_left: 0.0,
-            health: 3,
             submersion: Submersion::Dry,
             step_phase: 0.0,
             stroke_phase: 0.0,
@@ -213,6 +211,9 @@ impl Controller {
     /// Everything about *where* the player is goes; everything about who he is
     /// -- his health, the weapon in his hands, whether he is mid-combo -- stays,
     /// because arriving on a new level is a change of place and not a death.
+    /// His hit points are not even in reach of this any more: they live on a
+    /// [`crate::health::Health`] component beside the controller, which is what
+    /// lets one bar-drawing system treat him, a slime and a Mario alike.
     pub fn reset(&mut self) {
         self.velocity = Vec3::ZERO;
         self.grounded = false;
@@ -234,10 +235,18 @@ pub fn movement(
     tuning: Res<GameTuning>,
     loadout: Res<Loadout>,
     mut sounds: ResMut<SoundQueue>,
-    mut player: Query<(&mut Transform, &mut PreviousPose, &mut Controller), With<Player>>,
+    mut player: Query<
+        (
+            &mut Transform,
+            &mut PreviousPose,
+            &mut Controller,
+            &mut crate::health::Health,
+        ),
+        With<Player>,
+    >,
     camera: Query<&Transform, (With<Camera3d>, Without<Player>)>,
 ) {
-    let Ok((mut transform, mut previous, mut ctrl)) = player.single_mut() else {
+    let Ok((mut transform, mut previous, mut ctrl, mut health)) = player.single_mut() else {
         return;
     };
     previous.translation = transform.translation;
@@ -458,11 +467,11 @@ pub fn movement(
         previous.translation = transform.translation;
         previous.rotation = transform.rotation;
     }
-    if ctrl.health == 0 {
+    if health.dead() {
         transform.translation = respawn.0;
         ctrl.velocity = Vec3::ZERO;
         rise = 0.0;
-        ctrl.health = 3;
+        health.refill();
         ctrl.invulnerable_left = 1.5;
         previous.translation = transform.translation;
         previous.rotation = transform.rotation;
@@ -614,6 +623,9 @@ mod tests {
             Player,
             PreviousPose::new(&spawn),
             Controller::default(),
+            // `movement` respawns him when this runs out, so it is part of what
+            // the system needs rather than something only the fight reads.
+            crate::health::Health::new(crate::health::PLAYER_HEALTH),
             spawn,
         ));
         // Facing -Z, so "forward" input runs toward the castle.

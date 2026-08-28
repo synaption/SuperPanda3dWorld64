@@ -56,13 +56,8 @@ pub const SCALES: [u32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 /// the game is drawing frames that are torn in half and thrown away.
 pub const FRAME_CAPS: [u32; 7] = [0, 30, 60, 90, 120, 144, 240];
 
-/// The cap a fresh game starts at: none.
-///
-/// Off rather than a guess, because the right value is a fact about the screen
-/// the game is being played on and this has no way to know it -- and because
-/// there is no settings file, so a wrong guess would be one the player had to
-/// correct on every launch.
-const DEFAULT_FRAME_CAP: usize = 0;
+/// The cap a fresh game starts at: 60 fps.
+const DEFAULT_FRAME_CAP: usize = 2;
 
 /// How long [`cap_frames`] spins rather than sleeps at the end of a frame.
 ///
@@ -88,6 +83,17 @@ pub struct DisplaySettings {
     pub scale: usize,
     /// Index into [`FRAME_CAPS`], the same way.
     pub frame_cap: usize,
+    /// Whether every creature on the field wears its hit points over its head.
+    ///
+    /// **Off, and it is a display setting rather than a game one**, because
+    /// what it changes is what you are told and not what is true: the numbers
+    /// are being kept either way -- see [`crate::health`] -- and this decides
+    /// whether they are drawn. Off by default because a lawn of two hundred
+    /// creatures with a bar over each is a lawn you cannot see, and because the
+    /// fight it describes is meant to be read off the creatures themselves.
+    /// It is the setting to reach for when a number is in question rather than
+    /// one to leave on.
+    pub unit_health_bars: bool,
 }
 
 impl Default for DisplaySettings {
@@ -95,6 +101,7 @@ impl Default for DisplaySettings {
         Self {
             scale: DEFAULT_SCALE,
             frame_cap: DEFAULT_FRAME_CAP,
+            unit_health_bars: false,
         }
     }
 }
@@ -358,19 +365,10 @@ pub fn cap_frames(
 
 /// Whether a fresh window waits for the display.
 ///
-/// Off. The display this is played on is variable-refresh, so it follows the
-/// frame rate rather than the frame rate having to wait for it -- the wait buys
-/// no smoothness there and costs the whole of what it waits for. Measured on
-/// this game: with the wait in place 13.4% of frames took a stall of about
-/// fifteen milliseconds in `PostUpdate`, against 0.35% without it. The render
-/// schedule's present block sits on the same task pool the main world's
-/// parallel systems run on, so a main-world system that wants a worker thread
-/// queues behind a thread parked on the display.
-///
-/// A fixed display wants it back on, and the pause menu's Display page is where
-/// that is done. It is a named constant rather than a literal in `main` so this
-/// paragraph has somewhere to live and the menu's test has something to read.
-pub const DEFAULT_PRESENT_MODE: PresentMode = PresentMode::AutoNoVsync;
+/// On, so a fresh window avoids tearing and paces rendering to the display.
+/// Variable-refresh displays and diagnostics can turn it off from the pause
+/// menu's Display page.
+pub const DEFAULT_PRESENT_MODE: PresentMode = PresentMode::AutoVsync;
 
 /// Whether the window waits for the display before it shows a frame.
 ///
@@ -421,14 +419,15 @@ mod tests {
     #[test]
     fn the_frame_cap_wraps_through_its_choices() {
         let mut settings = DisplaySettings::default();
-        assert_eq!(settings.frame_cap_hz(), None, "a fresh game is uncapped");
+        assert_eq!(settings.frame_cap_hz(), Some(60), "a fresh game is 60 fps");
 
         settings.step_frame_cap(1);
-        assert_eq!(settings.frame_cap_hz(), Some(FRAME_CAPS[1]));
+        assert_eq!(settings.frame_cap_hz(), Some(FRAME_CAPS[3]));
 
         settings.step_frame_cap(-1);
-        assert_eq!(settings.frame_cap_hz(), None);
+        assert_eq!(settings.frame_cap_hz(), Some(60));
         // Off the near end and round to the far one, the way the scale does.
+        settings.frame_cap = 0;
         settings.step_frame_cap(-1);
         assert_eq!(settings.frame_cap_hz(), Some(*FRAME_CAPS.last().unwrap()));
         settings.step_frame_cap(1);

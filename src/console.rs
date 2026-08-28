@@ -281,6 +281,41 @@ pub const SPECS: &[TunableSpec] = &[
         doc: "how far one creature's alarm carries to its own side",
     },
     TunableSpec {
+        name: "threat_near",
+        low: 0.0,
+        high: 10.0,
+        step: 0.1,
+        doc: "attention something earns per appraisal just by being close",
+    },
+    TunableSpec {
+        name: "threat_shout",
+        low: 0.0,
+        high: 20.0,
+        step: 0.2,
+        doc: "attention a neighbour's alarm puts on what it is fighting",
+    },
+    TunableSpec {
+        name: "threat_kill",
+        low: 0.0,
+        high: 60.0,
+        step: 1.0,
+        doc: "attention a killer earns from everything that saw it",
+    },
+    TunableSpec {
+        name: "threat_decay",
+        low: 0.0,
+        high: 4.0,
+        step: 0.05,
+        doc: "fraction of accumulated attention shed per second",
+    },
+    TunableSpec {
+        name: "threat_switch",
+        low: 1.0,
+        high: 6.0,
+        step: 0.1,
+        doc: "how far a rival must out-threaten the current target to steal it",
+    },
+    TunableSpec {
         name: "sim_budget",
         low: 0.0,
         high: 2_000.0,
@@ -437,6 +472,32 @@ pub struct GameTuning {
     pub enemy_speed: f32,
     pub enemy_sight: f32,
     pub enemy_alert: f32,
+    /// The five numbers that divide a creature's attention. All of them are
+    /// read by [`crate::enemy::alert`] and nothing else.
+    ///
+    /// They are sliders rather than constants because the only thing that
+    /// matters about them is their *ratio*, and no ratio here is predictable
+    /// from first principles: whether a Mario punching slimes beside you is
+    /// worth more of an ant's attention than you standing in front of it is a
+    /// question about how a fight feels, and the only way to answer it is to
+    /// drag the row and watch the field turn.
+    ///
+    /// What a unit of attention is worth is set by `threat_near`, which is what
+    /// something directly underfoot earns each time a creature looks up. The
+    /// other three are quoted against it.
+    pub threat_near: f32,
+    pub threat_shout: f32,
+    pub threat_kill: f32,
+    /// How fast attention drains, as a fraction of what is held per second.
+    /// This is what stops a fight from being decided by whoever hit first: a
+    /// Mario that stops killing stops being interesting.
+    pub threat_decay: f32,
+    /// The hysteresis, and the whole reason a crowd does not flicker. A rival
+    /// has to beat the committed target by this factor before anything turns,
+    /// so the two scores may cross back and forth without moving anybody.
+    /// Below 1.0 would mean switching to something *less* threatening, which is
+    /// why the slider stops there.
+    pub threat_switch: f32,
     /// How many of the nearest enemies are simulated in full. The rest are
     /// moved by the flow field -- see [`crate::enemy::Detail`].
     pub sim_budget: f32,
@@ -509,6 +570,29 @@ impl Default for GameTuning {
             enemy_speed: 1.8,
             enemy_sight: 14.0,
             enemy_alert: 9.0,
+            // One unit of attention a look, for something standing on top of
+            // you, falling off to nothing at the edge of sight.
+            threat_near: 1.0,
+            // A neighbour's alarm is worth a couple of appraisals -- enough to
+            // be felt across a crowd, nowhere near enough to turn one on its
+            // own. Turning on a shout alone is what the old chain did, and it
+            // is what made a switch chaotic.
+            threat_shout: 2.0,
+            // A kill is worth about a second of standing next to somebody, and
+            // it is the only source big enough to actually take a fight off the
+            // player: three or four Marios' worth of killing in the same corner
+            // is what it takes, which is exactly when the enemies around it
+            // ought to be turning.
+            threat_kill: 12.0,
+            // A third of what is held, per second. Slow enough that a fight
+            // holds together across the second or two of nobody hitting
+            // anything, fast enough that a kill three seconds ago is history.
+            threat_decay: 0.35,
+            // Sixty per cent clear. WoW's tanking rule is the same idea at
+            // 110/130 per cent, and it is tighter than this because a raid is
+            // twenty deliberate players rather than a lawn full of Marios --
+            // the noisier the field, the wider the gap has to be.
+            threat_switch: 1.6,
             // The budget the crowd work is built around: a couple of hundred
             // enemies get collision, jostling and the aggro chain, and
             // everything past that is carried by the flow field. Chosen as a
@@ -584,6 +668,11 @@ impl GameTuning {
             "enemy_speed" => self.enemy_speed,
             "enemy_sight" => self.enemy_sight,
             "enemy_alert" => self.enemy_alert,
+            "threat_near" => self.threat_near,
+            "threat_shout" => self.threat_shout,
+            "threat_kill" => self.threat_kill,
+            "threat_decay" => self.threat_decay,
+            "threat_switch" => self.threat_switch,
             "sim_budget" => self.sim_budget,
             "enemy_lod_near" => self.enemy_lod_near,
             "enemy_lod_far" => self.enemy_lod_far,
@@ -641,6 +730,11 @@ impl GameTuning {
             "enemy_speed" => self.enemy_speed = value,
             "enemy_sight" => self.enemy_sight = value,
             "enemy_alert" => self.enemy_alert = value,
+            "threat_near" => self.threat_near = value,
+            "threat_shout" => self.threat_shout = value,
+            "threat_kill" => self.threat_kill = value,
+            "threat_decay" => self.threat_decay = value,
+            "threat_switch" => self.threat_switch = value,
             "sim_budget" => self.sim_budget = value,
             "enemy_lod_near" => self.enemy_lod_near = value,
             "enemy_lod_far" => self.enemy_lod_far = value,
@@ -1402,7 +1496,7 @@ pub fn draw(
     tuning: Res<GameTuning>,
     state: Res<GameState>,
     diagnostics: Res<DiagnosticsStore>,
-    player: Query<(&Controller, &Transform), With<Player>>,
+    player: Query<(&Controller, &Transform, &crate::health::Health), With<Player>>,
     enemies: Query<(), With<Enemy>>,
     mut panel: Query<(&mut Text, &mut Visibility), (With<ConsolePanel>, Without<TuningTray>)>,
     mut tray: Query<&mut Text, (With<TuningTray>, Without<ConsolePanel>)>,
@@ -1416,7 +1510,7 @@ pub fn draw(
         Visibility::Hidden
     };
     if console.open {
-        let Ok((controller, transform)) = player.single() else {
+        let Ok((controller, transform, health)) = player.single() else {
             return;
         };
         let fps = diagnostics
@@ -1437,11 +1531,12 @@ pub fn draw(
         // of the line, which is the only way moving it is visible at all.
         let (before, after) = console.split();
         **text = format!(
-            "BEVY DEBUG CONSOLE  ·  paused · log scroll {}\n{:?} · {:?} · health {} · enemies {} · {fps:.1} fps\npos {:.2}, {:.2}, {:.2}\n\n{log}\n\n> {before}|{after}",
+            "BEVY DEBUG CONSOLE  ·  paused · log scroll {}\n{:?} · {:?} · health {}/{} · enemies {} · {fps:.1} fps\npos {:.2}, {:.2}, {:.2}\n\n{log}\n\n> {before}|{after}",
             console.scroll,
             state.active,
             controller.motion,
-            controller.health,
+            health.current,
+            health.max,
             enemies.iter().len(),
             transform.translation.x,
             transform.translation.y,

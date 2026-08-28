@@ -39,11 +39,15 @@ const CONTROLS: &str = "mouse or up/down choose  ·  click/Enter select  ·  Esc
 
 /// How many text rows are spawned for the menu to write into.
 ///
-/// The longest page is the root's four, and two spare cost two text nodes that
-/// are hidden on every page rather than a page's worth of respawning. The
-/// spares are what the level list grows into: it is the one page whose length
-/// is a property of the game rather than of the menu.
-const ROWS: usize = 6;
+/// The longest page is the display page, and a couple spare cost a couple of
+/// text nodes that are hidden on every page rather than a page's worth of
+/// respawning. The spares are what the two growing lists reach into: the level
+/// list, whose length is a property of the game rather than of the menu, and
+/// the display page, which gains a row every time something becomes worth
+/// switching off. `every_page_has_rows_and_room_for_them` is what turns
+/// outgrowing this into a failing test rather than a row that is silently never
+/// drawn.
+const ROWS: usize = 8;
 
 /// Which page is showing.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
@@ -58,7 +62,7 @@ pub enum Page {
 /// One line of a page.
 ///
 /// The value rows ([`Item::RenderScale`], [`Item::Lighting`], [`Item::WindowMode`],
-/// [`Item::VSync`], [`Item::FrameCap`]) are also
+/// [`Item::VSync`], [`Item::FrameCap`], [`Item::UnitHealthBars`]) are also
 /// choosable: Enter on them steps the value forward, which is what a player who
 /// never tries the arrow keys will do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -84,6 +88,9 @@ enum Item {
     /// A ceiling on how many frames a second are drawn. See
     /// [`display::FRAME_CAPS`] for why it is a list of rates rather than a dial.
     FrameCap,
+    /// Whether the creatures on the field wear their hit points over their
+    /// heads. Off by default -- see [`DisplaySettings::unit_health_bars`].
+    UnitHealthBars,
     Back,
 }
 
@@ -115,6 +122,7 @@ impl Page {
                 Item::WindowMode,
                 Item::VSync,
                 Item::FrameCap,
+                Item::UnitHealthBars,
                 Item::Back,
             ],
         }
@@ -546,6 +554,9 @@ fn adjust(
             }
         }
         Item::FrameCap => settings.step_frame_cap(step),
+        // Two states, so the step's direction has nowhere to point, exactly as
+        // the lighting and window-mode rows above.
+        Item::UnitHealthBars => settings.unit_health_bars = !settings.unit_health_bars,
         _ => {}
     }
 }
@@ -662,6 +673,14 @@ pub fn draw(
                 match settings.frame_cap_hz() {
                     Some(hz) => format!("{hz} fps"),
                     None => "Off".to_string(),
+                }
+            ),
+            Item::UnitHealthBars => format!(
+                "Unit health bars       < {} >",
+                if settings.unit_health_bars {
+                    "On"
+                } else {
+                    "Off"
                 }
             ),
             Item::Back => "Back".to_string(),

@@ -35,3 +35,12 @@ make ow into a level
 enemies need to attack mario's too
 
 
+save file format, including settings
+
+SoA amortization
+
+ctrl+c/ctrl+v in ingame console
+
+pop in
+
+marios stuck in corner, need to be smart enough not to get stuck, pathing?  

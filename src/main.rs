@@ -19,6 +19,7 @@ mod flow;
 mod frame_chart;
 mod furniture;
 mod gravity;
+mod health;
 mod impostor;
 mod input;
 mod level;
@@ -29,6 +30,7 @@ mod player;
 mod shadow;
 mod shot;
 mod sky;
+#[cfg(feature = "spike")]
 mod spike;
 mod squad;
 mod water;
@@ -346,6 +348,8 @@ pub fn game_resources(app: &mut App) {
             debug: true,
         })
         .init_resource::<console::GameTuning>()
+        // The queue every kill is posted to and `enemy::alert` drains.
+        .init_resource::<enemy::Threats>()
         .init_resource::<console::ConsoleState>()
         .init_resource::<input::InputState>()
         .init_resource::<audio::SoundQueue>()
@@ -357,6 +361,8 @@ pub fn game_resources(app: &mut App) {
         .init_resource::<menu::MenuState>()
         .init_resource::<display::DisplaySettings>()
         .init_resource::<display::FramePacing>()
+        // How far through its fade each unit wearing a health bar is.
+        .init_resource::<health::BarFades>()
         .init_resource::<sky::Sky>()
         .init_resource::<impostor::ImpostorStats>()
         .init_resource::<frame_chart::CalculationTimes>()
@@ -379,8 +385,11 @@ pub fn game_resources(app: &mut App) {
 /// The input pipeline is not here: it reads real devices, and the headless
 /// callers have none.
 pub fn game_systems(app: &mut App) {
-    app.add_plugins(spike::plugin);
-    app.add_plugins(spike::harness);
+    #[cfg(feature = "spike")]
+    {
+        app.add_plugins(spike::plugin);
+        app.add_plugins(spike::harness);
+    }
     app.add_systems(First, frame_chart::begin)
         .add_systems(Last, frame_chart::finish)
         // After the chart has stopped its clock, so a frame held back to the
@@ -395,7 +404,18 @@ pub fn game_systems(app: &mut App) {
         // window, but the gun would spend half its frames a step behind the
         // torso carrying it.
         .add_systems(PostUpdate, (aim::systems(), weapon::systems()).chain())
-        .add_systems(PostUpdate, drawing());
+        .add_systems(PostUpdate, drawing())
+        // In `PostUpdate` rather than with the rest of the overlay, and pinned
+        // between two of Bevy's own sets: a bar is a world position projected
+        // through the camera and written into a UI node, so it has to run after
+        // the camera's `GlobalTransform` exists and before the layout that
+        // reads what it wrote. See `health::draw_unit_bars`.
+        .add_systems(
+            PostUpdate,
+            health::draw_unit_bars
+                .after(bevy::transform::TransformSystems::Propagate)
+                .before(bevy::ui::UiSystems::Layout),
+        );
 }
 
 /// Everything that happens to geometry after the world has moved: billboards
@@ -477,6 +497,10 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
         // After the walk step: a Mario mid-punch is punching, whatever the walk
         // made of it.
         enemy::ally_combat,
+        // And the other side of the same fight, straight after it, so a Mario
+        // that killed what it was hitting is not then hurt by the thing it just
+        // removed. Both raise threats, and `alert` below drains them together.
+        enemy::maul,
         enemy::alert,
         enemy::update,
         // Straight after the step that decided what is near enough to be drawn
@@ -529,8 +553,10 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
         sky::systems(),
         shadow::systems(),
         weapon::fade,
-        controls,
-        update_hud,
+        // Nested rather than three more entries in the tuple: Bevy's system
+        // tuples stop at twenty, and a nested one that chains itself keeps the
+        // order exactly as it reads.
+        (controls, update_hud, health::draw_player_bar).chain(),
     )
         .chain()
         .run_if(console::is_closed)
@@ -645,6 +671,10 @@ fn setup(
         Player,
         PreviousPose::new(&spawn),
         Controller::default(),
+        // A hundred points, which is a different kind of number from the three
+        // hearts this used to be: what threatens him is a crowd's worth of
+        // small hits rather than any one enemy. See [`health`].
+        health::Health::new(health::PLAYER_HEALTH),
         // He does not notice anything -- that is what the player is for -- but
         // he is very much noticeable, and a side is what makes him so.
         enemy::Side::Friendly,
@@ -775,6 +805,9 @@ fn setup(
         },
     ));
     frame_chart::spawn(&mut commands);
+    // The player's bar and the pool of floating ones. Built once here rather
+    // than per creature -- see `health::UNIT_BARS`.
+    health::spawn(&mut commands);
     commands.spawn(console::panel_bundle());
     commands.spawn(console::tuning_tray_bundle());
     menu::spawn(&mut commands);
@@ -915,10 +948,10 @@ fn update_hud(
     input: Res<InputState>,
     loadout: Res<weapon::Loadout>,
     squad: Res<squad::Squad>,
-    player: Query<&Controller, With<Player>>,
+    player: Query<(&Controller, &health::Health), With<Player>>,
     mut text: Query<&mut Text, With<Hud>>,
 ) {
-    let Ok(ctrl) = player.single() else {
+    let Ok((ctrl, health)) = player.single() else {
         return;
     };
     let Ok(mut hud) = text.single_mut() else {
@@ -932,7 +965,7 @@ fn update_hud(
         let following = squad.members.len();
         let marching = squad.marching();
         let holding = squad.sent.len() - marching;
-        format!("Super Bevy World 64\n{:?}  ·  {:?}  ·  Health {}  ·  {device}\nSquad {following} following · {marching} marching · {holding} holding\nWASD move · mouse look · Space jump · V jetpack/skate\nShift attack · X squad (hold to whistle, tap to send)\nF/right mouse aim · Y weapon ({weapon}) · ` console · F2 switch · Esc menu · F11 window", state.active, ctrl.motion, ctrl.health)
+        format!("Super Bevy World 64\n{:?}  ·  {:?}  ·  Health {}/{}  ·  {device}\nSquad {following} following · {marching} marching · {holding} holding\nWASD move · mouse look · Space jump · V jetpack/skate\nShift attack · X squad (hold to whistle, tap to send)\nF/right mouse aim · Y weapon ({weapon}) · ` console · F2 switch · Esc menu · F11 window", state.active, ctrl.motion, health.current, health.max)
     } else {
         String::new()
     };
@@ -1487,6 +1520,7 @@ mod tests {
             .add_plugins(bevy::input::InputPlugin)
             .init_resource::<console::ConsoleState>()
             .init_resource::<console::GameTuning>()
+            .init_resource::<enemy::Threats>()
             .init_resource::<input::InputState>()
             .init_resource::<menu::MenuState>()
             .init_resource::<display::DisplaySettings>()

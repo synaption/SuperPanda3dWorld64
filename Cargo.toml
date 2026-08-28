@@ -97,6 +97,25 @@ gamepad = ["bevy/bevy_gilrs", "bevy/gamepad"]
 # the render-phase queues -- and those cannot be timed from this crate at all.
 perf = ["bevy/trace", "bevy/trace_chrome"]
 
+# Where in a frame the time went, without a tracing viewer.
+#
+#   cargo run --features spike
+#
+# Bevy's own schedules are timed by bracketing `Main` with probe schedules, so
+# each frame is attributed across `First`, `PreUpdate`, `FixedMain`, `Update`,
+# `SpawnScene`, `PostUpdate` and `Last`. Any frame over the threshold writes a
+# line to a `spikes.txt` beside the executable -- a file rather than stderr
+# because the Windows build is a `windows_subsystem = "windows"` binary and has
+# no console to print to. Each line records the display settings it was taken
+# under, so one log can hold a whole sweep of configurations.
+#
+# Off by default: the probe schedules cost a little every frame, and this is an
+# instrument rather than a feature of the game. `perf` is the finer tool and
+# the two are independent -- reach for this one first, because it answers
+# "which phase" in a text file, and for `perf` when the answer is "which
+# system" and a span viewer is worth opening.
+spike = []
+
 [profile.dev]
 opt-level = 1
 

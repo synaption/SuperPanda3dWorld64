@@ -507,8 +507,9 @@ pub fn fire(
     aim: Res<Aim>,
     level: Res<LevelData>,
     assets: Option<Res<ShotAssets>>,
+    mut threats: ResMut<crate::enemy::Threats>,
     muzzles: Query<&GlobalTransform, With<Muzzle>>,
-    player: Query<&Transform, With<Player>>,
+    player: Query<(Entity, &Transform), With<Player>>,
     enemies: Targets,
 ) {
     loadout.cooldown = (loadout.cooldown - FIXED_DT).max(0.0);
@@ -527,7 +528,7 @@ pub fn fire(
     let from = match muzzles.iter().next() {
         Some(muzzle) => muzzle.translation(),
         None => match player.single() {
-            Ok(body) => body.translation + Vec3::Y * 1.2,
+            Ok((_, body)) => body.translation + Vec3::Y * 1.2,
             Err(_) => return,
         },
     };
@@ -567,8 +568,14 @@ pub fn fire(
             if let Some(entity) = struck {
                 commands.entity(entity).despawn();
                 // At the far end of the beam rather than at the gun: a hitscan
-                // shot kills where it lands, and that is where it is heard.
+                // shot kills where it lands, and that is where it is heard --
+                // and, for the same reason, where it is resented. Shooting into
+                // a crowd from cover still earns their attention, or a gun
+                // would be a way of killing things that never look up.
                 sounds.push_at(Sfx::Defeat, landed);
+                if let Ok((hero, _)) = player.single() {
+                    threats.kill(hero, landed);
+                }
             }
             if let Some(assets) = assets {
                 spawn_tracer(&mut commands, &assets, &tuning, origin, landed);
@@ -636,8 +643,15 @@ pub fn fly(
     mut commands: Commands,
     mut sounds: ResMut<SoundQueue>,
     level: Res<LevelData>,
+    mut threats: ResMut<crate::enemy::Threats>,
     mut bullets: Query<(Entity, &mut Bullet, &mut Transform), Without<Player>>,
+    player: Query<Entity, With<Player>>,
     enemies: Targets,
+    // Separate from `Targets` rather than a fourth term in it, because the ray
+    // test below borrows that query for the whole sweep and the hit has to be
+    // written afterwards. The two touch no component in common, which is what
+    // lets both exist in one system at all.
+    mut healths: Query<&mut crate::health::Health>,
 ) {
     for (entity, mut bullet, mut transform) in &mut bullets {
         let step = bullet.velocity * FIXED_DT;
@@ -656,8 +670,24 @@ pub fn fly(
             &enemies,
         );
         if let Some(hit) = struck {
-            commands.entity(hit).despawn();
-            sounds.push_at(Sfx::Defeat, landed);
+            // A bullet is worth exactly what a sword swing is. See
+            // [`crate::health::PLAYER_DAMAGE`] for why that is a decision
+            // rather than an oversight.
+            let health = healths.get_mut(hit).ok();
+            if crate::health::strike(health.map(Mut::into_inner), crate::health::PLAYER_DAMAGE) {
+                commands.entity(hit).despawn();
+                sounds.push_at(Sfx::Defeat, landed);
+            } else {
+                sounds.push_at(Sfx::Hurt, landed);
+            }
+            // A tick behind the rest -- this runs after `enemy::alert` -- which
+            // is a thirtieth of a second between a bullet landing and the crowd
+            // minding about it.
+            if let Ok(hero) = player.single() {
+                threats.kill(hero, landed);
+            }
+            // The round is spent whether or not it finished what it hit: it
+            // stops at the first body on its line either way.
             commands.entity(entity).despawn();
             continue;
         }
@@ -727,6 +757,7 @@ mod tests {
     fn range(weapon: Weapon, ahead: f32) -> (World, Entity) {
         let mut world = World::new();
         world.insert_resource(ground());
+        world.init_resource::<crate::enemy::Threats>();
         world.insert_resource(GameTuning::default());
         world.insert_resource(SoundQueue::default());
         world.insert_resource(InputState::default());
