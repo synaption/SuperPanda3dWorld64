@@ -27,6 +27,7 @@ mod pipe;
 mod player;
 mod shadow;
 mod shot;
+mod sky;
 mod squad;
 mod water;
 mod weapon;
@@ -268,6 +269,7 @@ pub fn game_resources(app: &mut App) {
         .init_resource::<squad::Whistle>()
         .init_resource::<menu::MenuState>()
         .init_resource::<display::DisplaySettings>()
+        .init_resource::<sky::Sky>()
         .init_resource::<impostor::ImpostorStats>()
         .init_resource::<weapon::Loadout>()
         .init_resource::<aim::Aim>()
@@ -420,6 +422,15 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
         water::find_ocean,
         water::drift_ocean,
         water::camera_medium,
+        // Reads the light the sky wrote *last* frame, which is what lets it sit
+        // ahead of the sky rather than in the middle of it -- a frame of lag on
+        // a colour that takes a minute to cross the sunset is not a thing that
+        // can be seen.
+        water::dim,
+        // After it, and that order is the point: `camera_medium` owns the fog
+        // and the clear colour underwater and the sky owns both above it, so
+        // the frame the camera surfaces has to end with the sky's answer.
+        sky::systems(),
         shadow::systems(),
         weapon::fade,
         controls,
@@ -509,6 +520,11 @@ fn setup(
         &asset_path(),
     );
     commands.insert_resource(shadow_art);
+    // The sky rides the camera and outlives every level, so it is put up here
+    // beside the other two `prepare`s rather than by whichever level is up
+    // first. `sky::advance` is what turns it off on a level that is not the
+    // castle grounds.
+    sky::prepare(&mut commands, &mut meshes, &mut images, &mut sprites);
     squad::spawn_circle(&mut commands, &mut meshes, &mut materials);
     commands.insert_resource(animation::CharacterAnimations::load(&assets));
     audio::preload(&mut commands, &assets);

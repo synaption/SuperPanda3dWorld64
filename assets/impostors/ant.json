@@ -3,16 +3,16 @@
   "cell_px": 128,
   "angles": 16,
   "frames": 16,
-  "world_size": 6.0039144,
-  "fps": 38.4,
+  "world_size": 6.1254935,
+  "fps": 25.6,
   "tiers": [
     {
       "elevation": 15.0,
-      "foot": 0.3931045
+      "foot": 0.39790624
     },
     {
       "elevation": 55.0,
-      "foot": 0.4966793
+      "foot": 0.49674523
     }
   ]
 }

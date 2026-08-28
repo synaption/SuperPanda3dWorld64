@@ -35,4 +35,3 @@ make ow into a level
 enemies need to attack mario's too
 
 
-day night cycle

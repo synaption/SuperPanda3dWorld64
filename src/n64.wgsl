@@ -56,17 +56,30 @@
 struct N64Material {
     // Tint applied to the texture, straight from the glTF material.
     base_color: vec4<f32>,
-    // rgb: the key light's colour. a: 1.0 when this surface is lit at all, and
-    // 0.0 when its colour is already baked into its vertices -- which is the
-    // whole of the castle, whose original RSP lighting was resolved offline.
+    // rgb: the key light's colour. a: how this surface is shaded.
+    //    1: lit here, from the three terms below.
+    //    0: lit offline -- the whole of the castle, whose RSP lighting was
+    //       resolved into its vertex colours, and the impostor sheets, which
+    //       are photographs of lit models. Their colour is finished, but it
+    //       was finished under a noon sun, so `daylight` dims it as the day
+    //       turns.
+    //   -1: luminous. The sky, which is where the light comes from rather than
+    //       something the light falls on, and which is therefore never dimmed.
     light: vec4<f32>,
     // rgb: the ambient term every lit vertex starts from.
     ambient: vec4<f32>,
     // xyz: unit vector from the surface *towards* the key light.
     to_light: vec4<f32>,
+    // rgb: how much of the light a baked surface was baked under is left. Read
+    // only in the `a == 0` case above.
+    daylight: vec4<f32>,
     // Alpha below which a fragment is thrown away, or 0.0 to keep every
     // fragment. This is how the tree cards get their outline.
     alpha_cutoff: f32,
+    // 1.0 for a surface in the world and 0.0 for the sky, which is drawn far
+    // past where the haze becomes total and would otherwise be a flat screen of
+    // fog colour. See `N64Uniform::fogged`.
+    fogged: f32,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> material: N64Material;
@@ -166,9 +179,20 @@ fn vertex(vertex: Vertex) -> N64VertexOutput {
 #else
     // One diffuse light and one ambient, summed at the vertex, and the last
     // this pipeline thinks about lighting.
+    //
+    // A luminous surface falls through both arms and keeps the 1.0 it starts
+    // with, which is what makes the sky the one thing in the world the time of
+    // day is not applied to twice.
     var shade = vec3<f32>(1.0, 1.0, 1.0);
-    if material.light.a > 0.0 && dot(world_normal, world_normal) > 0.0 {
-        shade = n64_shade(normalize(world_normal));
+    if material.light.a > 0.0 {
+        // A mesh with no normals cannot be lit, and keeps its own colour --
+        // see the zero written above.
+        if dot(world_normal, world_normal) > 0.0 {
+            shade = n64_shade(normalize(world_normal));
+        }
+    } else if material.light.a >= 0.0 {
+        // Already lit, somewhere else and at some other hour.
+        shade = material.daylight.rgb;
     }
     out.color = vec4<f32>(tint.rgb * shade, tint.a);
 #endif
@@ -185,6 +209,12 @@ fn fragment(in: N64VertexOutput) -> @location(0) vec4<f32> {
     // of the triangle's three corners. The length test is the mesh-has-no-
     // normals case: interpolating zeroes gives a zero vector, and normalizing
     // one of those is a NaN across the whole triangle.
+    //
+    // Only the lit case ever reaches here: `N64MaterialKey` compiles the
+    // per-pixel pipeline for a surface with `light.a > 0.0` and no other, so a
+    // baked surface is drawn by the vertex pipeline above whatever the player
+    // has the display option set to -- which is where its `daylight` is
+    // applied.
     if material.light.a > 0.0 && dot(in.world_normal, in.world_normal) > 0.0 {
         tint = vec4<f32>(tint.rgb * n64_shade(normalize(in.world_normal)), tint.a);
     }
@@ -201,9 +231,10 @@ fn fragment(in: N64VertexOutput) -> @location(0) vec4<f32> {
     // Fog is a property of the view rather than of the material, and this game
     // only ever sets the linear falloff -- above water and below it are the
     // same curve with different ends. Anything else is left unfogged rather
-    // than silently fogged wrongly.
+    // than silently fogged wrongly -- and so is the sky, which is the far
+    // distance rather than something standing in it.
 #ifdef DISTANCE_FOG
-    if fog.mode == FOG_MODE_LINEAR {
+    if fog.mode == FOG_MODE_LINEAR && material.fogged > 0.0 {
         let distance = length(in.world_position.xyz - view.world_position);
         color = linear_fog(fog, color, distance, vec3<f32>(0.0, 0.0, 0.0));
     }

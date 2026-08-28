@@ -105,6 +105,7 @@ src/
   pipe.rs        warp pipes, and the arc they throw their brood out on
   squad.rs       aiming at the ground, and the Marios whistled up and sent out
   water.rs       the water sheets and the underwater view
+  sky.rs         the day and night cycle: sun, moon, stars and the sky dome
   audio.rs       gameplay sound events -> layered samples
   console.rs     the debug console: commands, live tuning, pinned controls
   menu.rs        the pause menu: Escape, its pages, and what they change
@@ -404,6 +405,60 @@ rather than drag a walk cycle through the water he is held just under the
 surface, slowed to 0.45 of his walk, and drawn upright. Water shallower than he
 floats in is simply slow ground: the bottom is under his feet and he walks
 along it. `hero_wade` in the console is the speed.
+
+## Day and night
+
+The castle grounds run a clock. `sky_hour` on the console is the time in hours,
+`day_length` is how many seconds a whole circuit takes, and setting the latter
+to zero holds the sky wherever it is — which is how a sunset gets photographed.
+Five minutes a day by default.
+
+The sun runs round a circle tilted so noon lands sixty degrees up rather than
+overhead, rises due east at six and sets due west at eighteen. The moon is
+directly opposite it, so it is always full and always rises as the sun sets.
+Four shells ride the camera, drawn beyond where the haze becomes total and
+marked unfogged so the fog does not paint them out: an opaque dome whose vertex
+colours are rewritten as the light moves, four hundred star quads on a sphere
+that turns with the sun, and the two discs.
+
+Everything a person sees is keyed on **the sun's elevation** rather than on the
+hour. Twilight is not a time, it is the sun being just under the horizon, so a
+table of stops in `sky.rs` runs from deep night to noon and everything —
+zenith, horizon, the warm glow along the sun's own bearing, the key light, the
+ambient, how many stars show — is read out of it and interpolated. Re-tilt the
+orbit or lengthen the day and the look stays right.
+
+Two things join the sky to the world. The camera's fog and the clear colour are
+repainted with the dome's own horizon colour, so the far half of the level
+dissolves into exactly the sky standing over it — which is what carries a
+sunset down to the ground. And the castle is **not lit by this renderer**: its
+shading is baked into its vertex colours, and the impostor sheets are
+photographs of models lit at noon. Neither takes the key light at all, so
+`N64Lighting` carries a fourth term, `daylight` — how much of the light the
+bake was made under is left — and the shader multiplies every such surface by
+it. Without it the sun sets on the actors alone, walking about on grass that
+stays noon-bright at midnight. That term is derived from the same two light
+values in the table rather than tabulated separately, so there is one set of
+numbers to tune and not two to keep in step.
+
+It is a linear multiplier and the screen is not: midnight comes out near 0.06,
+which encodes to a bit over a quarter on the screen. That is a moonlit field
+you can still play in, and it is the number to read when the night looks wrong
+— picked by eye as linear values, the night stops came out at half brightness,
+which is a bright afternoon.
+
+Moving the sun means rewriting the uniform of every material in the game, since
+this renderer keeps its light in each material rather than in a bind group of
+its own. So the light steps rather than slides: it is rewritten once the sun
+has moved a quarter of a degree, about five times a second at the default day
+length, which is below what an eight-bit channel can show. The two discs are
+transforms rather than uniforms and move every frame.
+
+The castle only. A dome whose horizon is the XZ plane is a claim that up is
+`+Y`, and on the planet up is whichever way the core is not — the sun would set
+into the ground on one side of it and sit under the floor on the other. Leaving
+the castle hides all four shells and puts the light, the fog and the clear
+colour back where the rest of the game expects them.
 
 ## Sound
 

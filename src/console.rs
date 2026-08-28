@@ -351,6 +351,20 @@ pub const SPECS: &[TunableSpec] = &[
         step: 1.0,
         doc: "how many allies the Mario pipe keeps alive",
     },
+    TunableSpec {
+        name: "day_length",
+        low: 0.0,
+        high: 1800.0,
+        step: 10.0,
+        doc: "seconds in a whole day and night (0 holds the clock)",
+    },
+    TunableSpec {
+        name: "sky_hour",
+        low: 0.0,
+        high: 24.0,
+        step: 0.25,
+        doc: "time of day, in hours -- drag it to scrub the sky",
+    },
 ];
 
 #[derive(Resource, Clone, Debug)]
@@ -424,6 +438,14 @@ pub struct GameTuning {
     /// How many allies the Mario warp pipe keeps alive. Enemy pipes instead
     /// answer directly to the field-wide `enemy_limit` above.
     pub pipe_brood: f32,
+    /// How long a whole day and night takes, in seconds. Zero holds the clock
+    /// wherever it is, which is how you park the game in a sunset.
+    pub day_length: f32,
+    /// What time it is, in hours. Unusual among these in being written *back*
+    /// by the game as well as read: [`crate::sky`] keeps the clock and pushes
+    /// it here every frame, so the row reads the time and dragging it sets the
+    /// time. See `sky::advance`, which does the handshake.
+    pub sky_hour: f32,
 }
 
 impl Default for GameTuning {
@@ -495,6 +517,14 @@ impl Default for GameTuning {
             enemy_rate: 7.0,
             enemy_limit: 20.0,
             pipe_brood: 5.0,
+            // Five minutes a day: long enough that the light is not visibly
+            // sliding while you play, short enough that you do not have to
+            // wait a quarter of an hour to see a sunset.
+            day_length: 300.0,
+            // Mid morning, which is where the game has always started -- the
+            // top stop of `sky::RAMP` is the light it used to have all the
+            // time, and this is close enough to it to be that game.
+            sky_hour: 9.0,
         }
     }
 }
@@ -545,6 +575,8 @@ impl GameTuning {
             "enemy_rate" => self.enemy_rate,
             "enemy_limit" => self.enemy_limit,
             "pipe_brood" => self.pipe_brood,
+            "day_length" => self.day_length,
+            "sky_hour" => self.sky_hour,
             _ => return None,
         })
     }
@@ -599,6 +631,8 @@ impl GameTuning {
             "enemy_rate" => self.enemy_rate = value,
             "enemy_limit" => self.enemy_limit = value,
             "pipe_brood" => self.pipe_brood = value,
+            "day_length" => self.day_length = value,
+            "sky_hour" => self.sky_hour = value,
             _ => unreachable!(),
         }
         Ok((previous, value))

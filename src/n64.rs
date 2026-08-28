@@ -97,7 +97,21 @@ pub struct N64Lighting {
     pub to_light: Vec3,
     pub key: Vec3,
     pub ambient: Vec3,
-    /// Where these three terms are resolved. Lives here rather than beside the
+    /// What a surface whose lighting was resolved *offline* is multiplied by.
+    ///
+    /// The key and the ambient above only reach a surface this renderer lights.
+    /// The castle does not qualify -- its shading is its own vertex colours,
+    /// baked by the original tools -- and neither do the impostor sheets, which
+    /// are photographs of lit models. Both were made under one particular
+    /// light, and this is how much of that light there is now: 1.0 is the light
+    /// the bake was made under, and anything less is the same scene later in
+    /// the day.
+    ///
+    /// Without it a day and a night is a day and a night for the actors alone,
+    /// walking about on grass that stays noon-bright at midnight.
+    /// [`crate::sky`] is the only thing that ever moves it.
+    pub daylight: Vec3,
+    /// Where the lit surfaces' terms are resolved. Lives here rather than beside the
     /// render scale in [`crate::display`] because it travels the same road the
     /// terms themselves do: into every material's uniform and pipeline through
     /// [`translate`] and [`relight`], which already exist to carry a changed
@@ -117,6 +131,10 @@ impl Default for N64Lighting {
             // rather than merely its own colour.
             key: Vec3::new(0.68, 0.66, 0.58),
             ambient: Vec3::new(0.42, 0.44, 0.50),
+            // Every bake in the game was made under exactly the two terms
+            // above, so until something moves the sun a baked surface is shown
+            // at full strength and nothing is dimmed at all.
+            daylight: Vec3::ONE,
             // The console's answer is what the game starts as. Anything else
             // is something the player asked for.
             shading: Shading::Vertex,
@@ -130,11 +148,32 @@ impl Default for N64Lighting {
 #[derive(Clone, Copy, ShaderType)]
 pub struct N64Uniform {
     base_color: Vec4,
-    /// `rgb` the key light, `a` whether this surface takes light at all.
+    /// `rgb` the key light. `a` says how this surface is shaded, and it has
+    /// three states rather than the two it started with:
+    ///
+    ///   * **1** -- lit here, out of `light`, `ambient` and `to_light`.
+    ///   * **0** -- lit somewhere else, its shading already in its own vertices
+    ///     or in its picture, and dimmed by `daylight` as the day turns.
+    ///   * **-1** -- luminous: its colour is final and nothing is done to it.
+    ///     The sky, which is where the day's light comes *from*.
     light: Vec4,
     ambient: Vec4,
     to_light: Vec4,
+    /// `rgb` [`N64Lighting::daylight`], read only by the middle case above.
+    daylight: Vec4,
     alpha_cutoff: f32,
+    /// 1.0 for a surface standing *in* the world, which the camera's fog closes
+    /// over as it gets further away, and 0.0 for one that **is** the distance.
+    ///
+    /// Fog is a property of the view rather than of a material, so every
+    /// surface a fogged camera draws is fogged -- which is right for everything
+    /// the game had until the sky arrived. The sky is drawn six hundred units
+    /// out, four times past where the haze becomes total, so fogged like the
+    /// rest of the world it is a screen of flat fog colour and nothing else:
+    /// no gradient, no sun, no stars. It is not *at* a distance, it is what
+    /// distance looks like, and [`crate::sky`] matches the fog to its horizon
+    /// so the two meet without a seam.
+    fogged: f32,
 }
 
 impl N64Uniform {
@@ -163,8 +202,49 @@ impl N64Uniform {
             light: Vec4::ZERO,
             ambient: Vec4::ZERO,
             to_light: Vec4::Y,
+            daylight: Vec4::ONE,
             alpha_cutoff,
+            fogged: 1.0,
         }
+    }
+
+    /// A surface that gives off its own light: not lit here, and not dimmed
+    /// with the day either.
+    ///
+    /// The distinction from [`unlit`](Self::unlit) is the whole day and night
+    /// cycle. An unlit surface is one whose light was resolved *somewhere
+    /// else*, so when the sun goes down it has to be dimmed or the castle stays
+    /// noon-bright at midnight. A luminous one has no such debt: the sky is not
+    /// lit by the sun, it is where the sun is, and dimming it at dusk would
+    /// take the colour out of the sunset. [`crate::sky`] is the only caller.
+    pub fn luminous(alpha_cutoff: f32) -> Self {
+        Self {
+            light: Vec4::new(0.0, 0.0, 0.0, -1.0),
+            ..Self::unlit(alpha_cutoff)
+        }
+    }
+
+    /// The same surface with the camera's fog taken off it. See
+    /// [`N64Uniform::fogged`]; [`crate::sky`] is the only caller.
+    pub fn beyond_the_fog(mut self) -> Self {
+        self.fogged = 0.0;
+        self
+    }
+
+    /// Whether the camera's fog closes over this surface. See
+    /// [`N64Uniform::fogged`]; the field is private, and a test in
+    /// [`crate::sky`] has to be able to say that the sky is not fogged.
+    #[cfg(test)]
+    pub fn is_fogged(&self) -> bool {
+        self.fogged > 0.0
+    }
+
+    /// The tint the texture is multiplied by, as linear RGBA. The sky's colours
+    /// change every few frames and its geometry does not, so it is written here
+    /// rather than rebuilt into a mesh.
+    pub fn tinted(mut self, tint: Vec4) -> Self {
+        self.base_color = tint;
+        self
     }
 }
 
@@ -540,10 +620,14 @@ pub fn translate(
             light: lighting.key.extend(lit),
             ambient: lighting.ambient.extend(0.0),
             to_light: lighting.to_light.extend(0.0),
+            daylight: lighting.daylight.extend(0.0),
             alpha_cutoff: match alpha_mode {
                 AlphaMode::Mask(cutoff) => cutoff,
                 _ => 0.0,
             },
+            // Everything arriving out of a glTF stands in the world, so the
+            // haze closes over it like anything else.
+            fogged: 1.0,
         },
         base_color_texture: source.base_color_texture.clone(),
         alpha_mode,
@@ -573,6 +657,10 @@ pub fn relight(lighting: Res<N64Lighting>, mut materials: ResMut<Assets<N64Mater
         material.uniform.light = lighting.key.extend(lit);
         material.uniform.ambient = lighting.ambient.extend(0.0);
         material.uniform.to_light = lighting.to_light.extend(0.0);
+        // Written whatever the surface is. A lit one never reads it and a
+        // luminous one is told not to, so `light.a` above stays the one place
+        // that decides who gets dimmed and this stays an unconditional write.
+        material.uniform.daylight = lighting.daylight.extend(0.0);
         // Changing this changes the pipeline the surface is drawn with, not
         // just its uniform. Writing it through `get_mut` is what makes that
         // happen: the material asset counts as changed, and Bevy re-specialises

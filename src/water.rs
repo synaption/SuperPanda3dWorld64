@@ -27,6 +27,7 @@ use crate::{
     furniture::{self, SurfaceSpec},
     level::{LevelData, WaterBox},
 };
+use crate::n64::N64Lighting;
 use bevy::{
     asset::RenderAssetUsages,
     gltf::{Gltf, GltfMesh, GltfNode},
@@ -87,6 +88,19 @@ pub struct WaterSurface {
 #[derive(Resource, Default, PartialEq, Clone, Copy)]
 pub struct CameraMedium {
     submerged: bool,
+}
+
+impl CameraMedium {
+    /// Whether the camera is under a surface.
+    ///
+    /// Read by [`crate::sky`], which owns the fog and the clear colour above
+    /// water and must keep its hands off both below it: the whole point of
+    /// the underwater fog is that it closes in hard, and a sky repainting the
+    /// haze its own horizon colour every frame would undo that a frame after
+    /// [`camera_medium`] set it.
+    pub fn submerged(self) -> bool {
+        self.submerged
+    }
 }
 
 /// Air fog for the camera at startup. Bevy applies fog per camera rather than
@@ -494,6 +508,44 @@ pub fn camera_medium(
         end: range.1,
     };
     clear.0 = colour;
+}
+
+/// Takes the sheets down with the sun.
+///
+/// A water sheet is a flat quad this port draws itself, so it never goes
+/// through [`crate::n64::convert`] and never reaches the material that carries
+/// the day's light. Left alone it is the one surface in the castle that does
+/// not know the sun has set: the ground under the moat dims, the waterfall
+/// behind it dims, and a bright noon-blue rectangle of water sits over the top
+/// of both.
+///
+/// [`N64Lighting::daylight`] rather than anything of the sky's own, because
+/// that is exactly what this is -- a surface whose colour was decided
+/// somewhere other than here, dimmed by how much of that light is left. Only on
+/// the frames it changes, which on a level with no day and night is never.
+pub fn dim(
+    lighting: Res<N64Lighting>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    sheets: Query<&MeshMaterial3d<StandardMaterial>, With<WaterSurface>>,
+) {
+    if !lighting.is_changed() {
+        return;
+    }
+    let level = lighting.daylight;
+    for handle in &sheets {
+        if let Some(mut material) = materials.get_mut(&handle.0) {
+            // Linear, because this is a multiplier against an already-linear
+            // texture sample and not a colour anybody picked. The alpha is the
+            // sheet's own -- each water box was given its own in the .blend --
+            // and is read back off rather than written from a constant.
+            material.base_color = Color::linear_rgba(
+                level.x,
+                level.y,
+                level.z,
+                material.base_color.alpha(),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
