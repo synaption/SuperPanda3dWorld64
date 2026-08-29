@@ -28,7 +28,7 @@ than regenerated.
 writes the texture as `emissiveTexture` and leaves `baseColorFactor` black,
 which is faithful to the shader graph and useless to a game that lights its
 actors: the albedo is gone, and the model renders as a flat silhouette. The
-Hero's single "Atlas Hero" material is built this way. Where a material has an
+Luna's single "Atlas Luna" material is built this way. Where a material has an
 emissive texture and a black base colour, the texture is moved to
 `baseColorTexture` so it takes light like everything else in the level.
 
@@ -48,7 +48,7 @@ sys.path.insert(0, HERE)
 import rig  # noqa: E402
 
 # The node the decomp exporter parents both the joints and the mesh to.
-# Other actors name theirs differently -- the Hero's is `rig`, straight out of
+# Other actors name theirs differently -- Luna's is `rig`, straight out of
 # Rigify -- so this is only the default.
 SKELETON_ROOT = "armature"
 
@@ -131,7 +131,7 @@ def unemit_materials(gltf):
         # An emissive-only material carries no metallic/roughness, and glTF
         # defaults both to 1.0 -- a fully metallic surface. A PBR renderer
         # takes that at its word and gives back a white silhouette with the
-        # texture washed out of it, which is exactly what the Hero looked like
+        # texture washed out of it, which is exactly what Luna looked like
         # before these were written down.
         pbr.setdefault("metallicFactor", 0.0)
         pbr.setdefault("roughnessFactor", 1.0)

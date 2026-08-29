@@ -1,4 +1,4 @@
-//! Turning the Hero's upper body to face where he is aiming.
+//! Turning Luna's upper body to face where he is aiming.
 //!
 //! This is the procedural layer `docs/aim.md` specifies and its "As Built"
 //! section records as **not ported**: the design, the rig work and the tuned
@@ -22,7 +22,7 @@
 //!
 //! Only the twist is here. `docs/aim.md` also wants the rotation distributed up
 //! the spine, authored aim-offset poses and left-hand IK, and all three need
-//! the Rigify DEF bones parented properly in `TheHero.blend` first -- see the
+//! the Rigify DEF bones parented properly in `Luna.blend` first -- see the
 //! "As Built" note on why the exported skeleton is flat. This is the doc's own
 //! "simple first implementation can use only AIM_TORSO".
 
@@ -48,7 +48,7 @@ const PIVOT: &str = "AIM_TORSO";
 /// How far the aim ray is followed looking for something to converge on.
 ///
 /// Only used to turn the camera's direction into a *point*, so that a shot
-/// leaving the muzzle -- which is off to the side of the camera, in the Hero's
+/// leaving the muzzle -- which is off to the side of the camera, in Luna's
 /// hand -- travels toward what the crosshair is on rather than off parallel to
 /// it. Past this the ray has hit nothing and the point is simply far away,
 /// which converges close enough that the difference is invisible.
@@ -119,7 +119,7 @@ impl Aim {
 #[derive(Component)]
 pub struct AimTorso;
 
-/// Tags the pivot as the Hero's scene arrives.
+/// Tags the pivot as Luna's scene arrives.
 pub fn claim(mut commands: Commands, arrivals: Query<(Entity, &Name), Added<Name>>) {
     for (entity, name) in &arrivals {
         if name.as_str() == PIVOT {

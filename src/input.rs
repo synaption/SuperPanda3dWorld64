@@ -53,8 +53,19 @@ pub struct InputState {
     /// published alongside the hold.
     pub squad: bool,
     pub squad_released: bool,
+    /// The build button, held, and its release. The same two-field shape
+    /// `squad` has and for the same reason: how long it was down is what says
+    /// how big the machine is, so the falling edge is published beside the
+    /// hold. See [`crate::stellarator::place`].
+    pub build: bool,
+    pub build_released: bool,
+    /// The plant button, held, and its release: the pylon's half of the same
+    /// two-field shape. A hold opens a site on the ground and the release puts
+    /// a mast on it. See [`crate::pylon::place`].
+    pub pylon: bool,
+    pub pylon_released: bool,
     pub swap: bool,
-    /// Cycle the weapon in the Hero's hand. Latched: `weapon::swap` takes it.
+    /// Cycle the weapon in Luna's hand. Latched: `weapon::swap` takes it.
     pub swap_weapon: bool,
     pub debug: bool,
     /// Whether a pad was seen this frame, for the debug readout.
@@ -144,6 +155,10 @@ pub fn gather(
     let mut swap_weapon = keys.just_pressed(KeyCode::KeyY);
     let mut squad = keys.pressed(KeyCode::KeyX);
     let mut squad_released = keys.just_released(KeyCode::KeyX);
+    let mut build = keys.pressed(KeyCode::KeyB);
+    let mut build_released = keys.just_released(KeyCode::KeyB);
+    let mut pylon = keys.pressed(KeyCode::KeyG);
+    let mut pylon_released = keys.just_released(KeyCode::KeyG);
 
     if let Some(pad) = pad {
         let axis = |kind| pad.get(kind).unwrap_or(0.0);
@@ -188,6 +203,16 @@ pub fn gather(
         recenter |= just(GamepadButton::RightTrigger);
         squad |= button(GamepadButton::West);
         squad_released |= pad.just_released(GamepadButton::West);
+        // `Select` is what is left. Every face button, both shoulders and both
+        // triggers are claimed above, and the d-pad stands in for the stick.
+        build |= button(GamepadButton::Select);
+        build_released |= pad.just_released(GamepadButton::Select);
+        // The right stick's click, which is the last control on the pad that
+        // nothing else has taken: every face button, both shoulders, both
+        // triggers and `Select` are claimed above, and the d-pad stands in for
+        // the left stick.
+        pylon |= button(GamepadButton::RightThumb);
+        pylon_released |= pad.just_released(GamepadButton::RightThumb);
         boost |= button(GamepadButton::North)
             || button(GamepadButton::LeftTrigger2)
             || axis(GamepadAxis::LeftZ).abs() > THRUST_THRESHOLD;
@@ -201,12 +226,16 @@ pub fn gather(
     state.boost = boost;
     state.aim = aim;
     state.squad = squad;
+    state.build = build;
+    state.pylon = pylon;
     // Edges accumulate rather than overwrite: a press seen on a frame whose
     // consumer has not run yet must survive into the frame that consumes it.
     state.jump |= jump;
     state.attack |= attack;
     state.recenter |= recenter;
     state.squad_released |= squad_released;
+    state.build_released |= build_released;
+    state.pylon_released |= pylon_released;
     state.swap |= swap;
     state.swap_weapon |= swap_weapon;
     state.debug |= keys.just_pressed(KeyCode::F1);

@@ -3,7 +3,7 @@
 //! Health answers "how much more can I take". This answers "how much more can
 //! I do", and it is the one number standing between a jetpack that is a tool
 //! and a jetpack that is a second pair of legs. Before it, holding the booster
-//! in the air was free and unbounded -- the Hero could leave the ground at the
+//! in the air was free and unbounded -- Luna could leave the ground at the
 //! castle and arrive anywhere without ever touching it again, which quietly
 //! deletes the level's geometry as a thing the player has to solve.
 //!

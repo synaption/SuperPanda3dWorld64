@@ -31,7 +31,7 @@ The pipeline prefers the project-local Blender 5.2 LTS executable at
 `blender-5.2.0-linux-x64/blender`. `BLENDER=/path/to/blender` or the existing
 `--blender` options can override it. Blender 5.2's glTF exporter is configured
 to remove its redundant Armature object wrapper while retaining the standard
-skin joints, weights, and animations. The Hero is the deliberate exception:
+skin joints, weights, and animations. Luna is the deliberate exception:
 removing its Rigify object also removes its skin, so its specialized exporter
 retains the rig root and the adoption pass normalizes it.
 
@@ -68,18 +68,19 @@ assets/
     mesh_materials.json          45 material groups, 44 of them textured
     textures/                    the 21 PNGs those groups reference (2.9 MB)
   mario/          mario.glb + mario_clips.json   (209 animations)
-  hero/           hero.glb + hero_clips.json     (20 animations, 53 joints)
-                  target_pistol.glb              the weapon he carries
-  actors/         slime, ant, tree, warp_pipe; a clips sidecar each where
-                  the actor animates. goomba.* and scuttlebug.* are the two
-                  retired decomp enemies those replaced, kept as source rather
-                  than loaded.
+  luna/           luna.glb + luna_clips.json     (20 animations, 53 joints)
+  weapons/        target_pistol.glb              what Luna carries, and the
+                  Weapon_0*.blend/fbx sources not yet in the game
+  actors/         slime, ant, tree, warp_pipe, stellarator, pylon; a clips
+                  sidecar each where the actor animates. goomba.* and
+                  scuttlebug.* are the two retired decomp enemies those
+                  replaced, kept as source rather than loaded.
   sounds/mario64/ full source library plus 57 runtime WAVs and .source marker
-  sounds/se_zelda, sounds/vc_zelda   the Hero's effect and voice sets
+  sounds/se_zelda, sounds/vc_zelda   Luna's effect and voice sets
 ```
 
-`hero.glb` is built out of Blender rather than out of the decomp, so it goes
-through a different pipeline — see [Exporting the Hero](#exporting-the-hero).
+`luna.glb` is built out of Blender rather than out of the decomp, so it goes
+through a different pipeline — see [Exporting Luna](#exporting-the-luna).
 
 Every primary 3D asset also has a committed, self-contained Blender source.
 Run `python3 tools/build_blender_sources.py --check` to audit that invariant.
@@ -88,8 +89,8 @@ authoring assets, and intentionally share the primary asset's source. New
 models can be adopted once with `python3 tools/build_blender_sources.py`; edit
 and export their `.blend` files after that instead of returning to the SM64
 decomp exporter. Special pipelines retain their established source names:
-`castle.glb` uses `castle_grounds.blend`, and both Hero GLBs use
-`TheHero.blend`.
+`castle.glb` uses `castle_grounds.blend`, and both Luna GLBs use
+`Luna.blend`.
 
 For a rigged actor, export to a temporary GLB and run the adoption pass so
 Blender's armature wrapper is normalized and the clip sidecar stays current:
@@ -117,7 +118,7 @@ why the `weapons` stage is three lines long.
 What makes a weapon .blend a weapon is the empties it carries.
 `notes4LLMs.md` asks every one of them for hit boxes, colliders, hand placement
 and where the bullet comes out; for something held in a hand the last two are
-the ones that matter, and they are what `assets/hero/target_pistol.blend` has:
+the ones that matter, and they are what `assets/weapons/target_pistol.blend` has:
 
 | empty | what it is | read by |
 | --- | --- | --- |
@@ -136,7 +137,7 @@ Three conventions, and all three are load-bearing:
   aims quads in. Authoring it any other way means a correction in code.
 - **It is authored at life size, in metres.** The target pistol is 0.32 m from
   muzzle to heel. `weapon::carry` cancels the socket's inherited scale so that
-  0.32 m arrives as 0.32 m in the world, whatever the Hero's 0.81 and his
+  0.32 m arrives as 0.32 m in the world, whatever Luna's 0.81 and his
   Rigify stretch bones are doing to it — which keeps the size question answered
   in the .blend, where the rest of this document insists it lives.
 
@@ -158,16 +159,38 @@ Eight stages, and `--only <stage>` runs just one of them:
 | stage | writes | from |
 | --- | --- | --- |
 | `mario` | `assets/mario/mario.glb` + clips | `mario.blend` |
-| `hero` | `assets/hero/hero.glb` + clips | `TheHero.blend`, via `build_hero.py` |
-| `weapons` | `assets/hero/target_pistol.glb` | the weapon `.blend` files |
+| `luna` | `assets/luna/luna.glb` + clips | `Luna.blend`, via `build_luna.py` |
+| `weapons` | `assets/weapons/target_pistol.glb` | the weapon `.blend` files |
 | `castle` | `assets/bevy/castle.glb`, `castle.bin`, `water.png` | the committed NPZs, via `convert_level.py` |
 | `levels` | `assets/bevy/<level>_furniture.json`, `.glb` | `assets/levels/<level>.blend` |
 | `planet` | `assets/bevy/planet.glb` | `experimental/planet_gen/out/planet.glb`, copied |
 | `actors` | `assets/actors/*.glb` + a clips sidecar each | the actor `.blend` files |
 | `impostors` | `assets/impostors/*.png`, `*.json` | the actor GLBs above, rendered by the game |
 
-The Hero source needs Blender 5.x. Successful runs replace the files the game
+Luna source needs Blender 5.x. Successful runs replace the files the game
 already loads; no Rust changes or asset registration step is required.
+
+**Two actors are written by a script rather than modelled**, and are not in
+that table because nothing about them changes between runs:
+
+```bash
+python3 tools/generate_stellarator.py assets/actors/stellarator.glb
+python3 tools/generate_pylon.py            # writes assets/actors/pylon.glb
+```
+
+Both take their shape from a handful of numbers at the top of the generator,
+both write in the game's own axes standing on their own origin, and both are
+*measured* by the game rather than described to it — `stellarator::machine`
+and `pylon::mast` read the size, the footprint and where the beams hang back
+out of the file's own accessor bounds. Re-export either at another size and the
+ring drawn on the ground, the overlap test and everything hung off the model
+follow it with no Rust change at all. `--blend` on the pylon generator writes
+an editable `.blend` beside the `.glb` for anyone who would rather push the
+vertices around by hand.
+
+Blender's `.blend1` backups are no longer tracked. They are written
+automatically beside every save and are worth 67 MB of history for nothing; the
+`.blend` beside them is the source of truth.
 
 Two things about that table are worth knowing, because both used to be traps:
 
@@ -411,11 +434,26 @@ end up was to run the game.
 
 It is authored in `assets/levels/<level>.blend` now. Two things are *linked*
 into that file so that placing is done against what the game actually draws:
-the level's own geometry, as a backdrop; and each actor's model, as a
-collection each placement instances. Both are read-only, both follow a rebuild
-of the file they came from, and neither is exported — the holder collections
-are not even in the scene, so a warp pipe empty draws a warp pipe wherever it
+the level's own geometry, as a backdrop; and each placement's model, as a
+collection each empty instances. Both are read-only, both follow a rebuild of
+the file they came from, and neither is exported — the holder collections are
+not even in the scene, so a warp pipe empty draws a warp pipe wherever it
 stands and there is still only one warp pipe in the file.
+
+A placement created by hand is a bare empty, and a bare empty is a level editor
+you cannot see:
+
+```bash
+python3 tools/dress_level_furniture.py castle
+```
+
+hangs the right model off every placement that is missing one, moves nothing,
+and is idempotent. Which model each shows is `SHOWS` in
+`export_level_furniture.py` and where each is authored is `MODEL_SOURCE` beside
+it — one table, read by the dresser and by the one-shot that seeded the castle,
+so a new kind of placement is added in one place. `--strip` goes back to bare
+empties. The export reads none of it: a dressed level and a bare one write the
+same JSON, byte for byte.
 
 `python3 tools/build_assets.py --only levels` writes the two files the game
 reads:
@@ -455,9 +493,17 @@ depends on the answer:
 
 - **A warp pipe's whole transform is the level's** — position, turn about the
   vertical, and size. A pipe is drawn and not collided with, so nothing else
-  reads how big it is, and the `0.01` that used to be a literal in `world.rs`
-  is now simply the scale the pipe is drawn at in Blender. Resize one there and
-  it is that size in the game.
+  reads how big it is: resize one in Blender and it is that size in the game.
+  A scale of one is a warp pipe, because `warp_pipe.glb` is a three-metre warp
+  pipe. It was the decomp's 307 units across until a placement that came back
+  from an edit at Blender's own scale of one turned out to be a pipe 307 metres
+  across, with the player standing inside it and the screen black.
+- **A machine's is whole too.** A `stellarator` empty is a structure rather
+  than a creature: nothing moves it a tick later, and its size is already
+  something a player chooses while holding the build button, so the scale in
+  the .blend is the scale it is built at. One placed in a level is the same
+  entity the build button makes — same field, same footprint, same overlap
+  rules.
 - **An actor's is position only.** Its size is measured off its own glTF by
   `enemy::Kind::body` and is what its collision radius is built from, so an
   actor drawn at half size would still shoulder its way around the level at
@@ -467,10 +513,11 @@ depends on the answer:
   `tools/resize_actor.py`.
 
 Each placement is scaled to `DISPLAY_SCALE` in `export_level_furniture.py`,
-which is the factor the game draws that model at — `warp_pipe.glb` is 307 units
-across because that is how it came out of the decomp, and `mario.glb` is 160
-tall. It is a property of the model, not of the level, which is why an actor
-carrying a different one is a warning.
+which is the factor the game draws that model at. A one there means the model
+is authored at its final size, which every model in this game should be and all
+but Mario are — `mario.glb` is still the decomp's 160 units tall. It is a
+property of the model, not of the level, which is why an actor carrying a
+different one is a warning.
 
 Two names are checked twice on purpose. An unknown `spawns` stops the export,
 naming the object; and `src/furniture.rs` parses the same word into an enum, so
@@ -696,27 +743,27 @@ lists, so a part that draws untextured has to actively say so via
 `gsSPTexture(..., G_OFF)` or a shade-only combiner; without tracking that, the
 last texture bound leaks onto every solid part after it.
 
-## Exporting the Hero
+## Exporting Luna
 
-The Hero has no decomp behind him, so `export_actor_gltf.py` has nothing to
+Luna has no decomp behind him, so `export_actor_gltf.py` has nothing to
 work from and a three-step pipeline stands in its place. Run inside Blender,
 with the character's .blend open:
 
 ```python
-exec(open("//wsl.localhost/Ubuntu/home/bob/mario/tools/export_hero_gltf.py").read())
+exec(open("//wsl.localhost/Ubuntu/home/bob/mario/tools/export_luna_gltf.py").read())
 ```
 
 then, back on this side:
 
 ```bash
-python3 tools/adopt_blender_export.py assets/hero/hero_raw.glb \
-    --out assets/hero/hero.glb --sidecar assets/hero/hero_clips.json \
+python3 tools/adopt_blender_export.py assets/luna/luna_raw.glb \
+    --out assets/luna/luna.glb --sidecar assets/luna/luna_clips.json \
     --skeleton-root rig
-python3 tools/lock_root_motion.py assets/hero/hero.glb
-python3 tools/aim_rig.py assets/hero/hero.glb
+python3 tools/lock_root_motion.py assets/luna/luna.glb
+python3 tools/aim_rig.py assets/luna/luna.glb
 ```
 
-`tools/build_hero.py` runs all of it headless, which is the one to use after
+`tools/build_luna.py` runs all of it headless, which is the one to use after
 editing the .blend.
 
 Five things about the source file make each step necessary, and every one of
@@ -726,7 +773,7 @@ character is quietly wrong:
 **The rig ships in rest position.** `pose_position` is `REST`, which makes the
 armature ignore pose evaluation altogether. The keyframes are all still there
 and visible in the dope sheet; every exported clip is the bind pose held still.
-`export_hero_gltf.py` forces it to `POSE`.
+`export_luna_gltf.py` forces it to `POSE`.
 
 **Rigify carries 240 bones, 53 of which deform.** `export_def_bones` drops the
 controls and mechanisms, which is also what gets the exported skeleton down to
@@ -845,10 +892,13 @@ These run inside Blender rather than against exported files:
 - `tools/export_level_furniture.py` — a level's furniture .blend into the JSON
   and .glb the game reads. The `levels` stage runs this; see
   [Level furniture](#level-furniture).
+- `tools/dress_level_furniture.py` — links each placement's model into a level
+  .blend so the scene editor shows the things themselves. Never run by a build;
+  see [Level furniture](#level-furniture).
 - `tools/build_castle_furniture.py` — the one-shot that seeded
   `assets/levels/castle.blend` from the placements that used to be hard-coded.
 - `tools/build_quad_planet.py`, `tools/build_valkyrie.py`,
   `tools/render_valkyrie.py` — scene construction and rendering for work in
   progress.
 - `tools/blend_to_glb.py` — the generic `.blend` → `.glb` path, and the
-  Blender-resolution helper the Hero build uses.
+  Blender-resolution helper Luna build uses.

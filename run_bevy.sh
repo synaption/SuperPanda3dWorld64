@@ -6,7 +6,7 @@ set -euo pipefail
 # available as explicit options.
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-GAME_EXE="$REPO_ROOT/dist/windows/SuperBevyWorld64.exe"
+GAME_EXE="$REPO_ROOT/dist/windows/SpaceCrusaders.exe"
 
 usage() {
     cat <<'EOF'

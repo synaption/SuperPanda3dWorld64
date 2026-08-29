@@ -29,6 +29,7 @@ duplicate Blender called `pipe.001` is still a pipe:
     empty   gravity      ["mode"] "down" or "radial"; radial uses its location
     empty   pipe         ["spawns"] mario|slime|ant, ["interval"] seconds
     empty   slime|ant    one of those, standing there when the level comes up
+    empty   stellarator  a machine, at the size and the turn it is drawn with
     mesh    water        a water box: its footprint, at the height it sits
     mesh    <anything>   a drawn surface, exported to the GLB. ["drift_u"],
                          ["drift_v"] scroll it, ["alpha"] sets it transparent
@@ -69,6 +70,14 @@ FURNITURE = "Furniture"
 #: out of a pipe or was standing there when the level came up.
 ACTOR_KINDS = ("slime", "ant", "mario")
 
+#: Placements that are structures rather than creatures. Like a pipe and unlike
+#: an actor, the whole transform of one is the level's to decide: a stellarator
+#: is built at a size the player chooses when the build button puts one down, so
+#: a level saying what size it wants is saying something the game can already
+#: hear. `src/stellarator.rs` measures the model and follows it, so the scale
+#: here is a multiple of the machine's real size the way a pipe's is.
+PROP_KINDS = ("stellarator",)
+
 #: What a pipe produces if its `spawns` property says nothing, and how long it
 #: waits between two of them.
 DEFAULT_SPAWNS = "mario"
@@ -76,18 +85,57 @@ DEFAULT_INTERVAL = 12.0
 
 #: The factor the game draws each model at, which is what a placement showing
 #: that model is scaled by so the viewport tells the truth. It is a property of
-#: the model and not of the level: `warp_pipe.glb` is 307 units across because
-#: it came out of the decomp that way, and `mario.glb` is 160 tall.
+#: the model and not of the level: `mario.glb` is 160 units tall because it came
+#: out of the decomp that way.
 #:
-#: Only the pipe's is read back out (see `transform` below). An actor's size is
-#: measured off its own glTF by `enemy::Kind::body` and is what its collision
-#: radius is built from, so a level that scaled one would be drawing a creature
-#: at a size it does not collide at.
+#: A one here means the model is authored at its final size, which is what every
+#: model in this game ought to be and what the two Blender-made actors already
+#: are. The warp pipe was the last holdout at 0.01 -- it is the decomp's own
+#: 307-unit pipe -- and a placement of it that came back from an edit at
+#: Blender's default scale of one was a pipe 307 metres across. So it was
+#: resized in `assets/actors/warp_pipe.blend` and this became a one as well.
+#:
+#: Only the pipe's is read back out (see `read_furniture` below). An actor's
+#: size is measured off its own glTF by `enemy::Kind::body` and is what its
+#: collision radius is built from, so a level that scaled one would be drawing a
+#: creature at a size it does not collide at.
 DISPLAY_SCALE = {
-    "warp_pipe": 0.01,
+    "warp_pipe": 1.0,
+    "luna": 1.0,
+    "stellarator": 1.0,
     "mario": 0.00667,
     "slime": 1.0,
     "ant": 1.0,
+}
+
+#: What each placement is a placement *of*, keyed by the object's name up to
+#: the first dot -- the same stem `read_furniture` sorts on. A pipe shows a warp
+#: pipe and the spawn shows Luna, who is what is standing there when the
+#: level comes up; the rest are named after their own model.
+#:
+#: This is what `tools/dress_level_furniture.py` links into a level file so the
+#: thing being dragged about is the thing itself. Nothing in the export reads
+#: it: a placement is what its name says whether or not it has a model hanging
+#: off it, and a level file that has never been dressed exports identically.
+SHOWS = {
+    "pipe": "warp_pipe",
+    "spawn": "luna",
+    "stellarator": "stellarator",
+    "mario": "mario",
+    "slime": "slime",
+    "ant": "ant",
+}
+
+#: Where each model is authored. Every one of these is a .blend rather than the
+#: .glb the game loads, because a level links to it: edit the ant and every ant
+#: in every level is the new ant, next time the file is opened.
+MODEL_SOURCE = {
+    "warp_pipe": "assets/actors/warp_pipe.blend",
+    "stellarator": "assets/actors/stellarator.blend",
+    "luna": "assets/luna/Luna.blend",
+    "mario": "assets/mario/mario.blend",
+    "slime": "assets/actors/slime.blend",
+    "ant": "assets/actors/ant.blend",
 }
 
 
@@ -172,7 +220,7 @@ def footprint(obj):
 def read_furniture():
     """Every recognised object, sorted into the placements the game reads."""
     level = {"spawn": None, "gravity": None, "water": [], "pipes": [],
-             "actors": [], "surfaces": []}
+             "actors": [], "props": [], "surfaces": []}
     meshes = []
     unknown = []
     for obj in furniture_objects():
@@ -208,6 +256,17 @@ def read_furniture():
         elif kind in ACTOR_KINDS:
             check_display_scale(obj, kind)
             level["actors"].append({"kind": kind, "at": at})
+        elif kind in PROP_KINDS:
+            # A structure, and so the same three numbers a pipe gets. Nothing
+            # walks, so nothing overwrites the turn a second later, and the
+            # scale is read for the same reason a pipe's is: the game builds
+            # these at a size already.
+            level["props"].append({
+                "kind": kind,
+                "at": at,
+                "yaw": yaw_of(obj),
+                "scale": uniform_scale(obj),
+            })
         else:
             unknown.append((obj.name, obj.type))
     for name, type_ in unknown:
@@ -347,8 +406,8 @@ def export_inside_blender(argv):
         out.write("\n")
     print(f"wrote {args.json}: {len(level['water'])} water boxes, "
           f"{len(level['pipes'])} pipes, {len(level['actors'])} actors, "
-          f"{len(level['surfaces'])} surfaces, gravity "
-          f"{level['gravity']['mode']}")
+          f"{len(level['props'])} props, {len(level['surfaces'])} surfaces, "
+          f"gravity {level['gravity']['mode']}")
     print(f"wrote {args.glb}: {len(meshes)} surface meshes, {size:,} bytes")
 
 

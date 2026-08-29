@@ -13,6 +13,12 @@
 /assets/**/*.tmp
 /assets/**/*.bak
 
+# Blender's own backup of the file it last saved. Written automatically beside
+# every .blend, identical to the previous save, and worth 67 MB of history for
+# nothing: the .blend beside it is the source of truth and git holds its
+# history.
+*.blend1
+
 # What tools/build_assets.py last built, and out of what. Machine-local by
 # definition -- a clone that has never built an asset is supposed to arrive
 # without one and rebuild everything the first time.
@@ -81,3 +87,9 @@ desktop.ini
 *.exe
 
 blender-5.2.0-linux-x64/*
+# Third-party material libraries and downloaded tooling, cloned or fetched into
+# the tree by hand. Large, and none of it is the game: the pipeline is pointed
+# at them, they are not built from here.
+/cc0-textures/
+/tools_local/
+*.log

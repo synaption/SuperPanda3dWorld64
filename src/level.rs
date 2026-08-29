@@ -110,6 +110,27 @@ const PLANET_REACH: f32 = 200.0;
 /// [`LevelData::highest_below`].
 const GROUND_SKIN: f32 = 0.5;
 
+/// How many times [`LevelData::resolve_walls`] re-asks the level where the
+/// walls are.
+///
+/// One pass answers a flat wall exactly. More are needed only where leaving
+/// one wall walks a body into another it was not touching when the pass
+/// started -- the inside of a corner, a doorway's jamb -- and each pass is a
+/// fresh grid query, so this is the price of the worst case rather than of the
+/// common one. Four is comfortably past what the castle's tightest corners
+/// need; the loop stops the moment a pass finds nothing to do, which for a
+/// body walking in the open is the first one.
+const WALL_RESOLVE_PASSES: usize = 4;
+
+/// How far past merely touching a wall a body is put, in metres.
+///
+/// Landing exactly on the surface leaves the next frame's test to decide
+/// whether a body a rounding error deep is inside or outside, which is how a
+/// body sat against a wall ends up jittering. A millimetre is under the
+/// tolerance of anything that looks at these positions and over the error in
+/// reaching them.
+const WALL_SKIN: f32 = 0.001;
+
 #[derive(Clone, Copy)]
 struct CollisionTriangle {
     a: Vec3,
@@ -280,8 +301,11 @@ impl LevelData {
             for z in all_min.1..=all_max.1 {
                 for x in all_min.0..=all_max.0 {
                     cells[z * GRID_WIDTH + x].all.push(index);
-                    // floor_height historically accepted either winding and
-                    // selects by height, so retain that behavior here.
+                    // Filed by lean alone, with the sign of the normal
+                    // thrown away: the converted castle mesh is not
+                    // consistently wound, so a floor's normal is as likely to
+                    // be its underside as its top, and the query above picks
+                    // by height rather than by facing for the same reason.
                     if tri.normal.y.abs() > 0.01 {
                         cells[z * GRID_WIDTH + x].floors.push(index);
                     }
@@ -601,10 +625,12 @@ impl LevelData {
     /// `up` rather than down a column of `(x, z)`.
     ///
     /// The two shapes reach the same answer by different routes and that is
-    /// deliberate. Flat keeps the column lookup it has always used, so the
-    /// castle behaves to the millimetre as it did. A planet casts a ray from
-    /// [`GROUND_SKIN`] above the point to [`PLANET_REACH`] below it, because a
-    /// column is exactly the thing a sphere does not have.
+    /// deliberate. A flat level looks up the column of `(x, z)` the point
+    /// stands in, which is one grid cell and a handful of triangles. A planet
+    /// casts a ray from [`GROUND_SKIN`] above the point to [`PLANET_REACH`]
+    /// below it, because a column is exactly the thing a sphere does not have.
+    /// `the_castle_answers_the_general_query_the_way_it_answers_the_old_one`
+    /// is the test that keeps the two routes agreeing where both apply.
     pub fn ground_below(&self, from: Vec3, up: Vec3) -> Option<(Vec3, Vec3)> {
         match self.index {
             Index::Flat { .. } => self
@@ -637,48 +663,113 @@ impl LevelData {
         }
     }
 
-    /// Pushes a vertical player capsule out of steep collision triangles.
+    /// Pushes a vertical capsule out of the walls it has ended up inside.
     ///
     /// Collision is deliberately independent of Bevy's renderer so movement
-    /// can be exercised in headless tests.  The capsule is represented by a
-    /// line segment and a radius; testing three spheres along that segment is
-    /// sufficient for the castle's triangulated walls and is much cheaper than
-    /// bringing a general-purpose physics engine into the port.
+    /// can be exercised in headless tests. The body is a real capsule -- the
+    /// segment from `radius` above the feet to `radius` below the head, swept
+    /// by `radius` -- and each wall is measured against the whole of that
+    /// segment rather than against a few sample spheres strung along it. A
+    /// triangle can slip between two sample spheres and leave a body standing
+    /// in a wall it plainly touches; a segment cannot be straddled, and it is
+    /// no more expensive to test.
+    ///
+    /// The answer does not depend on the order the collision mesh happens to
+    /// be filed in. Every overlap in a pass is measured against the same
+    /// starting position and the pushes are then combined deepest first, so
+    /// shuffling the triangles moves nobody --
+    /// `wall_resolution_does_not_depend_on_triangle_order` is the test that
+    /// says so. Applying each push the moment it is found, which is what a
+    /// plain loop over the candidate list does, makes where a body ends up a
+    /// function of how the level was built.
     pub fn resolve_walls(&self, position: Vec3, up: Vec3, radius: f32, height: f32) -> Vec3 {
         let mut result = position;
         let mut candidates = Vec::new();
         let mut cells = Vec::new();
-        for _ in 0..3 {
-            let mut changed = false;
+        let mut contacts: Vec<Contact> = Vec::new();
+        for _ in 0..WALL_RESOLVE_PASSES {
             self.walls_near(result, up, &mut cells, &mut candidates);
+            contacts.clear();
+            // The capsule's spine. A body shorter than it is wide -- which no
+            // actor here is, but a caller may yet ask for -- degenerates to a
+            // sphere rather than to a segment pointing the wrong way.
+            let foot = result + up * radius;
+            let head = result + up * (height - radius).max(radius);
             for &index in &candidates {
                 let tri = self.triangles[index as usize];
-                let (a, b, c, normal) = (tri.a, tri.b, tri.c, tri.normal);
-                for rise in [radius, height * 0.5, height - radius] {
-                    let center = result + up * rise;
-                    let closest = closest_point_on_triangle(center, a, b, c);
-                    let offset = center - closest;
-                    // "Horizontal" is whatever lies flat against the ground
-                    // here, which on a planet is a different plane at every
-                    // point. With `up` at `+Y` this is the `(x, z)` it always
-                    // was, to the bit.
-                    let climb = offset.dot(up);
-                    let flat = offset - up * climb;
-                    let distance = flat.length();
-                    if distance < radius && climb.abs() < radius * 1.25 {
-                        let direction = if distance > 1e-5 {
-                            flat / distance
-                        } else {
-                            (normal - up * normal.dot(up)).normalize_or_zero()
-                        };
-                        result += direction * (radius - distance + 0.001);
-                        changed = true;
-                    }
+                let (on_capsule, on_wall) =
+                    closest_points_segment_triangle(foot, head, tri.a, tri.b, tri.c);
+                let offset = on_capsule - on_wall;
+                // "Horizontal" is whatever lies flat against the ground here,
+                // which on a planet is a different plane at every point. The
+                // push stays in that plane because a wall should stop a body,
+                // not lift it over itself.
+                let climb = offset.dot(up);
+                let flat = offset - up * climb;
+                let distance = flat.length();
+                // How far apart the two have to be *horizontally* to be clear,
+                // given how far apart they already are vertically. This is the
+                // whole of the difference between a capsule and a column, and
+                // leaving it out is what put invisible walls on the bridges: a
+                // moat face five metres below the deck is directly under the
+                // edge you are walking along, so its horizontal distance is
+                // nearly nothing, and a body clear of it by five metres was
+                // being shoved a metre and a half sideways by it.
+                //
+                // Where the contact is level with the body this is the radius
+                // and nothing has changed. Where it is a radius or more above
+                // the head or below the feet there is no overlap at all and
+                // the wall is not a wall to this body.
+                let square = radius * radius - climb * climb;
+                if square <= 0.0 {
+                    continue;
                 }
+                let clearance = square.sqrt();
+                if distance >= clearance {
+                    continue;
+                }
+                let direction = if distance > 1e-5 {
+                    flat / distance
+                } else {
+                    // Dead in the wall's plane: the offset says nothing about
+                    // which side to leave by, so the triangle's own facing
+                    // decides, flattened against the local ground.
+                    (tri.normal - up * tri.normal.dot(up)).normalize_or_zero()
+                };
+                if direction == Vec3::ZERO {
+                    continue;
+                }
+                contacts.push(Contact {
+                    direction,
+                    depth: clearance - distance + WALL_SKIN,
+                });
             }
-            if !changed {
+            if contacts.is_empty() {
                 break;
             }
+            // Deepest first, with ties broken on the direction itself so that
+            // two equally deep walls -- the two faces of a corner, usually --
+            // are always taken in the same order however the mesh was built.
+            contacts.sort_by(|a, b| {
+                b.depth.total_cmp(&a.depth).then_with(|| {
+                    a.direction
+                        .to_array()
+                        .partial_cmp(&b.direction.to_array())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            });
+            let mut push = Vec3::ZERO;
+            for contact in &contacts {
+                // What is left of this wall's demand once the pushes already
+                // taken are counted against it. A corner needs both of its
+                // faces and gets both; the same wall met twice, as a triangle
+                // spanning two grid cells is, needs only the deeper of them.
+                let remaining = contact.depth - push.dot(contact.direction);
+                if remaining > 0.0 {
+                    push += contact.direction * remaining;
+                }
+            }
+            result += push;
         }
         result
     }
@@ -1039,6 +1130,115 @@ fn segment_triangle_time(start: Vec3, direction: Vec3, tri: CollisionTriangle) -
     (0.0..1.0).contains(&t).then_some(t)
 }
 
+/// One wall pressing on a capsule: which way it wants the body to go, and how
+/// far.
+///
+/// A plane constraint rather than a triangle. Once the closest points are
+/// known that is all the shape a wall has left, and reducing it here is what
+/// lets [`LevelData::resolve_walls`] combine several of them without caring
+/// which triangle each came from.
+#[derive(Clone, Copy)]
+struct Contact {
+    /// Unit vector, flat against the local ground, pointing out of the wall.
+    direction: Vec3,
+    /// Metres along `direction` the body has to move to be clear.
+    depth: f32,
+}
+
+/// The closest pair of points between a segment and a triangle: one on the
+/// segment, one on the triangle.
+///
+/// This is the capsule test with the radius left out. A capsule is a segment
+/// swept by a radius, so the distance between its spine and a triangle,
+/// compared against that radius, is exactly whether the two overlap and by how
+/// much.
+///
+/// The answer is either at an end of the segment, along one of the triangle's
+/// edges, or -- when the segment runs through the face -- at the crossing
+/// itself. Testing those cases and keeping the nearest is the whole method.
+fn closest_points_segment_triangle(p: Vec3, q: Vec3, a: Vec3, b: Vec3, c: Vec3) -> (Vec3, Vec3) {
+    // A segment that passes through the face touches it, and no candidate
+    // taken from the boundary would say so: both ends can be well clear of
+    // every edge while the middle is through the middle.
+    let normal = (b - a).cross(c - a);
+    let denominator = normal.dot(q - p);
+    if denominator.abs() > 1e-12 {
+        let time = normal.dot(a - p) / denominator;
+        if (0.0..=1.0).contains(&time) {
+            let at = p + (q - p) * time;
+            if closest_point_on_triangle(at, a, b, c).distance_squared(at) <= 1e-10 {
+                return (at, at);
+            }
+        }
+    }
+    let pairs = [
+        (p, closest_point_on_triangle(p, a, b, c)),
+        (q, closest_point_on_triangle(q, a, b, c)),
+        closest_points_on_segments(p, q, a, b),
+        closest_points_on_segments(p, q, b, c),
+        closest_points_on_segments(p, q, c, a),
+    ];
+    let mut best = pairs[0];
+    let mut nearest = f32::INFINITY;
+    for (on_segment, on_triangle) in pairs {
+        let distance = on_segment.distance_squared(on_triangle);
+        if distance < nearest {
+            nearest = distance;
+            best = (on_segment, on_triangle);
+        }
+    }
+    best
+}
+
+/// The closest pair of points between two segments.
+///
+/// Real-Time Collision Detection, Christer Ericson, section 5.1.9. Parallel
+/// segments have a whole interval of equally close pairs and the degenerate
+/// branch below picks one end of it, which is all a depth query needs.
+fn closest_points_on_segments(p1: Vec3, q1: Vec3, p2: Vec3, q2: Vec3) -> (Vec3, Vec3) {
+    const TINY: f32 = 1e-12;
+    let d1 = q1 - p1;
+    let d2 = q2 - p2;
+    let r = p1 - p2;
+    let squared1 = d1.dot(d1);
+    let squared2 = d2.dot(d2);
+    let along2 = d2.dot(r);
+    if squared1 <= TINY && squared2 <= TINY {
+        return (p1, p2);
+    }
+    let (s, t);
+    if squared1 <= TINY {
+        s = 0.0;
+        t = (along2 / squared2).clamp(0.0, 1.0);
+    } else {
+        let along1 = d1.dot(r);
+        if squared2 <= TINY {
+            t = 0.0;
+            s = (-along1 / squared1).clamp(0.0, 1.0);
+        } else {
+            let between = d1.dot(d2);
+            let denominator = squared1 * squared2 - between * between;
+            let first = if denominator > TINY {
+                ((between * along2 - along1 * squared2) / denominator).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let second = (between * first + along2) / squared2;
+            if second < 0.0 {
+                t = 0.0;
+                s = (-along1 / squared1).clamp(0.0, 1.0);
+            } else if second > 1.0 {
+                t = 1.0;
+                s = ((between - along1) / squared1).clamp(0.0, 1.0);
+            } else {
+                t = second;
+                s = first;
+            }
+        }
+    }
+    (p1 + d1 * s, p2 + d2 * t)
+}
+
 fn closest_point_on_triangle(point: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
     // Real-Time Collision Detection, Christer Ericson, section 5.1.5.
     let ab = b - a;
@@ -1114,6 +1314,100 @@ mod tests {
         );
         let corrected = data.resolve_walls(Vec3::new(0.2, 0., 0.), Vec3::Y, 0.5, 1.8);
         assert!(corrected.x >= 0.5);
+    }
+
+    #[test]
+    fn wall_resolution_clears_a_wall_the_middle_of_the_body_meets() {
+        // A parapet from waist to shoulder: nothing at the feet, nothing over
+        // the head. Sample spheres strung along the body can miss a band like
+        // this between two of them; the capsule's spine runs through it.
+        let data = level(
+            &[
+                Vec3::new(0., 0.8, -2.),
+                Vec3::new(0., 1.2, -2.),
+                Vec3::new(0., 0.8, 2.),
+            ],
+            &[[0, 1, 2]],
+        );
+        let corrected = data.resolve_walls(Vec3::new(0.2, 0., 0.), Vec3::Y, 0.5, 1.8);
+        assert!(corrected.x >= 0.5, "left standing in the parapet at {corrected}");
+    }
+
+    #[test]
+    fn a_face_below_the_deck_is_not_a_wall_on_it() {
+        // The shape of every bridge over the castle's moat: something to stand
+        // on, and a sheer face dropping away under its edge. A body on the
+        // deck has that face metres below its feet, near enough underneath the
+        // edge that its *horizontal* distance is almost nothing -- so a test
+        // that asks only how far away it is sideways finds a wall right there
+        // and shoves the body off the middle of the bridge. That is an
+        // invisible wall, and it is what a capsule is meant not to have.
+        let data = level(
+            &[
+                // The deck, four metres square about the origin.
+                Vec3::new(-2., 0., -2.),
+                Vec3::new(2., 0., -2.),
+                Vec3::new(2., 0., 2.),
+                Vec3::new(-2., 0., 2.),
+                // The face under its western edge, dropping eight metres.
+                Vec3::new(-2., -1., -2.),
+                Vec3::new(-2., -1., 2.),
+                Vec3::new(-2., -9., -2.),
+                Vec3::new(-2., -9., 2.),
+            ],
+            &[[0, 1, 2], [0, 2, 3], [4, 5, 6], [5, 7, 6]],
+        );
+        // Standing on the deck a foot from that edge, and then right on it.
+        for x in [-1.0, -1.5, -1.9] {
+            let at = Vec3::new(x, 0., 0.);
+            let shoved = data.resolve_walls(at, Vec3::Y, 0.5, 1.8);
+            assert!(
+                (shoved - at).length() < 1e-3,
+                "a face {} m below the feet moved a body standing at {at} to {shoved}",
+                1.0,
+            );
+        }
+        // And the same face, brought up to stand across the deck instead, is a
+        // wall again -- the rule is where the thing is, not what it is.
+        let parapet = level(
+            &[
+                Vec3::new(-2., 0., -2.),
+                Vec3::new(2., 0., -2.),
+                Vec3::new(2., 0., 2.),
+                Vec3::new(-2., 0., 2.),
+                Vec3::new(-1., 0., -2.),
+                Vec3::new(-1., 0., 2.),
+                Vec3::new(-1., 2., -2.),
+                Vec3::new(-1., 2., 2.),
+            ],
+            &[[0, 1, 2], [0, 2, 3], [4, 5, 6], [5, 7, 6]],
+        );
+        let at = Vec3::new(-0.8, 0., 0.);
+        let shoved = parapet.resolve_walls(at, Vec3::Y, 0.5, 1.8);
+        assert!(shoved.x >= -0.5, "walked through the parapet to {shoved}");
+    }
+
+    #[test]
+    fn wall_resolution_does_not_depend_on_triangle_order() {
+        // The inside of a corner, so that resolving one face walks the body
+        // into the other and the order the two are taken in could matter.
+        let vertices = [
+            Vec3::new(0., 0., -2.),
+            Vec3::new(0., 3., -2.),
+            Vec3::new(0., 0., 2.),
+            Vec3::new(-2., 0., 0.),
+            Vec3::new(-2., 3., 0.),
+            Vec3::new(2., 0., 0.),
+        ];
+        let forwards = level(&vertices, &[[0, 1, 2], [3, 4, 5]]);
+        let backwards = level(&vertices, &[[3, 4, 5], [0, 1, 2]]);
+        let start = Vec3::new(0.2, 0., 0.2);
+        let first = forwards.resolve_walls(start, Vec3::Y, 0.5, 1.8);
+        let second = backwards.resolve_walls(start, Vec3::Y, 0.5, 1.8);
+        assert_eq!(first, second, "the mesh's build order moved the body");
+        // And it is out of both walls, not merely consistently in one of them.
+        assert!(first.x >= 0.5, "still in the first wall at {first}");
+        assert!(first.z >= 0.5, "still in the second wall at {first}");
     }
 
     #[test]

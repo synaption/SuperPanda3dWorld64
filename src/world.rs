@@ -27,7 +27,7 @@ use crate::{
     furniture,
     gravity::Gravity,
     level::{self, LevelData},
-    pipe, player, squad, water, weapon,
+    pipe, player, pylon, squad, stellarator, water, weapon,
 };
 use bevy::{
     gltf::{Gltf, GltfMesh, GltfNode},
@@ -161,6 +161,7 @@ pub fn spawn(
     assets: &AssetServer,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    art: &stellarator::FieldArt,
     load: &mut LevelLoad,
 ) {
     commands.insert_resource(id);
@@ -199,7 +200,7 @@ pub fn spawn(
             commands.insert_resource(collision);
             commands.insert_resource(furniture.gravity());
             commands.insert_resource(Respawn(furniture.spawn()));
-            spawn_inhabitants(&furniture, commands, assets);
+            spawn_inhabitants(&furniture, commands, assets, art);
             load.pending = None;
         }
         LevelId::Planet => {
@@ -232,6 +233,7 @@ fn spawn_inhabitants(
     furniture: &furniture::Furniture,
     commands: &mut Commands,
     assets: &AssetServer,
+    art: &stellarator::FieldArt,
 ) {
     // The phase is what keeps two of anything from moving in step, and it is
     // an index rather than a random number so a whole run stays reproducible
@@ -243,7 +245,25 @@ fn spawn_inhabitants(
                 enemy::spawn(commands, assets, kind, position, phase);
             }
             pipe::Spawn::Mario => {
-                squad::spawn_ally(commands, assets, position, phase);
+                squad::spawn_ally(
+                    commands,
+                    assets,
+                    crate::ActiveCharacter::Mario,
+                    position,
+                    phase,
+                );
+            }
+        }
+    }
+    // The structures. A machine the level put here is the same machine the
+    // build button puts here -- same spawn, same field, same footprint -- so it
+    // is picked up by the console's `stellarator_*` sliders and cleared away by
+    // a level change like any other. What the .blend adds is that one can be
+    // standing there before anybody has pressed anything.
+    for prop in furniture.props() {
+        match prop.kind {
+            furniture::PropKind::Stellarator => {
+                stellarator::spawn(commands, assets, art, prop.at, prop.yaw, prop.scale);
             }
         }
     }
@@ -253,10 +273,11 @@ fn spawn_inhabitants(
             // The enemy pipes have their interval overwritten from the console
             // every tick; the Mario pipe keeps the one the .blend gave it.
             pipe::WarpPipe::new(pipe.spawns, pipe.interval, index as f32),
-            WorldAssetRoot(assets.load("actors/warp_pipe.glb#Scene0")),
-            // Including the scale, which used to be the literal 0.01 that
-            // `warp_pipe.glb` needs and is now whatever the pipe is drawn at
-            // in the .blend.
+            WorldAssetRoot(assets.load(format!("{}#Scene0", pipe::MODEL))),
+            // The whole transform the .blend drew it with, scale included.
+            // Nothing here corrects the model's size: `pipe::MODEL` is a three
+            // metre warp pipe in its own file, so a pipe placed at Blender's
+            // scale of one is a pipe the size a pipe is.
             pipe.at,
         ));
     }
@@ -274,6 +295,14 @@ type LevelContents = Or<(
     With<LevelEntity>,
     With<enemy::Enemy>,
     With<squad::Ally>,
+    With<stellarator::Stellarator>,
+    // And what the player planted between the machines. The beams would in
+    // fact clear themselves -- `pylon::draw` redraws the whole set the moment
+    // the network changes, and every mast going away is a change -- but a mast
+    // left standing is a mast standing in the sky over the next level, and
+    // naming both here is one rule rather than two.
+    With<pylon::Pylon>,
+    With<pylon::Beam>,
     With<weapon::Bullet>,
     With<weapon::Tracer>,
     With<pipe::Launched>,
@@ -292,6 +321,7 @@ pub fn switch(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut load: ResMut<LevelLoad>,
+    art: Res<stellarator::FieldArt>,
     mut squad: ResMut<squad::Squad>,
     current: Res<LevelId>,
     contents: Query<Entity, LevelContents>,
@@ -319,6 +349,7 @@ pub fn switch(
         &assets,
         &mut meshes,
         &mut materials,
+        &art,
         &mut load,
     );
     // A level that is ready now puts the player down now. The planet cannot --
@@ -673,6 +704,7 @@ fn ground_to_stand_on(collision: &LevelData, centre: Vec3, sea_level: f32) -> Ve
 mod tests {
     use super::*;
     use crate::{level::Shape, player::Controller};
+    use bevy::ecs::system::RunSystemOnce;
     use bevy::gltf::GltfPlugin;
 
     /// The real game, headless, with the glTF loader bolted on.
@@ -701,6 +733,79 @@ mod tests {
         app.finish();
         app.cleanup();
         app
+    }
+
+    /// A machine placed in the .blend is standing on the level when it comes
+    /// up, at the size the level drew it -- footprint included, which is the
+    /// half that is not merely visual: two machines that overlap is the one
+    /// thing the build button refuses to do, and a placed one has to be in that
+    /// conversation.
+    #[test]
+    fn a_machine_placed_in_a_level_is_standing_there_when_it_comes_up() {
+        let level: furniture::Furniture = serde_json::from_str(
+            r#"{"level":"test","spawn":[0,0,0],"gravity":{"mode":"down"},
+                "props":[{"kind":"stellarator","at":[7,2,-3],
+                          "yaw":1.5707963,"scale":0.75}]}"#,
+        )
+        .expect("that should parse");
+        let mut app = crate::tests::headless();
+        app.world_mut()
+            .run_system_once(
+                move |mut commands: Commands,
+                      assets: Res<AssetServer>,
+                      mut meshes: ResMut<Assets<Mesh>>,
+                      mut materials: ResMut<Assets<StandardMaterial>>| {
+                    let art = stellarator::prepare(&mut commands, &mut meshes, &mut materials);
+                    spawn_inhabitants(&level, &mut commands, &assets, &art);
+                },
+            )
+            .expect("that should run");
+        app.update();
+        let mut machines = app
+            .world_mut()
+            .query::<(&stellarator::Stellarator, &Transform)>();
+        let found: Vec<_> = machines
+            .iter(app.world())
+            .map(|(machine, at)| (machine.radius, *at))
+            .collect();
+        assert_eq!(found.len(), 1, "one machine, not {}", found.len());
+        let (radius, at) = found[0];
+        assert!((at.translation - Vec3::new(7.0, 2.0, -3.0)).length() < 1e-4);
+        assert!((at.scale - Vec3::splat(0.75)).length() < 1e-6);
+        // A quarter turn about the vertical takes the model's +Z to +X.
+        assert!((at.rotation * Vec3::Z - Vec3::X).length() < 1e-4);
+        assert!(
+            (radius - stellarator::footprint(0.75)).abs() < 1e-4,
+            "it stands on {radius} m rather than the {} it was drawn at",
+            stellarator::footprint(0.75)
+        );
+    }
+
+    /// What a player built goes with the level he built it on.
+    ///
+    /// `LevelContents` is the one list that says what a level change takes
+    /// away, and the way it goes wrong is by omission: a thing spawned by a
+    /// system rather than by `spawn` is not marked, so it is only taken out if
+    /// somebody remembered to name it here. A mast that was forgotten is a mast
+    /// standing in the sky over the planet, several hundred metres from the
+    /// ground, with its beams still strung between where the castle used to
+    /// be.
+    #[test]
+    fn what_the_player_planted_is_taken_down_with_the_level() {
+        let mut world = World::new();
+        let mast = world.spawn(pylon::Pylon { radius: 1.0 }).id();
+        let beam = world.spawn(pylon::Beam).id();
+        let machine = world.spawn(stellarator::Stellarator { radius: 2.0 }).id();
+        // Something that belongs to nobody, to prove the filter is a filter.
+        let bystander = world.spawn(Transform::default()).id();
+        let taken: Vec<Entity> = world
+            .query_filtered::<Entity, LevelContents>()
+            .iter(&world)
+            .collect();
+        for entity in [mast, beam, machine] {
+            assert!(taken.contains(&entity), "{entity} would survive the switch");
+        }
+        assert!(!taken.contains(&bystander), "the filter takes everything");
     }
 
     /// The whole feature, end to end, on the real `assets/bevy/planet.glb`: ask

@@ -1,9 +1,9 @@
 """Export a .blend to .glb from the command line, headless.
 
-    python3 tools/blend_to_glb.py assets/hero/TheHero.blend
-    python3 tools/blend_to_glb.py assets/hero/TheHero.blend -o /tmp/hero.glb
+    python3 tools/blend_to_glb.py assets/luna/Luna.blend
+    python3 tools/blend_to_glb.py assets/luna/Luna.blend -o /tmp/luna.glb
 
-Unlike tools/export_hero_gltf.py, which knows the Hero's rig, this drives the
+Unlike tools/export_luna_gltf.py, which knows Luna's rig, this drives the
 project-local Blender 5.2 install and makes no assumptions about the file.
 It is the generic "just give me a glb" path.
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build and package Super Bevy World 64 for 64-bit Windows from Linux/WSL.
+# Build and package Space Crusaders for 64-bit Windows from Linux/WSL.
 #
 # This used to download an official Rust compiler and both standard libraries
 # into target/, because the distro's Rust 1.75 and the official Windows
@@ -14,7 +14,7 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WINDOWS_TARGET="x86_64-pc-windows-gnu"
 DIST_DIR="$REPO_ROOT/dist/windows"
-ZIP_PATH="$REPO_ROOT/dist/SuperBevyWorld64-windows-x64.zip"
+ZIP_PATH="$REPO_ROOT/dist/SpaceCrusaders-windows-x64.zip"
 
 require_command() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -47,12 +47,12 @@ echo "Packaging Windows build"
 mkdir -p \
     "$DIST_DIR/assets/actors" \
     "$DIST_DIR/assets/bevy" \
-    "$DIST_DIR/assets/hero" \
+    "$DIST_DIR/assets/luna" \
     "$DIST_DIR/assets/impostors" \
     "$DIST_DIR/assets/mario"
 
-cp "$REPO_ROOT/target/$WINDOWS_TARGET/release/super-bevy-world-64.exe" \
-    "$DIST_DIR/SuperBevyWorld64.exe"
+cp "$REPO_ROOT/target/$WINDOWS_TARGET/release/space-crusaders.exe" \
+    "$DIST_DIR/SpaceCrusaders.exe"
 cp "$REPO_ROOT/assets/bevy/water.png" "$DIST_DIR/assets/bevy/"
 # A level's furniture: the meshes somebody placed in `assets/levels/<level>.blend`.
 # Named by a `format!` at runtime rather than by a literal, so the scan below
@@ -81,8 +81,10 @@ cp \
     "$REPO_ROOT/assets/actors/warp_pipe.glb" \
     "$REPO_ROOT/assets/actors/slime.glb" \
     "$REPO_ROOT/assets/actors/ant.glb" \
+    "$REPO_ROOT/assets/actors/stellarator.glb" \
+    "$REPO_ROOT/assets/actors/pylon.glb" \
     "$DIST_DIR/assets/actors/"
-cp "$REPO_ROOT/assets/hero/hero.glb" "$DIST_DIR/assets/hero/"
+cp "$REPO_ROOT/assets/luna/luna.glb" "$DIST_DIR/assets/luna/"
 # The weapon models, read out of `weapon::Weapon::spec` rather than listed, for
 # the same reason the samples below are read out of the sound tables: the two
 # cannot drift if there is only one of them.
@@ -125,5 +127,5 @@ rm -f "$ZIP_PATH"
 
 echo
 echo "Windows build complete:"
-echo "  $DIST_DIR/SuperBevyWorld64.exe"
+echo "  $DIST_DIR/SpaceCrusaders.exe"
 echo "  $ZIP_PATH"

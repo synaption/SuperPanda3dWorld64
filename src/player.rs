@@ -29,11 +29,11 @@ const STROKE_SECONDS: f32 = 0.6;
 const SUBMERGED_DEPTH: f32 = 0.15;
 
 /// How far under the surface each character floats once they are in deep
-/// water: Mario swimming, the Hero held up by it.
+/// water: Mario swimming, Luna held up by it.
 const SWIM_FLOAT_DEPTH: f32 = 0.45;
 const WADE_FLOAT_DEPTH: f32 = 0.6;
 
-/// How fast the surface pulls the wading Hero back to that depth, and how
+/// How fast the surface pulls the wading Luna back to that depth, and how
 /// fast whatever vertical speed he ran off the bank with bleeds away. The
 /// original approaches 8 and 4 SM64 units per frame at 30 Hz, which at this
 /// port's scale of 1/100 is 2.4 and 1.2 units a second.
@@ -116,7 +116,7 @@ pub enum Motion {
 ///
 /// Deep water is not one behaviour, because the two characters do not have the
 /// same clips. Ported from `sm64py/hero/constants.py`, which says it plainly:
-/// the Hero has no swimming animation, so rather than draw a walk cycle
+/// Luna has no swimming animation, so rather than draw a walk cycle
 /// underwater he is held at the surface and slowed to a wade. It is the one
 /// place his move set is short of Mario's, and it is a gap in the source
 /// animation rather than something the controller could paper over.
@@ -144,14 +144,14 @@ impl Submersion {
 /// Which of the three a character is in.
 ///
 /// Split out from the controller so the rule is checked without a level, a
-/// water box or a renderer -- it is the part that decides whether the Hero
+/// water box or a renderer -- it is the part that decides whether Luna
 /// swims, which he must never do.
 pub fn submersion(character: ActiveCharacter, depth: Option<f32>) -> Submersion {
     if !depth.is_some_and(|depth| depth > SUBMERGED_DEPTH) {
         return Submersion::Dry;
     }
     match character {
-        ActiveCharacter::Hero => Submersion::Wading,
+        ActiveCharacter::Luna => Submersion::Wading,
         ActiveCharacter::Mario => Submersion::Swimming,
     }
 }
@@ -295,7 +295,7 @@ pub fn movement(
     if ctrl.submersion.in_water() != was_wet {
         sounds.push(Sfx::Splash);
     }
-    let boost = input_state.boost && state.active == ActiveCharacter::Hero;
+    let boost = input_state.boost && state.active == ActiveCharacter::Luna;
     let skate = boost && ctrl.grounded && !ctrl.submersion.in_water();
     if skate {
         // The skate is free, but it is not free *and* charging: holding the
@@ -307,9 +307,9 @@ pub fn movement(
     }
     let speed = match ctrl.submersion {
         Submersion::Swimming => tuning.mario_swim,
-        Submersion::Wading => tuning.hero_wade,
+        Submersion::Wading => tuning.luna_wade,
         Submersion::Dry if skate => tuning.skate_speed,
-        Submersion::Dry if state.active == ActiveCharacter::Hero => tuning.hero_speed,
+        Submersion::Dry if state.active == ActiveCharacter::Luna => tuning.luna_speed,
         Submersion::Dry => tuning.mario_speed,
     };
     let accel = if skate {
@@ -350,7 +350,7 @@ pub fn movement(
         }
         Submersion::Wading => {
             if jump_pressed {
-                // The Hero stays upright because he has no swim animation,
+                // Luna stays upright because he has no swim animation,
                 // but deep water must not swallow the jump control. Treat it
                 // as the same upward stroke Mario gets underwater.
                 rise = (rise + 3.8).min(6.0);
@@ -383,7 +383,7 @@ pub fn movement(
             .is_none_or(|energy| energy.thrust(FIXED_DT));
     // Water supplies its own vertical motion either way -- buoyancy for a
     // swimmer, the pull toward the surface below for a wader -- so gravity and
-    // the Hero's booster do not operate until the capsule leaves the box.
+    // Luna's booster do not operate until the capsule leaves the box.
     if !ctrl.submersion.in_water() {
         if thrusting {
             rise = (rise + tuning.jet_thrust).min(tuning.jet_rise);
@@ -613,7 +613,7 @@ pub fn sync_visual(
         visual.translation = render_pose.translation;
         visual.rotation = render_pose.rotation;
         visual.scale = match kind {
-            ActiveCharacter::Hero => Vec3::splat(0.81),
+            ActiveCharacter::Luna => Vec3::splat(0.81),
             ActiveCharacter::Mario => Vec3::splat(0.00667),
         };
     }
@@ -626,7 +626,7 @@ mod tests {
     use bevy::{camera::Camera3d, ecs::system::RunSystemOnce};
     use std::f32::consts::FRAC_PI_2;
 
-    /// The castle's Hero spawn, on the lawn in front of the gate.
+    /// The castle's Luna spawn, on the lawn in front of the gate.
     const SPAWN: Vec3 = Vec3::new(-13.28, 3.0, 46.64);
 
     /// A world holding just what `movement` reads: the real castle collision,
@@ -851,7 +851,7 @@ mod tests {
             .iter()
             .filter(|sfx| **sfx == Sfx::Step)
             .count();
-        // Two seconds at the Hero's speed covers roughly 20 units, which is
+        // Two seconds at Luna's speed covers roughly 20 units, which is
         // several strides and nowhere near one per tick.
         assert!(
             (2..=12).contains(&steps),
@@ -929,18 +929,18 @@ mod tests {
         Vec2::new(to.x - from.x, to.z - from.z).length()
     }
 
-    /// The Hero has no swimming clips, so he does not swim: deep water holds
+    /// Luna has no swimming clips, so he does not swim: deep water holds
     /// him at the surface and slows him to a wade, drawn upright. This is
     /// `act_wading` in `sm64py/hero/actions.py`, and it is the one place his
     /// move set is deliberately short of Mario's.
     #[test]
-    fn the_hero_wades_rather_than_swimming() {
+    fn the_luna_wades_rather_than_swimming() {
         let mut world = world_with(pool(6.0), Vec3::ZERO);
         let mut deepest = 0.0f32;
         for _ in 0..90 {
             tick(&mut world, 1);
             let (position, _, _, motion) = player(&mut world);
-            assert_ne!(motion, Motion::Swim, "the Hero is swimming");
+            assert_ne!(motion, Motion::Swim, "Luna is swimming");
             deepest = deepest.min(position.y);
         }
         assert_eq!(submersion_of(&mut world), Submersion::Wading);
@@ -1007,7 +1007,7 @@ mod tests {
     }
 
     #[test]
-    fn jump_moves_the_hero_up_in_deep_water() {
+    fn jump_moves_the_luna_up_in_deep_water() {
         let mut world = world_with(pool(6.0), Vec3::ZERO);
         tick(&mut world, 60);
         let (before, ..) = player(&mut world);
@@ -1030,7 +1030,7 @@ mod tests {
     /// Water shallower than he floats in is simply slow ground: the bottom is
     /// under his feet and he walks along it.
     #[test]
-    fn the_hero_walks_the_bottom_of_shallow_water() {
+    fn the_luna_walks_the_bottom_of_shallow_water() {
         let bottom = WADE_FLOAT_DEPTH - 0.2;
         let mut world = world_with(pool(bottom), Vec3::ZERO);
         tick(&mut world, 60);

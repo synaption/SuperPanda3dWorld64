@@ -33,11 +33,11 @@ pub struct TunableSpec {
 
 pub const SPECS: &[TunableSpec] = &[
     TunableSpec {
-        name: "hero_speed",
+        name: "luna_speed",
         low: 1.0,
         high: 30.0,
         step: 0.2,
-        doc: "Hero running speed",
+        doc: "Luna running speed",
     },
     TunableSpec {
         name: "mario_speed",
@@ -72,14 +72,14 @@ pub const SPECS: &[TunableSpec] = &[
         low: 1.0,
         high: 40.0,
         step: 0.2,
-        doc: "Hero skate speed",
+        doc: "Luna skate speed",
     },
     TunableSpec {
         name: "skate_accel",
         low: 0.1,
         high: 30.0,
         step: 0.2,
-        doc: "Hero skate acceleration",
+        doc: "Luna skate acceleration",
     },
     TunableSpec {
         name: "jet_thrust",
@@ -103,11 +103,11 @@ pub const SPECS: &[TunableSpec] = &[
         doc: "Mario swim speed",
     },
     TunableSpec {
-        name: "hero_wade",
+        name: "luna_wade",
         low: 0.5,
         high: 12.0,
         step: 0.2,
-        doc: "Hero wading speed",
+        doc: "Luna wading speed",
     },
     // The aiming layer. Every one of these came off a slider in the Panda3D
     // build rather than out of a calculation -- `docs/aim.md`, "As Built" --
@@ -253,11 +253,37 @@ pub const SPECS: &[TunableSpec] = &[
         doc: "Marios in the field",
     },
     TunableSpec {
+        name: "luna_count",
+        low: 0.0,
+        high: 200.0,
+        step: 1.0,
+        doc: "AI Lunas in the field, beside the Marios",
+    },
+    TunableSpec {
         name: "ally_speed",
         low: 0.5,
         high: 30.0,
         step: 0.2,
         doc: "ally walking speed",
+    },
+    // The stellarator's plasma, which is drawn as streaks riding its flux
+    // surface rather than as the skin the .glb carries. Both of these are on
+    // sliders for `tracer_width`'s reason: what a field turning at a given rate
+    // and flaring at a given brightness actually looks like is not something
+    // either number predicts from a still frame.
+    TunableSpec {
+        name: "stellarator_spin",
+        low: 0.0,
+        high: 4.0,
+        step: 0.05,
+        doc: "how fast the plasma travels round the ring",
+    },
+    TunableSpec {
+        name: "stellarator_glow",
+        low: 0.0,
+        high: 2.0,
+        step: 0.05,
+        doc: "how brightly the plasma flares",
     },
     TunableSpec {
         name: "enemy_speed",
@@ -417,7 +443,7 @@ pub const SPECS: &[TunableSpec] = &[
 
 #[derive(Resource, Clone, Debug)]
 pub struct GameTuning {
-    pub hero_speed: f32,
+    pub luna_speed: f32,
     pub mario_speed: f32,
     pub walk_accel: f32,
     pub decel: f32,
@@ -427,10 +453,10 @@ pub struct GameTuning {
     pub jet_thrust: f32,
     pub jet_rise: f32,
     pub mario_swim: f32,
-    /// The Hero does not swim, he wades: `WADE_SPEED_SCALE` in
+    /// Luna does not swim, he wades: `WADE_SPEED_SCALE` in
     /// `sm64py/hero/constants.py` is 0.45 of his walk, which is where the
     /// default below comes from.
-    pub hero_wade: f32,
+    pub luna_wade: f32,
     /// The aiming layer, from `docs/aim.md`'s "As Built". See
     /// [`crate::aim`], which is the only reader of all seven.
     pub torso_limit: f32,
@@ -468,7 +494,21 @@ pub struct GameTuning {
     pub sfx_volume: f32,
     pub sfx_range: f32,
     pub ally_count: f32,
+    /// How many allies in the field are Lunas rather than Marios.
+    ///
+    /// A second count beside [`Self::ally_count`] rather than a share of it:
+    /// the two characters are worth different things in a fight -- see
+    /// [`crate::ActiveCharacter::ally_health`] -- so how many of each is two
+    /// decisions, and asking for Lunas should not quietly take Marios away.
+    ///
+    /// Zero by default. The squad is Marios until somebody asks for otherwise,
+    /// which is what it has always been.
+    pub luna_count: f32,
     pub ally_speed: f32,
+    /// The plasma's two numbers. Read live by [`crate::stellarator::animate`]
+    /// and by nothing else.
+    pub stellarator_spin: f32,
+    pub stellarator_glow: f32,
     pub enemy_speed: f32,
     pub enemy_sight: f32,
     pub enemy_alert: f32,
@@ -528,7 +568,7 @@ pub struct GameTuning {
 impl Default for GameTuning {
     fn default() -> Self {
         Self {
-            hero_speed: 11.4,
+            luna_speed: 11.4,
             mario_speed: 9.6,
             walk_accel: 22.0,
             decel: 10.0,
@@ -538,7 +578,7 @@ impl Default for GameTuning {
             jet_thrust: 2.4,
             jet_rise: 6.0,
             mario_swim: 5.5,
-            hero_wade: 5.13,
+            luna_wade: 5.13,
             torso_limit: 60.0,
             torso_comfort: 20.0,
             torso_response: 0.12,
@@ -566,7 +606,10 @@ impl Default for GameTuning {
             // noticed the player is close enough to be heard undimmed.
             sfx_range: 12.0,
             ally_count: 8.0,
+            luna_count: 0.0,
             ally_speed: 7.0,
+            stellarator_spin: 1.0,
+            stellarator_glow: 1.0,
             enemy_speed: 1.8,
             enemy_sight: 14.0,
             enemy_alert: 9.0,
@@ -633,7 +676,7 @@ impl Default for GameTuning {
 impl GameTuning {
     pub fn get(&self, name: &str) -> Option<f32> {
         Some(match name {
-            "hero_speed" => self.hero_speed,
+            "luna_speed" => self.luna_speed,
             "mario_speed" => self.mario_speed,
             "walk_accel" => self.walk_accel,
             "decel" => self.decel,
@@ -643,7 +686,7 @@ impl GameTuning {
             "jet_thrust" => self.jet_thrust,
             "jet_rise" => self.jet_rise,
             "mario_swim" => self.mario_swim,
-            "hero_wade" => self.hero_wade,
+            "luna_wade" => self.luna_wade,
             "torso_limit" => self.torso_limit,
             "torso_comfort" => self.torso_comfort,
             "torso_response" => self.torso_response,
@@ -664,7 +707,10 @@ impl GameTuning {
             "sfx_volume" => self.sfx_volume,
             "sfx_range" => self.sfx_range,
             "ally_count" => self.ally_count,
+            "luna_count" => self.luna_count,
             "ally_speed" => self.ally_speed,
+            "stellarator_spin" => self.stellarator_spin,
+            "stellarator_glow" => self.stellarator_glow,
             "enemy_speed" => self.enemy_speed,
             "enemy_sight" => self.enemy_sight,
             "enemy_alert" => self.enemy_alert,
@@ -695,7 +741,7 @@ impl GameTuning {
         let previous = self.get(name).unwrap();
         let value = value.clamp(spec.low, spec.high);
         match name {
-            "hero_speed" => self.hero_speed = value,
+            "luna_speed" => self.luna_speed = value,
             "mario_speed" => self.mario_speed = value,
             "walk_accel" => self.walk_accel = value,
             "decel" => self.decel = value,
@@ -705,7 +751,7 @@ impl GameTuning {
             "jet_thrust" => self.jet_thrust = value,
             "jet_rise" => self.jet_rise = value,
             "mario_swim" => self.mario_swim = value,
-            "hero_wade" => self.hero_wade = value,
+            "luna_wade" => self.luna_wade = value,
             "torso_limit" => self.torso_limit = value,
             "torso_comfort" => self.torso_comfort = value,
             "torso_response" => self.torso_response = value,
@@ -726,7 +772,10 @@ impl GameTuning {
             "sfx_volume" => self.sfx_volume = value,
             "sfx_range" => self.sfx_range = value,
             "ally_count" => self.ally_count = value,
+            "luna_count" => self.luna_count = value,
             "ally_speed" => self.ally_speed = value,
+            "stellarator_spin" => self.stellarator_spin = value,
+            "stellarator_glow" => self.stellarator_glow = value,
             "enemy_speed" => self.enemy_speed = value,
             "enemy_sight" => self.enemy_sight = value,
             "enemy_alert" => self.enemy_alert = value,
@@ -838,13 +887,24 @@ pub enum Request {
     Crowd(usize, CrowdKind),
     /// Take every enemy off it again.
     ClearCrowd,
-    /// Put a named weapon in the Hero's hand.
+    /// Put a named weapon in Luna's hand.
     ///
     /// The weapon is a resource rather than a tunable float, so unlike every
     /// slider it cannot be set by writing into [`GameTuning`] -- hence a
     /// request. It is what lets `cargo run -- screenshot` photograph the gun:
     /// `SHOT_SETUP="weapon pistol"`, through the same path a player uses.
     Equip(crate::weapon::Weapon),
+    /// Plant this many pylons in a line out from the player, and a machine at
+    /// the near end to feed them.
+    ///
+    /// The network's benchmark and its screenshot in one: what a pylon looks
+    /// like, what the beams look like, and how a flood spreads along them are
+    /// all questions about a network of several, and planting several by hand
+    /// through the crosshair is a minute of walking. `pylon clear` takes them
+    /// away again.
+    Pylons(usize),
+    /// Take every planted mast off the map.
+    ClearPylons,
 }
 
 #[derive(Resource)]
@@ -978,7 +1038,8 @@ impl ConsoleState {
         self.echo(format!("> {line}"));
         match words[0].to_ascii_lowercase().as_str() {
             "help" | "?" => self.echo("commands: <name> [value], vars, reset <name|all>, close <name|all>, clear\ncrowd <n> [slime|ant|mix] puts a whole field down at once; crowd clear takes it away.
-weapon <sword|pistol> puts one in the Hero's hand; Y cycles it in play.\nLeft/Right/Home/End move the caret; Up/Down recall; Tab completes.\nSelect a variable then use [ and ] (Shift = 10x) to tune it. Wheel/PageUp/PageDown scroll the log."),
+pylon <n> plants a line of masts and a machine to feed them; pylon clear takes them away.
+weapon <sword|pistol> puts one in Luna's hand; Y cycles it in play.\nLeft/Right/Home/End move the caret; Up/Down recall; Tab completes.\nSelect a variable then use [ and ] (Shift = 10x) to tune it. Wheel/PageUp/PageDown scroll the log."),
             "vars" | "list" => {
                 for spec in SPECS {
                     self.echo(format!("  {:<18} {:>7.3}  [{:.3} .. {:.3}]  {}", spec.name, tuning.get(spec.name).unwrap(), spec.low, spec.high, spec.doc));
@@ -986,6 +1047,7 @@ weapon <sword|pistol> puts one in the Hero's hand; Y cycles it in play.\nLeft/Ri
             }
             "clear" => self.log.clear(),
             "crowd" => self.crowd(&words[1..]),
+            "pylon" | "pylons" | "grid" => self.pylons(&words[1..]),
             "weapon" | "equip" => self.weapon(&words[1..]),
             "reset" => self.reset(&words[1..], tuning),
             "close" | "hide" => self.close(&words[1..]),
@@ -1040,6 +1102,34 @@ weapon <sword|pistol> puts one in the Hero's hand; Y cycles it in play.\nLeft/Ri
             }
             None => self.echo(format!("no weapon {asked:?} -- try {}", names.join(", "))),
         }
+    }
+
+    /// `pylon <n>`, or `pylon clear`.
+    ///
+    /// Plants a line of masts running away from wherever the player is
+    /// standing, spaced so that each is inside the next one's reach, with a
+    /// stellarator at the near end feeding the lot. The same reason `crowd`
+    /// exists: the interesting thing about a network is what it does at a size
+    /// nobody wants to build by hand, and a screenshot of one has to be
+    /// reproducible.
+    fn pylons(&mut self, args: &[&str]) {
+        if matches!(args.first(), Some(&"clear") | Some(&"none")) {
+            self.pending.push(Request::ClearPylons);
+            self.echo("pylon: clearing the network");
+            return;
+        }
+        let count = match args.first() {
+            None => 4,
+            Some(raw) => match raw.parse::<usize>() {
+                Ok(count) => count,
+                Err(_) => {
+                    self.echo("pylon: needs a count -- `pylon 5`, or `pylon clear`");
+                    return;
+                }
+            },
+        };
+        self.pending.push(Request::Pylons(count));
+        self.echo(format!("pylon: planting {count}"));
     }
 
     /// `crowd <n> [slime|ant|mix]`, or `crowd clear`.
@@ -1569,10 +1659,10 @@ mod tests {
     fn command_sets_clamps_and_resets_tunables() {
         let mut console = ConsoleState::default();
         let mut tuning = GameTuning::default();
-        console.execute("hero_speed 999", &mut tuning);
-        assert_eq!(tuning.hero_speed, 30.0);
-        console.execute("reset hero_speed", &mut tuning);
-        assert_eq!(tuning.hero_speed, GameTuning::default().hero_speed);
+        console.execute("luna_speed 999", &mut tuning);
+        assert_eq!(tuning.luna_speed, 30.0);
+        console.execute("reset luna_speed", &mut tuning);
+        assert_eq!(tuning.luna_speed, GameTuning::default().luna_speed);
     }
 
     #[test]
@@ -1693,21 +1783,21 @@ mod tests {
     #[test]
     fn backspace_and_delete_work_either_side_of_the_caret() {
         let mut console = ConsoleState::default();
-        type_line(&mut console, "hero");
+        type_line(&mut console, "luna");
         console.step(-1);
         console.backspace();
-        assert_eq!(console.input, "heo");
+        assert_eq!(console.input, "lua");
         console.delete();
-        assert_eq!(console.input, "he");
+        assert_eq!(console.input, "lu");
         // The caret is at the end now: neither key has anything left to take.
         console.delete();
-        assert_eq!(console.input, "he");
+        assert_eq!(console.input, "lu");
         console.step(-1);
         console.step(-1);
         console.step(-1);
         console.backspace();
-        assert_eq!(console.input, "he");
-        assert_eq!(console.split(), ("", "he"));
+        assert_eq!(console.input, "lu");
+        assert_eq!(console.split(), ("", "lu"));
     }
 
     /// Completing works on the word the caret is in, not on the end of the

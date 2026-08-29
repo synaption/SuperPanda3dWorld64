@@ -59,19 +59,19 @@ pub enum Sfx {
 /// `assets/sounds`.
 pub type Layers = &'static [&'static [&'static str]];
 
-// The Hero speaks with the Zelda voice set and lands and steps with its
+// Luna speaks with the Zelda voice set and lands and steps with its
 // effect set, exactly as `sm64py.audio` pairs them.
-const HERO_JUMP: Layers = &[&["vc_zelda/vc_zelda_jump01.wav"]];
-const HERO_LAND: Layers = &[&[
+const LUNA_JUMP: Layers = &[&["vc_zelda/vc_zelda_jump01.wav"]];
+const LUNA_LAND: Layers = &[&[
     "se_zelda/se_zelda_landing01.wav",
     "se_zelda/se_zelda_landing02.wav",
 ]];
-const HERO_STEP: Layers = &[&[
+const LUNA_STEP: Layers = &[&[
     "se_zelda/se_zelda_step_left_m.wav",
     "se_zelda/se_zelda_step_right_m.wav",
 ]];
 // Two layers: the blade through the air, and the shout over it.
-const HERO_ATTACK: Layers = &[
+const LUNA_ATTACK: Layers = &[
     &["se_zelda/se_zelda_swing_s.wav"],
     &[
         "vc_zelda/vc_zelda_attack01.wav",
@@ -79,7 +79,7 @@ const HERO_ATTACK: Layers = &[
         "vc_zelda/vc_zelda_attack03.wav",
     ],
 ];
-const HERO_HURT: Layers = &[&[
+const LUNA_HURT: Layers = &[&[
     "vc_zelda/vc_zelda_damage01.wav",
     "vc_zelda/vc_zelda_damage02.wav",
 ]];
@@ -125,11 +125,11 @@ pub fn layers(character: ActiveCharacter, sfx: Sfx) -> Layers {
         (Sfx::Draw, _) => DRAW,
         (Sfx::Splash, _) => SPLASH,
         (Sfx::Stroke, _) => STROKE,
-        (Sfx::Jump, ActiveCharacter::Hero) => HERO_JUMP,
-        (Sfx::Land, ActiveCharacter::Hero) => HERO_LAND,
-        (Sfx::Step, ActiveCharacter::Hero) => HERO_STEP,
-        (Sfx::Attack, ActiveCharacter::Hero) => HERO_ATTACK,
-        (Sfx::Hurt, ActiveCharacter::Hero) => HERO_HURT,
+        (Sfx::Jump, ActiveCharacter::Luna) => LUNA_JUMP,
+        (Sfx::Land, ActiveCharacter::Luna) => LUNA_LAND,
+        (Sfx::Step, ActiveCharacter::Luna) => LUNA_STEP,
+        (Sfx::Attack, ActiveCharacter::Luna) => LUNA_ATTACK,
+        (Sfx::Hurt, ActiveCharacter::Luna) => LUNA_HURT,
         (Sfx::Jump, ActiveCharacter::Mario) => MARIO_JUMP,
         (Sfx::Land, ActiveCharacter::Mario) => MARIO_LAND,
         (Sfx::Step, ActiveCharacter::Mario) => MARIO_STEP,
@@ -152,7 +152,7 @@ pub fn all_paths() -> impl Iterator<Item = &'static str> {
         Sfx::Shoot,
         Sfx::Draw,
     ];
-    [ActiveCharacter::Hero, ActiveCharacter::Mario]
+    [ActiveCharacter::Luna, ActiveCharacter::Mario]
         .into_iter()
         .flat_map(|character| EVENTS.iter().map(move |sfx| layers(character, *sfx)))
         .flatten()
@@ -242,7 +242,7 @@ impl Rng {
     }
 }
 
-/// The pitch spread applied to every take, matching `HERO_PITCH_MIN/MAX`.
+/// The pitch spread applied to every take, matching `LUNA_PITCH_MIN/MAX`.
 const PITCH_SPREAD: f32 = 0.05;
 
 /// Chooses one take from each layer of an event.
@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn every_event_resolves_to_at_least_one_take() {
         let mut rng = Rng::default();
-        for character in [ActiveCharacter::Hero, ActiveCharacter::Mario] {
+        for character in [ActiveCharacter::Luna, ActiveCharacter::Mario] {
             for sfx in [
                 Sfx::Jump,
                 Sfx::Land,
@@ -585,7 +585,7 @@ mod tests {
     #[test]
     fn the_two_characters_never_share_a_voice() {
         // One event queue serves both, so a table that pointed Mario at the
-        // Hero's voice would substitute one character's shout for the other's.
+        // Luna's voice would substitute one character's shout for the other's.
         for sfx in [Sfx::Jump, Sfx::Attack, Sfx::Hurt, Sfx::Step, Sfx::Land] {
             for path in layers(ActiveCharacter::Mario, sfx)
                 .iter()
@@ -593,13 +593,13 @@ mod tests {
             {
                 assert!(path.starts_with("mario64/"), "Mario plays {path}");
             }
-            for path in layers(ActiveCharacter::Hero, sfx)
+            for path in layers(ActiveCharacter::Luna, sfx)
                 .iter()
                 .flat_map(|l| l.iter())
             {
                 assert!(
                     path.starts_with("se_zelda/") || path.starts_with("vc_zelda/"),
-                    "the Hero plays {path}"
+                    "Luna plays {path}"
                 );
             }
         }

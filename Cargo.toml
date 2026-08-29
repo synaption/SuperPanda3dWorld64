@@ -1,5 +1,5 @@
 [package]
-name = "super-bevy-world-64"
+name = "space-crusaders"
 version = "0.1.0"
 edition = "2021"
 # Bevy 0.19 declares 1.95. The repository's rustup toolchain is newer than that

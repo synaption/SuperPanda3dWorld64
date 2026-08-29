@@ -396,41 +396,68 @@ pub fn in_circle(ally: Vec3, centre: Vec3, radius: f32) -> bool {
     flat <= radius + ALLY_RADIUS && (ally.y - centre.y).abs() <= RECRUIT_HEIGHT
 }
 
-/// Puts one Mario in the field.
+/// Puts one ally in the field, as whichever character was asked for.
 ///
-/// Shared by the console's population count and by the Mario warp pipe, so the
-/// two cannot produce subtly different Marios -- the same reason `enemy::spawn`
-/// is shared between the level's placements and the enemy pipes.
-pub fn spawn_ally(commands: &mut Commands, assets: &AssetServer, home: Vec3, phase: f32) -> Entity {
+/// **Either playable character can be an ally**, which is the whole of what
+/// "Luna is AI-playable too" means here: the squad is not a crowd of Marios
+/// with a Luna hard-wired into the player's hands, it is a field of characters
+/// of which one happens to be driven by a controller. An AI Luna is the same
+/// model at the same scale, animating off the same clip table and fighting
+/// with the same rules, as the Luna the player is driving -- see
+/// [`crate::ActiveCharacter::model`], which is where both of them get their
+/// scene from.
+///
+/// Shared by the console's population counts and by the Mario warp pipe, so no
+/// two callers can produce subtly different allies -- the same reason
+/// `enemy::spawn` is shared between the level's placements and the enemy pipes.
+pub fn spawn_ally(
+    commands: &mut Commands,
+    assets: &AssetServer,
+    character: ActiveCharacter,
+    home: Vec3,
+    phase: f32,
+) -> Entity {
+    let (model, scale) = character.model();
     commands
         .spawn((
             Ally::new(home, phase),
-            // A Mario is on the player's side, and goes for what it notices on
+            // An ally is on the player's side, and goes for what it notices on
             // the other one exactly as an enemy goes for him.
             crate::enemy::Side::Friendly,
-            // And can be worn down like one. Twenty points is seven ant touches
-            // -- long enough that a Mario sent at something wins or loses on
-            // whether the rest of the squad went with it.
-            crate::health::Health::new(crate::health::MARIO_HEALTH),
+            // And can be worn down like one. A Mario's twenty points is seven
+            // ant touches -- long enough that one sent at something wins or
+            // loses on whether the rest of the squad went with it -- and a Luna
+            // carries the player's hundred, which is what makes filling the
+            // field with one or the other a decision.
+            crate::health::Health::new(character.ally_health()),
             crate::enemy::Aggro::default(),
-            // Allies animate off the same tables the playable Mario does.
-            ActiveCharacter::Mario,
+            // Allies animate off the same tables the playable characters do,
+            // and this is which table.
+            character,
             // And stand on the ground the same way, so they get the same disc
             // under them as the player.
             crate::shadow::ShadowCaster::new(
                 crate::player::PLAYER_RADIUS,
                 crate::player::PLAYER_HEIGHT,
             ),
-            WorldAssetRoot(assets.load("mario/mario.glb#Scene0")),
-            Transform::from_translation(home).with_scale(Vec3::splat(0.00667)),
+            WorldAssetRoot(assets.load(model)),
+            Transform::from_translation(home).with_scale(Vec3::splat(scale)),
         ))
         .id()
 }
 
-/// The Marios the console's population count answers for: the field's standing
+/// The allies the console's population counts answer for: the field's standing
 /// crowd, with the warp pipe's own brood left out of it.
-type StandingCrowd<'w, 's> =
-    Query<'w, 's, (Entity, &'static Transform), (With<Ally>, Without<crate::pipe::Brood>)>;
+///
+/// The character comes with them, because there are two counts now -- one per
+/// playable character -- and reconciling either one means knowing which of the
+/// standing allies are that one.
+type StandingCrowd<'w, 's> = Query<
+    'w,
+    's,
+    (Entity, &'static ActiveCharacter),
+    (With<Ally>, Without<crate::pipe::Brood>),
+>;
 
 /// Keeps the field's Mario population at whatever the console asks for.
 ///
@@ -453,33 +480,60 @@ pub fn maintain_population(
     allies: StandingCrowd,
     mut squad: ResMut<Squad>,
 ) {
-    let wanted = tuning.ally_count.round() as usize;
-    let live: Vec<_> = allies.iter().collect();
-    if live.len() == wanted {
-        return;
-    }
-    if live.len() > wanted {
-        for (entity, _) in live.iter().skip(wanted) {
-            squad.members.retain(|member| member != entity);
-            squad.sent.retain(|(sent, _, _)| sent != entity);
-            commands.entity(*entity).despawn();
+    // One reconciliation per character, against that character's own count.
+    // Two independent numbers rather than a total and a ratio: `ally_count 8`
+    // has always meant eight Marios and still does, and asking for four Lunas
+    // beside them should not take any of the Marios away.
+    let live: Vec<(Entity, ActiveCharacter)> = allies
+        .iter()
+        .map(|(entity, character)| (entity, *character))
+        .collect();
+    // Where in the cluster the next arrival stands. Counted across both
+    // characters, so a Luna and a Mario are never put down in the same slot.
+    let mut placed = live.len();
+    for character in ActiveCharacter::ALL {
+        let wanted = match character {
+            ActiveCharacter::Luna => tuning.luna_count,
+            ActiveCharacter::Mario => tuning.ally_count,
         }
-        return;
-    }
-    let Ok(leader) = player.single() else {
-        return;
-    };
-    // New arrivals stand around the leader in the same cluster the squad uses
-    // to follow him, so a crowd summoned from the console is not a pile.
-    for index in live.len()..wanted {
-        let offset = slot(index, FOLLOW_SPACING * 1.5);
-        let x = leader.translation.x + offset.x;
-        let z = leader.translation.z + offset.y;
-        let y = level
-            .floor_height(Vec3::new(x, leader.translation.y + PLAYER_HEIGHT, z))
-            .unwrap_or(leader.translation.y);
-        let home = Vec3::new(x, y, z);
-        spawn_ally(&mut commands, &assets, home, index as f32 * GOLDEN_ANGLE);
+        .round() as usize;
+        let standing: Vec<Entity> = live
+            .iter()
+            .filter(|(_, kind)| *kind == character)
+            .map(|(entity, _)| *entity)
+            .collect();
+        if standing.len() > wanted {
+            for entity in standing.iter().skip(wanted) {
+                squad.members.retain(|member| member != entity);
+                squad.sent.retain(|(sent, _, _)| sent != entity);
+                commands.entity(*entity).despawn();
+                placed -= 1;
+            }
+            continue;
+        }
+        let Ok(leader) = player.single() else {
+            return;
+        };
+        // New arrivals stand around the leader in the same cluster the squad
+        // uses to follow him, so a crowd summoned from the console is not a
+        // pile.
+        for _ in standing.len()..wanted {
+            let offset = slot(placed, FOLLOW_SPACING * 1.5);
+            let x = leader.translation.x + offset.x;
+            let z = leader.translation.z + offset.y;
+            let y = level
+                .floor_height(Vec3::new(x, leader.translation.y + PLAYER_HEIGHT, z))
+                .unwrap_or(leader.translation.y);
+            let home = Vec3::new(x, y, z);
+            spawn_ally(
+                &mut commands,
+                &assets,
+                character,
+                home,
+                placed as f32 * GOLDEN_ANGLE,
+            );
+            placed += 1;
+        }
     }
 }
 
@@ -653,22 +707,25 @@ pub fn move_allies(
 /// Plays each ally's own clip, off the same tables the player uses.
 pub fn animate_allies(
     animations: Res<CharacterAnimations>,
-    allies: Query<&Ally>,
+    allies: Query<(&Ally, &ActiveCharacter)>,
     mut players: Query<(
         &AllyAnimationRoot,
         &mut AnimationPlayer,
         &mut AnimationTransitions,
     )>,
 ) {
-    if !animations.ready(ActiveCharacter::Mario) {
-        return;
-    }
     for (root, mut player, mut transitions) in &mut players {
-        let Ok(ally) = allies.get(root.0) else {
+        let Ok((ally, character)) = allies.get(root.0) else {
             continue;
         };
-        let (name, rate) = crate::animation::resolve(ActiveCharacter::Mario, &ally.state);
-        let Some(clip) = animations.named(ActiveCharacter::Mario, name) else {
+        // Asked per ally rather than once for the system: a field can hold
+        // Marios and Lunas at the same time, and one glTF finishing loading
+        // before the other must not hold up the half that is ready.
+        if !animations.ready(*character) {
+            continue;
+        }
+        let (name, rate) = crate::animation::resolve(*character, &ally.state);
+        let Some(clip) = animations.named(*character, name) else {
             continue;
         };
         // Through the shared applier rather than played here, so which clips
@@ -705,7 +762,12 @@ type CircleQuery<'w, 's> = Query<
 /// A flat annulus of unit outer radius, scaled to the circle's size when
 /// drawn. Built here rather than from a torus so the ring stays flat on the
 /// ground and its thickness stays proportional to how wide it has grown.
-fn ring_mesh() -> Mesh {
+///
+/// Shared with [`crate::stellarator`], which draws a machine's footprint with
+/// it. Two rings a player is asked to read while holding two different buttons
+/// should be visibly the same kind of mark, and one mesh is how that stays
+/// true.
+pub fn ring_mesh() -> Mesh {
     const SEGMENTS: usize = 64;
     const INNER: f32 = 0.94;
     let mut positions = Vec::with_capacity(SEGMENTS * 2);

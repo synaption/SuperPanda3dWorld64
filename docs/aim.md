@@ -1173,7 +1173,7 @@ What exists in this repo, and where the skeleton forced a different shape from t
 
 The rig
 
-The Hero's exported skeleton is flat. Rigify's DEF bones in TheHero.blend are driven by constraints rather than by parenting, so `export_def_bones` emits all 53 of them as children of `rig`: the arms are not under the shoulders, the shoulders are not under the spine, and the pelvis is a sibling of the thighs. No bone in the file turns the upper body.
+Luna's exported skeleton is flat. Rigify's DEF bones in Luna.blend are driven by constraints rather than by parenting, so `export_def_bones` emits all 53 of them as children of `rig`: the arms are not under the shoulders, the shoulders are not under the spine, and the pelvis is a sibling of the thighs. No bone in the file turns the upper body.
 
 Rebuilding the anatomical hierarchy above is not available. The clips hold one local transform per bone per frame, and re-expressing them under new parents means decomposing world matrices back into translation/rotation/scale, which the Rigify stretch bones make lossy -- their non-uniform scale leaves shear that a glTF TRS cannot hold. Measured over every clip and frame, it moves his fingertips by up to 315 mm.
 
@@ -1197,4 +1197,4 @@ Not built yet
 
 Upper/lower body subparts -- he still has no clip that would use them, and **this is the gap you will see first.** `WEAPON_SOCKET` now carries the target pistol, but there is no `rifle_idle` and no `rifle_fire`, so the hand holding it is in whatever pose the idle or the run left it in: down by his hip. `src/weapon.rs` works around that by cancelling the socket's rotation and pointing the gun down the aim itself, which puts the shot where the crosshair is and reads as hip firing rather than as a man taking aim. An authored pair of clips -- a gun idle and a gun fire, played on the upper body only -- is what fixes it properly, and it is a rig job rather than a code one.
 
-Still absent: distributed aim rotation, aim-offset poses and left-hand IK, all three of which need the Rigify DEF bones parented properly in `TheHero.blend` first. No melee hitboxes and no weapon sweep; the melee tracking curve is described above, but nothing reads it for hit detection, because the sword is still resolved on a timer.
+Still absent: distributed aim rotation, aim-offset poses and left-hand IK, all three of which need the Rigify DEF bones parented properly in `Luna.blend` first. No melee hitboxes and no weapon sweep; the melee tracking curve is described above, but nothing reads it for hit detection, because the sword is still resolved on a timer.

@@ -39,7 +39,7 @@ const PLAYER_REACH: f32 = 0.37;
 const TOUCH_MARGIN: f32 = 0.25;
 
 /// How far a swing reaches past the body it is aimed at. Wider than a touch on
-/// purpose: the Hero swings a sword, and a weapon that only hits what is already
+/// purpose: Luna swings a sword, and a weapon that only hits what is already
 /// standing on him is not a weapon.
 ///
 /// Past the *body*, like [`PLAYER_REACH`] and unlike its own first version. As a
@@ -288,7 +288,7 @@ fn sizes() -> &'static [Size; KINDS.len()] {
 /// Anything that did survive to change an actor's drawn size would show up in
 /// `the_sheets_agree_with_the_models_they_were_baked_from`, which checks this
 /// measurement against a sheet the renderer actually drew.
-fn measure(model: &str) -> Option<Size> {
+pub fn measure(model: &str) -> Option<Size> {
     let bytes = std::fs::read(crate::asset_path().join(model)).ok()?;
     // 12 bytes of header, then the JSON chunk's length and type.
     let length = u32::from_le_bytes(bytes.get(12..16)?.try_into().ok()?) as usize;
@@ -2140,7 +2140,7 @@ pub fn update(
     tuning: Res<GameTuning>,
     mut fixed_tick: Local<u32>,
 ) {
-    let Ok((hero, player)) = player.single() else {
+    let Ok((luna, player)) = player.single() else {
         return;
     };
     let player = player.translation;
@@ -2208,7 +2208,7 @@ pub fn update(
                     &mut aggro,
                     &mut wander,
                     quirk,
-                    hero,
+                    luna,
                     &tuning,
                     elapsed,
                     dt,
@@ -2817,7 +2817,7 @@ pub fn combat(
     mut player: Query<(Entity, &Transform, &mut Controller, &mut Health), With<Player>>,
     mut enemies: Query<(Entity, &Enemy, &Transform, &Detail, Option<&mut Health>), Without<Player>>,
 ) {
-    let Ok((hero, player_transform, mut controller, mut hero_health)) = player.single_mut() else {
+    let Ok((luna, player_transform, mut controller, mut luna_health)) = player.single_mut() else {
         return;
     };
     // The cooldown gates the whole resolution rather than only the damage.
@@ -2879,7 +2879,7 @@ pub fn combat(
             // Everything near enough to have seen that gets angrier at him for
             // it, which is the other half of why a squad can pull a fight off
             // him: he is on the same ledger they are.
-            threats.kill(hero, transform.translation);
+            threats.kill(luna, transform.translation);
             continue;
         }
         let reach = radius + PLAYER_REACH;
@@ -2912,7 +2912,7 @@ pub fn combat(
             } else {
                 sounds.push_at(Sfx::Hurt, transform.translation);
             }
-            threats.kill(hero, transform.translation);
+            threats.kill(luna, transform.translation);
             controller.velocity.y = BOUNCE_VELOCITY;
             controller.grounded = false;
             continue;
@@ -2922,7 +2922,7 @@ pub fn combat(
         controller.invulnerable_left = INVULNERABLE_SECONDS;
         // What it costs him depends on what touched him, which is the only
         // thing that makes one kind of enemy more dangerous than another.
-        hero_health.hurt(enemy.kind.damage());
+        luna_health.hurt(enemy.kind.damage());
         sounds.push(Sfx::Hurt);
         // One hit a tick: walking into a cluster of them costs one heart, not
         // one per enemy in the cluster.
@@ -5518,14 +5518,5 @@ mod tests {
             "the far enemy kept the skeleton the model spawned, so the next one \
              it is given will be its second"
         );
-    }
-
-    #[test]
-    #[ignore]
-    fn diagnose_spots() {
-        let (level, _) = crate::level::load();
-        for (i, at) in crowd_spots(6, &level).iter().enumerate() {
-            println!("{i}: {at:?}");
-        }
     }
 }

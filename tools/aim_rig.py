@@ -1,4 +1,4 @@
-"""Give the Hero's exported skeleton the runtime pivots docs/aim.md asks for.
+"""Give Luna's exported skeleton the runtime pivots docs/aim.md asks for.
 
 docs/aim.md wants an `AIM_TORSO` bone carrying no authored motion, so the game
 can turn the upper body toward the aim while the clips underneath keep playing,
@@ -6,7 +6,7 @@ and a `WEAPON_SOCKET` under the right hand for a weapon to hang off. Neither
 exists in the export, and neither can simply be added in Blender, because of
 what the export actually looks like:
 
-**The exported skeleton is flat.** Rigify's DEF bones in TheHero.blend are not
+**The exported skeleton is flat.** Rigify's DEF bones in Luna.blend are not
 parented to each other -- they are driven by constraints off the control rig --
 so `export_def_bones` has nothing to hang them from and every one of them comes
 out as a child of `rig`. The arms are not under the shoulders, the shoulders
@@ -19,7 +19,7 @@ them under a different parent means decomposing a world matrix back into
 translation/rotation/scale -- which the Rigify stretch bones make lossy, since
 their non-uniform scale leaves shear in the world matrix that a glTF TRS cannot
 hold. Measured over every clip and frame, rebuilding an anatomical hierarchy
-moves the Hero's fingertips by up to 315 mm. It is not a rounding error, it is
+moves Luna's fingertips by up to 315 mm. It is not a rounding error, it is
 a different animation.
 
 What *is* exact is inserting a pivot the clips never touch. A new node with no
@@ -52,9 +52,9 @@ Run last, after tools/lock_root_motion.py: locking reads the joints that have
 no parent among the joints, and afterwards the pelvis has one. It will refuse
 rather than mislock, which is the point of the ordering.
 
-    python3 tools/aim_rig.py assets/hero/hero.glb
+    python3 tools/aim_rig.py assets/luna/luna.glb
 
-tools/build_hero.py runs this as its final stage.
+tools/build_luna.py runs this as its final stage.
 """
 
 import argparse
@@ -304,7 +304,7 @@ def verify(before, after):
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("model", nargs="?", default=os.path.join(
-        os.path.dirname(HERE), "assets", "hero", "hero.glb"))
+        os.path.dirname(HERE), "assets", "luna", "luna.glb"))
     parser.add_argument("--out", default=None, help="defaults to in place")
     parser.add_argument("--no-verify", action="store_true",
                         help="skip re-deriving every frame of every clip")

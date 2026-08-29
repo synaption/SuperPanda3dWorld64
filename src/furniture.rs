@@ -54,6 +54,8 @@ pub struct Furniture {
     #[serde(default)]
     actors: Vec<ActorSpec>,
     #[serde(default)]
+    props: Vec<PropSpec>,
+    #[serde(default)]
     surfaces: Vec<SurfaceSpec>,
 }
 
@@ -98,8 +100,10 @@ struct PipeSpec {
     /// Which way it is turned, about the vertical, in radians.
     #[serde(default)]
     yaw: f32,
-    /// How big. `warp_pipe.glb` is 307 units across and a warp pipe is three
-    /// metres, so this is 0.01 unless somebody has resized one.
+    /// How big, as a multiple of the size the model is authored at -- so `1.0`
+    /// unless a level wants an unusual pipe. See [`pipe::MODEL`]: the warp pipe
+    /// is a three-metre warp pipe in its own file, which is what lets this mean
+    /// the plain thing rather than carrying the model's unit conversion.
     #[serde(default = "unscaled")]
     scale: f32,
 }
@@ -112,6 +116,39 @@ fn unscaled() -> f32 {
 struct ActorSpec {
     kind: Kind,
     at: [f32; 3],
+}
+
+/// A structure standing in the level: something built rather than something
+/// alive.
+///
+/// It carries the same three numbers a pipe does rather than the one an actor
+/// does, and for the same reason. Nothing about a stellarator is decided by its
+/// behaviour a tick after it appears -- it has none -- and its size is already
+/// something the game lets a player choose while holding the build button, so a
+/// level that says how big it wants one is saying a thing the game can hear.
+#[derive(Deserialize, Debug, Clone, Copy)]
+struct PropSpec {
+    kind: PropKind,
+    at: [f32; 3],
+    /// Which way it is turned, about the vertical, in radians.
+    #[serde(default)]
+    yaw: f32,
+    /// How big, as a multiple of the size the model is authored at.
+    #[serde(default = "unscaled")]
+    scale: f32,
+}
+
+/// What can be stood in a level that is not a creature and not a pipe.
+///
+/// Its own enum rather than a member of [`Kind`], because [`Kind`] is the list
+/// of things a *warp pipe can produce* -- and a pipe that throws a fusion
+/// reactor twelve metres across out of its mouth is not the feature anybody
+/// asked for. The two lists are separate so that adding to one does not offer
+/// the other something it cannot do.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PropKind {
+    Stellarator,
 }
 
 /// What can be placed, and what a pipe can produce.
@@ -149,6 +186,21 @@ pub struct Pipe {
     pub spawns: pipe::Spawn,
     pub interval: f32,
     pub at: Transform,
+}
+
+/// One structure, ready to spawn.
+///
+/// Its three numbers apart rather than gathered into a `Transform` the way
+/// [`Pipe`]'s are, because that is the shape [`crate::stellarator::spawn`]
+/// takes them in: a machine's scale is not only how big it is drawn but what
+/// its footprint is measured from, so it is a number the spawn reads rather
+/// than a row of a matrix it copies.
+#[derive(Debug, Clone, Copy)]
+pub struct Prop {
+    pub kind: PropKind,
+    pub at: Vec3,
+    pub yaw: f32,
+    pub scale: f32,
 }
 
 /// A drawn surface: a mesh in the .glb, and what makes it move.
@@ -247,6 +299,19 @@ impl Furniture {
             .collect()
     }
 
+    /// The structures standing in the level when it comes up.
+    pub fn props(&self) -> Vec<Prop> {
+        self.props
+            .iter()
+            .map(|p| Prop {
+                kind: p.kind,
+                at: point(p.at),
+                yaw: p.yaw,
+                scale: p.scale,
+            })
+            .collect()
+    }
+
     pub fn surfaces(&self) -> &[SurfaceSpec] {
         &self.surfaces
     }
@@ -274,28 +339,83 @@ mod tests {
 
     /// The placements this replaced were literals in `world.rs`, and the
     /// migration's whole claim is that the level did not move. A round trip
-    /// through Blender is where it would have: metres for centimetres, Y for
-    /// Z, or a spawn that ends up inside the castle wall.
+    /// through Blender is where it would: metres for centimetres, Y for Z, or a
+    /// spawn that ends up inside the castle wall.
+    ///
+    /// **What it does not do is pin where anything is.** It used to, and that
+    /// made dragging a warp pipe in Blender a failing test and a source edit --
+    /// which is the coupling the .blend was supposed to have broken. The
+    /// castle's furniture is the level designer's to move; what the game needs
+    /// is that every piece of it comes back in metres and lands on the castle.
     #[test]
-    fn the_castle_is_where_it_always_was() {
+    fn every_placement_lands_on_the_castle() {
         let castle = castle();
-        assert!((castle.spawn() - Vec3::new(-13.28, 3.0, 46.64)).length() < 1e-3);
-        let pipes = castle.pipes();
-        assert_eq!(pipes[0].spawns, pipe::Spawn::Mario);
-        assert!((pipes[0].at.translation - Vec3::new(-9.15, 2.6, 46.3)).length() < 1e-3);
-        assert!(pipes
+        let (collision, _) = crate::level::load();
+        let (low, high) = collision.bounds();
+        let mut placements = vec![("the spawn", castle.spawn())];
+        for pipe in castle.pipes() {
+            placements.push(("a pipe", pipe.at.translation));
+        }
+        for (_, at) in castle.actors() {
+            placements.push(("an actor", at));
+        }
+        for prop in castle.props() {
+            placements.push(("a machine", prop.at));
+        }
+        for &(what, at) in &placements {
+            assert!(
+                at.x > low.x && at.x < high.x && at.z > low.y && at.z < high.y,
+                "{what} at {at:?} is outside the castle's collision, {low:?}..{high:?}"
+            );
+            // Near the grounds rather than exactly on them. A designer may
+            // stand a pipe on a hillside or sink one into it, and an enemy
+            // dropped a little high or a little low walks to the floor in its
+            // first second. What is being caught here is an axis swapped on
+            // the way through Blender, which puts a placement tens of metres
+            // into the air or under the map.
+            let floor = collision
+                .floor_height(at + Vec3::Y * NEAR_GROUND)
+                .unwrap_or_else(|| panic!("{what} at {at:?} has no floor under it"));
+            assert!(
+                (at.y - floor).abs() < NEAR_GROUND,
+                "{what} at {at:?} is {} m from the floor at {floor}",
+                at.y - floor
+            );
+        }
+        // The castle grounds are a hundred and fifty metres across and the
+        // furniture is spread over them, so a file that came back in the
+        // decomp's centimetres collapses into a heap at the origin -- which is
+        // the one mistake the check above cannot see, every placement being
+        // near the floor at nought.
+        let spread = placements
             .iter()
-            .any(|pipe| pipe.spawns == pipe::Spawn::Enemy(enemy::Kind::Ant)
-                && (pipe.at.translation - Vec3::new(46.8, 5.4, -68.1)).length() < 1e-3));
-        // `warp_pipe.glb` is 307 units across and a warp pipe is three metres.
-        // The factor was a literal in `world.rs` until the .blend drew the
-        // pipe at it.
-        assert!((pipes[0].at.scale.x - 0.01).abs() < 1e-6);
-        // The moat, from the decomp's first water box.
-        let moat = castle.water_boxes()[0];
-        assert!((moat.min_x - -71.29).abs() < 1e-2 && (moat.max_x - 82.53).abs() < 1e-2);
-        assert!((moat.surface_y - -0.81).abs() < 1e-3);
+            .flat_map(|&(_, here)| placements.iter().map(move |&(_, there)| here.distance(there)))
+            .fold(0.0f32, f32::max);
+        assert!(spread > 50.0, "the whole level fits in {spread} m: wrong unit?");
+        // Nothing collides with a warp pipe, so its size is the level's to say
+        // and this is not pinned either -- but a pipe is a pipe, and the last
+        // time this went wrong it went wrong by a hundred.
+        for pipe in castle.pipes() {
+            let across = pipe.at.scale.x * enemy::measure(pipe::MODEL).map_or(3.0, |p| p.radius * 2.0);
+            assert!(
+                (1.0..12.0).contains(&across),
+                "a warp pipe {across} m across is not a warp pipe"
+            );
+        }
+        // The water is the decomp's, and both boxes have to be the right way
+        // up and big enough to swim in.
+        let water = castle.water_boxes();
+        assert_eq!(water.len(), 2, "the moat and the bay");
+        for box_ in water {
+            assert!(box_.max_x - box_.min_x > 1.0 && box_.max_z - box_.min_z > 1.0);
+            assert!(box_.surface_y < castle.spawn().y, "the spawn is under water");
+        }
     }
+
+    /// How far off the floor a placement may be and still be standing on the
+    /// castle: the probe starts this far above one, and this is the most it may
+    /// be out by in either direction.
+    const NEAR_GROUND: f32 = 4.0;
 
     /// A water box with its corners named the wrong way round is a box that
     /// contains nothing, and a plane in Blender can be dragged through itself
@@ -339,6 +459,43 @@ mod tests {
         )
         .expect("that should parse");
         assert_eq!(level.pipes()[0].at.scale, Vec3::ONE);
+    }
+
+    /// A machine standing in the level gets the whole transform a pipe does.
+    /// Its size is not decoration: `stellarator::footprint` measures what it
+    /// stands on from the same number, so a level that draws a small one has
+    /// placed a small one and not merely drawn one.
+    #[test]
+    fn a_machine_carries_the_turn_and_the_size_it_was_drawn_at() {
+        let level: Furniture = serde_json::from_str(
+            r#"{"level":"test","spawn":[0,0,0],"gravity":{"mode":"down"},
+                "props":[{"kind":"stellarator","at":[7,2,-3],
+                          "yaw":1.5707963,"scale":0.75}]}"#,
+        )
+        .expect("that should parse");
+        let prop = level.props()[0];
+        assert_eq!(prop.kind, PropKind::Stellarator);
+        assert!((prop.at - Vec3::new(7.0, 2.0, -3.0)).length() < 1e-4);
+        assert!((prop.yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+        assert!((prop.scale - 0.75).abs() < 1e-6);
+    }
+
+    /// A level file written before machines could be placed says nothing about
+    /// them, and must still parse -- and one that names a structure this game
+    /// does not have must not, for the reason a mistyped `spawns` must not.
+    #[test]
+    fn a_level_with_no_machines_is_a_level_with_no_machines() {
+        let bare: Furniture = serde_json::from_str(
+            r#"{"level":"test","spawn":[0,0,0],"gravity":{"mode":"down"}}"#,
+        )
+        .expect("that should parse");
+        assert!(bare.props().is_empty());
+        let error = serde_json::from_str::<Furniture>(
+            r#"{"level":"test","spawn":[0,0,0],"gravity":{"mode":"down"},
+                "props":[{"kind":"tokamak","at":[0,0,0]}]}"#,
+        )
+        .expect_err("that should not parse");
+        assert!(error.to_string().contains("tokamak"), "{error}");
     }
 
     /// The planet's gravity is not authored anywhere yet, but the format has

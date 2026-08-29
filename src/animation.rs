@@ -1,7 +1,7 @@
 //! Which clip each character plays, and how fast.
 //!
 //! Ported from `sm64py/hero/animations.py` and `sm64py/mario/animations.py`.
-//! Clips are looked up **by name** rather than by export index: the Hero's
+//! Clips are looked up **by name** rather than by export index: Luna's
 //! names are the Blender action names, spaces, capitals, trailing space and
 //! all -- `Idle ` really does end in a space -- and Mario's are `anim_XX`
 //! after the decomp's `MARIO_ANIM_*` hex id. Names are the source of truth in
@@ -18,7 +18,7 @@ use crate::{
 };
 use bevy::{animation::RepeatAnimation, gltf::Gltf, platform::collections::HashMap, prelude::*};
 
-// -- the Hero's clips, verbatim out of Blender ------------------------------
+// -- Luna's clips, verbatim out of Blender ------------------------------
 const IDLE: &str = "Idle ";
 const IDLE_VAR: &str = "idle var";
 const WALK: &str = "walk Var1";
@@ -67,8 +67,8 @@ const RUN_SPEED: f32 = 6.0;
 /// Divisor turning ground speed into a walk playback rate, so one cycle of the
 /// clip plays in exactly the time one stride covers and the feet stay planted.
 /// Measured per character: Mario's walk is 77 frames of a cartoon stride, the
-/// Hero's 40 frames of a human one, so they cannot share a number.
-const HERO_WALK_DIVISOR: f32 = 4.11;
+/// Luna's 40 frames of a human one, so they cannot share a number.
+const LUNA_WALK_DIVISOR: f32 = 4.11;
 const MARIO_WALK_DIVISOR: f32 = 3.30;
 
 /// The ground speed at which Mario's walk plays at its authored rate, and so
@@ -93,11 +93,11 @@ const SLIDE_COMPRESSION: f32 = 0.25;
 /// what a name resolves to.
 #[derive(Resource, Default)]
 pub struct CharacterAnimations {
-    hero: HashMap<String, AnimationNodeIndex>,
+    luna: HashMap<String, AnimationNodeIndex>,
     mario: HashMap<String, AnimationNodeIndex>,
-    hero_graph: Handle<AnimationGraph>,
+    luna_graph: Handle<AnimationGraph>,
     mario_graph: Handle<AnimationGraph>,
-    hero_source: Handle<Gltf>,
+    luna_source: Handle<Gltf>,
     mario_source: Handle<Gltf>,
 }
 
@@ -144,7 +144,7 @@ pub struct AllyAnimationRoot(pub Entity);
 impl CharacterAnimations {
     pub fn load(assets: &AssetServer) -> Self {
         Self {
-            hero_source: assets.load("hero/hero.glb"),
+            luna_source: assets.load("luna/luna.glb"),
             mario_source: assets.load("mario/mario.glb"),
             ..default()
         }
@@ -152,7 +152,7 @@ impl CharacterAnimations {
 
     fn clips(&self, character: ActiveCharacter) -> &HashMap<String, AnimationNodeIndex> {
         match character {
-            ActiveCharacter::Hero => &self.hero,
+            ActiveCharacter::Luna => &self.luna,
             ActiveCharacter::Mario => &self.mario,
         }
     }
@@ -166,7 +166,7 @@ impl CharacterAnimations {
     /// anything to it. An index is only a position in *this* graph.
     pub fn graph(&self, character: ActiveCharacter) -> Handle<AnimationGraph> {
         match character {
-            ActiveCharacter::Hero => self.hero_graph.clone(),
+            ActiveCharacter::Luna => self.luna_graph.clone(),
             ActiveCharacter::Mario => self.mario_graph.clone(),
         }
     }
@@ -187,11 +187,11 @@ pub fn resolve_clips(
     mut graphs: ResMut<Assets<AnimationGraph>>,
     mut animations: ResMut<CharacterAnimations>,
 ) {
-    if animations.hero.is_empty() {
-        if let Some(gltf) = gltfs.get(&animations.hero_source) {
+    if animations.luna.is_empty() {
+        if let Some(gltf) = gltfs.get(&animations.luna_source) {
             let (table, graph) = graph_of(gltf, &mut graphs);
-            animations.hero = table;
-            animations.hero_graph = graph;
+            animations.luna = table;
+            animations.luna_graph = graph;
         }
     }
     if animations.mario.is_empty() {
@@ -229,17 +229,17 @@ fn graph_of(
 /// Split out from the systems so the whole table is exercised without a
 /// renderer: this is the part that can point a character at the wrong clip.
 pub fn resolve(character: ActiveCharacter, state: &AnimationState) -> (&'static str, f32) {
-    let hero = character == ActiveCharacter::Hero;
+    let luna = character == ActiveCharacter::Luna;
     let clip = match state.motion {
         Motion::Idle if state.still_for > IDLE_VAR_AFTER => {
-            if hero {
+            if luna {
                 IDLE_VAR
             } else {
                 M_IDLE_VAR
             }
         }
         Motion::Idle => {
-            if hero {
+            if luna {
                 IDLE
             } else {
                 M_IDLE
@@ -248,35 +248,35 @@ pub fn resolve(character: ActiveCharacter, state: &AnimationState) -> (&'static 
         // Walk and run are one state in the port, chosen by speed here the
         // same way both source tables choose theirs.
         Motion::Run if state.speed > RUN_SPEED => {
-            if hero {
+            if luna {
                 RUN
             } else {
                 M_RUN
             }
         }
         Motion::Run => {
-            if hero {
+            if luna {
                 WALK
             } else {
                 M_WALK
             }
         }
         Motion::Jump => {
-            if hero {
+            if luna {
                 JUMP_RISE
             } else {
                 M_JUMP
             }
         }
         Motion::Fall => {
-            if hero {
+            if luna {
                 JUMP_FALL
             } else {
                 M_FALL
             }
         }
         Motion::Land => {
-            if hero {
+            if luna {
                 LAND
             } else {
                 M_LAND
@@ -288,36 +288,36 @@ pub fn resolve(character: ActiveCharacter, state: &AnimationState) -> (&'static 
         // coming back down is any other descent.
         Motion::Fly => {
             if state.rising {
-                if hero {
+                if luna {
                     JUMP_RISE
                 } else {
                     M_JUMP
                 }
-            } else if hero {
+            } else if luna {
                 JUMP_FALL
             } else {
                 M_FALL
             }
         }
-        // The Hero has no skate clip either, so he runs; the cadence below is
+        // Luna has no skate clip either, so he runs; the cadence below is
         // what sells it, since a skate is the one place where the ground is
         // meant to go by faster than the stride covers it.
         Motion::Skate => {
-            if hero {
+            if luna {
                 RUN
             } else {
                 M_SKATE
             }
         }
         Motion::Swim if state.speed > 0.5 => {
-            if hero {
+            if luna {
                 WALK
             } else {
                 M_SWIM
             }
         }
         Motion::Swim => {
-            if hero {
+            if luna {
                 IDLE
             } else {
                 M_WATER_IDLE
@@ -325,7 +325,7 @@ pub fn resolve(character: ActiveCharacter, state: &AnimationState) -> (&'static 
         }
         // Attacks alternate, so holding the button reads as a combo rather
         // than as one swing played twice.
-        Motion::Attack => match (hero, state.combo) {
+        Motion::Attack => match (luna, state.combo) {
             (true, 0) => ATTACK1,
             (true, _) => ATTACK2,
             (false, 0) => M_PUNCH1,
@@ -338,7 +338,7 @@ pub fn resolve(character: ActiveCharacter, state: &AnimationState) -> (&'static 
 /// Walk cycles are scaled by speed; everything else plays as authored.
 fn play_rate(character: ActiveCharacter, clip: &str, state: &AnimationState) -> f32 {
     let divisor = match (character, clip) {
-        (ActiveCharacter::Hero, WALK) => HERO_WALK_DIVISOR,
+        (ActiveCharacter::Luna, WALK) => LUNA_WALK_DIVISOR,
         (ActiveCharacter::Mario, M_WALK) => MARIO_WALK_DIVISOR,
         // Wading has no clip of its own and borrows the walk. Played slowly it
         // reads as pushing through water; tying it to speed as well would
@@ -449,11 +449,27 @@ pub fn claim_players(
     for (entity, mut player) in &mut players {
         let mut ancestor = entity;
         loop {
-            // Allies are checked before characters: an ally carries Mario's
-            // own marker, and the more specific owner has to win.
+            // Allies are checked before characters: an ally carries a
+            // character marker of its own, and the more specific owner has to
+            // win -- an ally is animated off its `Ally` state rather than off
+            // the player's.
+            //
+            // `try_insert` throughout, and it is a race rather than tidiness.
+            // This runs in `presentation`, and `world::switch` -- which
+            // despawns every Mario, every enemy and all their scenes -- runs in
+            // `overlay`. The two are separate `Update` sets with no order
+            // between them, so a player claimed here can be despawned before
+            // the claim is applied. A plain `insert` on it is an error the
+            // command queue raises out of `apply_deferred`, which is a panic
+            // with no system name on it in a windowed build. A scene that went
+            // away has nothing to claim, and saying so is the whole of the fix.
             if allies.contains(ancestor) {
-                commands.entity(entity).insert((
-                    AnimationOwner(ActiveCharacter::Mario),
+                commands.entity(entity).try_insert((
+                    // The ally's own character rather than Mario's: an ally is
+                    // whichever of the two the squad was filled with, and a
+                    // Luna claimed as a Mario would look its clips up in the
+                    // wrong table and stand still.
+                    AnimationOwner(characters.get(ancestor).copied().unwrap_or_default()),
                     AllyAnimationRoot(ancestor),
                     // The cross-fade between clips is this component's job now.
                     AnimationTransitions::new(),
@@ -463,7 +479,7 @@ pub fn claim_players(
             if let Ok(enemy) = enemies.get(ancestor) {
                 let (graph, node) = enemy_graphs.get_or_add(&enemy.animation, &mut graphs);
                 player.play(node).repeat();
-                commands.entity(entity).insert((
+                commands.entity(entity).try_insert((
                     crate::enemy::EnemyAnimationRoot {
                         owner: ancestor,
                         clip: node,
@@ -475,7 +491,7 @@ pub fn claim_players(
             if let Ok(character) = characters.get(ancestor) {
                 commands
                     .entity(entity)
-                    .insert((AnimationOwner(*character), AnimationTransitions::new()));
+                    .try_insert((AnimationOwner(*character), AnimationTransitions::new()));
                 break;
             }
             let Ok(parent) = hierarchy.get(ancestor) else {
@@ -503,9 +519,11 @@ pub fn attach_graphs(
         if !animations.ready(owner.0) {
             continue;
         }
+        // `try_insert` for [`claim_players`]'s reason: `world::switch` can
+        // despawn the scene this player is in between the query and the flush.
         commands
             .entity(entity)
-            .insert(AnimationGraphHandle(animations.graph(owner.0)));
+            .try_insert(AnimationGraphHandle(animations.graph(owner.0)));
     }
 }
 
@@ -578,7 +596,7 @@ mod tests {
 
     #[test]
     fn walking_becomes_running_with_speed() {
-        for character in [ActiveCharacter::Hero, ActiveCharacter::Mario] {
+        for character in [ActiveCharacter::Luna, ActiveCharacter::Mario] {
             let (slow, _) = resolve(character, &state(Motion::Run, 2.0));
             let (fast, _) = resolve(character, &state(Motion::Run, 12.0));
             assert_ne!(slow, fast, "{character:?} walks and runs the same clip");
@@ -587,11 +605,11 @@ mod tests {
 
     #[test]
     fn the_walk_rate_tracks_speed_but_stays_bounded() {
-        let slow = resolve(ActiveCharacter::Hero, &state(Motion::Run, 1.0)).1;
-        let brisk = resolve(ActiveCharacter::Hero, &state(Motion::Run, 5.0)).1;
+        let slow = resolve(ActiveCharacter::Luna, &state(Motion::Run, 1.0)).1;
+        let brisk = resolve(ActiveCharacter::Luna, &state(Motion::Run, 5.0)).1;
         assert!(brisk > slow, "the stride does not keep up: {slow} {brisk}");
         // Even at an absurd tuned speed the legs stay watchable.
-        let silly = resolve(ActiveCharacter::Hero, &state(Motion::Run, 400.0)).1;
+        let silly = resolve(ActiveCharacter::Luna, &state(Motion::Run, 400.0)).1;
         assert!((MIN_PLAY_RATE..=MAX_PLAY_RATE).contains(&silly), "{silly}");
     }
 
@@ -600,7 +618,7 @@ mod tests {
         // Only the walk is speed-scaled; a run scaled too would drift away
         // from how it looks in Blender.
         assert_eq!(
-            resolve(ActiveCharacter::Hero, &state(Motion::Run, 12.0)).1,
+            resolve(ActiveCharacter::Luna, &state(Motion::Run, 12.0)).1,
             1.0
         );
     }
@@ -624,16 +642,16 @@ mod tests {
     #[test]
     fn standing_still_long_enough_plays_the_fidget() {
         let mut idle = state(Motion::Idle, 0.0);
-        assert_eq!(resolve(ActiveCharacter::Hero, &idle).0, IDLE);
+        assert_eq!(resolve(ActiveCharacter::Luna, &idle).0, IDLE);
         idle.still_for = IDLE_VAR_AFTER + 1.0;
-        assert_eq!(resolve(ActiveCharacter::Hero, &idle).0, IDLE_VAR);
+        assert_eq!(resolve(ActiveCharacter::Luna, &idle).0, IDLE_VAR);
         // And the fidget plays once rather than looping.
         assert!(!loops(IDLE_VAR));
     }
 
     #[test]
     fn attacks_alternate_so_a_combo_reads_as_two_swings() {
-        for character in [ActiveCharacter::Hero, ActiveCharacter::Mario] {
+        for character in [ActiveCharacter::Luna, ActiveCharacter::Mario] {
             let mut attack = state(Motion::Attack, 0.0);
             let first = resolve(character, &attack).0;
             attack.combo = 1;
@@ -647,9 +665,9 @@ mod tests {
     fn thrust_holds_the_jump_and_falling_holds_the_descent() {
         let mut flying = state(Motion::Fly, 0.0);
         flying.rising = true;
-        assert_eq!(resolve(ActiveCharacter::Hero, &flying).0, JUMP_RISE);
+        assert_eq!(resolve(ActiveCharacter::Luna, &flying).0, JUMP_RISE);
         flying.rising = false;
-        assert_eq!(resolve(ActiveCharacter::Hero, &flying).0, JUMP_FALL);
+        assert_eq!(resolve(ActiveCharacter::Luna, &flying).0, JUMP_FALL);
     }
 
     /// The tables name clips by hand against two exporters, so this is what
@@ -658,7 +676,7 @@ mod tests {
     #[test]
     fn every_named_clip_exists_in_its_glb() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
-        let hero = clip_names(&root.join("hero/hero.glb"));
+        let luna = clip_names(&root.join("luna/luna.glb"));
         let mario = clip_names(&root.join("mario/mario.glb"));
         let motions = [
             Motion::Idle,
@@ -671,9 +689,9 @@ mod tests {
             Motion::Swim,
             Motion::Attack,
         ];
-        for character in [ActiveCharacter::Hero, ActiveCharacter::Mario] {
+        for character in [ActiveCharacter::Luna, ActiveCharacter::Mario] {
             let present = match character {
-                ActiveCharacter::Hero => &hero,
+                ActiveCharacter::Luna => &luna,
                 ActiveCharacter::Mario => &mario,
             };
             for motion in motions {

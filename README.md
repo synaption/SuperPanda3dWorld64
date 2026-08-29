@@ -1,14 +1,24 @@
-# Super Bevy World 64
+# Space Crusaders
 
 A native Rust/Bevy game and research project that combines a reconstructed
-Super Mario 64 castle grounds with two playable movement systems. Play as the
-Hero, with original traversal and combat moves, or switch to Mario to compare
+Super Mario 64 castle grounds with two playable movement systems. Play as
+Luna, with original traversal and combat moves, or switch to Mario to compare
 against the ported SM64 physics on the same level.
 
 The current build includes the castle grounds, water, enemies, warp pipes, a
-Mario squad, sound effects, a third-person aiming camera, keyboard/mouse and
-gamepad input, a pause menu with level selection and display settings, and a
-debug console.
+squad you can fill with Marios or with AI Lunas, stellarators you build and a
+pylon network you plant to carry their power across the map, sound effects, a
+third-person aiming camera, keyboard/mouse and gamepad input, a pause menu with
+level selection and display settings, and a debug console.
+
+Hold `B` to grow a stellarator on the ground you are looking at, and `G` to
+plant a pylon. Pylons string beams to every mast within reach that they can
+see, and power floods out from the machines along them; `pylon 5` in the
+console puts a whole ring of them down at once. The network's graph search is
+the crowd's — `src/route.rs` holds both the breadth-first flood the flow field
+sweeps the castle with and the travelling-salesman tour the supply packet makes
+its rounds on. See
+[Machines and the pylon network](docs/project-guide.md#machines-and-the-pylon-network).
 
 There is a second level, and it is round. The pause menu's **Level** page also
 offers the generated planet from
@@ -62,7 +72,7 @@ guides, controls, asset workflows, and design notes.
 - [Project guide](docs/project-guide.md) — gameplay systems, controls,
   architecture, and porting notes.
 - [Asset pipeline](docs/pipeline.md) — what is bundled under `assets/`, how to
-  regenerate it, and the actor and Hero export workflows.
+  regenerate it, and the actor and Luna export workflows.
 - [Aiming and attack animation design](docs/aim.md) — the proposed
   partial-body animation and procedural aiming approach.
 
@@ -103,4 +113,9 @@ The presentation of the game should be like a "recomp" of a fictional N64/PSX ga
 Gearbits - indie AC + bugs
 Megaton Musashi W: Wired - terrain
 dysonsphere project - interplanetary RTS.  
+Perimeter - pylons
 
+PBR materials
+- git@github.com:Kimbatt/cc0-textures.git
+- https://github.com/NVIDIA-Omniverse/PhysicalAI-SimReady-Materials
+- https://github.com/texturedesign/materials-dataset

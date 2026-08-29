@@ -1,6 +1,6 @@
 """Lock a clip's horizontal travel so the controller owns the character's position.
 
-The Hero's clips were authored on a stage rather than on the spot, and it shows
+Luna's clips were authored on a stage rather than on the spot, and it shows
 in the exported data: measured at the spine, `Idle ` sits at the origin, the run
 cycles start 0.68 units forward of it, and `Attack 2` starts 0.83 forward and
 lunges another 0.85 during the swing. At the game's scale that is a couple of
@@ -24,8 +24,8 @@ amount, so the body keeps its shape; everything below a root moves with its
 parent already.
 
 Usage:
-    python3 tools/lock_root_motion.py assets/hero/hero.glb
-    python3 tools/lock_root_motion.py assets/hero/hero.glb --reference DEF-spine
+    python3 tools/lock_root_motion.py assets/luna/luna.glb
+    python3 tools/lock_root_motion.py assets/luna/luna.glb --reference DEF-spine
 """
 
 import argparse

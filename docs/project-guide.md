@@ -13,7 +13,7 @@ The project combines elements of different old N64 games, taken from their
 decomps, for research. It starts with Super Mario 64 — the castle grounds, and
 Mario's motion system as reconstructed by the Render96 recomp.
 
-The character you play is **the Hero**, a rigged model with twenty
+The character you play is **Luna**, a rigged model with twenty
 hand-authored clips of his own. He is not Mario in a different costume: rather
 than retarget Mario's 209 animations onto him, he has his own action machine
 built around the moves he actually has — walk, run, jump, a two-hit sword
@@ -22,7 +22,7 @@ What he shares with Mario is everything below the neck: the same level, the
 same collision, the same quarter-step movement, and the same 30 Hz tick.
 
 Mario is still here. He wanders the field as an NPC, **F2** hands control back
-to him at wherever the Hero is standing, and the field can be filled with more
+to him at wherever Luna is standing, and the field can be filled with more
 of him as a squad. Keeping him is what makes the two movement systems directly
 comparable over the same ground.
 
@@ -72,8 +72,8 @@ The script adds the `x86_64-pc-windows-gnu` standard library through rustup if
 it is missing, regenerates the level blob, and produces:
 
 ```text
-dist/windows/SuperBevyWorld64.exe
-dist/SuperBevyWorld64-windows-x64.zip
+dist/windows/SpaceCrusaders.exe
+dist/SpaceCrusaders-windows-x64.zip
 ```
 
 The ZIP includes the runtime GLB assets and is the file to copy to Windows.
@@ -131,12 +131,14 @@ once and neither has to be selected.
 | Look | mouse, or `Q` / `E` | right stick |
 | Jump (booster take-off while skating) | `Space` | south (A) |
 | Attack: swing the sword, or fire the gun | Left Shift or left mouse | east (B) |
-| Skate on the ground, fly in the air (Hero) | hold `V` | hold north (Y) or left trigger |
+| Skate on the ground, fly in the air (Luna) | hold `V` | hold north (Y) or left trigger |
 | Aim | hold `F` or right mouse | right trigger |
 | Switch weapon (sword / pistol) | `Y` | left shoulder |
 | Recenter camera | `R` | right shoulder |
 | Squad: hold to whistle, tap to send | `X` | west (X) |
-| Switch Hero/Mario in place | `F2` | Start |
+| Build a stellarator: hold to grow it, tap for the smallest | `B` | Select |
+| Plant a pylon: hold to open a site, release to plant | `G` | right stick click |
+| Switch Luna/Mario in place | `F2` | Start |
 | Pause menu (pauses the simulation) | `Escape` | Select |
 | Tuning console (pauses the simulation) | `` ` `` | — |
 | Debug text | `F1` | — |
@@ -173,12 +175,30 @@ twice on a slow frame and swallow it on a fast one. Presses are recorded once
 per frame in `src/input.rs` and consumed by the step that acts on them, so an
 edge fires exactly once whenever that step happens to run.
 
-**Quirks are kept deliberately.** Collision queries take the *first* triangle
-in list order that passes rather than the best one, which reproduces surface
-cucking, where a lower triangle shadows a higher one. Wall pushback tests every
-wall against the entry position while accumulating the output, so overlapping
-walls each push by their full amount. These are not bugs to fix; changing any
-of them changes how the game plays.
+**The original's collision quirks are not kept.** They were, once: floor
+queries took the first triangle in list order that passed rather than the best
+one, and wall pushback applied each wall's full shove as it was found. Both
+made where a body ended up a function of the order the level mesh happened to
+be built in. `LevelData::resolve_walls` now measures every overlap in a pass
+against the same starting position and combines them deepest first, and the
+body it measures is a real capsule tested against the whole of each triangle
+rather than three sample spheres strung along a line — so a wall that meets a
+body between two of those spheres is a wall it is pushed out of.
+`wall_resolution_does_not_depend_on_triangle_order` is the test that says
+shuffling the mesh moves nobody, and
+`wall_resolution_clears_a_wall_the_middle_of_the_body_meets` is the one that
+says the parapet at waist height is solid.
+
+A capsule is not a column, and the difference is what a body is pushed by. Each
+contact is asked how far apart the two have to be *horizontally* given how far
+apart they already are vertically — `sqrt(radius² - climb²)` — so a face level
+with the body pushes by the whole radius, and one a radius or more above its
+head or below its feet does not push at all. Leaving that out put invisible
+walls on the bridges: a moat face five metres under the deck sits almost
+directly beneath the edge you walk along, which is no horizontal distance at
+all, and a body clear of it by five metres was being shoved a metre and a half
+sideways. `a_face_below_the_deck_is_not_a_wall_on_it` is the test that says it
+is not.
 
 **Distances are the original's, converted.** The port works at 1/100 of SM64's
 scale, so a constant that reads 8 units per frame in the decomp is 2.4 units a
@@ -358,7 +378,7 @@ shut is what low-passes it.
 
 ## Animation
 
-Clips are chosen **by name** rather than by export index. The Hero's names are
+Clips are chosen **by name** rather than by export index. Luna's names are
 the Blender action names — spaces, capitals, trailing space and all; `Idle `
 really does end in a space — and Mario's are `anim_XX` after the decomp's
 `MARIO_ANIM_*` hex id. Names are what both exporters guarantee, and an index
@@ -400,11 +420,11 @@ in open air looking down through it, and tinting the world in that case looks
 wrong.
 
 Deep water is not one behaviour, because the two characters do not have the
-same clips. Mario swims. The Hero does not: he has no swimming animation, so
+same clips. Mario swims. Luna does not: he has no swimming animation, so
 rather than drag a walk cycle through the water he is held just under the
 surface, slowed to 0.45 of his walk, and drawn upright. Water shallower than he
 floats in is simply slow ground: the bottom is under his feet and he walks
-along it. `hero_wade` in the console is the speed.
+along it. `luna_wade` in the console is the speed.
 
 ## Day and night
 
@@ -468,7 +488,7 @@ identically with no device present and the whole of it stays testable headless.
 
 Each event resolves to a stack of layers that play together, which is what SM64
 itself does for a jump — a terrain sound from the ground and a voice from
-Mario. The Hero speaks with the Zelda voice set and steps with its effect set;
+Mario. Luna speaks with the Zelda voice set and steps with its effect set;
 Mario uses samples imported from an extracted asset tree, because the decomp
 ships a sound taxonomy and no waveforms. Jump, landing, footfalls, attacks,
 taking damage, defeating an enemy, breaking the water surface, and swim strokes
@@ -504,9 +524,9 @@ asserts the file is in the repository — which is what catches a typo or a
 sample renamed out from under them. `build_windows.sh` reads the same names out
 of the source to decide what to package.
 
-## The Marios
+## The squad
 
-The field is full of Marios, and they are the squad. One button carries two
+The field is full of allies, and they are the squad. One button carries two
 commands, told apart by how long it is held: **held**, a circle grows on the
 ground where the view is pointing and everyone inside it when the button comes
 up joins and follows; **tapped**, the squad it already has is sent to the spot
@@ -537,6 +557,57 @@ a step rather than a crowd milling around.
 `ally_count` in the console is the population, reconciled live — set it to 60
 and the lawn fills; set it to 0 and it clears. The Mario pipe's own brood is
 not in that count and stays when the lawn is cleared.
+
+**Luna is AI-playable too.** An ally is a character rather than a Mario: the
+same two the player switches between with `F2` are the two the squad can be
+filled with, and `luna_count` is the second population beside `ally_count`. An
+AI Luna is the same model at the same scale as the one the player drives —
+both come out of `ActiveCharacter::model`, so there is one place either is
+named — animating off Luna's own clip table and fighting under the same rules.
+What differs is what she is worth: an ally Luna carries the player's hundred
+points of health against a Mario's twenty, which is what makes filling the
+field with one or the other a decision rather than a colour choice. Two counts
+rather than a share of one, so asking for Lunas never quietly takes Marios
+away.
+
+## Machines and the pylon network
+
+Two things you build, on two keys, aimed the same way the squad is ordered —
+the ray out of the middle of the screen, marched until it meets ground.
+
+**A stellarator** (`B`) is the thing that makes power. Hold the key and a
+footprint ring opens on the ground and the machine grows inside it up to the
+size it was authored at; let go and it is built, unless the ring is red, which
+means another machine is already standing there. What is drawn inside its coils
+is not the plasma mesh in the glTF — that is hidden as it arrives — but sixty-
+four streaks riding the same flux surface the mesh describes. See
+`src/stellarator.rs`.
+
+**A pylon** (`G`) is how that power gets anywhere. Each mast strings a beam to
+every other mast within 42 m that it can see, head to head against the level's
+own collision — a beam eight metres up clears a hedge a walker would have to go
+round — and power floods outward from whatever machine can reach a mast at all.
+The ring under the crosshair says which of three things the site is: red for
+blocked by something already standing, amber for legal but joined to nothing,
+cyan for legal and wired in. A live mast breathes and its beams are lit; a dark
+one stands still. Standing near a live mast fills the jetpack bar four times
+faster, which is the reason to push a network outward rather than ring the
+machine with masts and stop.
+
+The network shares its algorithms with the pathing rather than having its own.
+`src/route.rs` holds both: `flood`, the breadth-first walk that spreads power
+from mast to mast and that `flow::rebuild` sweeps the castle with to tell a
+crowd of thousands which way the player is, and `tour`, a nearest-neighbour
+travelling-salesman walk improved by 2-opt. The tour is what decides the order
+the supply packet — the mote of light you can watch crossing the beams — calls
+at every live mast in, and each leg between two calls is expanded into the
+shortest chain of real beams by the same flood, so the packet never flies
+through a hillside on its way to the next stop.
+
+`pylon 5` in the console plants a ring of masts around the player with a
+machine in the middle of it, and `pylon clear` takes them away: the same reason
+`crowd` exists, which is that the interesting thing about a network is what it
+does at a size nobody wants to build by hand. See `src/pylon.rs`.
 
 ## Billboards
 
@@ -926,7 +997,7 @@ which every one of those constants comfortably cleared. The authored ant is
 **5 m across**, and at that size the absolute numbers are all *inside* it: a
 Mario was ordered to stand 1.3 m within an ant's body, and the player's sword —
 2.2 m — could not reach an ant that `spread` correctly held 3.27 m away, so the
-Hero could not hit one at all. Measured on a settled field of 200, worst
+Luna could not hit one at all. Measured on a settled field of 200, worst
 overlap: Mario/enemy 1.72 m and Mario/Mario 0.52 m before, **0.00 m** for both
 after, with three pairs of the two hundred in light contact.
 
@@ -1172,6 +1243,6 @@ Still to port:
   when the scuttlebug was fifteen mesh primitives and nine materials for
   seventy-six triangles. Replacing both decomp enemies with authored art took
   most of it already — a slime is two primitives and an ant is one — so what is
-  left of the idea belongs to Mario and the Hero rather than to the enemies.
+  left of the idea belongs to Mario and Luna rather than to the enemies.
 
 See `next.md` for what is wanted next.

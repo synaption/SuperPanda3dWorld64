@@ -1,4 +1,4 @@
-//! What the Hero is holding, and what happens when he pulls the trigger.
+//! What Luna is holding, and what happens when he pulls the trigger.
 //!
 //! `docs/aim.md` sketches a `WeaponController` and lists the two ways a ranged
 //! weapon can resolve -- "Projectile / hitscan" -- without picking one. Both are
@@ -15,7 +15,7 @@
 //! that joint, so the hand carries it for free and there is no per-frame
 //! position to compute and no frame of lag in it.
 //!
-//! Its rotation is another matter. The Hero has no clip that holds a gun --
+//! Its rotation is another matter. Luna has no clip that holds a gun --
 //! `docs/aim.md`'s "Not built yet" says so, and authoring one is a rig job
 //! rather than a code one -- so the hand it is attached to is in whatever pose
 //! the idle or the run put it in, which is by his side pointing at the floor. A
@@ -32,14 +32,14 @@
 //!
 //! ## Where the shot comes from
 //!
-//! The muzzle, not the camera. `assets/hero/target_pistol.blend` carries a
+//! The muzzle, not the camera. `assets/weapons/target_pistol.blend` carries a
 //! `MUZZLE` empty at the end of the bore -- one of the four things
 //! `notes4LLMs.md` asks every weapon .blend to include -- and it survives the
 //! glTF export as an ordinary childless node, so the runtime finds it by name
 //! and reads its `GlobalTransform`. Shots are then aimed at [`aim::Aim::point`]
 //! rather than fired along the muzzle's own forward, so they converge on what
 //! the crosshair is over instead of running parallel to it and missing
-//! everything by the width of the Hero's shoulders.
+//! everything by the width of Luna's shoulders.
 
 use crate::{
     aim::Aim,
@@ -123,7 +123,7 @@ pub struct Spec {
     /// What it is called in the HUD.
     pub name: &'static str,
     /// The glTF held in the hand, where the weapon has a model. The sword does
-    /// not: it is part of the Hero's own mesh, sheathed on his back.
+    /// not: it is part of Luna's own mesh, sheathed on his back.
     pub model: Option<&'static str>,
     /// How the shot resolves, or `None` for a melee weapon, which is resolved
     /// by `enemy::combat` off the swing instead.
@@ -132,7 +132,7 @@ pub struct Spec {
     pub interval: f32,
 }
 
-/// What the Hero can be carrying.
+/// What Luna can be carrying.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Weapon {
     /// The sword, swung by `player::movement` and resolved by `enemy::combat`.
@@ -164,7 +164,7 @@ impl Weapon {
             },
             Weapon::Pistol => Spec {
                 name: "pistol",
-                model: Some("hero/target_pistol.glb#Scene0"),
+                model: Some("weapons/target_pistol.glb#Scene0"),
                 // Hitscan by default -- a target pistol is the one gun that
                 // should never be leading its target. `gun_projectile` on the
                 // console swaps it, which is how the other path stays honest
@@ -197,7 +197,7 @@ impl Weapon {
     }
 }
 
-/// What the Hero is carrying, and how long until it will fire again.
+/// What Luna is carrying, and how long until it will fire again.
 #[derive(Resource, Debug, Default)]
 pub struct Loadout {
     pub equipped: Weapon,
@@ -339,7 +339,7 @@ pub fn equip(mut console: ResMut<crate::console::ConsoleState>, mut loadout: Res
 /// Points the held weapon down the aim, and shows only the one in hand.
 ///
 /// The scale is put back as well as the rotation, and that is not tidiness. The
-/// socket's world scale is the Hero's own 0.81 times whatever the Rigify stretch
+/// socket's world scale is Luna's own 0.81 times whatever the Rigify stretch
 /// bones are doing to the arm this frame, and a pistol authored at 0.32 m in the
 /// .blend has to come out 0.32 m long in the world whatever the elbow is up to.
 /// Cancelling it here is what keeps the size question answered in the .blend --
@@ -388,7 +388,7 @@ pub fn carry(
 /// Aimed at the point the camera's ray landed on rather than along the muzzle's
 /// own forward, so a gun held off to one side still puts its shot on the
 /// crosshair. If that point is behind the muzzle -- the camera's ray hit a wall
-/// between the eye and the Hero -- there is nothing sensible to converge on and
+/// between the eye and Luna -- there is nothing sensible to converge on and
 /// the aim direction is used unchanged.
 pub fn lay(muzzle: Vec3, aim: &Aim) -> (Vec3, Vec3) {
     let toward = aim.point - muzzle;
@@ -594,8 +594,8 @@ pub fn fire(
                 // a crowd from cover still earns their attention, or a gun
                 // would be a way of killing things that never look up.
                 sounds.push_at(Sfx::Defeat, landed);
-                if let Ok((hero, _)) = player.single() {
-                    threats.kill(hero, landed);
+                if let Ok((luna, _)) = player.single() {
+                    threats.kill(luna, landed);
                 }
             }
             if let Some(assets) = assets {
@@ -704,8 +704,8 @@ pub fn fly(
             // A tick behind the rest -- this runs after `enemy::alert` -- which
             // is a thirtieth of a second between a bullet landing and the crowd
             // minding about it.
-            if let Ok(hero) = player.single() {
-                threats.kill(hero, landed);
+            if let Ok(luna) = player.single() {
+                threats.kill(luna, landed);
             }
             // The round is spent whether or not it finished what it hit: it
             // stops at the first body on its line either way.
@@ -835,13 +835,13 @@ mod tests {
     #[test]
     fn a_drained_bar_takes_the_gun_out_of_service() {
         let (mut world, enemy) = range(Weapon::Pistol, 8.0);
-        let hero = world
+        let luna = world
             .query_filtered::<Entity, With<Player>>()
             .single(&world)
             .expect("no player on the range");
         // Flown to nothing, which is the only way into a lockout.
         {
-            let mut energy = world.get_mut::<crate::energy::Energy>(hero).unwrap();
+            let mut energy = world.get_mut::<crate::energy::Energy>(luna).unwrap();
             while energy.thrust(crate::player::FIXED_DT) {}
             assert!(energy.drained());
         }
@@ -857,10 +857,10 @@ mod tests {
             "the press was latched rather than spent, and will fire itself later"
         );
         // Full again, and the gun is back with it.
-        world.get_mut::<crate::energy::Energy>(hero).unwrap().level = 1.0;
+        world.get_mut::<crate::energy::Energy>(luna).unwrap().level = 1.0;
         for _ in 0..2 {
             world
-                .get_mut::<crate::energy::Energy>(hero)
+                .get_mut::<crate::energy::Energy>(luna)
                 .unwrap()
                 .advance(crate::player::FIXED_DT);
         }
@@ -1177,7 +1177,7 @@ mod tests {
         );
     }
 
-    /// A camera ray that hit a wall between the eye and the Hero leaves an aim
+    /// A camera ray that hit a wall between the eye and Luna leaves an aim
     /// point *behind* the muzzle, and firing backwards at it would be worse
     /// than ignoring it.
     #[test]

@@ -1,6 +1,6 @@
 # Documentation wiki
 
-This wiki contains the detailed documentation for Super Bevy World 64. Start
+This wiki contains the detailed documentation for Space Crusaders. Start
 with the page that matches what you want to do:
 
 ## Getting started
@@ -23,10 +23,15 @@ with the page that matches what you want to do:
 - [Gravity](project-guide.md#gravity) — flat down, down towards the middle of a
   planet, and what had to change to have both.
 - [Timing and the port](project-guide.md#timing-and-the-port) — the fixed 30 Hz
-  tick, latched input, and the original quirks kept on purpose.
+  tick, latched input, and the original collision quirks that are deliberately
+  *not* kept.
 - [Water](project-guide.md#water) — the surface sheets, the underwater view,
   and why the two characters treat deep water differently.
-- [The Marios](project-guide.md#the-marios) — squad selection and commands.
+- [The squad](project-guide.md#the-squad) — selection, commands, and filling
+  the field with AI Lunas as well as Marios.
+- [Machines and the pylon network](project-guide.md#machines-and-the-pylon-network)
+  — building stellarators, planting pylons, and the graph search the network
+  shares with the crowd's pathing.
 - [Warp pipes](project-guide.md#warp-pipes) — what each produces, and the arc
   it is thrown out on.
 - [Combat](project-guide.md#combat) — hit resolution and the immunity window.
@@ -41,11 +46,11 @@ with the page that matches what you want to do:
 - [Project guide](project-guide.md) — the complete technical reference,
   including project layout, architecture, and porting notes.
 - [Asset pipeline](pipeline.md) — what is committed under `assets/`, how to
-  regenerate it, and the actor and Hero export workflows.
+  regenerate it, and the actor and Luna export workflows.
 - [Assets and provenance](pipeline.md#what-is-committed) — what is bundled,
   where it came from, and the notice to read before publishing.
 - [Exporting actors](pipeline.md#exporting-actors) and
-  [Exporting the Hero](pipeline.md#exporting-the-hero) — the two export paths
+  [Exporting Luna](pipeline.md#exporting-the-luna) — the two export paths
   and why each step exists.
 - [Bevy 0.19 upgrade notes](bevy-0.19-upgrade.md) — what the engine upgrade
   changed and what it broke.

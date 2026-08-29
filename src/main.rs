@@ -1,6 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-//! Super Bevy World 64.
+//! Space Crusaders.
 //!
 //! Comments throughout cite paths under `app/` and `sm64py/`. Those are the
 //! Panda3D implementation this game was ported from, which was removed once
@@ -28,12 +28,15 @@ mod menu;
 mod n64;
 mod pipe;
 mod player;
+mod pylon;
+mod route;
 mod shadow;
 mod shot;
 mod sky;
 #[cfg(feature = "spike")]
 mod spike;
 mod squad;
+mod stellarator;
 mod water;
 mod weapon;
 mod world;
@@ -64,11 +67,57 @@ struct GameState {
     debug: bool,
 }
 
+/// Who is on screen: the one the player is driving, and -- since an ally is a
+/// character too -- who each of the squad is.
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
-enum ActiveCharacter {
+pub enum ActiveCharacter {
     #[default]
-    Hero,
+    Luna,
     Mario,
+}
+
+impl ActiveCharacter {
+    /// Both playable characters, for anything that has to do a thing per
+    /// character rather than for the one in hand.
+    pub const ALL: [ActiveCharacter; 2] = [ActiveCharacter::Luna, ActiveCharacter::Mario];
+
+    /// The scene this character is drawn from, and the scale it is drawn at.
+    ///
+    /// One place rather than four. The player's two visuals, the squad's
+    /// allies and anything else that ever puts a character in the world all
+    /// ask here, so a Luna the AI is driving is the same model at the same
+    /// size as the Luna the player drives -- and re-exporting either model at
+    /// a different size is one edit.
+    ///
+    /// The scales are the models', not a style choice: Luna's glTF is authored
+    /// a little over life size and Mario's is in SM64 units, which are a
+    /// hundred to the metre.
+    pub fn model(self) -> (&'static str, f32) {
+        match self {
+            ActiveCharacter::Luna => ("luna/luna.glb#Scene0", 0.81),
+            ActiveCharacter::Mario => ("mario/mario.glb#Scene0", 0.00667),
+        }
+    }
+
+    /// How much punishment one of these takes as an ally.
+    ///
+    /// Luna is the character the game is balanced around and it shows: an AI
+    /// Luna is worth five Marios in a fight, which is what makes the choice of
+    /// who to fill the field with a choice at all.
+    pub fn ally_health(self) -> i32 {
+        match self {
+            ActiveCharacter::Luna => health::PLAYER_HEALTH,
+            ActiveCharacter::Mario => health::MARIO_HEALTH,
+        }
+    }
+
+    /// What to call one of these in the console and the HUD.
+    pub fn name(self) -> &'static str {
+        match self {
+            ActiveCharacter::Luna => "Luna",
+            ActiveCharacter::Mario => "Mario",
+        }
+    }
 }
 
 #[derive(Component)]
@@ -98,7 +147,7 @@ fn log_panics_to_a_file() {
         if let Some(path) = &log {
             use std::io::Write;
             if let Ok(mut file) = std::fs::File::create(path) {
-                let _ = writeln!(file, "Super Bevy World 64 stopped with:\n\n{info}");
+                let _ = writeln!(file, "Space Crusaders stopped with:\n\n{info}");
             }
         }
         previous(info);
@@ -165,7 +214,7 @@ fn register_world_asset_types(app: &mut App) {
 /// other two pools, so a small machine gets fewer than this and only a large
 /// one is held back to it. `COMPUTE_THREADS` overrides it for measuring:
 ///
-///   COMPUTE_THREADS=8 ./SuperBevyWorld64.exe
+///   COMPUTE_THREADS=8 ./SpaceCrusaders.exe
 const COMPUTE_THREADS: usize = 4;
 
 fn task_pool_options() -> TaskPoolOptions {
@@ -284,7 +333,7 @@ fn main() {
             })
             .set(WindowPlugin {
                 primary_window: Some(Window {
-                    title: "Super Bevy World 64".into(),
+                    title: "Space Crusaders".into(),
                     // Borderless rather than exclusive fullscreen: it takes
                     // the monitor's own resolution and refresh rate instead
                     // of asking for a mode switch, so alt-tabbing away and
@@ -344,7 +393,7 @@ pub fn add_game(app: &mut App) {
 pub fn game_resources(app: &mut App) {
     app.insert_resource(ClearColor(water::SKY_COLOUR))
         .insert_resource(GameState {
-            active: ActiveCharacter::Hero,
+            active: ActiveCharacter::Luna,
             aiming: false,
             debug: true,
         })
@@ -359,6 +408,11 @@ pub fn game_resources(app: &mut App) {
         .init_resource::<animation::EnemyGraphs>()
         .init_resource::<squad::Squad>()
         .init_resource::<squad::Whistle>()
+        .init_resource::<stellarator::Build>()
+        // The pylon network and the key that plants one. Beside the machine's
+        // build state because they are the same control in a different hand.
+        .init_resource::<pylon::Plant>()
+        .init_resource::<pylon::Network>()
         .init_resource::<menu::MenuState>()
         .init_resource::<display::DisplaySettings>()
         .init_resource::<display::FramePacing>()
@@ -474,7 +528,12 @@ fn input_pipeline() -> ScheduleConfigs<ScheduleSystem> {
 /// said. Initialising these in a test turns that into a failing assertion.
 fn simulation() -> ScheduleConfigs<ScheduleSystem> {
     (
-        player::movement,
+        // Nested rather than two more entries: Bevy's system tuples stop at
+        // twenty. `pylon::supply` runs straight after the step that moved him,
+        // so the bar he is filling is filled against where he is now rather
+        // than where he was. It only ever adds, so its place in the tick is a
+        // matter of which pylon it measures against and nothing else.
+        (player::movement, pylon::supply).chain(),
         // Before anything that reads it. The field is what the crowd tier
         // navigates by, and one built from last tick's player position would
         // send two thousand enemies a step behind him.
@@ -538,6 +597,14 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
         animation::update,
         squad::whistle,
         squad::animate_allies,
+        // The build button and the plasma it draws, and then the pylons.
+        // Beside the whistle because it is the same control in a different
+        // hand: one aim, one hold, one release. Nested because Bevy's system
+        // tuples stop at twenty, and chained because the pylons follow the
+        // machines rather than lead them -- a network rebuilt this frame
+        // should be looking at the stellarator that went up this frame rather
+        // than at last frame's world. See [`stellarator`] and [`pylon`].
+        (stellarator::systems(), pylon::systems()).chain(),
         water::drift,
         water::adopt_surfaces,
         water::find_ocean,
@@ -592,6 +659,19 @@ fn overlay() -> ScheduleConfigs<ScheduleSystem> {
         // Straight after it, because the two share the console's request queue
         // and each hands back what the other one wanted. See `ConsoleState::defer`.
         weapon::equip,
+        // Out here rather than in `presentation` because a scene finishes
+        // loading whenever it does, and a console left open must not be the
+        // difference between a machine with a blue balloon inside it and one
+        // without.
+        stellarator::claim,
+        // Beside it and for the same reason: a mast's scene finishes loading
+        // whenever it does, and a console left open must not be the difference
+        // between an emitter that breathes and one that does not.
+        pylon::claim,
+        // Straight after `enemy::crowd` and `weapon::equip` in spirit: the
+        // three share the console's request queue and each hands back what the
+        // others wanted. See `ConsoleState::defer`.
+        pylon::command,
         enemy::sync_animation_visibility,
         audio::play,
         console::draw,
@@ -615,7 +695,7 @@ fn asset_path() -> PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|parent| parent.join("assets")))
-        .filter(|path| path.join("hero/hero.glb").is_file())
+        .filter(|path| path.join("luna/luna.glb").is_file())
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"))
 }
 
@@ -656,6 +736,12 @@ fn setup(
     // castle grounds.
     sky::prepare(&mut commands, &mut meshes, &mut images, &mut sprites);
     squad::spawn_circle(&mut commands, &mut meshes, &mut materials);
+    // The build preview, which outlives a level exactly as the whistle ring
+    // does: the thing you build with must not go away when you change level.
+    let field = stellarator::prepare(&mut commands, &mut meshes, &mut materials);
+    // The pylon's own preview ring and the beams' shared art, put up once for
+    // the same reason: what you build with outlives the level you build it on.
+    pylon::prepare(&mut commands, &mut meshes, &mut materials);
     commands.insert_resource(animation::CharacterAnimations::load(&assets));
     audio::preload(&mut commands, &assets);
     // The level itself -- its collision, its gravity, its scenery and its
@@ -667,6 +753,10 @@ fn setup(
         &assets,
         &mut meshes,
         &mut materials,
+        // Handed straight across rather than read back as a resource: the
+        // insert above has not been applied yet, and the castle may have a
+        // machine standing on it.
+        &field,
         &mut load,
     );
     let spawn = Transform::from_translation(world::castle_spawn());
@@ -705,21 +795,24 @@ fn setup(
     // It also settles which shadow: only one of the two visuals is ever shown,
     // and `project` already hides the disc of a caster nobody is drawing.
     let shadow = shadow::ShadowCaster::new(player::PLAYER_RADIUS, player::PLAYER_HEIGHT);
-    commands.spawn((
-        PlayerVisual,
-        ActiveCharacter::Hero,
-        shadow,
-        WorldAssetRoot(assets.load("hero/hero.glb#Scene0")),
-        Transform::from_scale(Vec3::splat(0.81)),
-    ));
-    commands.spawn((
-        PlayerVisual,
-        ActiveCharacter::Mario,
-        shadow,
-        WorldAssetRoot(assets.load("mario/mario.glb#Scene0")),
-        Visibility::Hidden,
-        Transform::from_scale(Vec3::splat(0.00667)),
-    ));
+    // Both visuals off `ActiveCharacter::model`, so the player's Luna and an
+    // AI one are the same model at the same size by construction.
+    for character in ActiveCharacter::ALL {
+        let (model, scale) = character.model();
+        commands.spawn((
+            PlayerVisual,
+            character,
+            shadow,
+            WorldAssetRoot(assets.load(model)),
+            // Only the character in hand is drawn, and Luna is who the game
+            // starts on.
+            match character {
+                ActiveCharacter::Luna => Visibility::Inherited,
+                _ => Visibility::Hidden,
+            },
+            Transform::from_scale(Vec3::splat(scale)),
+        ));
+    }
 
     // No light entity and no ambient resource: every surface in the world is
     // drawn by `n64::N64Material`, which carries its own key and ambient terms
@@ -844,10 +937,10 @@ fn controls(
         // The squad is made of Marios, and the player has just become one of
         // them or stopped being one. Either way it is not a squad any more.
         squad.disband();
-        state.active = if state.active == ActiveCharacter::Hero {
+        state.active = if state.active == ActiveCharacter::Luna {
             ActiveCharacter::Mario
         } else {
-            ActiveCharacter::Hero
+            ActiveCharacter::Luna
         };
         for (kind, mut visibility) in &mut visuals {
             *visibility = if *kind == state.active {
@@ -977,7 +1070,7 @@ fn update_hud(
         let following = squad.members.len();
         let marching = squad.marching();
         let holding = squad.sent.len() - marching;
-        format!("Super Bevy World 64\n{:?}  ·  {:?}  ·  Health {}/{}  ·  {device}\nSquad {following} following · {marching} marching · {holding} holding\nWASD move · mouse look · Space jump · V jetpack/skate\nShift attack · X squad (hold to whistle, tap to send)\nF/right mouse aim · Y weapon ({weapon}) · ` console · F2 switch · Esc menu · F11 window", state.active, ctrl.motion, health.current, health.max)
+        format!("Space Crusaders\n{:?}  ·  {:?}  ·  Health {}/{}  ·  {device}\nSquad {following} following · {marching} marching · {holding} holding\nWASD move · mouse look · Space jump · V jetpack/skate\nShift attack · X squad (hold to whistle, tap to send)\nB build stellarator (hold to grow, tap for the smallest)\nG plant pylon (hold to place, beams link on sight)\nF/right mouse aim · Y weapon ({weapon}) · ` console · F2 switch · Esc menu · F11 window", state.active, ctrl.motion, health.current, health.max)
     } else {
         String::new()
     };
@@ -986,7 +1079,10 @@ fn update_hud(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bevy::{asset::AssetPlugin, ecs::schedule::Schedule, world_serialization::WorldAsset};
+    use bevy::{
+        asset::AssetPlugin, ecs::schedule::Schedule, ecs::system::RunSystemOnce,
+        world_serialization::WorldAsset,
+    };
     use enemy::Enemy;
 
     /// Initialises a schedule the way the game does at startup.
@@ -1120,6 +1216,224 @@ mod tests {
         );
     }
 
+    /// Luna is playable by the AI as well as by the player.
+    ///
+    /// The squad used to be Marios by construction: `spawn_ally` loaded
+    /// Mario's glTF and stamped Mario's animation table on whatever came out
+    /// of it. This asks the console for a field of Lunas instead and checks
+    /// what actually stands there -- that they are Lunas rather than Marios,
+    /// that they carry the health an AI Luna is worth rather than a Mario's,
+    /// that they are ordinary squad members the whistle can pick up, and that
+    /// the two kinds live in the field side by side.
+    #[test]
+    fn the_squad_can_be_filled_with_lunas_beside_the_marios() {
+        let mut app = headless();
+        app.update();
+        {
+            let mut tuning = app.world_mut().resource_mut::<console::GameTuning>();
+            tuning.ally_count = 3.0;
+            tuning.luna_count = 2.0;
+        }
+        // A few frames for `maintain_population` to reconcile both counts and
+        // for the squad to be stepped with them in it.
+        for _ in 0..8 {
+            app.update();
+        }
+        let mut allies = app
+            .world_mut()
+            .query::<(&squad::Ally, &ActiveCharacter, &health::Health)>();
+        let standing: Vec<_> = allies
+            .iter(app.world())
+            .map(|(_, character, health)| (*character, health.max))
+            .collect();
+        let lunas = standing
+            .iter()
+            .filter(|(character, _)| *character == ActiveCharacter::Luna)
+            .count();
+        let marios = standing
+            .iter()
+            .filter(|(character, _)| *character == ActiveCharacter::Mario)
+            .count();
+        assert_eq!((lunas, marios), (2, 3), "the field holds {standing:?}");
+        // Each kind is worth what its character is worth, which is the whole
+        // reason for asking for one rather than the other.
+        for (character, max) in &standing {
+            assert_eq!(*max, character.ally_health(), "{character:?} has {max} hp");
+        }
+        // Asking for fewer takes the right ones away and leaves the rest.
+        app.world_mut()
+            .resource_mut::<console::GameTuning>()
+            .luna_count = 0.0;
+        for _ in 0..4 {
+            app.update();
+        }
+        let mut allies = app.world_mut().query::<(&squad::Ally, &ActiveCharacter)>();
+        let left: Vec<_> = allies
+            .iter(app.world())
+            .map(|(_, character)| *character)
+            .collect();
+        assert_eq!(left.len(), 3, "{left:?}");
+        assert!(
+            left.iter().all(|kind| *kind == ActiveCharacter::Mario),
+            "clearing the Lunas took a Mario with them: {left:?}"
+        );
+    }
+
+    /// The build button, end to end, through the game's own schedules.
+    ///
+    /// The unit tests in [`stellarator`] prove the arithmetic; this proves the
+    /// *wiring* -- that the button reaches the system, that the system finds
+    /// the camera and the player it aims between, that a machine ends up in the
+    /// world with its plasma inside it, and that the second one is refused for
+    /// standing on the first. None of that is reachable from a test that calls
+    /// `stellarator::fits` directly, and all of it is a game that opens and
+    /// shuts if it is wrong.
+    #[test]
+    fn a_held_button_builds_a_stellarator_where_it_was_aimed() {
+        let mut app = headless();
+        app.update();
+        // Long enough to have grown past the smallest machine, so the hold is
+        // being read rather than only the release.
+        for _ in 0..40 {
+            app.world_mut().resource_mut::<input::InputState>().build = true;
+            app.update();
+        }
+        {
+            let mut input = app.world_mut().resource_mut::<input::InputState>();
+            input.build = false;
+            input.build_released = true;
+        }
+        app.update();
+
+        let aim = app.world().resource::<stellarator::Build>().aim;
+        let mut machines = app
+            .world_mut()
+            .query::<(&stellarator::Stellarator, &Transform)>();
+        let built: Vec<_> = machines
+            .iter(app.world())
+            .map(|(machine, at)| (machine.radius, at.translation))
+            .collect();
+        assert_eq!(built.len(), 1, "the button built {} machines", built.len());
+        let (radius, at) = built[0];
+        assert_eq!(at, aim, "the machine is not where the crosshair was");
+        assert!(
+            radius > stellarator::footprint(stellarator::build_scale(0.0)),
+            "a two-thirds-second hold built the smallest machine there is"
+        );
+        // Its plasma came with it: one field of wisps for the machine and one
+        // for the preview that is still standing where it was aimed.
+        let mut wisps = app.world_mut().query::<&stellarator::Wisp>();
+        assert_eq!(wisps.iter(app.world()).count(), stellarator::WISPS * 2);
+
+        // And the same site a second time is refused, because there is a
+        // machine standing on it. Nothing has moved the player or the camera,
+        // so the aim resolves to the same spot.
+        for _ in 0..40 {
+            app.world_mut().resource_mut::<input::InputState>().build = true;
+            app.update();
+        }
+        {
+            let mut input = app.world_mut().resource_mut::<input::InputState>();
+            input.build = false;
+            input.build_released = true;
+        }
+        app.update();
+        assert!(
+            !app.world().resource::<stellarator::Build>().fits,
+            "the site under the first machine reads as clear"
+        );
+        let mut machines = app.world_mut().query::<&stellarator::Stellarator>();
+        assert_eq!(
+            machines.iter(app.world()).count(),
+            1,
+            "a second machine was built through the first"
+        );
+    }
+
+    /// The plant key, end to end, and the network it builds.
+    ///
+    /// The unit tests in [`pylon`] prove the graph; this proves the *wiring* --
+    /// that the key reaches the system, that a mast ends up standing where the
+    /// crosshair was, that a second mast in reach of it is linked to it with a
+    /// beam that gets drawn, and that a machine put down beside them lights the
+    /// pair up. None of that is reachable from a test that calls
+    /// `pylon::links` directly, and all of it is a game that opens and shuts if
+    /// it is wrong.
+    #[test]
+    fn planted_masts_wire_themselves_to_the_machine_that_feeds_them() {
+        let mut app = headless();
+        app.update();
+        // Long enough to have opened a site, so the hold is being read rather
+        // than only the release.
+        for _ in 0..20 {
+            app.world_mut().resource_mut::<input::InputState>().pylon = true;
+            app.update();
+        }
+        {
+            let mut input = app.world_mut().resource_mut::<input::InputState>();
+            input.pylon = false;
+            input.pylon_released = true;
+        }
+        app.update();
+
+        let aim = app.world().resource::<pylon::Plant>().aim;
+        let mut masts = app.world_mut().query::<(&pylon::Pylon, &Transform)>();
+        let planted: Vec<_> = masts
+            .iter(app.world())
+            .map(|(_, at)| at.translation)
+            .collect();
+        assert_eq!(planted.len(), 1, "the key planted {} masts", planted.len());
+        assert_eq!(planted[0], aim, "the mast is not where the crosshair was");
+        // Nothing is making power yet, so it stands dark -- which is a network
+        // of one node and no beams.
+        let network = app.world().resource::<pylon::Network>();
+        assert_eq!(network.nodes.len(), 1);
+        assert!(!network.powered(0), "a mast with no machine has power");
+
+        // A second mast a few metres along, put down by hand rather than by
+        // aiming again: the crosshair has not moved and the first mast is
+        // standing where it points.
+        let beside = aim + Vec3::new(8.0, 0.0, 0.0);
+        app.world_mut()
+            .run_system_once(move |mut commands: Commands, assets: Res<AssetServer>| {
+                pylon::spawn(&mut commands, &assets, beside, 0.0);
+            })
+            .unwrap();
+        app.update();
+        let network = app.world().resource::<pylon::Network>();
+        assert_eq!(network.nodes.len(), 2, "the second mast never joined");
+        assert_eq!(network.links.len(), 1, "no beam between two masts in reach");
+        assert!(
+            !network.powered(0) && !network.powered(1),
+            "a linked pair lit itself with no machine anywhere"
+        );
+        // The beam is a thing in the world rather than a pair of indices.
+        let mut beams = app.world_mut().query::<&pylon::Beam>();
+        assert_eq!(beams.iter(app.world()).count(), 1);
+
+        // And a machine beside them lights the pair up, one hop apart.
+        let feeding = aim - Vec3::new(8.0, 0.0, 0.0);
+        app.world_mut()
+            .run_system_once(
+                move |mut commands: Commands,
+                      assets: Res<AssetServer>,
+                      art: Res<stellarator::FieldArt>| {
+                    stellarator::spawn(&mut commands, &assets, &art, feeding, 0.0, 0.5);
+                },
+            )
+            .unwrap();
+        app.update();
+        let network = app.world().resource::<pylon::Network>();
+        let hops: Vec<_> = network.nodes.iter().map(|node| node.hops).collect();
+        assert_eq!(network.live(), 2, "the machine lit {hops:?}");
+        // The nearer mast is fed straight off the machine and the further one
+        // through it, which is the flood doing its job rather than everything
+        // happening to be in range of everything.
+        assert!(hops.contains(&Some(0)), "{hops:?}");
+        // The supply packet has somewhere to go now.
+        assert!(network.run.len() >= 2, "no supply run over a live pair");
+    }
+
     /// The jetpack is metered, end to end.
     ///
     /// The unit tests in [`energy`] prove the arithmetic; this proves the
@@ -1144,11 +1458,11 @@ mod tests {
         ));
         app.update();
         let mut players = app.world_mut().query_filtered::<Entity, With<Player>>();
-        let hero = players
+        let luna = players
             .iter(app.world())
             .next()
             .expect("no player in the world");
-        let bar = |app: &App| *app.world().get::<energy::Energy>(hero).unwrap();
+        let bar = |app: &App| *app.world().get::<energy::Energy>(luna).unwrap();
         assert_eq!(bar(&app).level, 1.0, "he did not start with a full bar");
         // Off the ground and then the booster held down and *kept* down: five
         // seconds of flight, then three more of holding a dead key through the

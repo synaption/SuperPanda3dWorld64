@@ -35,8 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # different name, or one source produces more than one processed runtime GLB.
 SOURCE_OVERRIDES = {
     "assets/bevy/castle.glb": "assets/bevy/castle_grounds.blend",
-    "assets/hero/hero.glb": "assets/hero/TheHero.blend",
-    "assets/hero/TheHero.glb": "assets/hero/TheHero.blend",
+    "assets/luna/luna.glb": "assets/luna/Luna.blend",
 }
 
 SKIP_PARTS = {"packs"}

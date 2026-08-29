@@ -36,7 +36,7 @@ use std::collections::HashMap;
 /// packaging script copies a named list of assets, and a shader missing from
 /// that list is a game that starts and draws nothing while saying why only in a
 /// log nobody has a console open to read.
-const SHADER: &str = "embedded://super_bevy_world_64/n64.wgsl";
+const SHADER: &str = "embedded://space_crusaders/n64.wgsl";
 
 /// The shader def that moves the lighting from the vertex stage to the
 /// fragment stage. Set per pipeline by [`N64Material::specialize`] from the

@@ -68,8 +68,10 @@ const REBUILD: f32 = 0.1;
 /// The height a cell's ground query is asked from, above everything in the map.
 const SKY: f32 = 90.0;
 
-/// Unreachable, or not yet reached by the sweep.
-const FAR: u32 = u32::MAX;
+/// Unreachable, or not yet reached by the sweep. The sweep is
+/// [`crate::route::flood`] and this is its own name for the same value, so the
+/// grid can be read without the graph module in hand.
+const FAR: u32 = crate::route::UNREACHED;
 
 /// How fast word gets around, in cells a second.
 ///
@@ -483,36 +485,33 @@ pub fn rebuild(
     }
     field.swept_from = Some(from);
 
-    field.steps.fill(FAR);
-
-    // A plain queue rather than a priority queue: every step costs one, which
-    // makes diagonals slightly cheap and is invisible on a crowd. A real metric
-    // would buy nothing here and cost a heap.
-    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
-    if field.walkable[from] {
-        field.steps[from] = 0;
-        queue.push_back(from);
+    // Seeded from the player's own cell, or -- when he is somewhere the survey
+    // called unwalkable, which is to say in the air, in the water, or on a
+    // ledge between cells -- from whatever walkable cells touch it, so the
+    // crowd still comes for him.
+    let sources: Vec<usize> = if field.walkable[from] {
+        vec![from]
     } else {
-        // The player is somewhere the survey called unwalkable -- in the air,
-        // in the water, on a ledge between cells. Seed from whatever walkable
-        // cells touch his, so the crowd still comes for him.
-        for (_, neighbour) in neighbours(from) {
-            if field.walkable[neighbour] {
-                field.steps[neighbour] = 0;
-                queue.push_back(neighbour);
-            }
-        }
-    }
-    while let Some(here) = queue.pop_front() {
-        let next = field.steps[here] + 1;
-        for (step, neighbour) in neighbours(here) {
-            if field.steps[neighbour] != FAR || !field.passable(here, step, neighbour) {
-                continue;
-            }
-            field.steps[neighbour] = next;
-            queue.push_back(neighbour);
-        }
-    }
+        neighbours(from)
+            .filter(|&(_, cell)| field.walkable[cell])
+            .map(|(_, cell)| cell)
+            .collect()
+    };
+    // The sweep itself is [`crate::route::flood`], which is the same walk the
+    // pylon network runs over its masts. What is local to a flow field is the
+    // *edges* -- which is what `passable` is -- and those stay here.
+    let swept = {
+        // Borrowed for the sweep and no longer: `flood` writes into its own
+        // array and hands it back, so the field is only mutated once that
+        // borrow is over.
+        let grid = &*field;
+        crate::route::flood(WIDTH * WIDTH, sources, |here| {
+            neighbours(here)
+                .filter(move |&(step, there)| grid.passable(here, step, there))
+                .map(|(_, there)| there)
+        })
+    };
+    field.steps = swept.steps;
 
     // And the directions, from the finished distances: point at whichever
     // neighbour is nearest the player.

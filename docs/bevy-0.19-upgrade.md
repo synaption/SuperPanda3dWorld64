@@ -1,4 +1,4 @@
-# Upgrading Super Bevy World 64 from Bevy 0.12.1 to 0.19
+# Upgrading Space Crusaders from Bevy 0.12.1 to 0.19
 
 Done. This is the record of what changed and, where it matters, why — kept
 because seven releases' worth of renames is not something worth rediscovering

@@ -22,6 +22,24 @@ use crate::{
 };
 use bevy::prelude::*;
 
+/// The model a warp pipe is drawn from.
+///
+/// Authored at its final size -- three metres across, two tall, standing on
+/// its own origin -- the way `enemy::sizes` says every actor in this game is.
+///
+/// It was 307 units across for a long time, because that is what it was in the
+/// decomp, and the port's 1/100 world scale was applied on the way in: first as
+/// a literal here, and then, once the level moved into Blender, as a `scale` of
+/// 0.01 on every pipe placement in `assets/levels/castle.blend`. That is the
+/// pattern `enemy::sizes` refuses -- a size in one file and the number that
+/// corrects it in another -- and it failed the way it always does. A pipe empty
+/// that came back from an edit at Blender's own scale of one was a pipe 307
+/// metres across, larger than the castle, with the player standing inside it.
+///
+/// So the pipe was resized in `assets/actors/warp_pipe.blend` instead, and a
+/// placement's scale now means what it says: one is a warp pipe.
+pub const MODEL: &str = "actors/warp_pipe.glb";
+
 /// Take-off speed: 60 units a frame. Gravity takes 4 a frame back, so the
 /// launch peaks `v*v/8` = 450 units up -- clearing the pipe's own 205-unit rim
 /// by as much again -- and stays up for `v/2` frames, a full second.
@@ -229,7 +247,13 @@ pub fn fire(
                 enemy_count += 1;
                 enemy::spawn(&mut commands, &assets, kind, mouth, phase)
             }
-            Spawn::Mario => squad::spawn_ally(&mut commands, &assets, mouth, phase),
+            Spawn::Mario => squad::spawn_ally(
+                &mut commands,
+                &assets,
+                crate::ActiveCharacter::Mario,
+                mouth,
+                phase,
+            ),
         };
         commands
             .entity(born)
@@ -287,6 +311,30 @@ pub fn fly(
 mod tests {
     use super::*;
     use bevy::ecs::system::RunSystemOnce;
+
+    /// The size in the file is the size in the game, so a pipe re-exported in
+    /// the decomp's own units would be a hundred times too big -- and unlike a
+    /// creature, nothing measures a pipe at runtime to notice. Nothing collides
+    /// with one, so the only thing that would say so is the screen.
+    #[test]
+    fn a_warp_pipe_is_the_size_a_warp_pipe_is() {
+        let pipe = enemy::measure(MODEL).expect("actors/warp_pipe.glb should measure");
+        let across = pipe.radius * 2.0;
+        assert!(
+            (2.0..5.0).contains(&across),
+            "a warp pipe is about three metres across, not {across}"
+        );
+        assert!(
+            (1.0..3.5).contains(&pipe.height),
+            "a warp pipe is about two metres tall, not {}",
+            pipe.height
+        );
+        assert!(
+            pipe.lift < 1e-3,
+            "a pipe stands on its own origin, not {} below it",
+            pipe.lift
+        );
+    }
 
     /// One flat floor, wider than any arc here can reach.
     fn ground(height: f32) -> LevelData {

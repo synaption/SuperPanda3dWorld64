@@ -36,28 +36,20 @@ from mathutils import Vector
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from export_level_furniture import DISPLAY_SCALE  # noqa: E402
+from dress_level_furniture import linked_model  # noqa: E402
+from export_level_furniture import DISPLAY_SCALE, SHOWS, stem  # noqa: E402
 
 REFERENCE = ROOT / "assets" / "bevy" / "castle_grounds.blend"
 COLLISION = ROOT / "assets" / "castle_grounds" / "collision.npz"
 WATER_TEXTURE = ROOT / "assets" / "bevy" / "water.png"
 OUTPUT = ROOT / "assets" / "levels" / "castle.blend"
 
-#: The model each kind of placement shows, linked in so that what is being
-#: dragged about is the thing itself rather than a labelled box. The scale
-#: beside it is `DISPLAY_SCALE`, which is what the game draws that model at --
-#: see `export_level_furniture.py`, where the two are kept honest.
-MODELS = {
-    "warp_pipe": ROOT / "assets" / "actors" / "warp_pipe.blend",
-    "slime": ROOT / "assets" / "actors" / "slime.blend",
-    "ant": ROOT / "assets" / "actors" / "ant.blend",
-    "mario": ROOT / "assets" / "mario" / "mario.blend",
-}
-
-#: Blender's own "do not export this" collection. The actor sources keep a
-#: reference icosphere in one, and a preview that included it would be an actor
-#: standing inside a ball.
-NOT_EXPORTED = "glTF_not_exported"
+#: Which model each placement shows and where it is authored are `SHOWS` and
+#: `MODEL_SOURCE` in the exporter, and the scale it is drawn at is
+#: `DISPLAY_SCALE` beside them. All three are read from there rather than
+#: repeated here, so that this and `tools/dress_level_furniture.py` -- which
+#: puts the models back onto a level whose empties have lost them -- cannot come
+#: to different conclusions about what an ant looks like.
 
 #: SM64 units to metres, the port's world scale. Everything read out of the
 #: decomp-derived data is in the former and everything authored here is in the
@@ -185,8 +177,8 @@ def empty(name, at, into, display="PLAIN_AXES", size=1.0):
     return obj
 
 
-def link_models():
-    """Every actor's model, linked in and ready to be instanced.
+def link_models(kinds):
+    """Every model these placements show, linked in and ready to be instanced.
 
     The holder collections are deliberately *not* put in the scene. A
     collection instance draws its contents wherever the instancing empty
@@ -197,28 +189,19 @@ def link_models():
     Linked rather than appended for the same reason the castle is: re-exporting
     an actor should move what is being placed against, and an actor's model is
     not authored here.
+
+    The linking itself is `dress_level_furniture.linked_model`, which is the
+    tool that puts a model back onto a placement that has lost one. Seeding a
+    level and dressing one are the same operation, so they are the same code:
+    a file this wrote and a file that tool repaired are indistinguishable.
     """
     models = {}
-    for kind, path in MODELS.items():
-        if not path.is_file():
-            print(f"no {path}; {kind} placements will be bare empties")
-            continue
-        with bpy.data.libraries.load(str(path), link=True) as (source, target):
-            target.objects = list(source.objects)
-            target.collections = [name for name in source.collections
-                                  if name == NOT_EXPORTED]
-        hidden = {obj.name for collection in target.collections if collection
-                  for obj in collection.objects}
-        holder = bpy.data.collections.new(f"Model {kind}")
-        for obj in target.objects:
-            if obj is not None and obj.name not in hidden:
-                holder.objects.link(obj)
-        models[kind] = holder
-        print(f"linked {kind}: {len(holder.objects)} objects from {path.name}")
+    for kind in sorted(kinds):
+        linked_model(kind, models)
     return models
 
 
-def placement(name, model, at, models, into):
+def placement(name, at, models, into):
     """One thing standing somewhere, drawn as the thing it is.
 
     A collection instance is an empty with a collection hanging off it, so
@@ -227,11 +210,13 @@ def placement(name, model, at, models, into):
     that you can see where the warp pipe's mouth actually comes to.
 
     Its scale is [`DISPLAY_SCALE`], which is the factor the game draws that
-    model at -- `warp_pipe.glb` is 307 units across and a warp pipe is three
-    metres. The exporter reads it back for the placements whose size is the
-    level's business and refuses it for the ones whose size is the model's.
+    model at -- one for everything authored at its final size, and 0.00667 for
+    Mario, who is still the decomp's 160 units tall. The exporter reads it back
+    for the placements whose size is the level's business and refuses it for the
+    ones whose size is the model's.
     """
     obj = empty(name, at, into, display="PLAIN_AXES", size=0.5)
+    model = SHOWS[stem(name)]
     scale = DISPLAY_SCALE.get(model, 1.0)
     obj.scale = (scale, scale, scale)
     holder = models.get(model)
@@ -333,16 +318,17 @@ def main():
                     display="SINGLE_ARROW", size=6.0)
     gravity["mode"] = "down"
 
-    models = link_models()
+    models = link_models({SHOWS["pipe"]}
+                         | {SHOWS[kind] for kind, _ in ACTORS})
     for spawns, interval, at in PIPES:
         # Every pipe shows a warp pipe. What comes out of it is a property, not
         # a different model, which is the distinction the level editor has to
         # make visible: three identical pipes producing three different things.
-        pipe = placement("pipe", "warp_pipe", at, models, furniture)
+        pipe = placement("pipe", at, models, furniture)
         pipe["spawns"] = spawns
         pipe["interval"] = interval
     for kind, at in ACTORS:
-        placement(kind, kind, at, models, furniture)
+        placement(kind, at, models, furniture)
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=str(OUTPUT), compress=True,

@@ -17,8 +17,8 @@ shows it worst, since every sprite in the atlas then faces the wrong way.
 The eight stages, in the order they have to run:
 
     mario      assets/mario/mario.glb        + mario_clips.json
-    hero       assets/hero/hero.glb          + hero_clips.json
-    weapons    assets/hero/*.glb             what the Hero carries
+    luna       assets/luna/luna.glb          + luna_clips.json
+    weapons    assets/weapons/*.glb          what Luna carries
     castle     assets/bevy/castle.glb, castle.bin, water.png
     levels     assets/bevy/*_furniture.json, *.glb   what is placed in each
     planet     assets/bevy/planet.glb        the generated planet, LOD0
@@ -78,7 +78,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools"
 SRC = ROOT / "src"
 ACTOR_DIR = ROOT / "assets" / "actors"
-WEAPON_DIR = ROOT / "assets" / "hero"
+WEAPON_DIR = ROOT / "assets" / "weapons"
 IMPOSTOR_DIR = ROOT / "assets" / "impostors"
 
 # Where the stamps live. At the root rather than under `assets/`, because it is
@@ -92,7 +92,7 @@ STAMPS = ROOT / ".build_assets.json"
 # `world::PLANET_CENTRE`.
 LEVELS = ("castle",)
 
-# What the Hero can hold. Static props rather than actors: no rig, no clips,
+# What Luna can hold. Static props rather than actors: no rig, no clips,
 # and so no adoption pass -- the export is the runtime file. Each one is
 # authored with its grip on the origin and its bore down +Z, which is what
 # lets `weapon::follow_socket` place it from the hand joint alone. See
@@ -136,7 +136,7 @@ RENDER_SOURCES = (
     SRC / "console.rs",             # `GameTuning`, which the draw chain reads
 )
 
-STAGES = ("mario", "hero", "weapons", "castle", "levels", "planet",
+STAGES = ("mario", "luna", "weapons", "castle", "levels", "planet",
           "actors", "impostors")
 
 
@@ -233,42 +233,42 @@ def plan_mario():
     )]
 
 
-def build_hero(staging, blender):
-    """The Hero has his own Rigify export, root-motion and aiming passes."""
-    out = staging / "hero.glb"
-    sidecar = staged(staging, ROOT / "assets/hero/hero_clips.json",
-                     "hero_clips.json")
-    command = [sys.executable, TOOLS / "build_hero.py",
+def build_luna(staging, blender):
+    """Luna has his own Rigify export, root-motion and aiming passes."""
+    out = staging / "luna.glb"
+    sidecar = staged(staging, ROOT / "assets/luna/luna_clips.json",
+                     "luna_clips.json")
+    command = [sys.executable, TOOLS / "build_luna.py",
                "--out", out, "--sidecar", sidecar]
     if blender:
         command.extend(["--blender", blender])
     run(command)
-    os.replace(out, ROOT / "assets/hero/hero.glb")
-    os.replace(sidecar, ROOT / "assets/hero/hero_clips.json")
+    os.replace(out, ROOT / "assets/luna/luna.glb")
+    os.replace(sidecar, ROOT / "assets/luna/luna_clips.json")
 
 
-def plan_hero():
+def plan_luna():
     return [Unit(
-        name="hero",
-        build=build_hero,
-        # Four tools rather than one: build_hero.py is a driver, and the export,
+        name="luna",
+        build=build_luna,
+        # Four tools rather than one: build_luna.py is a driver, and the export,
         # the adoption, the aim rig and the root-motion lock each live in their
         # own file. See that script's docstring for what each does.
-        inputs=(ROOT / "assets/hero/TheHero.blend",
-                ROOT / "assets/hero/hero_clips.json",
-                TOOLS / "build_hero.py",
-                TOOLS / "export_hero_gltf.py",
+        inputs=(ROOT / "assets/luna/Luna.blend",
+                ROOT / "assets/luna/luna_clips.json",
+                TOOLS / "build_luna.py",
+                TOOLS / "export_luna_gltf.py",
                 TOOLS / "adopt_blender_export.py",
                 TOOLS / "aim_rig.py",
                 TOOLS / "lock_root_motion.py",
                 TOOLS / "blend_to_glb.py"),
-        outputs=(ROOT / "assets/hero/hero.glb",),
+        outputs=(ROOT / "assets/luna/luna.glb",),
         blender=True,
     )]
 
 
 def plan_weapons():
-    """The Hero's weapons: a plain mesh export each, straight to the runtime file.
+    """Luna's weapons: a plain mesh export each, straight to the runtime file.
 
     No adoption pass and no sidecar. A weapon has no skeleton to normalise and
     no clips to name, so `blend_to_glb` already writes exactly what the game
@@ -508,7 +508,7 @@ def plan_impostors():
 
 PLANS = {
     "mario": plan_mario,
-    "hero": plan_hero,
+    "luna": plan_luna,
     "weapons": plan_weapons,
     "castle": plan_castle,
     "levels": plan_levels,

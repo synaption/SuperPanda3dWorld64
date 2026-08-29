@@ -1,0 +1,128 @@
+{
+  "Attack 1 beta": {
+    "frames": 37,
+    "loop_end": 37,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "Attack 2": {
+    "frames": 29,
+    "loop_end": 29,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "Attack 2 baked": {
+    "frames": 32,
+    "loop_end": 31,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "Idle ": {
+    "frames": 31,
+    "loop_end": 30,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "Running Stepped": {
+    "frames": 41,
+    "loop_end": 41,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "Running normal": {
+    "frames": 42,
+    "loop_end": 42,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "Spin Kick": {
+    "frames": 47,
+    "loop_end": 46,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "Walk Var happy": {
+    "frames": 40,
+    "loop_end": 39,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "_run": {
+    "frames": 44,
+    "loop_end": 44,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "attack 1 Stepped": {
+    "frames": 40,
+    "loop_end": 39,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "idle normal": {
+    "frames": 31,
+    "loop_end": 30,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "idle var": {
+    "frames": 24,
+    "loop_end": 23,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "jump Heavy": {
+    "frames": 20,
+    "loop_end": 19,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "jump IN short": {
+    "frames": 10,
+    "loop_end": 10,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "jump Impact": {
+    "frames": 24,
+    "loop_end": 23,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "jump all": {
+    "frames": 85,
+    "loop_end": 84,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "jump down": {
+    "frames": 13,
+    "loop_end": 13,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "jump down alternate": {
+    "frames": 52,
+    "loop_end": 52,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "jump up": {
+    "frames": 10,
+    "loop_end": 10,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "sword draw": {
+    "frames": 14,
+    "loop_end": 14,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "walk Var1": {
+    "frames": 40,
+    "loop_end": 39,
+    "loop_start": 0,
+    "start_frame": 0
+  }
+}
