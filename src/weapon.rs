@@ -77,6 +77,25 @@ type Targets<'w, 's> = Query<
     (Without<Player>, Without<Ally>, Without<Bullet>),
 >;
 
+/// The buildings a round can knock a piece out of: warp pipes, and anything else
+/// that ever stands on the other side.
+///
+/// Read-only and separate from the query that spends the damage, exactly as
+/// [`Targets`] is separate from `healths` in [`fly`]: the sweep borrows this for
+/// the whole ray test, and the hit is written afterwards. The two touch no
+/// component in common, which is what lets both exist in one system.
+type Buildings<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Transform,
+        &'static crate::enemy::Side,
+        &'static crate::structure::Structure,
+    ),
+    (Without<Player>, Without<Bullet>),
+>;
+
 /// The joint `tools/aim_rig.py` hangs a weapon from, and the empty
 /// `target_pistol.blend` marks the end of the bore with.
 ///
@@ -457,6 +476,8 @@ fn nearest_hit(
     range: f32,
     level: &LevelData,
     enemies: &Targets,
+    buildings: &Buildings,
+    mine: crate::enemy::Side,
 ) -> (Option<Entity>, Vec3) {
     // Whatever the level does to the shot bounds everything else, so it is
     // measured once and used as the range for the bodies.
@@ -476,6 +497,32 @@ fn nearest_hit(
             up,
             radius,
             height,
+        ) {
+            if distance < best {
+                best = distance;
+                struck = Some(entity);
+            }
+        }
+    }
+    // And the buildings, against the same running nearest. Only the ones on the
+    // other side: a round that could take a chunk out of your own network would
+    // make firing anywhere near a mast a mistake, and the sword already refuses
+    // the same thing in [`crate::structure::demolish`].
+    //
+    // Upright rather than along the body's own axis, unlike a crawler above: a
+    // building stands on the ground, and nothing in this game tips one over.
+    for (entity, transform, side, structure) in buildings {
+        if *side == mine {
+            continue;
+        }
+        if let Some(distance) = ray_hits_body(
+            origin,
+            direction,
+            best,
+            transform.translation,
+            Vec3::Y,
+            structure.radius,
+            structure.height,
         ) {
             if distance < best {
                 best = distance;
@@ -511,7 +558,12 @@ pub fn fire(
     muzzles: Query<&GlobalTransform, With<Muzzle>>,
     player: Query<(Entity, &Transform), With<Player>>,
     mut energy: Query<&mut crate::energy::Energy, With<Player>>,
+    mut drops: ResMut<crate::nuclonium::Drops>,
     enemies: Targets,
+    buildings: Buildings,
+    // Separate from the two sweeps above for [`fly`]'s reason: those are
+    // borrowed for the whole ray test, and the blow is landed afterwards.
+    mut healths: Query<&mut crate::health::Health>,
 ) {
     loadout.cooldown = (loadout.cooldown - FIXED_DT).max(0.0);
     let spec = loadout.equipped.spec();
@@ -585,15 +637,40 @@ pub fn fire(
             }
         }
         Shot::Hitscan { range } => {
-            let (struck, landed) = nearest_hit(origin, direction, range, &level, &enemies);
+            let (struck, landed) = nearest_hit(
+                origin,
+                direction,
+                range,
+                &level,
+                &enemies,
+                &buildings,
+                crate::enemy::Side::Friendly,
+            );
             if let Some(entity) = struck {
-                commands.entity(entity).despawn();
-                // At the far end of the beam rather than at the gun: a hitscan
-                // shot kills where it lands, and that is where it is heard --
-                // and, for the same reason, where it is resented. Shooting into
-                // a crowd from cover still earns their attention, or a gun
-                // would be a way of killing things that never look up.
-                sounds.push_at(Sfx::Defeat, landed);
+                // **Spent against the pool rather than deleting what it hit.**
+                // This branch used to despawn outright, which was invisible
+                // while everything it could reach died to one blow anyway --
+                // `PLAYER_DAMAGE` one-shots every creature the game places. A
+                // warp pipe does not, and a hitscan round that removed one in a
+                // single trigger pull would make the sword and the projectile
+                // gun the slow ways of doing it.
+                let health = healths.get_mut(entity).ok();
+                if crate::health::strike(health.map(Mut::into_inner), crate::health::PLAYER_DAMAGE)
+                {
+                    commands.entity(entity).despawn();
+                    if enemies.get(entity).is_ok() {
+                        drops.maybe(landed);
+                    }
+                    // At the far end of the beam rather than at the gun: a
+                    // hitscan shot kills where it lands, and that is where it is
+                    // heard -- and, for the same reason, where it is resented.
+                    // Shooting into a crowd from cover still earns their
+                    // attention, or a gun would be a way of killing things that
+                    // never look up.
+                    sounds.push_at(Sfx::Defeat, landed);
+                } else {
+                    sounds.push_at(Sfx::Hurt, landed);
+                }
                 if let Ok((luna, _)) = player.single() {
                     threats.kill(luna, landed);
                 }
@@ -667,7 +744,9 @@ pub fn fly(
     mut threats: ResMut<crate::enemy::Threats>,
     mut bullets: Query<(Entity, &mut Bullet, &mut Transform), Without<Player>>,
     player: Query<Entity, With<Player>>,
+    mut drops: ResMut<crate::nuclonium::Drops>,
     enemies: Targets,
+    buildings: Buildings,
     // Separate from `Targets` rather than a fourth term in it, because the ray
     // test below borrows that query for the whole sweep and the hit has to be
     // written afterwards. The two touch no component in common, which is what
@@ -689,14 +768,28 @@ pub fn fly(
             travelled,
             &level,
             &enemies,
+            &buildings,
+            // Every bullet in the game is the player's. A round that could
+            // knock down his own network would make firing near a mast a
+            // mistake -- see [`Buildings`].
+            crate::enemy::Side::Friendly,
         );
         if let Some(hit) = struck {
             // A bullet is worth exactly what a sword swing is. See
             // [`crate::health::PLAYER_DAMAGE`] for why that is a decision
             // rather than an oversight.
+            //
+            // No recovery window: [`crate::structure::RECOVERY`] exists to stop
+            // one *held* swing spending six blows, and a round is a discrete
+            // event. Each one that lands ought to count.
             let health = healths.get_mut(hit).ok();
             if crate::health::strike(health.map(Mut::into_inner), crate::health::PLAYER_DAMAGE) {
                 commands.entity(hit).despawn();
+                // Buildings leave nothing behind; creatures leave something one
+                // time in twenty. See [`crate::nuclonium::Drops::maybe`].
+                if enemies.get(hit).is_ok() {
+                    drops.maybe(landed);
+                }
                 sounds.push_at(Sfx::Defeat, landed);
             } else {
                 sounds.push_at(Sfx::Hurt, landed);
@@ -779,6 +872,9 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(ground());
         world.init_resource::<crate::enemy::Threats>();
+        // See `enemy::tests::world`: a shot that lands rolls for a drop, so the
+        // die has to exist wherever one can be fired.
+        world.init_resource::<crate::nuclonium::Drops>();
         world.insert_resource(GameTuning::default());
         world.insert_resource(SoundQueue::default());
         world.insert_resource(InputState::default());

@@ -36,7 +36,7 @@ BLEND_IMPORTER = Path(__file__).resolve().parent / "build_blender_sources.py"
 #
 # For reference, at the port's scale of one unit to the metre: Luna is 1.93 m
 # tall, an ant's body spans 4.10 m and stands 1.72 m, and a warp pipe is 3 m.
-MACHINE_WIDTH = 32.0
+MACHINE_WIDTH = 16.0
 
 # What the shape below spans in its own unit, across its widest part -- which is
 # the coils. A coil sweeps out to `major + 1.13 + 0.2` and carries a tube of

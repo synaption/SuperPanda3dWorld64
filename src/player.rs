@@ -26,11 +26,11 @@ const STROKE_SECONDS: f32 = 0.6;
 
 /// How far under the surface counts as being in the water at all. Above this
 /// the feet are wet and nothing else changes.
-const SUBMERGED_DEPTH: f32 = 0.15;
+pub(crate) const SUBMERGED_DEPTH: f32 = 0.15;
 
 /// How far under the surface each character floats once they are in deep
 /// water: Mario swimming, Luna held up by it.
-const SWIM_FLOAT_DEPTH: f32 = 0.45;
+pub(crate) const SWIM_FLOAT_DEPTH: f32 = 0.45;
 const WADE_FLOAT_DEPTH: f32 = 0.6;
 
 /// How fast the surface pulls the wading Luna back to that depth, and how

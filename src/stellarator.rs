@@ -21,22 +21,39 @@
 //! see [`fits`], which is the whole of the rule and is plain arithmetic so it
 //! can be tested without a window.
 //!
-//! **The plasma is not the plasma mesh.** `tools/generate_stellarator.py`
-//! writes a `Twisted Plasma Surface` into the .glb -- a closed, faintly
-//! transparent skin sitting inside the coils -- and this module hides it the
-//! frame it arrives (see [`claim`]). Drawn, it is a blue balloon: a single
-//! blended shell with no depth to it, which reads as a solid object wedged in
-//! the machine rather than as confined plasma, and which this renderer's one
-//! diffuse light has nothing interesting to say about.
+//! **The plasma is not the plasma mesh.**
+//! `tools/generate_stellarator.py` writes a `Twisted Plasma Surface` into the
+//! .glb -- a closed, faintly transparent skin sitting inside the coils -- and
+//! this module hides it the frame it arrives (see [`claim`]). Drawn, it is a
+//! blue balloon: a single blended shell with no depth to it, which reads as a
+//! solid object wedged in the machine rather than as confined plasma, and which
+//! this renderer's one diffuse light has nothing interesting to say about.
 //!
-//! What is drawn instead is [`Wisp`]s: short glowing streaks riding the *same*
-//! flux surface the mesh describes, marching round the ring, winding around the
-//! tube as they go, and flaring and dying on their own clocks. [`flux_point`]
-//! is the generator's own parametrisation transcribed, so the light is where
-//! the field is rather than near it, and the twist you can see chasing round
-//! the coils is the machine's real field periods.
+//! **What is drawn instead is the machine's stock.** A stellarator is where the
+//! squad's nuclonium ends up -- see [`crate::nuclonium`] for the road it comes
+//! home on -- and what turns inside the coils is that nuclonium itself,
+//! [`Orbit`]ing the *same* flux surface the plasma mesh describes: round the
+//! ring, winding around the tube as it goes. [`flux_point`] is the generator's
+//! own parametrisation transcribed, so what you see is where the field is
+//! rather than near it, and the twist chasing round the coils is the machine's
+//! real field periods.
 //!
-//! Nothing here is random. Every wisp's phase, speed and pulse comes off
+//! There were streaks of light here before, on the same surface, and they were
+//! prettier. They were also a lie the player could not read anything off: a
+//! machine holding nothing and a machine holding four hundred looked exactly
+//! alike. **A field made of the stock is a stock gauge you can see from across
+//! the valley** -- an empty reactor is dark, a full one is a solid green ring
+//! -- which is worth more than the streaks were, and costs the same draw call.
+//! Emptiness being visible is the point rather than a regression.
+//!
+//! Above [`ORBIT_CAP`] the machine stops adding motes and goes on counting.
+//! Five hundred already reads as full, a five-hundred-and-first is a mote
+//! nobody can pick out of the ring it joins, and the alternative is a fifty
+//! thousandth one -- so the cap is what stops a long session turning the
+//! machine into a frame-rate bill. What is *held* is never capped; see
+//! [`Store`].
+//!
+//! Nothing here is random. Every mote's phase, speed and winding comes off
 //! [`crate::squad::GOLDEN_ANGLE`] advanced per index, which is the same trick
 //! the ambling Marios and the enemy crowd use and for the same reason: a field
 //! that never repeats, out of a machine with no random number generator in it,
@@ -162,8 +179,8 @@ fn measure() -> Option<Machine> {
         };
         let mesh = &json["meshes"][index as usize];
         for primitive in mesh["primitives"].as_array()? {
-            let accessor = &json["accessors"]
-                [primitive["attributes"]["POSITION"].as_u64()? as usize];
+            let accessor =
+                &json["accessors"][primitive["attributes"]["POSITION"].as_u64()? as usize];
             let corner = |which: &str| -> Option<Vec3> {
                 let bounds = accessor[which].as_array()?;
                 Some(Vec3::new(
@@ -261,18 +278,75 @@ pub struct BuildSite;
 #[derive(Component)]
 pub struct Footprint;
 
-/// One streak of plasma, and the four clocks that make it its own.
+/// One mote of nuclonium turning inside the coils, and the two clocks that
+/// make it its own.
 ///
 /// `u` runs round the ring the long way and `v` round the tube; `rate` and
-/// `wind` are how fast this one does each, and `pulse` is where it is in its
-/// own fade. All five are seeded off the golden angle in [`add_field`].
+/// `wind` are how fast this one does each. All four are seeded off the golden
+/// angle by the mote's own index in [`mote`], which is what lets the field be
+/// grown one mote at a time and still be evenly spread at every count: the
+/// hundredth arrival lands in the gap the first ninety-nine left, without
+/// anything having to be re-laid.
 #[derive(Component)]
-pub struct Wisp {
+pub struct Orbit {
+    /// Which arrival this was, counting from the machine's first. Kept so that
+    /// a machine giving stock back sheds its *newest* motes and leaves an
+    /// evenly spread field behind -- see [`stock`].
+    index: u32,
     u: f32,
     rate: f32,
     v: f32,
     wind: f32,
-    pulse: f32,
+    /// Which nested flux surface it rides, from the axis out. See
+    /// [`MOTE_REACH`]: the field fills the tube rather than tiling its skin,
+    /// which is both what plasma looks like and what stops five hundred motes
+    /// forming a hollow shell with a hole down the middle.
+    rho: f32,
+    /// How much of its arrival is still to happen, from one down to nothing.
+    ///
+    /// **A mote is a ball that just flew here, and it has to arrive rather than
+    /// appear.** What a shipment does is land at this machine's feed point --
+    /// the middle of the coils, which is `Vec3::Y * machine().lift` in the
+    /// machine's own frame -- and stop existing. If the mote it turns into is
+    /// placed on its flux surface on the first frame, the substance the player
+    /// watched crossing the whole valley finishes by blinking out at one point
+    /// and back in at another one a metre away.
+    ///
+    /// So a new mote starts exactly where the flight ended and swims out to its
+    /// orbit over [`ARRIVE_SECONDS`]. It costs one lerp per mote per frame and
+    /// it is what makes the hand-off continuous -- and because a mote carries
+    /// the same [`crate::nuclonium::Trail`] a ball on the lawn does, the swim
+    /// out draws its own wake into the coils.
+    settling: f32,
+}
+
+/// What one machine is holding, and how much of it is on screen.
+///
+/// Its own component rather than a field on [`Stellarator`], because it is what
+/// the *machine* is for rather than what it is: the build preview is a
+/// stellarator with no stock, and the ore patches `next.md` wants would credit
+/// this same component from somewhere that is not a pylon at all.
+///
+/// The two numbers are deliberately not the same number. `held` is the truth
+/// and has no ceiling; `shown` is how many motes are actually parented to the
+/// machine and stops at [`ORBIT_CAP`]. [`stock`] is the one thing that moves
+/// `shown`, by spawning or despawning the difference.
+#[derive(Component, Default, Debug)]
+pub struct Store {
+    /// Units of nuclonium this machine has taken in. Never capped.
+    pub held: u32,
+    /// How many are drawn. `min(held, ORBIT_CAP)`, reached one tick at a time.
+    shown: u32,
+}
+
+impl Store {
+    /// How many motes a machine holding this much should be drawing.
+    ///
+    /// The cap in one place, as a function, so the test that pins it does not
+    /// have to build a world to ask.
+    pub fn drawn(held: u32) -> u32 {
+        held.min(ORBIT_CAP)
+    }
 }
 
 /// One of the machine's modular coils, and what makes it drift on its own
@@ -305,32 +379,53 @@ const COIL_NODE: &str = "Modular Coil ";
 /// About the shape's own centre plane, not the model's origin -- the file is
 /// lifted so it stands on the ground, and [`Machine::lift`] is that offset.
 pub fn flux_point(u: f32, v: f32) -> Vec3 {
+    flux_point_at(u, v, 1.0)
+}
+
+/// The same shape, `rho` of the way out from its own axis.
+///
+/// `rho = 1` is [`flux_point`] -- the plasma's skin, the surface the .glb's mesh
+/// describes. `rho = 0` is the magnetic axis: the curve running down the middle
+/// of the tube, which is what is left when the two terms that carry `v` are
+/// taken away. Anything between is a nested surface inside the last one, which
+/// is what a flux surface *is*, so this is the shape's own natural parameter
+/// rather than a fudge factor bolted onto it.
+///
+/// It exists so the motes can fill the tube instead of tiling its skin -- see
+/// [`MOTE_REACH`], which is how far out they are allowed to go and why that is
+/// less than all the way.
+pub fn flux_point_at(u: f32, v: f32, rho: f32) -> Vec3 {
     let twist = PERIODS * u;
     let section = MINOR * (1.0 + 0.16 * twist.cos());
-    let radius = MAJOR + section * v.cos() + 0.16 * twist.cos();
-    let height = 0.72 * MINOR * v.sin() + 0.18 * twist.sin();
+    let radius = MAJOR + rho * section * v.cos() + 0.16 * twist.cos();
+    let height = rho * 0.72 * MINOR * v.sin() + 0.18 * twist.sin();
     Vec3::new(radius * u.cos(), height, -(radius * u.sin()))
 }
 
 // -- placing ----------------------------------------------------------------
 
-/// The smallest machine a tap puts down, the largest a full hold reaches, and
-/// how long the hold takes to cross between them.
+/// How big a machine the build button puts down: **one size, the size the model
+/// was authored at.**
 ///
-/// The growth is [`crate::squad::circle_radius`]'s shape and it starts from the
-/// same [`crate::squad::TAP_SECONDS`], so one button in the player's hands
-/// behaves one way: nothing happens for the length of a tap, and then the thing
-/// under the crosshair opens out.
+/// The hold used to grow it, between half and full over a second and a bit,
+/// borrowing the shape of [`crate::squad::circle_radius`] so that one button in
+/// the player's hands behaved one way. It looked like a feature and played like
+/// a mistake: every machine came out a slightly different size depending on how
+/// long a thumb happened to rest on a key, none of the sizes meant anything --
+/// a small stellarator is not cheaper, does not hold less and does not power
+/// less -- and two machines side by side just looked wrong. A stellarator is a
+/// stellarator.
 ///
-/// **The top of the range is the authored size and not a multiple of it.** The
-/// hold picks how much of a machine to build, never how much *more* than one,
-/// so `--scale` in the generator is the last word on how big a stellarator can
-/// be. It stopped being that for a while: a cap of 1.6 meant re-exporting the
-/// model at half size still left a fourteen-metre machine reachable, and the
-/// only way to find that out was to build one.
-const SCALE_MIN: f32 = 0.5;
-const SCALE_MAX: f32 = 1.0;
-const GROW_SECONDS: f32 = 1.2;
+/// The hold still opens the footprint ring, which is the half of it that was
+/// ever load-bearing: it says *where* the machine is going and whether the site
+/// is clear, and it is the same ring at the same size the whole time.
+///
+/// One, and not a multiple of one, so `--scale` in `generate_stellarator.py` is
+/// the last word on how big a stellarator can be. That has been wrong before: a
+/// cap of 1.6 meant re-exporting the model at half size still left a
+/// fourteen-metre machine reachable, and the only way to find that out was to
+/// build one.
+pub const BUILD_SCALE: f32 = 1.0;
 
 /// How much ground a machine built at this size stands on.
 ///
@@ -342,10 +437,15 @@ pub fn footprint(scale: f32) -> f32 {
     machine().radius * scale
 }
 
-/// How big the machine has grown after the button has been down this long.
-pub fn build_scale(held_for: f32) -> f32 {
-    let grown = ((held_for - squad::TAP_SECONDS) / GROW_SECONDS).clamp(0.0, 1.0);
-    SCALE_MIN + (SCALE_MAX - SCALE_MIN) * grown
+/// How big the machine is after the button has been down this long.
+///
+/// A constant function of its argument, kept as a function rather than dissolved
+/// into the two call sites because it is *the* answer to "how big is the machine
+/// about to be" -- the preview ring, the overlap test and the spawn all ask it,
+/// and a size that stops being one decision is a ring that stops matching what
+/// gets built. See [`BUILD_SCALE`] for why holding no longer grows it.
+pub fn build_scale(_held_for: f32) -> f32 {
+    BUILD_SCALE
 }
 
 /// Is there room for a machine of this size here?
@@ -356,11 +456,9 @@ pub fn build_scale(held_for: f32) -> f32 {
 /// support rings in the same column of air, and a rule that let them through
 /// would put one through the other.
 pub fn fits(at: Vec3, radius: f32, placed: &[(Vec3, f32)]) -> bool {
-    placed
-        .iter()
-        .all(|(other, other_radius)| {
-            Vec2::new(at.x - other.x, at.z - other.z).length() >= radius + other_radius
-        })
+    placed.iter().all(|(other, other_radius)| {
+        Vec2::new(at.x - other.x, at.z - other.z).length() >= radius + other_radius
+    })
 }
 
 /// The live placement: how long the button has been down, where it resolves to,
@@ -392,62 +490,95 @@ impl Build {
 /// entities and nothing else.
 ///
 /// Deliberately **not** under a [`bevy::world_serialization::WorldAssetRoot`].
-/// `n64::convert` restyles what it finds inside a loaded scene, and a wisp is
-/// not level geometry that was lit offline -- it is a light source drawn as a
-/// flat bright streak, so it keeps its standard material and is left alone.
-/// This is why the machine's own model hangs off a *child* of the machine: the
-/// walk up to a scene root has to miss the wisps and find the .glb.
+/// `n64::convert` restyles what it finds inside a loaded scene, and a mote of
+/// nuclonium is not level geometry that was lit offline -- it is drawn with the
+/// same unlit core and camera-facing glow a ball on the lawn wears, so it keeps
+/// its standard material and is left alone. This is why the machine's own model
+/// hangs off a *child* of the machine: the walk up to a scene root has to miss
+/// the motes and find the .glb.
+///
+/// There are no mote handles in here. They live in [`crate::nuclonium::Art`],
+/// which is the whole point -- what turns in the coils has to be visibly the
+/// same substance the Marios carried in, and two modules building a green ball
+/// each is two green balls that drift apart the first time one is tuned.
 #[derive(Resource, Clone)]
 pub struct FieldArt {
-    wisp: Handle<Mesh>,
     ring: Handle<Mesh>,
-    /// Dim to hot, and what a wisp's brightness is quantised onto.
-    ladder: Vec<Handle<StandardMaterial>>,
     clear: Handle<StandardMaterial>,
     blocked: Handle<StandardMaterial>,
 }
 
-/// How many streaks one machine's field is made of.
+/// How many motes one machine will draw before it stops drawing more.
 ///
-/// Sixty-four is what it takes for the ring to read as *confined plasma*
-/// rather than as sparks in a cage. Half that and the eye follows individual
-/// streaks around the machine and counts them, which is a very different
-/// picture: what should look like one thing turning looks like thirty things
-/// orbiting.
-pub const WISPS: usize = 64;
-
-/// How many brightnesses there are to be drawn at.
+/// Five hundred, which is the number that reads as *full*: the flux surface is
+/// about forty metres of ring and a mote is a few centimetres across, so at
+/// this count they are shoulder to shoulder and the machine is a solid turning
+/// band of green. Adding a five hundred and first changes nothing anybody could
+/// see and costs two entities, every frame, for the rest of the session.
 ///
-/// A ladder of shared materials rather than one material per wisp whose alpha
-/// is written every frame. Thirty-two streaks a machine is thirty-two uniform
-/// buffers to keep rewriting, and the difference between one step of this
-/// ladder and the next is not something you can see on a streak five
-/// centimetres wide: what carries the fade smoothly is the *length*, which is
-/// in the wisp's own transform and costs nothing.
-const LADDER: usize = 8;
+/// The count itself is not capped -- see [`Store`] -- so a player who banks ten
+/// thousand has banked ten thousand and the HUD says so. This is a drawing
+/// limit and nothing else.
+pub const ORBIT_CAP: u32 = 500;
 
-/// How long a streak is at its dimmest and at its brightest, in model units,
-/// and how thick.
+/// How big one mote is against a ball lying on the lawn.
 ///
-/// The length is what carries the fade -- see [`LADDER`] -- so the two ends of
-/// it are far apart on purpose: a dying wisp shrinks to a spark and a flaring
-/// one draws a real arc through the coils.
+/// Much smaller, and it has to be: five hundred at field size would be five
+/// hundred one-metre glows inside a machine four metres across, which is not a
+/// dense field but a solid green sphere with a stellarator somewhere inside it.
+/// At this size a full machine is a band you can see the twist in, and a machine
+/// holding three is three distinct sparks going round -- which is the reading
+/// the low end has to support just as much as the high end does.
+const MOTE_SCALE: f32 = 0.22;
+
+/// How wide the plasma is at its narrowest, measured from its own axis, in the
+/// shape's units.
 ///
-/// The width was five and a half centimetres and had to grow. A machine is
-/// looked at from across a lawn as often as from inside it, and at twenty
-/// metres that was under two pixels: a field that disappeared at exactly the
-/// distance the player usually stands. Nine centimetres holds up out to the
-/// far side of the castle grounds and is still thin enough up close to be a
-/// filament rather than a bar.
-const WISP_SHORT: f32 = 0.18;
-const WISP_LONG: f32 = 1.25;
-const WISP_WIDTH: f32 = 0.09;
+/// The tube's cross-section is an ellipse: `section` across and `0.72 * MINOR`
+/// tall, and `section` is never smaller than `MINOR * (1.0 - 0.16)`. So the
+/// tight direction is the vertical one, and that is the one the motes have to be
+/// kept clear of.
+const TUBE_HALF: f32 = 0.72 * MINOR;
 
-/// How much of the ring apart the two samples the streak is aimed along are.
-const TANGENT: f32 = 0.02;
+/// How much room one mote's glow needs, in the shape's units.
+///
+/// The *glow*, not the little sphere at the middle of it. What the player sees
+/// of a mote is a card three times wider than the ball, and a field fitted to
+/// the balls is a field of halos hanging out through the coils -- which is
+/// exactly what the first version did.
+///
+/// It covers the trail behind a mote as well, without a second number: a trail
+/// is laid along the path -- which is a flux surface, and therefore already
+/// inside -- and it is drawn narrower than the glow that makes it (see
+/// [`crate::nuclonium::Trail`]), so anything this clears, that clears too.
+const MOTE_GLOW: f32 = crate::nuclonium::GLOW_RADIUS * MOTE_SCALE;
 
-/// How many times a second a wisp flares, before its own rate is applied.
-const FLARE_HZ: f32 = 0.55;
+/// How far out from the magnetic axis a mote may sit, as a fraction of the way
+/// to the plasma's surface.
+///
+/// **Not one, and it is derived rather than chosen.** The motes ride the flux
+/// surface family (see [`flux_point_at`]), and one sitting exactly *on* the
+/// outermost surface has half its glow outside it. So they are held back by
+/// their own glow's width: the outermost mote's card reaches the skin and stops
+/// there, which is what "inside the plasma" means when the thing being contained
+/// is light rather than a body.
+///
+/// Deriving it is what keeps it true. Every term here -- the ball's radius, how
+/// far its halo reaches, how big a mote is drawn, how fat the tube is -- belongs
+/// to somebody else and any of them can move; written down as a number, this
+/// would be right until the first time one of them did.
+const MOTE_REACH: f32 = (TUBE_HALF - MOTE_GLOW) / TUBE_HALF;
+
+/// How long a mote takes to swim from the feed point out to its orbit.
+///
+/// Long enough to be a journey and short enough that a machine taking delivery
+/// of a dozen at once is not a machine with a dozen things visibly wandering
+/// about in it. See [`Orbit::settling`].
+const ARRIVE_SECONDS: f32 = 0.6;
+const _: () = assert!(
+    MOTE_REACH > 0.0,
+    "a mote's glow is wider than the plasma it is supposed to be inside"
+);
 
 /// How far a coil rides up and down from where it was modelled, and how often.
 ///
@@ -469,48 +600,12 @@ const COIL_HZ: f32 = 0.18;
 /// as a wave running round the coils of any one of them.
 const COIL_SEPARATION: f32 = 0.15;
 
-/// How sharply a flare falls away either side of its peak.
-///
-/// A plain sine spends half its time bright, which is a ring of solid light.
-/// Raised, it spends most of it near nothing and passes briefly through hot,
-/// which is what makes the field read as something moving through the coils
-/// rather than as a lamp bolted inside them. Above three the ring is mostly
-/// dark and the flares read as flashes going off; this is the far side of
-/// that, where at any moment a good third of the field is showing.
-const FLARE_SHARPNESS: f32 = 2.2;
-
 /// Builds the shared art and puts the preview up, hidden. Called from startup.
 pub fn prepare(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
 ) -> FieldArt {
-    let ladder = (0..LADDER)
-        .map(|step| {
-            let heat = (step + 1) as f32 / LADDER as f32;
-            // Blue throughout, and never all the way to white. The red
-            // channel comes in on the cube, so it is still nearly absent
-            // three-quarters of the way up the ladder and reaches only two
-            // thirds at the top: a hot wisp is a pale cyan filament with a
-            // blue body, which is what plasma looks like. Taking red to one
-            // put white sticks inside the coils -- the machine's own colour
-            // fell out of the effect at exactly the brightness you look at.
-            let colour = Color::srgb(
-                0.05 + 0.55 * heat * heat * heat,
-                0.42 + 0.48 * heat,
-                1.0,
-            );
-            materials.add(StandardMaterial {
-                base_color: colour.with_alpha(0.10 + 0.80 * heat),
-                emissive: colour.to_linear() * (2.0 + 10.0 * heat),
-                unlit: true,
-                alpha_mode: AlphaMode::Blend,
-                double_sided: true,
-                cull_mode: None,
-                ..default()
-            })
-        })
-        .collect();
     let flat = |colour: Color| StandardMaterial {
         base_color: colour,
         alpha_mode: AlphaMode::Blend,
@@ -520,15 +615,10 @@ pub fn prepare(
         ..default()
     };
     let art = FieldArt {
-        // The tracer's mesh, and the tracer's trick: a unit cuboid stretched
-        // along one axis is a streak, and there is one of them rather than one
-        // mesh per wisp.
-        wisp: meshes.add(Cuboid::new(1.0, 1.0, 1.0)),
         // The whistle's annulus, at unit radius, scaled to the footprint when
         // it is drawn. Shared with the squad so the two rings a player is asked
         // to read are visibly the same kind of mark.
         ring: meshes.add(squad::ring_mesh()),
-        ladder,
         clear: materials.add(flat(Color::srgba(0.40, 0.95, 1.00, 0.80))),
         blocked: materials.add(flat(Color::srgba(1.00, 0.35, 0.30, 0.80))),
     };
@@ -556,7 +646,11 @@ pub fn prepare(
             machine().radius,
         )),
     ));
-    add_field(commands, site, &art);
+    // No field on the preview, and none on a machine at the moment it is built.
+    // A stellarator arrives empty and fills up; what the ring on the ground
+    // promises is a footprint, which is the part of the preview that was ever
+    // load-bearing.
+    //
     // Handed back as well as inserted, because the level that comes up in this
     // same run wants it and an inserted resource does not exist until the next
     // sync point. Nothing but handles, so the clone is free.
@@ -564,38 +658,49 @@ pub fn prepare(
     art
 }
 
-/// Hangs one machine's worth of plasma off `parent`.
+/// One mote of nuclonium, as a bundle, seeded off its own index.
 ///
-/// The wisps are children of the machine rather than of its model, which is
+/// The motes are children of the machine rather than of its model, which is
 /// what lets the model be turned upright and scaled without the field having to
 /// be un-turned again: everything below the machine is in the generator's own
 /// units, and the machine's own uniform scale is the only size in it.
-fn add_field(commands: &mut Commands, parent: Entity, art: &FieldArt) {
-    for index in 0..WISPS {
-        // One golden-angle walk feeds all five numbers. Successive wisps are
-        // never at the same place, never at the same speed and never flaring
-        // together, and the whole field is a function of its index.
-        let phase = index as f32 * GOLDEN_ANGLE;
-        let spread = |scale: f32| (phase * scale).sin().abs();
-        commands.entity(parent).with_child((
-            Wisp {
-                u: phase,
-                rate: 0.65 + 0.70 * spread(0.37),
-                v: phase * 2.0,
-                wind: 0.80 + 1.10 * spread(0.21),
-                pulse: phase * 1.7,
-            },
-            bevy::light::NotShadowCaster,
-            Mesh3d(art.wisp.clone()),
-            MeshMaterial3d(art.ladder[0].clone()),
-            Transform::default(),
-            // Shown by `animate` on the first frame it is worth seeing.
-            Visibility::Hidden,
-        ));
-    }
+///
+/// A function of the index alone, so [`stock`] can add the next one without
+/// knowing anything about the ones already turning.
+fn mote(art: &crate::nuclonium::Art, index: u32) -> impl Bundle + use<> {
+    // One golden-angle walk feeds all four numbers. Successive motes are never
+    // at the same place and never at the same speed, and the whole field is a
+    // function of how many have arrived.
+    let phase = index as f32 * GOLDEN_ANGLE;
+    let spread = |scale: f32| (phase * scale).sin().abs();
+    (
+        Orbit {
+            index,
+            u: phase,
+            rate: 0.65 + 0.70 * spread(0.37),
+            v: phase * 2.0,
+            wind: 0.80 + 1.10 * spread(0.21),
+            // Square-rooted, so the motes are spread evenly over the tube's
+            // *area* rather than over its radius -- without it half of them
+            // crowd into the middle, where a circle has almost no room.
+            rho: MOTE_REACH * spread(0.53).sqrt(),
+            // The whole of the arrival is still ahead of it. See
+            // [`Orbit::settling`].
+            settling: 1.0,
+        },
+        crate::nuclonium::core(art, crate::nuclonium::Kind::Nuclonium),
+        // Placed by `orbit` on the first frame it runs; this is what it wears
+        // for the one frame before that.
+        Transform::default(),
+        Visibility::Hidden,
+    )
 }
 
-/// Puts one machine in the world: the model, and the field inside it.
+/// Puts one machine in the world: the model, and an empty store.
+///
+/// No shared art is wanted any more, and its absence is the change: a machine's
+/// field is grown out of what it is holding by [`stock`], so there is nothing
+/// to build at the moment one goes up.
 ///
 /// Shared by the build button and by anything else that ever wants one, the
 /// same way [`crate::squad::spawn_ally`] is shared between the console and the
@@ -603,7 +708,6 @@ fn add_field(commands: &mut Commands, parent: Entity, art: &FieldArt) {
 pub fn spawn(
     commands: &mut Commands,
     assets: &AssetServer,
-    art: &FieldArt,
     at: Vec3,
     yaw: f32,
     scale: f32,
@@ -613,6 +717,10 @@ pub fn spawn(
             Stellarator {
                 radius: footprint(scale),
             },
+            // Empty. Every unit in it arrived down a beam -- see
+            // [`crate::nuclonium::ship`] -- so a machine that has just gone up
+            // is a machine with a dark field, which is the truth about it.
+            Store::default(),
             Transform::from_translation(at)
                 .with_rotation(Quat::from_rotation_y(yaw))
                 .with_scale(Vec3::splat(scale)),
@@ -628,7 +736,6 @@ pub fn spawn(
         // here, the quarter turn about X and the lift, are the generator's now.
         Transform::default(),
     ));
-    add_field(commands, built, art);
     built
 }
 
@@ -711,14 +818,7 @@ pub fn place(
             // reads as a texture rather than as things somebody put there.
             let away = build.aim - leader.translation;
             let yaw = away.x.atan2(away.z);
-            spawn(
-                &mut commands,
-                &assets,
-                &art,
-                build.aim,
-                yaw,
-                build_scale(held),
-            );
+            spawn(&mut commands, &assets, build.aim, yaw, build_scale(held));
         }
     }
     let showing = build.showing();
@@ -815,96 +915,146 @@ pub fn float_coils(time: Res<Time>, mut coils: Query<(&Coil, &GlobalTransform, &
     }
 }
 
-/// Runs every wisp in every field: round the ring, round the tube, and up and
-/// down its own flare.
+/// Grows and shrinks each machine's field to match what it is holding.
 ///
-/// One system for the built machines and the preview alike -- the preview is a
-/// field with no machine around it, so what you are shown while you are aiming
-/// is exactly what you are about to build.
+/// One mote per unit of nuclonium in the store, up to [`ORBIT_CAP`]. Nothing
+/// here re-lays the field: a mote's place on the flux surface is a function of
+/// its index alone (see [`mote`]), so the arrival that takes a machine from
+/// ninety-nine to a hundred spawns one entity and disturbs nothing, and the
+/// hundredth mote lands in the gap the first ninety-nine left.
+///
+/// `Store::shown` is written here and nowhere else, and it is stepped *before*
+/// the spawn it stands for has happened. That is deliberate: `Commands` are
+/// deferred to the next sync point, so a system that counted its own children
+/// instead would spawn the same mote again on every frame until the queue
+/// flushed -- which, at sixty frames a second, is a machine that eats the world
+/// because a ball arrived.
+///
+/// Shrinking is the same loop backwards and is unreachable today -- nothing
+/// spends what a machine is holding. It is written anyway because the first
+/// thing that spends it will be a cost taken in one place, and a field that
+/// stayed at its high-water mark would be a machine reporting money it no
+/// longer has.
+pub fn stock(
+    mut commands: Commands,
+    art: Res<crate::nuclonium::Art>,
+    mut machines: Query<(Entity, &mut Store)>,
+    motes: Query<(Entity, &Orbit, &ChildOf)>,
+) {
+    for (machine, mut store) in &mut machines {
+        let wanted = Store::drawn(store.held);
+        while store.shown < wanted {
+            let index = store.shown;
+            let born = commands.spawn((mote(&art, index), ChildOf(machine))).id();
+            // The same glow a ball on the lawn wears, aimed at the camera every
+            // frame by `nuclonium::shimmer` along with all the others -- there
+            // is nothing stellarator-shaped about a mote's appearance, and that
+            // is the point of it looking like what the Marios carried in.
+            commands.entity(born).with_child(crate::nuclonium::halo(
+                &art,
+                crate::nuclonium::Kind::Nuclonium,
+                index as f32 * GOLDEN_ANGLE,
+            ));
+            store.shown += 1;
+        }
+        if store.shown > wanted {
+            // Everything from `wanted` up, taken by index rather than by
+            // whatever order the query hands them over in: what has to be left
+            // behind is the *prefix* of the sequence `mote` lays down, because
+            // that is the part that is evenly spread.
+            for (spare, _, _) in motes
+                .iter()
+                .filter(|(_, mote, parent)| parent.parent() == machine && mote.index >= wanted)
+            {
+                commands.entity(spare).despawn();
+            }
+            store.shown = wanted;
+        }
+    }
+}
+
+/// Turns every mote in every machine: round the ring, and round the tube as it
+/// goes.
 ///
 /// Reads the wall clock rather than counting frames, so the field turns at the
 /// same rate whatever the frame rate is. Both sliders are read live: what a
-/// plasma looks like at a given speed and brightness is not something either
+/// machine looks like at a given speed and mote size is not something either
 /// number predicts, which is the same argument `tracer_width` is on a slider
 /// for.
-pub fn animate(
+pub fn orbit(
     time: Res<Time>,
     tuning: Res<GameTuning>,
-    art: Res<FieldArt>,
-    mut wisps: Query<(
-        &Wisp,
-        &mut Transform,
-        &mut Visibility,
-        &mut MeshMaterial3d<StandardMaterial>,
-    )>,
+    mut motes: Query<(&mut Orbit, &mut Transform, &mut Visibility)>,
 ) {
     let now = time.elapsed_secs();
-    for (wisp, mut transform, mut visible, mut material) in &mut wisps {
-        let u = wisp.u + now * tuning.stellarator_spin * wisp.rate;
-        let v = wisp.v + now * tuning.stellarator_spin * wisp.wind;
-        // Nought to one, most of it spent near nought. See [`FLARE_SHARPNESS`].
-        let flare = (0.5 + 0.5 * (now * FLARE_HZ * wisp.rate + wisp.pulse).sin())
-            .powf(FLARE_SHARPNESS)
-            * tuning.stellarator_glow;
-        let step = ((flare * LADDER as f32) as usize).min(LADDER - 1);
-        if flare <= 0.0 {
-            *visible = Visibility::Hidden;
-            continue;
+    let dt = time.delta_secs();
+    // Everything below is in the *file's* units rather than in the shape's,
+    // which is what keeps the field inside the coils when the model is
+    // re-exported at another `--scale`.
+    let size = machine().scale;
+    for (mut mote, mut transform, mut visible) in &mut motes {
+        let u = mote.u + now * tuning.stellarator_spin * mote.rate;
+        let v = mote.v + now * tuning.stellarator_spin * mote.wind;
+        // Lifted with the machine, so a mote is inside the coils rather than
+        // buried in the lawn they are standing on.
+        let axis = Vec3::Y * machine().lift;
+        let riding = flux_point_at(u, v, mote.rho) * size + axis;
+        // Still swimming out from where its shipment landed, if it only just
+        // got here. Smoothed at both ends rather than a straight lerp, so it
+        // leaves the feed point and joins its orbit without a corner at either.
+        // See [`Orbit::settling`].
+        mote.settling = (mote.settling - dt / ARRIVE_SECONDS).max(0.0);
+        let along = 1.0 - mote.settling;
+        let centre = axis.lerp(riding, along * along * (3.0 - 2.0 * along));
+        *transform = Transform::from_translation(centre)
+            .with_scale(Vec3::splat(MOTE_SCALE * size * tuning.stellarator_glow));
+        // Hidden until it has been put somewhere, so a mote never flashes at
+        // the machine's origin -- down on the lawn -- for the frame between
+        // being spawned and being placed.
+        if *visible == Visibility::Hidden {
+            *visible = Visibility::Inherited;
         }
-        *visible = Visibility::Inherited;
-        if material.0.id() != art.ladder[step].id() {
-            material.0 = art.ladder[step].clone();
-        }
-        // The streak lies along the ring's own tangent, taken as a chord across
-        // two nearby samples rather than differentiated: the parametrisation is
-        // a sum of cosines with a seven-fold twist in it, and a chord is both
-        // shorter to write and exactly what is being drawn.
-        //
-        // Everything below is in the *file's* units rather than in the shape's,
-        // which is what keeps the plasma inside the coils when the model is
-        // re-exported at another `--scale`.
-        let size = machine().scale;
-        let ahead = flux_point(u + TANGENT, v) * size;
-        let behind = flux_point(u - TANGENT, v) * size;
-        let along = ahead - behind;
-        let Some(direction) = along.try_normalize() else {
+    }
+}
+
+/// Carries out `nuclonium store <n>` from the console.
+///
+/// Sets what every machine on the map is holding, which [`stock`] then grows or
+/// sheds a field to match on the next frame. In the overlay with the rest of
+/// the console's requests, for [`crate::pylon::command`]'s reason: the console
+/// is open at the moment the line is typed.
+pub fn command(mut console: ResMut<crate::console::ConsoleState>, mut machines: Query<&mut Store>) {
+    for request in console.take_requests() {
+        let crate::console::Request::Stock(held) = request else {
+            console.defer(request);
             continue;
         };
-        let length = (WISP_SHORT + (WISP_LONG - WISP_SHORT) * flare.min(1.0)) * size;
-        // Lifted with the machine, so a wisp is inside the coils rather than
-        // buried in the lawn they are standing on.
-        let centre = (ahead + behind) * 0.5 + Vec3::Y * machine().lift;
-        *transform = Transform::from_translation(centre)
-            // `looking_to` points local -Z along what it is given, so the -Z
-            // here puts local +Z -- the axis the cuboid is stretched on -- along
-            // the direction of travel. The same turn `weapon::spawn_tracer`
-            // makes, for the same mesh.
-            .looking_to(-direction, Vec3::Y)
-            .with_scale(Vec3::new(WISP_WIDTH * size, WISP_WIDTH * size, length));
+        for mut store in &mut machines {
+            store.held = held;
+        }
     }
 }
 
 /// Aiming and drawing, in the order one frame does them.
 pub fn systems() -> bevy::ecs::schedule::ScheduleConfigs<bevy::ecs::system::ScheduleSystem> {
-    (place, animate, float_coils).chain()
+    (place, stock, orbit, float_coils).chain()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The hold grows the machine the same way the whistle grows its circle,
-    /// and stops in the same two places.
+    /// Holding the button aims the machine. It does not size it.
     #[test]
-    fn the_machine_grows_from_a_tap_to_its_cap() {
-        assert_eq!(build_scale(0.0), SCALE_MIN);
-        assert_eq!(build_scale(squad::TAP_SECONDS), SCALE_MIN);
-        let half = build_scale(squad::TAP_SECONDS + GROW_SECONDS * 0.5);
-        assert!(half > SCALE_MIN && half < SCALE_MAX, "{half}");
-        let grown = build_scale(squad::TAP_SECONDS + GROW_SECONDS);
-        assert!((grown - SCALE_MAX).abs() < 1e-3, "{grown}");
-        // Leaning on the button does not grow it past the cap.
-        assert!(build_scale(60.0) <= SCALE_MAX + 1e-3);
+    fn every_machine_the_button_builds_is_the_same_size() {
+        // A tap, a hold and leaning on the key for a minute all build the same
+        // machine. The hold aims it; it does not size it.
+        for held in [0.0, squad::TAP_SECONDS, 0.6, 1.4, 60.0] {
+            assert_eq!(build_scale(held), BUILD_SCALE, "held for {held}");
+        }
+        // And the one size is the size the file was authored at, so the
+        // generator's `--scale` is the last word on how big one can be.
+        assert_eq!(footprint(build_scale(2.0)), machine().radius);
     }
 
     /// Two machines may stand beside each other and may not stand through each
@@ -915,11 +1065,7 @@ mod tests {
         let radius = machine().radius;
         let placed = [(there, radius)];
         // Touching rims is allowed; anything nearer is not.
-        assert!(fits(
-            Vec3::new(radius * 2.0, 0.0, 0.0),
-            radius,
-            &placed
-        ));
+        assert!(fits(Vec3::new(radius * 2.0, 0.0, 0.0), radius, &placed));
         assert!(!fits(
             Vec3::new(radius * 2.0 - 0.1, 0.0, 0.0),
             radius,
@@ -971,6 +1117,214 @@ mod tests {
         assert_eq!(samples, 97 * 31);
     }
 
+    /// Every mote, glow and all, is inside the plasma.
+    ///
+    /// The thing being contained is the *card*, not the little sphere at the
+    /// middle of it -- a field fitted to the balls hangs its halos out through
+    /// the coils, which is what the first version of this did and what it was
+    /// reported as. So the glow is treated as a box around each mote and the
+    /// whole box has to be inside the tube's own ellipse.
+    ///
+    /// Swept over the surface rather than over the motes an actual machine
+    /// happens to have spawned, because what has to hold is the *rule*: any
+    /// `(u, v)` at [`MOTE_REACH`], which is the furthest out one can be put.
+    #[test]
+    fn a_motes_glow_stays_inside_the_plasma_it_is_confined_by() {
+        let mut samples = 0;
+        for i in 0..89 {
+            for j in 0..37 {
+                let u = i as f32 / 89.0 * std::f32::consts::TAU;
+                let v = j as f32 / 37.0 * std::f32::consts::TAU;
+                let twist = PERIODS * u;
+                let section = MINOR * (1.0 + 0.16 * twist.cos());
+                // The tube's own axis at this angle, and the mote's offset from
+                // it -- which is the pair `flux_point_at` interpolates between.
+                let axis = flux_point_at(u, v, 0.0);
+                let mote = flux_point_at(u, v, MOTE_REACH);
+                let across =
+                    Vec2::new(mote.x, mote.z).length() - Vec2::new(axis.x, axis.z).length();
+                let along = mote.y - axis.y;
+                assert!(
+                    (across.abs() + MOTE_GLOW) <= section,
+                    "u={u} v={v}: a glow reaches {} out of a tube {section} wide",
+                    across.abs() + MOTE_GLOW
+                );
+                assert!(
+                    (along.abs() + MOTE_GLOW) <= TUBE_HALF,
+                    "u={u} v={v}: a glow reaches {} up a tube {TUBE_HALF} tall",
+                    along.abs() + MOTE_GLOW
+                );
+                samples += 1;
+            }
+        }
+        assert_eq!(samples, 89 * 37);
+        // And the axis really is the middle: with `rho` at nothing there is no
+        // `v` left in the answer, which is what makes the interpolation above a
+        // radius rather than a fudge.
+        for v in [0.0, 1.1, 2.7, 5.5] {
+            let point = flux_point_at(0.3, v, 0.0);
+            assert!((point - flux_point_at(0.3, 0.0, 0.0)).length() < 1e-5);
+        }
+        // `flux_point` is still exactly the skin, so the older test that pins
+        // the surface against the coils is still pinning the same thing.
+        assert_eq!(flux_point(1.2, 2.3), flux_point_at(1.2, 2.3, 1.0));
+    }
+
+    /// A machine draws what it is holding, up to the cap, and goes on counting
+    /// past it.
+    ///
+    /// The arithmetic on its own, because the two halves fail in ways that look
+    /// nothing alike: a cap applied to `held` is a player whose bank quietly
+    /// stops going up at five hundred, and a cap not applied to the field is a
+    /// machine that spawns two entities a ball for the rest of the session.
+    #[test]
+    fn the_field_stops_growing_long_before_the_count_does() {
+        assert_eq!(Store::drawn(0), 0, "an empty machine draws an empty field");
+        assert_eq!(Store::drawn(1), 1);
+        assert_eq!(Store::drawn(ORBIT_CAP - 1), ORBIT_CAP - 1);
+        assert_eq!(Store::drawn(ORBIT_CAP), ORBIT_CAP);
+        // Past the cap the field stands still.
+        assert_eq!(Store::drawn(ORBIT_CAP + 1), ORBIT_CAP);
+        assert_eq!(Store::drawn(50_000), ORBIT_CAP);
+        // And the count itself is untouched -- there is no ceiling on `held`,
+        // which is the whole distinction the two fields exist to make.
+        let store = Store {
+            held: 50_000,
+            shown: Store::drawn(50_000),
+        };
+        assert_eq!(store.held, 50_000);
+    }
+
+    /// Nuclonium arriving at a machine ends up turning inside it, and stops
+    /// arriving on screen at the cap.
+    ///
+    /// Through [`stock`] itself rather than through the whole game, because
+    /// what is being checked is the bookkeeping: that `shown` is stepped by the
+    /// system rather than by counting children -- `Commands` are deferred, so a
+    /// system that counted would spawn the same mote again every frame until
+    /// the queue flushed -- and that a machine handed more than the cap stops.
+    #[test]
+    fn a_machine_grows_a_field_out_of_what_it_is_holding() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        world.insert_resource(Assets::<Mesh>::default());
+        world.insert_resource(Assets::<StandardMaterial>::default());
+        world.insert_resource(Assets::<Image>::default());
+        // The motes are drawn out of `nuclonium`'s own art, which is the point
+        // of them: what turns in the coils is the substance the Marios carried
+        // in. So the real builder is run rather than a stand-in.
+        world
+            .run_system_once(
+                |mut commands: Commands,
+                 mut meshes: ResMut<Assets<Mesh>>,
+                 mut materials: ResMut<Assets<StandardMaterial>>,
+                 mut images: ResMut<Assets<Image>>| {
+                    crate::nuclonium::prepare(
+                        &mut commands,
+                        &mut meshes,
+                        &mut materials,
+                        &mut images,
+                    );
+                },
+            )
+            .expect("the art would not build");
+        let machine = world
+            .spawn((Stellarator { radius: 2.0 }, Store::default()))
+            .id();
+
+        // Nothing held, nothing drawn.
+        world.run_system_once(stock).expect("stock would not run");
+        let mut motes = world.query::<&Orbit>();
+        assert_eq!(motes.iter(&world).count(), 0);
+
+        // Three arrive.
+        world.get_mut::<Store>(machine).unwrap().held = 3;
+        world.run_system_once(stock).expect("stock would not run");
+        let mut motes = world.query::<&Orbit>();
+        assert_eq!(motes.iter(&world).count(), 3);
+        // Running again adds nothing. This is the deferred-command trap: the
+        // three above did not exist yet when `shown` was stepped past them.
+        world.run_system_once(stock).expect("stock would not run");
+        let mut motes = world.query::<&Orbit>();
+        assert_eq!(
+            motes.iter(&world).count(),
+            3,
+            "it spawned the same field twice"
+        );
+
+        // And far past the cap it draws exactly the cap.
+        world.get_mut::<Store>(machine).unwrap().held = ORBIT_CAP + 250;
+        world.run_system_once(stock).expect("stock would not run");
+        let mut motes = world.query::<&Orbit>();
+        assert_eq!(motes.iter(&world).count(), ORBIT_CAP as usize);
+        assert_eq!(
+            world.get::<Store>(machine).unwrap().held,
+            ORBIT_CAP + 250,
+            "the drawing limit was applied to the count"
+        );
+    }
+
+    /// A mote swims out from where its shipment landed rather than appearing on
+    /// its orbit.
+    ///
+    /// The last link in "nuclonium never changes place without travelling". A
+    /// shipment ends its flight at this machine's feed point -- the middle of
+    /// the coils -- and stops existing; if the mote it becomes were placed on
+    /// its flux surface on the first frame, the substance the player watched
+    /// cross the valley would finish by blinking from one point to another. See
+    /// [`Orbit::settling`].
+    #[test]
+    fn a_mote_swims_out_from_the_feed_point_it_arrived_at() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        world.insert_resource(GameTuning::default());
+        let mut clock: Time = Time::default();
+        clock.advance_by(std::time::Duration::from_millis(16));
+        world.insert_resource(clock);
+        let mote = world
+            .spawn((
+                Orbit {
+                    index: 0,
+                    u: 0.0,
+                    rate: 1.0,
+                    v: 0.0,
+                    wind: 1.0,
+                    rho: MOTE_REACH,
+                    settling: 1.0,
+                },
+                Transform::default(),
+                Visibility::Hidden,
+            ))
+            .id();
+        // Where the flight ends, in the machine's own frame: `feed_point` in
+        // `pylon` is this same lift, taken in the world.
+        let feed = Vec3::Y * machine().lift;
+        world.run_system_once(orbit).expect("orbit would not run");
+        let landed = world.get::<Transform>(mote).unwrap().translation;
+        assert!(
+            landed.distance(feed) < 0.05,
+            "a mote appeared {} m from the point its shipment landed at",
+            landed.distance(feed)
+        );
+        // And it is on its orbit shortly afterwards, rather than drifting in
+        // for ever.
+        for _ in 0..(ARRIVE_SECONDS / 0.016) as usize + 2 {
+            world.run_system_once(orbit).expect("orbit would not run");
+        }
+        assert_eq!(
+            world.get::<Orbit>(mote).unwrap().settling,
+            0.0,
+            "the arrival never finished"
+        );
+        let riding = world.get::<Transform>(mote).unwrap().translation;
+        assert!(
+            riding.distance(feed) > 0.05,
+            "the mote never left the middle of the machine"
+        );
+    }
+
     /// The two names this module and the generator have agreed on, and what
     /// each one gets.
     ///
@@ -984,11 +1338,16 @@ mod tests {
     fn the_plasma_is_hidden_and_only_the_coils_are_set_floating() {
         use bevy::ecs::system::RunSystemOnce;
         let mut world = World::new();
-        let plasma = world.spawn((Name::new(PLASMA_NODE), Transform::default())).id();
+        let plasma = world
+            .spawn((Name::new(PLASMA_NODE), Transform::default()))
+            .id();
         // Not at the origin, so a `rest` that was assumed rather than read
         // would move it.
         let coil = world
-            .spawn((Name::new("Modular Coil 07"), Transform::from_xyz(0.1, 0.2, 0.3)))
+            .spawn((
+                Name::new("Modular Coil 07"),
+                Transform::from_xyz(0.1, 0.2, 0.3),
+            ))
             .id();
         let ring = world
             .spawn((Name::new("Support Ring 1"), Transform::default()))
@@ -1043,7 +1402,9 @@ mod tests {
             world
                 .resource_mut::<Time<()>>()
                 .advance_by(std::time::Duration::from_millis(150));
-            world.run_system_once(float_coils).expect("it would not run");
+            world
+                .run_system_once(float_coils)
+                .expect("it would not run");
             let at = world.get::<Transform>(coil).unwrap().translation;
             assert_eq!(
                 (at.x, at.y),

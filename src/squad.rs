@@ -22,6 +22,7 @@
 
 use crate::{
     animation::{AllyAnimationRoot, AnimationState, CharacterAnimations},
+    audio::{Sfx, SoundQueue},
     console::GameTuning,
     level::LevelData,
     player::{Player, PLAYER_HEIGHT},
@@ -77,7 +78,7 @@ const FOLLOW_ARRIVE: f32 = 1.1;
 /// moving the target around and a tight cluster there just means they shove
 /// each other.
 const SEND_SPACING: f32 = 2.0;
-const SEND_ARRIVE: f32 = 1.4;
+pub(crate) const SEND_ARRIVE: f32 = 1.4;
 
 /// The angle between one slot in a cluster and the next. The golden angle is
 /// what keeps a spiral from lining its points up into spokes, which is the
@@ -131,6 +132,15 @@ const AMBLE_SPEED: f32 = crate::animation::MARIO_STRIDE_SPEED;
 pub struct Ally {
     /// Where it should be standing, and how near counts as there.
     pub goal: Option<(Vec2, f32)>,
+    /// What it decided to do with itself this tick.
+    ///
+    /// Written by [`crate::goap::plan`] and read by nothing but [`move_allies`],
+    /// which walks towards whatever it says and asks no questions about why.
+    /// [`Self::goal`] is still the *record* of what the player ordered; this is
+    /// the decision about whether that is the thing to be doing right now, which
+    /// is a different question and now has its own module. See [`crate::goap`]
+    /// for why a priority chain could not answer it.
+    pub plan: crate::goap::Goal,
     /// Where it ambles around when it has no goal: the spot it was left, the
     /// spot it is currently walking to, how long it still has to stand about
     /// first, and its phase, which is what keeps a crowd from moving as one
@@ -154,6 +164,14 @@ pub struct Ally {
     /// the same job for the same reason. Written down by
     /// [`crate::enemy::maul`] and counted off by it.
     pub hurt_left: f32,
+    /// Whether it was out of its depth last tick.
+    ///
+    /// Kept rather than recomputed where it is wanted, because what it is for is
+    /// noticing the *edge*: entering and leaving the water is a splash, and a
+    /// depth read fresh each tick can say "wet" a hundred times running without
+    /// anything having happened. [`crate::player::Controller::submersion`] is
+    /// the same field doing the same job for the player.
+    pub swimming: bool,
 }
 
 impl Ally {
@@ -161,6 +179,7 @@ impl Ally {
     pub fn new(home: Vec3, phase: f32) -> Self {
         let mut ally = Self {
             goal: None,
+            plan: crate::goap::Goal::Idle,
             home,
             stroll: Vec2::new(home.x, home.z),
             rest_left: 0.0,
@@ -169,6 +188,7 @@ impl Ally {
             state: AnimationState::default(),
             swing_left: 0.0,
             hurt_left: 0.0,
+            swimming: false,
         };
         ally.amble_somewhere_else();
         ally
@@ -384,6 +404,18 @@ impl Squad {
         count
     }
 
+    /// Where the `index`'th follower should be standing, and how near counts.
+    ///
+    /// Handed out rather than read off `Ally::goal` so that [`crate::goap`] can
+    /// score an order without the walk step having already written it down --
+    /// the record of what was asked for and the decision about it are separate
+    /// things now. `None` before the leader has been seen at all, which is the
+    /// first tick of a session.
+    pub fn follow_slot(&self, index: usize) -> Option<(Vec2, f32)> {
+        self.anchor
+            .map(|anchor| (anchor + slot(index, FOLLOW_SPACING), FOLLOW_ARRIVE))
+    }
+
     /// Sent somewhere and not there yet.
     pub fn marching(&self) -> usize {
         self.sent.iter().filter(|(_, _, arrived)| !arrived).count()
@@ -421,6 +453,9 @@ pub fn spawn_ally(
     commands
         .spawn((
             Ally::new(home, phase),
+            // Drawn between two ticks rather than at them, the way the player
+            // has always been. See [`Glide`].
+            Glide::default(),
             // An ally is on the player's side, and goes for what it notices on
             // the other one exactly as an enemy goes for him.
             crate::enemy::Side::Friendly,
@@ -452,12 +487,8 @@ pub fn spawn_ally(
 /// The character comes with them, because there are two counts now -- one per
 /// playable character -- and reconciling either one means knowing which of the
 /// standing allies are that one.
-type StandingCrowd<'w, 's> = Query<
-    'w,
-    's,
-    (Entity, &'static ActiveCharacter),
-    (With<Ally>, Without<crate::pipe::Brood>),
->;
+type StandingCrowd<'w, 's> =
+    Query<'w, 's, (Entity, &'static ActiveCharacter), (With<Ally>, Without<crate::pipe::Brood>)>;
 
 /// Keeps the field's Mario population at whatever the console asks for.
 ///
@@ -605,34 +636,118 @@ pub fn update_goals(
     }
 }
 
-/// Walks each ally toward its goal, or lets it amble where it stands.
+/// How quickly a swimming ally is pulled to the height it floats at, as a
+/// fraction of the remaining gap a second.
+///
+/// A pull rather than a snap for [`settle`]'s reason, and slow enough that
+/// walking off a ledge into the moat is a body sinking and bobbing back up
+/// rather than one that changes height between two frames.
+const SWIM_RISE: f32 = 3.0;
+
+/// How far off a straight line a Mario will swing to keep out of the water, and
+/// how many deflections it tries before giving up and wading in.
+///
+/// Tried outward in pairs, left and right of where it wanted to go, so it takes
+/// the smallest detour that works rather than always swinging the same way
+/// round a pond. Nine tries at ten degrees covers a right angle either side,
+/// which is enough to get round anything short of walking into a bay -- and
+/// walking into a bay is what the last resort is for.
+const SKIRT_STEP: f32 = std::f32::consts::PI / 18.0;
+const SKIRT_TRIES: usize = 9;
+
+/// How far ahead a Mario looks for water, in strides.
+///
+/// One step is a fortieth of a second of walking and far too short to steer on:
+/// by the time the next footfall is wet the one after it is in the middle of the
+/// moat. Looking a second or so ahead is what turns this from a body that stops
+/// at the water's edge into one that goes round.
+const SKIRT_LOOKAHEAD: f32 = 30.0;
+
+/// Bends a step to keep out of deep water.
+///
+/// Returns the heading to actually walk, as a unit vector. The straight line is
+/// tried first and taken whenever it is dry, so this costs one water lookup for
+/// everything not near a shore.
+///
+/// **It gives up rather than refuses**, and that is the whole of what makes it
+/// safe. A Mario already standing in the moat, or one whose ball has rolled into
+/// it, would otherwise be pinned: every direction is wet, no heading is
+/// acceptable, and it stands there for the rest of the session. So a Mario that
+/// cannot find a dry way walks the way it wanted to and swims -- see
+/// [`move_allies`], which is what actually carries it once it is in.
+///
+/// Separate from the walk step and taking a `LevelData` rather than a query, so
+/// the rule can be exercised against a hand-built water box with no world
+/// around it.
+pub fn skirt(level: &LevelData, from: Vec3, heading: Vec2, reach: f32) -> Vec2 {
+    let dry = |direction: Vec2| {
+        let ahead = from + Vec3::new(direction.x, 0.0, direction.y) * reach;
+        // The floor under the probe rather than the walker's own height: a
+        // shoreline is a slope, and a point measured at the height it is
+        // standing now reads as dry right up until it is swimming.
+        let ground = level.floor_height(ahead + Vec3::Y * PLAYER_HEIGHT);
+        let at = Vec3::new(ahead.x, ground.unwrap_or(ahead.y), ahead.z);
+        !level
+            .water_depth(at)
+            .is_some_and(|depth| depth > SWIMMING_DEPTH)
+    };
+    if dry(heading) {
+        return heading;
+    }
+    for try_ in 1..=SKIRT_TRIES {
+        let turn = try_ as f32 * SKIRT_STEP;
+        for side in [turn, -turn] {
+            let (sin, cos) = side.sin_cos();
+            let bent = Vec2::new(
+                heading.x * cos - heading.y * sin,
+                heading.x * sin + heading.y * cos,
+            );
+            if dry(bent) {
+                return bent;
+            }
+        }
+    }
+    // Ringed by water, or already in it. Go where it meant to.
+    heading
+}
+
+/// How deep the water has to be before a Mario swims in it rather than walking
+/// through it.
+///
+/// The player's own number, so a Mario in the squad and the Mario the player is
+/// driving change behaviour at the same depth -- see
+/// [`crate::player::submersion`], which is the rule this mirrors.
+pub(crate) const SWIMMING_DEPTH: f32 = crate::player::SUBMERGED_DEPTH;
+
+/// Walks each ally toward its plan, swims it if it is out of its depth, or lets
+/// it amble where it stands.
 pub fn move_allies(
     tuning: Res<GameTuning>,
     level: Res<LevelData>,
-    squad: Res<Squad>,
+    mut sounds: ResMut<SoundQueue>,
     // One still in the air out of the Mario pipe is flown by `pipe::fly`, and
     // walking it toward a goal at the same time would drag it out of its arc.
-    mut allies: Query<
-        (
-            Entity,
-            &mut Ally,
-            &mut Transform,
-            Option<&crate::enemy::Aggro>,
-        ),
-        Without<crate::pipe::Launched>,
-    >,
+    mut allies: Query<(Entity, &mut Ally, &mut Transform), Without<crate::pipe::Launched>>,
 ) {
     let dt = crate::player::FIXED_DT;
-    for (entity, mut ally, mut transform, aggro) in &mut allies {
-        let ordered = squad.members.contains(&entity)
-            || squad.sent.iter().any(|(sent, _, _)| *sent == entity);
-        // A goal outlives the order it came from by exactly one tick, which is
-        // how being released is noticed: it stands where the order left it and
-        // ambles from there, rather than walking back to wherever it was
-        // recruited.
-        if !ordered && ally.goal.take().is_some() {
+    for (_entity, mut ally, mut transform) in &mut allies {
+        // The order it was given outlives being released by exactly one tick,
+        // which is how being released is noticed: it stands where the order left
+        // it and ambles from there, rather than walking back to wherever it was
+        // recruited. The *plan* is rewritten from scratch every tick by
+        // `goap::plan`, so nothing here has to expire it.
+        if !matches!(ally.plan, crate::goap::Goal::Obey { .. }) && ally.goal.take().is_some() {
             ally.home = transform.translation;
             ally.amble_somewhere_else();
+        }
+        // How deep it is standing, which decides everything below: whether it
+        // walks or swims, how fast, and whether it is held at the surface or
+        // dropped onto the floor.
+        let depth = level.water_depth(transform.translation);
+        let swimming = depth.is_some_and(|depth| depth > SWIMMING_DEPTH);
+        if swimming != ally.swimming {
+            ally.swimming = swimming;
+            sounds.push_at(Sfx::Splash, transform.translation);
         }
         // Mid-punch it stands where it is and throws it. `ally_combat` owns
         // the swing itself; what it means here is that a Mario is not walking.
@@ -640,67 +755,230 @@ pub fn move_allies(
             ally.velocity = Vec3::ZERO;
             continue;
         }
-        // What it has noticed, if it is still there to be noticed. This beats
-        // both the order and the amble: a Mario that has seen a slime deals
-        // with the slime and picks its errand back up afterwards, which is
-        // what the order still sitting in `goal` is for.
-        let hunting = aggro
-            .and_then(|aggro| aggro.target.map(|_| aggro.at))
-            .map(|at| {
-                let room = aggro.map_or(0.0, |aggro| aggro.room);
-                // Its own body, not `ALLY_RADIUS` -- that is how near counts as
-                // arriving, and what matters here is how much of it the shove
-                // will insist on keeping outside the thing it is hitting.
-                (
-                    Vec2::new(at.x, at.z),
-                    room + crate::player::PLAYER_RADIUS + STRIKE_RANGE,
-                )
-            });
-        // Standing about between ambles. An ally that has nowhere to be is
-        // still for seconds at a time, which is what lets the idle actually
-        // play.
-        if ally.rest_left > 0.0 && ally.goal.is_none() && hunting.is_none() {
+        // Standing about between ambles -- but only when there is genuinely
+        // nothing to do, which is exactly what an idle plan means. An ally with
+        // nowhere to be is still for seconds at a time, which is what lets the
+        // idle clip actually play.
+        if ally.rest_left > 0.0 && !ally.plan.urgent() {
             ally.rest_left -= dt;
             ally.stand(dt);
+            settle(&level, &mut transform, depth, swimming, dt);
             continue;
         }
         let here = Vec2::new(transform.translation.x, transform.translation.z);
-        let (target, arrive) = match (hunting, ally.goal) {
-            (Some(hunt), _) => hunt,
-            (None, Some((target, arrive))) => (target, arrive),
-            // Nowhere to be: amble to the spot picked last time it arrived, so
-            // an idle field of Marios is not a field of statues.
-            (None, None) => (ally.stroll, WANDER_ARRIVE),
-        };
+        // Where it decided to go. Ambling is the only thing without a
+        // destination of its own, and it walks to the spot it picked last time.
+        //
+        // Everything about *choosing* between a fight, an order, a ball and a
+        // mast now lives in [`crate::goap`], which is a pure function over one
+        // struct. What is left here is a body walking to a point -- see that
+        // module for why the two had to come apart.
+        let (target, arrive) = ally
+            .plan
+            .destination()
+            .unwrap_or((ally.stroll, WANDER_ARRIVE));
         let to_target = target - here;
         let distance = to_target.length();
         if distance <= arrive {
-            if ally.goal.is_none() {
+            if !ally.plan.urgent() {
                 // Arrived nowhere in particular: stand about a while, then
-                // amble somewhere else.
+                // amble somewhere else. A real plan is somewhere in particular
+                // -- picking a new stroll on top of one would send the Mario
+                // away from the ball it is standing on before `nuclonium::haul` had
+                // a chance to notice it had got there.
                 ally.amble_somewhere_else();
             }
             ally.stand(dt);
+            settle(&level, &mut transform, depth, swimming, dt);
             continue;
         }
-        // Ease off over the last stride so arriving is not a hard stop.
-        let pace = if hunting.is_some() || ally.goal.is_some() {
-            tuning.ally_speed
+        // Round the pond rather than through it -- unless it is already in the
+        // water, or what it is going to get is, in which case the detour is a
+        // Mario walking in circles round the thing it came for. See [`skirt`].
+        let straight = to_target / distance;
+        let goal_is_wet = level
+            .water_depth(Vec3::new(target.x, transform.translation.y, target.y))
+            .is_some_and(|depth| depth > SWIMMING_DEPTH);
+        let heading = if swimming || goal_is_wet {
+            straight
         } else {
-            AMBLE_SPEED
+            skirt(
+                &level,
+                transform.translation,
+                straight,
+                SKIRT_LOOKAHEAD * dt,
+            )
+        };
+        // Ease off over the last stride so arriving is not a hard stop. A plan
+        // is a job and is walked at the squad's marching pace; ambling is not.
+        // Swimming is its own speed, and the player's own -- a Mario in the
+        // squad and the Mario the player is driving cross the moat together.
+        let pace = match (swimming, ally.plan.urgent()) {
+            (true, _) => tuning.mario_swim,
+            (false, true) => tuning.ally_speed,
+            (false, false) => AMBLE_SPEED,
         };
         let speed = pace * (distance / arrive.max(0.001)).min(1.0);
-        let step = to_target / distance * speed * dt;
+        let step = heading * speed * dt;
         transform.translation.x += step.x;
         transform.translation.z += step.y;
-        if let Some(height) = level.floor_height(transform.translation + Vec3::Y * PLAYER_HEIGHT) {
-            transform.translation.y = height;
-        }
+        // Re-read after the step: it has moved, so the depth it is riding is
+        // the depth where it now is rather than where it set off from.
+        let arrived_depth = level.water_depth(transform.translation);
+        settle(&level, &mut transform, arrived_depth, swimming, dt);
+        // Faced along the way it is actually going rather than at the thing it
+        // is going to, so a Mario swinging round a bay is not walking sideways
+        // for the length of the detour.
         transform.rotation = Quat::from_rotation_y(step.x.atan2(step.y));
         ally.velocity = Vec3::new(step.x / dt, 0.0, step.y / dt);
-        ally.state.motion = crate::player::Motion::Run;
+        ally.state.motion = match swimming {
+            // Mario has a swim clip and the ally animation reads the same
+            // tables the player does, so this is the whole of making one swim.
+            true => crate::player::Motion::Swim,
+            false => crate::player::Motion::Run,
+        };
         ally.state.speed = speed;
         ally.state.still_for = 0.0;
+    }
+}
+
+/// Puts an ally at the height it belongs at: floating if it is swimming,
+/// standing on the ground if it is not.
+///
+/// Its own function because three places in [`move_allies`] need it -- walking,
+/// arriving and resting -- and an ally that is only re-seated on the ticks it
+/// moves is one that sinks to the bottom of the moat the moment it stops.
+///
+/// The float is a pull rather than a snap, so breaking the surface is a body
+/// rising through it rather than a body teleporting to it, and it is the
+/// player's own `SWIM_FLOAT_DEPTH` so the two ride the water at the same height.
+fn settle(
+    level: &LevelData,
+    transform: &mut Transform,
+    depth: Option<f32>,
+    swimming: bool,
+    dt: f32,
+) {
+    if swimming {
+        if let Some(depth) = depth {
+            let rise = depth - crate::player::SWIM_FLOAT_DEPTH;
+            transform.translation.y += rise * (SWIM_RISE * dt).min(1.0);
+        }
+        return;
+    }
+    if let Some(height) = level.floor_height(transform.translation + Vec3::Y * PLAYER_HEIGHT) {
+        transform.translation.y = height;
+    }
+}
+
+// -- gliding ----------------------------------------------------------------
+
+/// How far an ally may have moved in one tick and still be drawn as having
+/// travelled there.
+///
+/// A Mario walks four metres a second, so a third of a metre is a busy tick and
+/// six metres is not a walk at all -- it is a warp pipe, a level swapping under
+/// it, or a body being put somewhere. Interpolating one of those draws the ally
+/// sliding across the map over the next thirty-third of a second, through
+/// everything in between. `player::sync_visual` has no equivalent because the
+/// player is never moved that way with the visual still attached.
+const GLIDE_JUMP: f32 = 6.0;
+
+/// Where an ally stood at the end of each of the last two ticks.
+///
+/// **The simulation runs at thirty steps a second and the game is drawn at
+/// whatever the monitor does.** Luna has been drawn between two of those steps
+/// since the beginning -- that is [`crate::player::RenderPose`], and it is the
+/// only reason she does not judder -- but a Mario was drawn *at* them: the
+/// same pose held for two or three frames and then jumped a whole tick's stride
+/// at once. Beside a leader who glides, that reads as the squad stuttering
+/// along behind her, which is exactly what it is.
+///
+/// The fix cannot be to interpolate the ally's `Transform` in place, because
+/// that transform is not a picture -- it is where the Mario *is*. Forty systems
+/// read it: the fight measures reach against it, the planner scores errands off
+/// it, the walk steps from it. Smoothing it in place would feed a drawn
+/// half-step back into the next tick's arithmetic, and a simulation whose input
+/// depends on the frame rate is not a simulation.
+///
+/// So the pose is banked instead. [`bank`] writes down where the tick left the
+/// ally, [`steady`] puts that exact pose back before the next tick reads it,
+/// and [`glide`] draws whatever is in between. Every system in the fixed step
+/// sees the same numbers it always saw; the drawn frames in between get the
+/// smoothing, and nothing that runs on the fixed step can tell the difference.
+///
+/// One component rather than a field on [`Ally`], because it is nothing to do
+/// with being an ally -- it is a body being drawn between two steps, which is
+/// what anything simulated on a fixed step and drawn on a variable one needs.
+#[derive(Component, Clone, Copy, Default)]
+pub struct Glide {
+    /// The tick before last, and the last tick. `None` until a tick has
+    /// actually happened: an ally spawned this frame has one pose and nothing
+    /// to interpolate it against.
+    was: Option<(Vec3, Quat)>,
+    now: Option<(Vec3, Quat)>,
+}
+
+impl Glide {
+    /// Where to draw it, `alpha` of the way through the step after the one that
+    /// has been simulated.
+    ///
+    /// A teleport is not interpolated -- see [`GLIDE_JUMP`] -- it is simply
+    /// where it now is.
+    pub fn between(&self, alpha: f32) -> Option<(Vec3, Quat)> {
+        let (was, now) = (self.was?, self.now?);
+        if was.0.distance(now.0) > GLIDE_JUMP {
+            return Some(now);
+        }
+        Some((was.0.lerp(now.0, alpha), was.1.slerp(now.1, alpha)))
+    }
+}
+
+/// Puts every ally back on its simulated pose, before the tick that reads it.
+///
+/// First in the fixed step, and that is the whole of its correctness: the
+/// frames since the last tick have been drawing the ally somewhere between two
+/// poses, and the tick about to run must start from the second of them rather
+/// than from wherever the last drawn frame happened to leave it. See [`Glide`].
+pub fn steady(mut allies: Query<(&Glide, &mut Transform), With<Ally>>) {
+    for (glide, mut at) in &mut allies {
+        let Some((translation, rotation)) = glide.now else {
+            continue;
+        };
+        at.translation = translation;
+        at.rotation = rotation;
+    }
+}
+
+/// Writes down where this tick left every ally.
+///
+/// Last in the fixed step, after everything that could have moved one: the walk,
+/// the fight, the warp pipe's arc. See [`Glide`].
+pub fn bank(mut allies: Query<(&mut Glide, &Transform), With<Ally>>) {
+    for (mut glide, at) in &mut allies {
+        let pose = (at.translation, at.rotation);
+        glide.was = glide.now.or(Some(pose));
+        glide.now = Some(pose);
+    }
+}
+
+/// Draws every ally between the last two ticks, once per frame.
+///
+/// The same job [`crate::player::sync_visual`] does for Luna, and off the same
+/// clock: `overstep_fraction` is how far through the current step the wall
+/// clock has got, so an ally is drawn exactly as far along its stride. See
+/// [`Glide`].
+pub fn glide(
+    fixed_time: Res<Time<Fixed>>,
+    mut allies: Query<(&Glide, &mut Transform), With<Ally>>,
+) {
+    let alpha = fixed_time.overstep_fraction().clamp(0.0, 1.0);
+    for (glide, mut at) in &mut allies {
+        let Some((translation, rotation)) = glide.between(alpha) else {
+            continue;
+        };
+        at.translation = translation;
+        at.rotation = rotation;
     }
 }
 
@@ -888,6 +1166,66 @@ pub fn whistle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The drawn pose is somewhere on the stride, never past either end of it.
+    ///
+    /// The whole safety argument for [`Glide`] is that it only ever draws
+    /// *between* two poses the simulation actually produced. Anything that ran
+    /// ahead of the second one would be a Mario drawn where the fight has not
+    /// put it yet, which is the extrapolation this deliberately is not.
+    #[test]
+    fn the_drawn_pose_stays_between_the_two_ticks_it_is_between() {
+        let (was, now) = (Vec3::ZERO, Vec3::new(0.12, 0.0, 0.0));
+        let glide = Glide {
+            was: Some((was, Quat::IDENTITY)),
+            now: Some((now, Quat::from_rotation_y(1.0))),
+        };
+        for step in 0..=10 {
+            let alpha = step as f32 / 10.0;
+            let (at, _) = glide.between(alpha).expect("a banked pose was not drawn");
+            let along = (at - was).dot(now - was) / (now - was).length_squared();
+            assert!(
+                (-1e-5..=1.0 + 1e-5).contains(&along),
+                "drawn {along} of the way along a stride at alpha {alpha}"
+            );
+        }
+        assert_eq!(glide.between(0.0).unwrap().0, was);
+        assert_eq!(glide.between(1.0).unwrap().0, now);
+    }
+
+    /// A Mario put somewhere is put there, rather than sliding across the map.
+    ///
+    /// A warp pipe, a respawn and a level swap all move a body outright, and
+    /// interpolating one of those draws it travelling through everything in
+    /// between over the next thirty-third of a second. See [`GLIDE_JUMP`].
+    #[test]
+    fn a_mario_that_was_put_somewhere_does_not_glide_there() {
+        let there = Vec3::new(GLIDE_JUMP * 3.0, 0.0, 0.0);
+        let glide = Glide {
+            was: Some((Vec3::ZERO, Quat::IDENTITY)),
+            now: Some((there, Quat::IDENTITY)),
+        };
+        assert_eq!(
+            glide.between(0.5).unwrap().0,
+            there,
+            "a teleport was drawn as a walk"
+        );
+    }
+
+    /// Nothing to interpolate is drawn as nothing, not as the origin.
+    ///
+    /// An ally spawned this frame has one pose and no history, and a `Glide`
+    /// that answered `Vec3::ZERO` to that would put every new Mario at the
+    /// middle of the map for one frame.
+    #[test]
+    fn a_mario_with_no_history_is_left_where_it_stands() {
+        assert!(Glide::default().between(0.5).is_none());
+        let banked = Glide {
+            was: None,
+            now: Some((Vec3::X, Quat::IDENTITY)),
+        };
+        assert!(banked.between(0.5).is_none());
+    }
 
     #[test]
     fn a_cluster_spreads_without_stacking_or_lining_up() {
@@ -1101,18 +1439,173 @@ mod tests {
         assert_eq!(aim, player);
     }
 
+    /// A flat lawn with a pond cut into one half of it.
+    ///
+    /// Ground everywhere, water only where the box says, so a walker can stand
+    /// on either side and the shoreline is a straight line at `z = 0`.
+    fn lawn_with_a_pond() -> LevelData {
+        let corners = [
+            Vec3::new(-60., 0., -60.),
+            Vec3::new(60., 0., -60.),
+            Vec3::new(60., 0., 60.),
+            Vec3::new(-60., 0., 60.),
+        ];
+        LevelData::new(
+            corners.to_vec(),
+            vec![[0, 1, 2], [0, 2, 3]],
+            vec![crate::level::WaterBox {
+                min_x: -20.,
+                min_z: 0.,
+                max_x: 20.,
+                max_z: 40.,
+                // Above the floor, so anything inside the box is out of its
+                // depth rather than paddling.
+                surface_y: 3.0,
+            }],
+        )
+    }
+
+    #[test]
+    fn a_dry_heading_is_taken_as_it_is() {
+        let level = lawn_with_a_pond();
+        // Walking away from the pond, over open lawn: no deflection at all, and
+        // that is the case that has to stay free -- it is every step the squad
+        // takes that is not near a shore.
+        let away = Vec2::new(0.0, -1.0);
+        let kept = skirt(&level, Vec3::new(0.0, 0.0, -5.0), away, 6.0);
+        assert!((kept - away).length() < 1e-6, "{kept:?}");
+    }
+
+    #[test]
+    fn a_mario_walks_round_a_pond_rather_than_into_it() {
+        let level = lawn_with_a_pond();
+        // Standing just short of the shore, pointed straight at the water.
+        let from = Vec3::new(0.0, 0.0, -2.0);
+        let into = Vec2::new(0.0, 1.0);
+        let bent = skirt(&level, from, into, 8.0);
+        assert!(
+            (bent - into).length() > 1e-3,
+            "walked straight in: {bent:?}"
+        );
+        // And what it picked is genuinely dry, which is the whole point -- a
+        // deflection that still ends in the pond is not avoidance.
+        let ahead = from + Vec3::new(bent.x, 0.0, bent.y) * 8.0;
+        assert!(
+            level
+                .water_depth(ahead)
+                .is_none_or(|depth| depth <= SWIMMING_DEPTH),
+            "the detour is wet too: {ahead:?}"
+        );
+        // Still roughly the way it wanted to go, rather than a right-about
+        // turn: `skirt` tries the smallest deflections first.
+        assert!(bent.dot(into) > 0.0, "it turned round: {bent:?}");
+    }
+
+    #[test]
+    fn something_ringed_by_water_goes_where_it_meant_to() {
+        // **The give-up case, and it is the one that keeps this safe.** A Mario
+        // already in the pond has no dry heading anywhere; refusing all of them
+        // would pin it there for the rest of the session. It swims out instead.
+        let level = lawn_with_a_pond();
+        let middle = Vec3::new(0.0, 0.0, 20.0);
+        let wanted = Vec2::new(0.0, 1.0);
+        assert_eq!(skirt(&level, middle, wanted, 4.0), wanted);
+    }
+
+    /// An ally that walks into deep water swims in it rather than trudging
+    /// along the bottom.
+    #[test]
+    fn an_ally_out_of_its_depth_swims_at_the_surface() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        world.insert_resource(lawn_with_a_pond());
+        world.insert_resource(GameTuning::default());
+        squad_resources(&mut world);
+        // Dropped into the middle of the pond, at the bottom of it, with its
+        // plan pointing across -- so it is walking rather than standing, which
+        // is the case that used to drag it along the floor.
+        let under = Vec3::new(0.0, 0.0, 20.0);
+        let ally = world
+            .spawn((
+                {
+                    let mut ally = Ally::new(under, 0.0);
+                    ally.plan = crate::goap::Goal::Fetch {
+                        ball: Entity::from_raw_u32(99).unwrap(),
+                        at: Vec2::new(0.0, 38.0),
+                        arrive: 1.0,
+                    };
+                    ally
+                },
+                Transform::from_translation(under),
+            ))
+            .id();
+        for _ in 0..90 {
+            // The plan is written by hand here rather than by `goap::plan`,
+            // which would clear it -- there is no ball in this world. So the
+            // walk step is run on its own.
+            world
+                .run_system_once(move_allies)
+                .expect("move_allies could not run");
+        }
+        let state = world.get::<Ally>(ally).unwrap();
+        assert!(state.swimming, "it never noticed it was in the water");
+        assert_eq!(
+            state.state.motion,
+            crate::player::Motion::Swim,
+            "it is playing a walk cycle underwater"
+        );
+        let at = world.get::<Transform>(ally).unwrap().translation;
+        // Riding the surface rather than the floor: the pond is three metres
+        // deep and it floats just under the top of it.
+        let depth = 3.0 - at.y;
+        assert!(
+            (depth - crate::player::SWIM_FLOAT_DEPTH).abs() < 0.4,
+            "floating {depth} m down rather than {}",
+            crate::player::SWIM_FLOAT_DEPTH
+        );
+        // And it did swim somewhere rather than treading water on the spot.
+        assert!(at.z > under.z + 1.0, "it went nowhere: {at:?}");
+    }
+
+    /// One fixed tick of the squad, in the order the game runs it.
+    ///
+    /// `goap::plan` sits between the two, because that is where it sits in the
+    /// real schedule and because a test that ran only the walk step would be
+    /// exercising a Mario with no plan -- which stands still, whatever else is
+    /// true about it. Deciding is its own system now; see [`crate::goap`].
+    fn tick(world: &mut World) {
+        use bevy::ecs::system::RunSystemOnce;
+        world
+            .run_system_once(update_goals)
+            .expect("update_goals could not run");
+        world
+            .run_system_once(crate::goap::plan)
+            .expect("goap::plan could not run");
+        world
+            .run_system_once(move_allies)
+            .expect("move_allies could not run");
+    }
+
+    /// Everything a squad tick reads that is not the level or the tuning.
+    fn squad_resources(world: &mut World) {
+        world.insert_resource(Squad::default());
+        world.insert_resource(Time::<Fixed>::from_hz(30.0));
+        // The plan asks what the network is lit with, and the walk step makes a
+        // splash when somebody goes in the water.
+        world.init_resource::<crate::pylon::Network>();
+        world.insert_resource(SoundQueue::default());
+    }
+
     /// The follow behaviour end to end: recruit an ally, run the two fixed-step
     /// systems, and watch it walk to its slot behind the leader.
     #[test]
     fn a_recruited_ally_walks_to_its_slot_behind_the_leader() {
-        use bevy::ecs::system::RunSystemOnce;
-
         let mut world = World::new();
         let (collision, _) = crate::level::load();
         world.insert_resource(collision);
         world.insert_resource(GameTuning::default());
-        world.insert_resource(Squad::default());
-        world.insert_resource(Time::<Fixed>::from_hz(30.0));
+        squad_resources(&mut world);
         let leader = Vec3::new(-13.28, 3.0, 46.64);
         world.spawn((Player, Transform::from_translation(leader)));
         // Standing well off to the side, with nothing to do.
@@ -1124,12 +1617,7 @@ mod tests {
         // Unrecruited, it stays near where it was left rather than walking to
         // the leader.
         for _ in 0..30 {
-            world
-                .run_system_once(update_goals)
-                .expect("update_goals could not run");
-            world
-                .run_system_once(move_allies)
-                .expect("move_allies could not run");
+            tick(&mut world);
         }
         let wandered = world.get::<Transform>(ally).unwrap().translation;
         assert!(
@@ -1139,12 +1627,7 @@ mod tests {
 
         world.resource_mut::<Squad>().recruit(&[ally]);
         for _ in 0..90 {
-            world
-                .run_system_once(update_goals)
-                .expect("update_goals could not run");
-            world
-                .run_system_once(move_allies)
-                .expect("move_allies could not run");
+            tick(&mut world);
         }
         let arrived = world.get::<Transform>(ally).unwrap().translation;
         let flat = Vec2::new(arrived.x - leader.x, arrived.z - leader.z).length();
@@ -1173,13 +1656,11 @@ mod tests {
     /// the number underneath it.
     #[test]
     fn an_idle_ally_ambles_rather_than_twitching() {
-        use bevy::ecs::system::RunSystemOnce;
-
         let mut world = World::new();
         let (collision, _) = crate::level::load();
         world.insert_resource(collision);
         world.insert_resource(GameTuning::default());
-        world.insert_resource(Squad::default());
+        squad_resources(&mut world);
         let start = Vec3::new(-13.28, 3.0, 46.64);
         world.spawn((Player, Transform::from_translation(start)));
         let ally = world
@@ -1190,9 +1671,7 @@ mod tests {
         let mut clips = Vec::new();
         let mut walked = 0;
         for _ in 0..300 {
-            world
-                .run_system_once(move_allies)
-                .expect("move_allies could not run");
+            tick(&mut world);
             let ally = world.get::<Ally>(ally).unwrap();
             if ally.state.motion == crate::player::Motion::Run {
                 walked += 1;
@@ -1218,14 +1697,11 @@ mod tests {
     /// Sent somewhere, an ally holds the spot rather than drifting off it.
     #[test]
     fn a_sent_ally_arrives_and_holds_its_ground() {
-        use bevy::ecs::system::RunSystemOnce;
-
         let mut world = World::new();
         let (collision, _) = crate::level::load();
         world.insert_resource(collision);
         world.insert_resource(GameTuning::default());
-        world.insert_resource(Squad::default());
-        world.insert_resource(Time::<Fixed>::from_hz(30.0));
+        squad_resources(&mut world);
         let leader = Vec3::new(-13.28, 3.0, 46.64);
         world.spawn((Player, Transform::from_translation(leader)));
         let ally = world
@@ -1237,12 +1713,7 @@ mod tests {
         assert_eq!(world.resource_mut::<Squad>().send(target), 1);
 
         for _ in 0..150 {
-            world
-                .run_system_once(update_goals)
-                .expect("update_goals could not run");
-            world
-                .run_system_once(move_allies)
-                .expect("move_allies could not run");
+            tick(&mut world);
         }
         let squad = world.resource::<Squad>();
         assert_eq!(squad.marching(), 0, "never reported arriving");
@@ -1254,12 +1725,7 @@ mod tests {
         );
         // Held: an order is not a suggestion, so it does not wander home.
         for _ in 0..90 {
-            world
-                .run_system_once(update_goals)
-                .expect("update_goals could not run");
-            world
-                .run_system_once(move_allies)
-                .expect("move_allies could not run");
+            tick(&mut world);
         }
         let later = world.get::<Transform>(ally).unwrap().translation;
         assert!(

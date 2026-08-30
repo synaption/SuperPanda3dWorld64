@@ -102,6 +102,7 @@ WEAPONS = ("target_pistol",)
 # Actor -> its clip sidecar, or None where the actor does not animate.
 ACTORS = {
     "ant": "ant_clips.json",
+    "pylon": None,
     "slime": "slime_clips.json",
     "tree": None,
     "warp_pipe": None,

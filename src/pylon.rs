@@ -31,15 +31,24 @@
 //!     expanded once, when the network changes, into the list of masts the
 //!     packet actually flies between -- see [`Network::rebuild`].
 //!
-//! What the player gets out of it is range. Standing near a live pylon fills
-//! the jetpack bar several times faster than standing on open ground, so a line
-//! of masts across a valley is a line of places you can fly from -- which is
-//! why the network is worth pushing outward rather than being decoration
-//! around the machine that powers it.
+//! What the player gets out of it is range, and a road. Standing near a live
+//! pylon fills the jetpack bar several times faster than standing on open
+//! ground, so a line of masts across a valley is a line of places you can fly
+//! from; and a mast is where a Mario hands in what it picked off a dead enemy,
+//! which then flies home down the beams to a machine -- see [`crate::nuclonium`],
+//! which owns the balls and asks [`Network::supply_route`] for the way back.
+//! Both are why the network is worth pushing outward rather than being
+//! decoration around the machine that powers it.
 //!
-//! **The model is measured, never written down.** `tools/generate_pylon.py`
-//! writes `assets/actors/pylon.glb`, and [`measure`] reads its height and its
-//! footprint back out of the file's own accessor bounds. Regenerating the mast
+//! And a mast can be lost. Every pylon stands as a [`crate::structure::Structure`]
+//! on the friendly side, which is the whole of what makes the crowd come for it:
+//! [`crate::enemy::alert`] asks what side a thing is on and never asks whether it
+//! can walk. A network is something to defend now rather than something you
+//! finish.
+//!
+//! **The model is measured, never written down.** The asset pipeline exports
+//! `assets/actors/pylon.blend` to `pylon.glb`, and [`measure`] reads its height
+//! and footprint back out of the file's own accessor bounds. Re-exporting it
 //! at another size moves the beams, the ring on the ground and the overlap test
 //! with it, for the reason [`crate::stellarator::machine`] documents at
 //! length: an asset somebody is free to re-export must not have a copy of its
@@ -60,18 +69,32 @@ use bevy::prelude::*;
 /// The model, named once: [`spawn`] loads it and [`measure`] reads it off disk.
 const MODEL: &str = "actors/pylon.glb#Scene0";
 
-/// The glTF node holding the emitter head. `tools/generate_pylon.py` writes it,
-/// and [`claim`] finds it to give it its idle shimmer.
+/// The optional glTF node holding the emitter head. [`claim`] finds it to give
+/// it its idle shimmer; models without a separate head still use their upper
+/// edge as the beam height.
 const EMITTER_NODE: &str = "Pylon Emitter";
 
 /// How far a beam carries, in metres.
 ///
-/// The castle grounds are a bit over 160 m across, so this is roughly a quarter
-/// of the map: far enough that three or four masts cross it and the network is
-/// something you plan, near enough that where you put them matters. It is a
-/// property of the *beam* rather than of the model, which is why it is written
-/// here and the mast's own dimensions are not.
-pub const REACH: f32 = 42.0;
+/// **Long enough that line of sight is the rule and range is the backstop.**
+/// It was 42 m -- about a quarter of the castle grounds -- and at that length
+/// the thing a player was actually planning around was the number, not the
+/// terrain: masts went down in a chain at regular intervals and the hills the
+/// beams were supposed to be threading between never came into it. A beam is
+/// light. What ought to stop it is something standing in the way.
+///
+/// So it is now most of the map. The castle grounds are a bit over 160 m
+/// across, and a mast on the high ground can reach very nearly any other mast
+/// it can *see* -- which turns the question from "how far apart" into "what is
+/// between them", and makes a ridge line a real decision rather than scenery.
+///
+/// Not infinite, and the reason is not tidiness. [`links`] is a pair-wise sweep
+/// that runs the cheap range test first precisely so the expensive visibility
+/// ray runs only for pairs that passed it; with no range at all every pair of
+/// masts on the map is a ray cast into the level's collision on every rebuild.
+/// A number a little larger than the world is what keeps that ordering
+/// meaningful on the next, bigger level rather than only on this one.
+pub const REACH: f32 = 150.0;
 
 /// How near a live pylon the player has to be for the bar to fill faster, and
 /// by how much.
@@ -116,10 +139,11 @@ pub fn mast() -> &'static Mast {
 /// Reads the mast's size out of `assets/actors/pylon.glb`.
 ///
 /// Accessor bounds rather than a walk over vertices: every glTF accessor
-/// carries `min` and `max`, and the generator writes one mesh per node with no
-/// skins anywhere, so the node chain is the whole of the transform. The same
+/// carries `min` and `max`. Blender may leave its Y-up conversion on the node,
+/// so those local bounds are transformed before they are measured. The same
 /// job [`crate::stellarator::machine`] does, with one fewer subtlety -- there
-/// is no baked scale to recover here, because the pylon is authored in metres.
+/// is no authored scale to recover here, because the pylon is authored in
+/// metres.
 fn measure() -> Option<Mast> {
     let bytes = std::fs::read(crate::asset_path().join(MODEL.trim_end_matches("#Scene0"))).ok()?;
     let length = u32::from_le_bytes(bytes.get(12..16)?.try_into().ok()?) as usize;
@@ -129,6 +153,27 @@ fn measure() -> Option<Mast> {
     for node in json["nodes"].as_array()? {
         let Some(index) = node["mesh"].as_u64() else {
             continue;
+        };
+        let numbers = |key: &str, count: usize| -> Option<Vec<f32>> {
+            let values = node.get(key)?.as_array()?;
+            (values.len() == count).then(|| {
+                values
+                    .iter()
+                    .map(|value| value.as_f64().unwrap_or(0.0) as f32)
+                    .collect()
+            })
+        };
+        let transform = if let Some(matrix) = numbers("matrix", 16) {
+            Mat4::from_cols_array(matrix.as_slice().try_into().ok()?)
+        } else {
+            let translation = numbers("translation", 3).unwrap_or_else(|| vec![0.0; 3]);
+            let rotation = numbers("rotation", 4).unwrap_or_else(|| vec![0.0, 0.0, 0.0, 1.0]);
+            let scale = numbers("scale", 3).unwrap_or_else(|| vec![1.0; 3]);
+            Mat4::from_scale_rotation_translation(
+                Vec3::from_slice(&scale),
+                Quat::from_array(rotation.as_slice().try_into().ok()?),
+                Vec3::from_slice(&translation),
+            )
         };
         let mesh = &json["meshes"][index as usize];
         for primitive in mesh["primitives"].as_array()? {
@@ -143,13 +188,24 @@ fn measure() -> Option<Mast> {
                 ))
             };
             let (min, max) = (corner("min")?, corner("max")?);
-            low = low.min(min);
-            high = high.max(max);
+            let mut part_low = Vec3::splat(f32::MAX);
+            let mut part_high = Vec3::splat(f32::MIN);
+            for x in [min.x, max.x] {
+                for y in [min.y, max.y] {
+                    for z in [min.z, max.z] {
+                        let point = transform.transform_point3(Vec3::new(x, y, z));
+                        part_low = part_low.min(point);
+                        part_high = part_high.max(point);
+                    }
+                }
+            }
+            low = low.min(part_low);
+            high = high.max(part_high);
             if mesh["name"].as_str() == Some(EMITTER_NODE) {
                 // The middle of the head rather than the top of it: a beam
                 // leaves the emitter, and hanging it off the point would leave
                 // every link visibly missing the thing it comes out of.
-                emitter = Some((min.y + max.y) * 0.5);
+                emitter = Some((part_low.y + part_high.y) * 0.5);
             }
         }
     }
@@ -232,6 +288,16 @@ pub struct Node {
     pub top: Vec3,
     /// Hops from the nearest machine, or `None` for a mast with no power.
     pub hops: Option<u32>,
+    /// Which machine feeds this mast *directly*, as an index into
+    /// [`Network::feeds`], for the masts one is close enough to reach.
+    ///
+    /// `None` for a mast fed through its neighbours and for a dark one, so this
+    /// is exactly the set of places power enters the network. Two things want
+    /// that, and both used to guess at it: [`draw`], which now strings a beam
+    /// along it so a machine is visibly *part* of the network rather than a prop
+    /// standing near one, and [`Network::supply_route`], which ends a shipment's
+    /// flight at it.
+    pub feed: Option<usize>,
 }
 
 /// The live network: who is linked to whom, who has power, and the round the
@@ -249,8 +315,13 @@ pub struct Network {
     /// The masts the packet flies between, in order, each linked to the next.
     /// Empty while there is nothing live to visit.
     pub run: Vec<usize>,
-    /// How many machines were feeding the network when it was last built.
-    pub machines: usize,
+    /// Where the machines feeding the network were when it was last built.
+    ///
+    /// Positions rather than the count this used to be, because a shipment
+    /// coming home down the beams has to be *delivered* somewhere -- see
+    /// [`Self::supply_route`]. The count is still what [`relink`] watches for a
+    /// change, and it is `feeds.len()`.
+    pub feeds: Vec<Vec3>,
     /// Bumped on every rebuild. The beam-drawing system redraws when it
     /// changes and does nothing at all when it does not.
     pub revision: u64,
@@ -259,9 +330,7 @@ pub struct Network {
 impl Network {
     /// Whether a mast has power.
     pub fn powered(&self, node: usize) -> bool {
-        self.nodes
-            .get(node)
-            .is_some_and(|node| node.hops.is_some())
+        self.nodes.get(node).is_some_and(|node| node.hops.is_some())
     }
 
     /// Whether the mast standing as `entity` has power.
@@ -306,21 +375,32 @@ impl Network {
                 at,
                 top: at + lift,
                 hops: None,
+                feed: None,
             })
             .collect();
         let tops: Vec<Vec3> = self.nodes.iter().map(|node| node.top).collect();
         self.links = links(&tops, &sees);
-        self.machines = machines.len();
+        self.feeds = machines.to_vec();
 
         // Power. The sources are the masts a machine can reach and see; the
         // flood carries it outward from there, and a mast the sweep never
         // reaches is a mast standing dark.
         let mut touching = Vec::new();
         for (index, top) in tops.iter().enumerate() {
-            if machines
+            // Which machine, not merely whether one -- see [`Node::feed`]. The
+            // nearest of those that can reach and see it, so a mast standing
+            // between two machines draws its beam to the one it is beside.
+            let feed = machines
                 .iter()
-                .any(|feed| in_reach(*feed, *top) && sees(*feed, *top))
-            {
+                .enumerate()
+                .filter(|(_, feed)| in_reach(**feed, *top) && sees(**feed, *top))
+                .min_by(|(_, a), (_, b)| {
+                    a.distance_squared(*top)
+                        .total_cmp(&b.distance_squared(*top))
+                })
+                .map(|(which, _)| which);
+            if feed.is_some() {
+                self.nodes[index].feed = feed;
                 touching.push(index);
             }
         }
@@ -366,6 +446,53 @@ impl Network {
             self.run.extend_from_slice(&chain[1..]);
         }
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// The way home from `node`: the points a delivered ball flies through to
+    /// reach a machine.
+    ///
+    /// **The flood is read backwards.** [`Self::rebuild`] already walked outward
+    /// from the machines and wrote every mast's hop count, so the shortest way
+    /// *to* a machine is simply: step to whichever neighbour has a smaller
+    /// count, until the count is zero, and then leave the network for the feed
+    /// point that mast is drawing from. No second search, no path stored per
+    /// mast -- the number that decides which masts are lit is the same number
+    /// that decides which way is downhill.
+    ///
+    /// Returns `None` for a mast with no power, which has no way home by
+    /// definition. The route is beam heights rather than ground positions, so
+    /// what the player watches is a ball travelling *along the beams* it can
+    /// see, and the last leg drops to the machine's own coils.
+    pub fn supply_route(&self, node: usize) -> Option<Vec<Vec3>> {
+        let mut hops = self.nodes.get(node)?.hops?;
+        let mut wired = vec![Vec::new(); self.nodes.len()];
+        for &(a, b) in &self.links {
+            wired[a].push(b);
+            wired[b].push(a);
+        }
+        let mut legs = vec![self.nodes[node].top];
+        let mut here = node;
+        while hops > 0 {
+            // The neighbour nearest the machine. Strictly nearer, so the walk
+            // cannot stall on a tie or double back, and it terminates because
+            // the count falls by at least one every step.
+            let next = wired[here]
+                .iter()
+                .copied()
+                .filter(|&other| self.nodes[other].hops.is_some_and(|theirs| theirs < hops))
+                .min_by_key(|&other| self.nodes[other].hops.unwrap_or(u32::MAX))?;
+            here = next;
+            hops = self.nodes[here].hops?;
+            legs.push(self.nodes[here].top);
+        }
+        // Off the end of the network and into the machine that lit it. The mast
+        // the walk finished on is one with no hops, which is one `rebuild`
+        // recorded a [`Node::feed`] for, so this is the actual source rather
+        // than a guess at the nearest -- and it is the same beam [`draw`] has
+        // already strung, so the last leg of the flight is one the player can
+        // watch the ball travelling along.
+        legs.push(*self.feeds.get(self.nodes[here].feed?)?);
+        Some(legs)
     }
 
     /// Where the packet is after flying `along` legs of the run, and which way
@@ -472,6 +599,15 @@ pub struct GridArt {
     blocked: Handle<StandardMaterial>,
 }
 
+/// How wide a ring the console's `pylon <n>` plants its masts on.
+///
+/// A distance of its own rather than a fraction of [`REACH`], which is what it
+/// was. A beam now carries most of the way across the map, and a ring at a
+/// fraction of that is a ring whose far side is over the horizon -- the command
+/// exists to put a network in *one photograph*, and the thing being photographed
+/// is a handful of masts, not the radius they happen to be legal at.
+const COMMAND_RING: f32 = 18.0;
+
 /// How thick a beam is drawn, in metres. Thin enough to be a beam rather than a
 /// girder, thick enough to survive the internal render resolution the display
 /// settings can drop the world to.
@@ -557,6 +693,13 @@ pub fn spawn(commands: &mut Commands, assets: &AssetServer, at: Vec3, yaw: f32) 
             Pylon {
                 radius: mast().radius,
             },
+            // What makes a mast a thing the crowd comes for. A `Side` is all
+            // [`crate::enemy::alert`] asks of anything before it decides to
+            // chase it, so these three components -- and no targeting code at
+            // all -- are why an ant walking past a pylon stops and hits it.
+            crate::enemy::Side::Friendly,
+            crate::structure::Structure::new(mast().radius, mast().height),
+            crate::health::Health::new(crate::health::PYLON_HEALTH),
             Transform::from_translation(at).with_rotation(Quat::from_rotation_y(yaw)),
             Visibility::default(),
         ))
@@ -715,7 +858,7 @@ pub fn relink(
 ) {
     let standing = masts.iter().count();
     let feeding = machines.iter().count();
-    if standing == network.nodes.len() && feeding == network.machines {
+    if standing == network.nodes.len() && feeding == network.feeds.len() {
         return;
     }
     let mut planted: Vec<(Entity, Vec3)> = masts
@@ -758,14 +901,33 @@ pub fn draw(
     for beam in &beams {
         commands.entity(beam).despawn();
     }
-    for &(a, b) in &network.links {
-        let (from, to) = (network.nodes[a].top, network.nodes[b].top);
+    // Every beam there is: mast to mast, and machine to mast for the masts a
+    // machine feeds directly.
+    //
+    // **The second kind was missing entirely**, and the network read as a set of
+    // masts standing near a stellarator rather than as anything joined to it.
+    // Power flooded out of the machine and the supply packet made its rounds, so
+    // it *worked* -- there was simply nothing on the screen saying where any of
+    // it came from, and the further a mast could be planted from its source the
+    // more plainly that showed. Now the loose end of the beams is the machine.
+    let feeds = network.nodes.iter().filter_map(|node| {
+        node.feed
+            .and_then(|which| network.feeds.get(which))
+            .map(|feed| (*feed, node.top, true))
+    });
+    let links = network.links.iter().map(|&(a, b)| {
+        (
+            network.nodes[a].top,
+            network.nodes[b].top,
+            network.powered(a) && network.powered(b),
+        )
+    });
+    for (from, to, live) in links.chain(feeds) {
         let span = to - from;
         let length = span.length();
         if length <= 1e-3 {
             continue;
         }
-        let live = network.powered(a) && network.powered(b);
         commands.spawn((
             Beam,
             bevy::light::NotShadowCaster,
@@ -824,7 +986,14 @@ pub fn carry(
     packet.along = (packet.along + PACKET_SPEED * time.delta_secs() / length) % legs as f32;
     if let Some((at, heading)) = network.packet_at(packet.along) {
         *transform = Transform::from_translation(at)
-            .looking_to(if heading == Vec3::ZERO { -Vec3::Z } else { -heading }, Vec3::Y)
+            .looking_to(
+                if heading == Vec3::ZERO {
+                    -Vec3::Z
+                } else {
+                    -heading
+                },
+                Vec3::Y,
+            )
             .with_scale(Vec3::new(PACKET_SIZE, PACKET_SIZE, PACKET_SIZE * 2.4));
         *visible = Visibility::Visible;
     } else {
@@ -848,7 +1017,8 @@ pub fn supply(
         return;
     };
     let near = network.nodes.iter().any(|node| {
-        node.hops.is_some() && node.at.distance_squared(transform.translation) <= SUPPLY_RADIUS.powi(2)
+        node.hops.is_some()
+            && node.at.distance_squared(transform.translation) <= SUPPLY_RADIUS.powi(2)
     });
     if near {
         // The extra fill only. `player::drive` has already advanced the bar
@@ -947,7 +1117,6 @@ pub fn command(
     assets: Res<AssetServer>,
     mut console: ResMut<crate::console::ConsoleState>,
     level: Res<LevelData>,
-    art: Res<stellarator::FieldArt>,
     player: Query<&Transform, With<Player>>,
     standing: Query<Entity, With<Pylon>>,
 ) {
@@ -992,17 +1161,16 @@ pub fn command(
         };
         // The machine that feeds them, in the middle. At 0.6 of its authored
         // size, which leaves the ring clear of its footprint: a stellarator is
-        // thirty metres across, and one standing through a mast is the very
+        // sixteen metres across, and one standing through a mast is the very
         // thing the placement rule refuses by hand.
         stellarator::spawn(
             &mut commands,
             &assets,
-            &art,
             ground(centre).unwrap_or(centre),
             0.0,
             0.6,
         );
-        let radius = REACH * 0.55;
+        let radius = COMMAND_RING;
         for step in 0..count {
             let angle = step as f32 / count as f32 * std::f32::consts::TAU;
             let (sin, cos) = angle.sin_cos();
@@ -1127,6 +1295,67 @@ mod tests {
     }
 
     #[test]
+    fn a_delivered_ball_walks_downhill_to_the_machine_that_lit_the_mast() {
+        let mut network = Network::default();
+        // Four masts in a chain, fed at the near end only, so the far one is
+        // three hops out and there is exactly one way home.
+        let masts: Vec<_> = (0..4)
+            .map(|index| {
+                (
+                    Entity::from_raw_u32(index + 1).unwrap(),
+                    at(REACH * 0.6 * index as f32, 0.0),
+                )
+            })
+            .collect();
+        let feed = at(-REACH * 0.5, 0.0);
+        network.rebuild(masts, &[feed], open);
+        assert_eq!(network.live(), 4);
+        assert_eq!(network.nodes[3].hops, Some(3));
+
+        // Every lit mast records which machine lit it, and only the ones a
+        // machine reaches directly: that is the set `draw` strings the feed
+        // beams along and the set a shipment's last leg ends at.
+        assert_eq!(
+            network.nodes[0].feed,
+            Some(0),
+            "the near mast has no source"
+        );
+        assert_eq!(
+            network.nodes[3].feed, None,
+            "a mast three hops out is not fed by the machine directly"
+        );
+
+        let route = network
+            .supply_route(3)
+            .expect("a lit mast has a way back to what lit it");
+        // Four masts and then the machine, at beam height until the last leg.
+        assert_eq!(route.len(), 5, "{route:?}");
+        assert_eq!(route[0], network.nodes[3].top);
+        assert_eq!(route[4], feed);
+        // Strictly downhill: every step is nearer the machine than the last.
+        for (step, pair) in route[..4].windows(2).enumerate() {
+            assert!(
+                pair[1].distance(feed) < pair[0].distance(feed),
+                "leg {step} of {route:?} does not head home"
+            );
+        }
+        // The mast the machine feeds directly is one leg and the machine.
+        assert_eq!(network.supply_route(0).map(|route| route.len()), Some(2));
+        // And a dark mast has no way home at all.
+        let mut dark = Network::default();
+        dark.rebuild(
+            vec![(Entity::from_raw_u32(1).unwrap(), at(0.0, 0.0))],
+            &[],
+            open,
+        );
+        assert!(dark.supply_route(0).is_none());
+        assert!(
+            dark.supply_route(7).is_none(),
+            "and neither has a mast that is not there"
+        );
+    }
+
+    #[test]
     fn a_mast_may_not_be_planted_through_something_already_standing() {
         let radius = mast().radius;
         let taken = [(at(0.0, 0.0), radius)];
@@ -1141,7 +1370,7 @@ mod tests {
         // A pylon is a tall thin thing that stands on the ground and carries
         // its beams near the top. All three are properties of the shape rather
         // than of its size, which is the point: how big a pylon is is the
-        // author's to change in `tools/generate_pylon.py`.
+        // author's to change in `assets/actors/pylon.blend`.
         assert!(measured.height > 2.0, "{measured:?}");
         assert!(measured.radius * 4.0 < measured.height, "{measured:?}");
         assert!(

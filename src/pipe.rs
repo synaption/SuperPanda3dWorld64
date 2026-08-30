@@ -89,6 +89,47 @@ impl Spawn {
     fn is_enemy(self) -> bool {
         matches!(self, Self::Enemy(_))
     }
+
+    /// Which side of the fight the pipe producing this is on.
+    ///
+    /// **A pipe is on the side of what comes out of it**, and that one sentence
+    /// is the whole of why warp pipes can be attacked. It gives every pipe a
+    /// [`crate::enemy::Side`], and a side is all
+    /// [`crate::enemy::alert`] asks of anything before it decides to chase it --
+    /// so a squad standing near a slime nest goes for the nest, and a crowd
+    /// standing near the Mario pipe goes for that. Neither needed a line of
+    /// targeting code; both fall out of the pipe being on a side at all.
+    pub fn side(self) -> crate::enemy::Side {
+        match self {
+            Self::Enemy(_) => crate::enemy::Side::Hostile,
+            Self::Mario => crate::enemy::Side::Friendly,
+        }
+    }
+}
+
+/// How big a pipe placed at `scale` is, as a cylinder to be fought as.
+///
+/// Measured off `warp_pipe.glb` rather than written down here, for the reason
+/// [`MODEL`] spends a paragraph on: the pipe was resized in its own .blend
+/// exactly so that nothing in the game would carry a second copy of how big it
+/// is. [`crate::furniture`] measures the same file the same way to space the
+/// enemies it drops around one.
+pub fn body(scale: f32) -> (f32, f32) {
+    // Measured once for the whole process, the way [`crate::pylon::mast`] and
+    // `enemy::sizes` are. `measure` is a file read and a JSON parse, and this is
+    // asked for by the fight -- once a level for the placement, but a caller
+    // that ever asks per tick must not be reading a megabyte off disk to do it.
+    static PIPE: std::sync::OnceLock<crate::enemy::Size> = std::sync::OnceLock::new();
+    let size = PIPE.get_or_init(|| {
+        crate::enemy::measure(MODEL).unwrap_or(crate::enemy::Size {
+            // A pipe-shaped fallback, reachable only with the model missing
+            // from the install. See `enemy::UNMEASURED` for the same argument.
+            radius: 1.5,
+            height: 3.0,
+            lift: 0.0,
+        })
+    });
+    (size.radius * scale, size.height * scale)
 }
 
 /// A pipe that things climb out of, up to a population it then holds.

@@ -123,9 +123,31 @@ def fbm(directions, seed, frequency=1.0, octaves=5, lacunarity=2.0, gain=0.5):
     return total / norm
 
 
+def _smoothstep01(value):
+    value = np.clip(value, 0.0, 1.0)
+    return value * value * (3.0 - 2.0 * value)
+
+
+def _terrace(value, steps, flatness):
+    """Broad level benches separated by deliberately steep transitions."""
+    value = np.clip(value, 0.0, 1.0)
+    width = max((1.0 - flatness) / steps, 1e-3)
+    result = np.full_like(value, 0.5 / steps)
+    for boundary in range(1, steps):
+        centre = boundary / steps
+        result += _smoothstep01((value - centre + width * 0.5) / width) / steps
+    # The lowest bench must meet the water rather than form a vertical rim.
+    # Its approach is broad enough to be a beach and narrow enough that most
+    # of the bench remains useful level ground.
+    shore_width = 0.7 / steps
+    return result * _smoothstep01(value / shore_width)
+
+
 def seed_elevation(face_directions_list, seed, relief=1.0,
-                   detail=0.22, detail_frequency=4.5, octaves=5):
-    """A plausible starting planet: continents, coastal shelves, ranges.
+                   detail=0.22, detail_frequency=4.5, octaves=5,
+                   terrace_steps=4, terrace_flatness=0.72,
+                   route_width=0.08, seabed_relief=0.16):
+    """A playable starting planet: farm benches, routed cliffs and seabeds.
 
     Takes all six faces at once and returns all six, because the normalization
     has to be shared. Range-normalizing each face against its own min and max
@@ -137,6 +159,8 @@ def seed_elevation(face_directions_list, seed, relief=1.0,
     the shared edge is literally the same point, so it gets the same value.
     """
     fields = []
+    roughness = []
+    routes = []
     for directions in face_directions_list:
         # A low-frequency domain warp keeps coastlines from reading as noise.
         warp_vec = np.stack([fbm(directions + 11.0 * axis, seed + 700 + axis, 1.1, 3)
@@ -145,21 +169,48 @@ def seed_elevation(face_directions_list, seed, relief=1.0,
         continents = fbm(warped, seed, frequency=1.15, octaves=5)
         rough = fbm(warped, seed + 31, frequency=detail_frequency, octaves=octaves)
         fields.append(continents + detail * (rough - 0.5))
+        roughness.append(rough)
+        # Long zero contours cross the height contours from more than one
+        # direction.  Where they do, the smooth source terrain is kept instead
+        # of terraced, cutting broad ramps through otherwise steep shoulders.
+        route_field = fbm(directions, seed + 1901, frequency=1.45, octaves=3)
+        routes.append(np.abs(route_field - 0.5))
 
     low = min(float(f.min()) for f in fields)
     high = max(float(f.max()) for f in fields)
     span = max(high - low, 1e-9)
 
     out = []
-    for field in fields:
+    for field, rough, route_distance in zip(fields, roughness, routes):
         f = (field - low) / span
         # Push the histogram away from the sea-level threshold so coasts are
         # decisive rather than a fringe of half-submerged mush, then flatten
         # the deep ocean floor, which nothing walks on and which otherwise eats
         # most of the 16-bit range.
         f = np.clip((f - 0.5) * 1.35 + 0.5, 0.0, 1.0)
-        f = np.where(f < 0.5, 0.5 - np.maximum(0.5 - f, 0.0) ** 1.5 * 1.2, f)
+        signed = (f - 0.5) * 2.0
+
+        # Below sea level, keep the whole bottom gently varying.  A cliff on
+        # land is an obstacle; a cliff under water would make Luna's promised
+        # walking route disappear while Mario simply swims over it.
+        depth = _smoothstep01(np.maximum(-signed, 0.0))
+        seabed = -seabed_relief * depth
+
+        # Above sea level, most of each broad altitude band is genuinely flat,
+        # with steep hills between.  Ribbons sampled independently of height
+        # soften selected shoulders back to the original broad slope, so every
+        # useful bench has approaches rather than being a mesa sealed on all
+        # sides. Fine detail fades out of the low farm belt and returns toward
+        # the high, optional terrain.
+        land = np.maximum(signed, 0.0)
+        terraced = _terrace(land, terrace_steps, terrace_flatness)
+        ramp = 1.0 - _smoothstep01(route_distance / max(route_width, 1e-3))
+        shaped_land = terraced * (1.0 - ramp) + land * ramp
+        highland_detail = np.clip((land - 0.20) / 0.55, 0.0, 1.0)
+        shaped_land += (rough - 0.5) * detail * 0.18 * highland_detail
+
+        shaped = np.where(signed < 0.0, seabed, shaped_land)
         # Relief scales about sea level so slope can be tuned without
-        # repainting the shape of the land.
-        out.append(np.clip(0.5 + (f - 0.5) * relief, 0.0, 1.0))
+        # repainting the shape of the continents or moving the shoreline.
+        out.append(np.clip(0.5 + 0.5 * shaped * relief, 0.0, 1.0))
     return out

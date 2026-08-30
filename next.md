@@ -82,4 +82,18 @@ furniture::tests::the_castle_is_where_it_always_was fails: the ant warp pipe mov
 
 X reorganize, clear clutter, get rid of unneccisary tests
 
-  X I do not want to preserve  SM64 collision quirks, including triangle ordering and unusual wall-resolution behavior
+X I do not want to preserve  SM64 collision quirks, including triangle orderingand unusual wall-resolution behavior
+
+sometimes I have CPU load spikes per frame until I change the frame rate limit,but If I change it back to the same limit the spikes go away. 
+
+health bar should be blue
+
+enemies are getting inside walls a lot, I still fall through things often
+
+need a way to spawn mario
+
+portals
+
+marios have a similar stutter when they are following luna.  the ball trail still starts so abruptly.  I don't like the visibale transition.  it should be a smooth transition that wraps around the ball.  the balls should not abrupty change location.  they should always smoothly transition.  for instance when they go into a pylon they should not abruptly aprear in the pylon network.  they should physically travel from where they are to the network.  the orbs need to be emissive.  they should liket their suroundings slightly
+
+vfx needs lightning/electricity

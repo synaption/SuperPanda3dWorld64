@@ -48,6 +48,15 @@ pub struct InputState {
     pub boost: bool,
     pub aim: bool,
     pub recenter: bool,
+    /// The action button, held, and its release.
+    ///
+    /// **Not bound to anything by itself.** [`crate::action::route`] copies it
+    /// onto one of the four pairs below, whichever the Tab picker is pointed
+    /// at, and clears it on the way past -- so this is the raw button and those
+    /// are what the game reads. See [`crate::action`] for why there is one
+    /// button rather than four keys.
+    pub action: bool,
+    pub action_released: bool,
     /// The squad button, held. Its *release* is the command, and how long it
     /// was down is what tells a whistle from an order, so the falling edge is
     /// published alongside the hold.
@@ -64,6 +73,12 @@ pub struct InputState {
     /// a mast on it. See [`crate::pylon::place`].
     pub pylon: bool,
     pub pylon_released: bool,
+    /// The resource button, held, and its release. The same two-field shape
+    /// `squad` has, because it is the same gesture: a hold opens a circle on
+    /// the ground and the release calls everything loose inside it into Luna's
+    /// train. See [`crate::nuclonium::call`].
+    pub grab: bool,
+    pub grab_released: bool,
     pub swap: bool,
     /// Cycle the weapon in Luna's hand. Latched: `weapon::swap` takes it.
     pub swap_weapon: bool,
@@ -153,8 +168,8 @@ pub fn gather(
     let mut recenter = keys.just_pressed(KeyCode::KeyR);
     let mut swap = keys.just_pressed(KeyCode::F2);
     let mut swap_weapon = keys.just_pressed(KeyCode::KeyY);
-    let mut squad = keys.pressed(KeyCode::KeyX);
-    let mut squad_released = keys.just_released(KeyCode::KeyX);
+    let mut action = keys.pressed(KeyCode::KeyX);
+    let mut action_released = keys.just_released(KeyCode::KeyX);
     let mut build = keys.pressed(KeyCode::KeyB);
     let mut build_released = keys.just_released(KeyCode::KeyB);
     let mut pylon = keys.pressed(KeyCode::KeyG);
@@ -201,8 +216,8 @@ pub fn gather(
         // booster and the aim.
         swap_weapon |= just(GamepadButton::LeftTrigger);
         recenter |= just(GamepadButton::RightTrigger);
-        squad |= button(GamepadButton::West);
-        squad_released |= pad.just_released(GamepadButton::West);
+        action |= button(GamepadButton::West);
+        action_released |= pad.just_released(GamepadButton::West);
         // `Select` is what is left. Every face button, both shoulders and both
         // triggers are claimed above, and the d-pad stands in for the stick.
         build |= button(GamepadButton::Select);
@@ -225,7 +240,13 @@ pub fn gather(
     state.look_stick = look_stick;
     state.boost = boost;
     state.aim = aim;
-    state.squad = squad;
+    state.action = action;
+    // Cleared rather than written: X does not reach the squad or the balls any
+    // more except through the picker. `action::route` runs between this and
+    // anything that reads them, and puts the button wherever it is currently
+    // aimed.
+    state.squad = false;
+    state.grab = false;
     state.build = build;
     state.pylon = pylon;
     // Edges accumulate rather than overwrite: a press seen on a frame whose
@@ -233,7 +254,7 @@ pub fn gather(
     state.jump |= jump;
     state.attack |= attack;
     state.recenter |= recenter;
-    state.squad_released |= squad_released;
+    state.action_released |= action_released;
     state.build_released |= build_released;
     state.pylon_released |= pylon_released;
     state.swap |= swap;

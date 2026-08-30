@@ -7,6 +7,7 @@
 //! the port took over; they are provenance for a constant or a rule rather
 //! than files to open, and `git log` still has them if one needs reading.
 
+mod action;
 mod aim;
 mod animation;
 mod audio;
@@ -19,6 +20,7 @@ mod energy;
 mod flow;
 mod frame_chart;
 mod furniture;
+mod goap;
 mod gravity;
 mod health;
 mod impostor;
@@ -26,6 +28,7 @@ mod input;
 mod level;
 mod menu;
 mod n64;
+mod nuclonium;
 mod pipe;
 mod player;
 mod pylon;
@@ -37,6 +40,7 @@ mod sky;
 mod spike;
 mod squad;
 mod stellarator;
+mod structure;
 mod water;
 mod weapon;
 mod world;
@@ -407,12 +411,20 @@ pub fn game_resources(app: &mut App) {
         .init_resource::<animation::PlayerAnimation>()
         .init_resource::<animation::EnemyGraphs>()
         .init_resource::<squad::Squad>()
+        .init_resource::<action::Action>()
         .init_resource::<squad::Whistle>()
         .init_resource::<stellarator::Build>()
         // The pylon network and the key that plants one. Beside the machine's
         // build state because they are the same control in a different hand.
         .init_resource::<pylon::Plant>()
         .init_resource::<pylon::Network>()
+        // The one die in the game -- see `nuclonium::Drops::maybe` -- and what the
+        // squad has managed to ship back down the beams.
+        .init_resource::<nuclonium::Drops>()
+        .init_resource::<nuclonium::Bank>()
+        // The grab circle's own hold, beside the squad whistle's: same gesture,
+        // same shape, two circles that must not resize each other.
+        .init_resource::<nuclonium::Grab>()
         .init_resource::<menu::MenuState>()
         .init_resource::<display::DisplaySettings>()
         .init_resource::<display::FramePacing>()
@@ -513,7 +525,16 @@ pub fn drawing() -> ScheduleConfigs<ScheduleSystem> {
 /// leaves and re-enters fullscreen, and Escape drops the cursor and grabs it
 /// again. The key looks dead. It was pressed exactly once and acted on twice.
 fn input_pipeline() -> ScheduleConfigs<ScheduleSystem> {
-    (console::input, menu::input, input::gather)
+    // `action::choose` reads the keyboard for the Tab picker; `action::route`
+    // then points X at whatever it settled on, between the snapshot being taken
+    // and anything reading it. See [`action`] for why that indirection exists.
+    (
+        console::input,
+        menu::input,
+        input::gather,
+        action::choose,
+        action::route,
+    )
         .chain()
         .after(InputSystems)
 }
@@ -533,7 +554,13 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
         // so the bar he is filling is filled against where he is now rather
         // than where he was. It only ever adds, so its place in the tick is a
         // matter of which pylon it measures against and nothing else.
-        (player::movement, pylon::supply).chain(),
+        // `squad::steady` goes first in the whole tick, and that placement is
+        // its correctness rather than tidiness: the drawn frames since the last
+        // tick have been showing every Mario somewhere between two poses, and
+        // this puts the simulated one back before anything reads it. See
+        // [`squad::Glide`], and `squad::bank` at the bottom of this list, which
+        // is the other half of it.
+        (squad::steady, player::movement, pylon::supply).chain(),
         // Before anything that reads it. The field is what the crowd tier
         // navigates by, and one built from last tick's player position would
         // send two thousand enemies a step behind him.
@@ -545,22 +572,58 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
         enemy::rouse_crowd,
         squad::maintain_population,
         squad::update_goals,
-        squad::move_allies,
+        // Decide, walk, and then pick up whatever the walk arrived at, in that
+        // order. `goap::plan` scores every job a Mario could be doing this tick
+        // and writes down the winner; `move_allies` walks to it and knows
+        // nothing about why; `haul` goes last so a Mario that reached a ball
+        // this tick is holding it this tick rather than next.
+        //
+        // Nested rather than three more entries, for the reason the tuple above
+        // is: Bevy's system tuples stop at twenty.
+        // Nested rather than three more entries, for the reason the tuple above
+        // is: Bevy's system tuples stop at twenty.
+        //
+        // `escort` decides what joins Luna's train and what leaves it, and
+        // reaches out from every live mast for whatever ended up beside it --
+        // which is the one place a ball is handed over however it arrived.
+        // Where the train actually swims to is `nuclonium::swim`, per drawn
+        // frame; the whistle that fills it is `nuclonium::call`, likewise. See
+        // both for why those two are drawn rather than simulated.
+        (
+            goap::plan,
+            squad::move_allies,
+            nuclonium::haul,
+            nuclonium::escort,
+        )
+            .chain(),
         // Before `enemy::combat`, so a shot and a swing in the same tick are
         // resolved in the order the trigger was pulled rather than the swing
         // silently winning. Both take the same latched edge and only one of
         // them is allowed to, so in practice they never both act -- but the
         // order is the cheap half of making that true.
-        weapon::swap,
-        weapon::fire,
-        enemy::combat,
+        (weapon::swap, weapon::fire).chain(),
+        // The player's blows, and the window that rate-limits the ones that
+        // land on something which cannot walk away. `recover` goes first so a
+        // window opened last tick has been counted down before this tick's
+        // attackers arrive; it is its own system rather than a line inside
+        // `siege` because two systems hit buildings, and a window counted down
+        // inside one of them would run at a different rate -- or not at all --
+        // in a level with no enemies in it.
+        //
+        // `demolish` is the sword against the nests, straight after the sword
+        // against the crowd: one swing, two kinds of thing it might land on,
+        // and the building's own window is what stops it spending twice.
+        (structure::recover, enemy::combat, structure::demolish).chain(),
         // After the walk step: a Mario mid-punch is punching, whatever the walk
         // made of it.
         enemy::ally_combat,
-        // And the other side of the same fight, straight after it, so a Mario
-        // that killed what it was hitting is not then hurt by the thing it just
-        // removed. Both raise threats, and `alert` below drains them together.
-        enemy::maul,
+        // And the other two sides of the same fight, straight after it, so a
+        // Mario that killed what it was hitting is not then hurt by the thing it
+        // just removed. `siege` is `maul` pointed at the things that cannot walk
+        // away. All three raise threats, and `alert` below drains them together
+        // -- a mast going down is an act, and the squad ought to hear about it
+        // on the tick it happens.
+        (enemy::maul, structure::siege).chain(),
         enemy::alert,
         enemy::update,
         // Straight after the step that decided what is near enough to be drawn
@@ -576,9 +639,33 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
         // After everything that moved an enemy this tick, so a bullet is
         // tested against where its target actually ended up.
         weapon::fly,
+        // Last of the things that kill: every drop this tick has been queued by
+        // now, so a ball is on the ground on the tick the thing that left it
+        // died. `ship` beside it, flying the ones already on their way home.
+        //
+        // `health::mend` rides in the same nest -- Bevy's tuples stop at twenty
+        // and this list is at it -- and belongs beside them anyway: it is the
+        // red half of the same drop, handed to whoever ran over it, and it goes
+        // after `shed` so one dropped this tick is on the ground before anybody
+        // is asked whether they are standing on it.
+        // `linger` rides along too: it is the clock on a ball nobody came
+        // for, and it goes after `mend` so a red one absorbed this tick is not
+        // also aged this tick.
+        (
+            nuclonium::shed,
+            nuclonium::ship,
+            health::mend,
+            nuclonium::linger,
+        )
+            .chain(),
         // The feet come round after the walk step that decided where he was
         // facing, for the same reason `ally_combat` follows the walk.
-        aim::turn_body,
+        //
+        // And `squad::bank` last of everything, because "where this tick left
+        // the Marios" is only true once nothing else is going to move one --
+        // the walk, the fight, the warp pipe's arc are all above it. See
+        // [`squad::Glide`].
+        (aim::turn_body, squad::bank).chain(),
     )
         .chain()
         .run_if(console::is_closed)
@@ -588,7 +675,15 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
 /// Everything that runs per rendered frame while the console is closed.
 fn presentation() -> ScheduleConfigs<ScheduleSystem> {
     (
-        player::sync_visual,
+        // Nested rather than two entries, for the reason every other nest in
+        // this list is: Bevy's system tuples stop at twenty. `glide` does for
+        // the squad exactly what `sync_visual` does for Luna -- draws it
+        // between two fixed ticks -- and one without the other is a squad
+        // stuttering along behind a leader who glides. See [`squad::Glide`].
+        // Both before the camera, which frames her, and long before
+        // `nuclonium::swim`, which swims a carried ball after the pose its
+        // carrier is actually drawn at.
+        (player::sync_visual, squad::glide).chain(),
         camera::update,
         animation::resolve_clips,
         animation::claim_players,
@@ -604,7 +699,29 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
         // machines rather than lead them -- a network rebuilt this frame
         // should be looking at the stellarator that went up this frame rather
         // than at last frame's world. See [`stellarator`] and [`pylon`].
-        (stellarator::systems(), pylon::systems()).chain(),
+        // Then the balls the squad carries between them, which is all
+        // presentation: a loose one bobs and turns on wall-clock time, and
+        // nothing in the simulation reads where it ended up. Nested in with the
+        // machines and the masts for the tuple-of-twenty reason, and it belongs
+        // there anyway -- it is the third thing the network is made of.
+        // `call` first, because it is a button and the circle it draws is
+        // aimed with this frame's camera; then `swim`, which glides the train
+        // it filled after the player's *rendered* pose; then the look, and
+        // then the trail, which records where all of that ended up.
+        (
+            stellarator::systems(),
+            pylon::systems(),
+            nuclonium::call,
+            nuclonium::swim,
+            nuclonium::shimmer,
+            nuclonium::trail,
+            // And last, the light all of that throws on the ground it is
+            // moving over -- after `shimmer`, because a ball's pool of light is
+            // measured from where the bob left it this frame. See
+            // [`nuclonium::SPILLS`].
+            nuclonium::spill,
+        )
+            .chain(),
         water::drift,
         water::adopt_surfaces,
         water::find_ocean,
@@ -672,6 +789,11 @@ fn overlay() -> ScheduleConfigs<ScheduleSystem> {
         // three share the console's request queue and each hands back what the
         // others wanted. See `ConsoleState::defer`.
         pylon::command,
+        // Straight after it, and for the third time in this chain the reason is
+        // `ConsoleState::defer`: these systems share one request queue and each
+        // hands back what the others asked for.
+        nuclonium::command,
+        stellarator::command,
         enemy::sync_animation_visibility,
         audio::play,
         console::draw,
@@ -680,6 +802,10 @@ fn overlay() -> ScheduleConfigs<ScheduleSystem> {
         // asked for rather than last frame's.
         display::resize,
         menu::draw,
+        // The X-button picker, beside the menu because it is the same kind of
+        // thing: an overlay that stays legible whatever the game underneath it
+        // is doing, including being paused with the console up.
+        action::draw,
         // Both of these belong out here rather than in `presentation`: a frame
         // drawn while the console is open is still a frame, and being stuck
         // fullscreen because the console is up is exactly the trap F11 exists
@@ -738,10 +864,13 @@ fn setup(
     squad::spawn_circle(&mut commands, &mut meshes, &mut materials);
     // The build preview, which outlives a level exactly as the whistle ring
     // does: the thing you build with must not go away when you change level.
-    let field = stellarator::prepare(&mut commands, &mut meshes, &mut materials);
+    stellarator::prepare(&mut commands, &mut meshes, &mut materials);
     // The pylon's own preview ring and the beams' shared art, put up once for
     // the same reason: what you build with outlives the level you build it on.
     pylon::prepare(&mut commands, &mut meshes, &mut materials);
+    // And the one mesh every resource ball is drawn with, for the same reason
+    // again: a kill should cost an entity and no allocation.
+    nuclonium::prepare(&mut commands, &mut meshes, &mut materials, &mut images);
     commands.insert_resource(animation::CharacterAnimations::load(&assets));
     audio::preload(&mut commands, &assets);
     // The level itself -- its collision, its gravity, its scenery and its
@@ -753,10 +882,6 @@ fn setup(
         &assets,
         &mut meshes,
         &mut materials,
-        // Handed straight across rather than read back as a resource: the
-        // insert above has not been applied yet, and the castle may have a
-        // machine standing on it.
-        &field,
         &mut load,
     );
     let spawn = Transform::from_translation(world::castle_spawn());
@@ -916,6 +1041,7 @@ fn setup(
     commands.spawn(console::panel_bundle());
     commands.spawn(console::tuning_tray_bundle());
     menu::spawn(&mut commands);
+    action::spawn(&mut commands);
     if let Ok(mut cursor) = cursor.single_mut() {
         cursor.grab_mode = CursorGrabMode::Locked;
         cursor.visible = false;
@@ -1053,6 +1179,7 @@ fn update_hud(
     input: Res<InputState>,
     loadout: Res<weapon::Loadout>,
     squad: Res<squad::Squad>,
+    bank: Res<nuclonium::Bank>,
     player: Query<(&Controller, &health::Health), With<Player>>,
     mut text: Query<&mut Text, With<Hud>>,
 ) {
@@ -1070,7 +1197,8 @@ fn update_hud(
         let following = squad.members.len();
         let marching = squad.marching();
         let holding = squad.sent.len() - marching;
-        format!("Space Crusaders\n{:?}  ·  {:?}  ·  Health {}/{}  ·  {device}\nSquad {following} following · {marching} marching · {holding} holding\nWASD move · mouse look · Space jump · V jetpack/skate\nShift attack · X squad (hold to whistle, tap to send)\nB build stellarator (hold to grow, tap for the smallest)\nG plant pylon (hold to place, beams link on sight)\nF/right mouse aim · Y weapon ({weapon}) · ` console · F2 switch · Esc menu · F11 window", state.active, ctrl.motion, health.current, health.max)
+        let stored = bank.stored;
+        format!("Space Crusaders\n{:?}  ·  {:?}  ·  Health {}/{}  ·  {device}\nSquad {following} following · {marching} marching · {holding} holding · Nuclonium {stored}\nWASD move · mouse look · Space jump · V jetpack/skate\nShift attack · X squad (hold to whistle, tap to send)\nB build stellarator (hold to grow, tap for the smallest)\nG plant pylon (hold to place, beams link on sight)\nF/right mouse aim · Y weapon ({weapon}) · ` console · F2 switch · Esc menu · F11 window", state.active, ctrl.motion, health.current, health.max)
     } else {
         String::new()
     };
@@ -1284,7 +1412,7 @@ mod tests {
     /// The unit tests in [`stellarator`] prove the arithmetic; this proves the
     /// *wiring* -- that the button reaches the system, that the system finds
     /// the camera and the player it aims between, that a machine ends up in the
-    /// world with its plasma inside it, and that the second one is refused for
+    /// world with an empty store on it, and that the second one is refused for
     /// standing on the first. None of that is reachable from a test that calls
     /// `stellarator::fits` directly, and all of it is a game that opens and
     /// shuts if it is wrong.
@@ -1292,8 +1420,8 @@ mod tests {
     fn a_held_button_builds_a_stellarator_where_it_was_aimed() {
         let mut app = headless();
         app.update();
-        // Long enough to have grown past the smallest machine, so the hold is
-        // being read rather than only the release.
+        // Long enough that a hold is being read rather than only a release --
+        // which used to grow the machine and now only opens the ring.
         for _ in 0..40 {
             app.world_mut().resource_mut::<input::InputState>().build = true;
             app.update();
@@ -1316,14 +1444,23 @@ mod tests {
         assert_eq!(built.len(), 1, "the button built {} machines", built.len());
         let (radius, at) = built[0];
         assert_eq!(at, aim, "the machine is not where the crosshair was");
-        assert!(
-            radius > stellarator::footprint(stellarator::build_scale(0.0)),
-            "a two-thirds-second hold built the smallest machine there is"
+        assert_eq!(
+            radius,
+            stellarator::footprint(stellarator::BUILD_SCALE),
+            "the hold sized the machine; it is only supposed to aim it"
         );
-        // Its plasma came with it: one field of wisps for the machine and one
-        // for the preview that is still standing where it was aimed.
-        let mut wisps = app.world_mut().query::<&stellarator::Wisp>();
-        assert_eq!(wisps.iter(app.world()).count(), stellarator::WISPS * 2);
+        // It arrived empty, and nothing is turning inside it. A machine's
+        // field is its stock -- see [`stellarator::stock`] -- so a brand new
+        // one being dark is the thing to assert, not a bug to work around.
+        let mut stores = app.world_mut().query::<&stellarator::Store>();
+        let held: Vec<u32> = stores.iter(app.world()).map(|store| store.held).collect();
+        assert_eq!(held, vec![0], "a machine was built holding something");
+        let mut motes = app.world_mut().query::<&stellarator::Orbit>();
+        assert_eq!(
+            motes.iter(app.world()).count(),
+            0,
+            "an empty machine has a field"
+        );
 
         // And the same site a second time is refused, because there is a
         // machine standing on it. Nothing has moved the player or the camera,
@@ -1414,13 +1551,9 @@ mod tests {
         // And a machine beside them lights the pair up, one hop apart.
         let feeding = aim - Vec3::new(8.0, 0.0, 0.0);
         app.world_mut()
-            .run_system_once(
-                move |mut commands: Commands,
-                      assets: Res<AssetServer>,
-                      art: Res<stellarator::FieldArt>| {
-                    stellarator::spawn(&mut commands, &assets, &art, feeding, 0.0, 0.5);
-                },
-            )
+            .run_system_once(move |mut commands: Commands, assets: Res<AssetServer>| {
+                stellarator::spawn(&mut commands, &assets, feeding, 0.0, 0.5);
+            })
             .unwrap();
         app.update();
         let network = app.world().resource::<pylon::Network>();
@@ -1432,6 +1565,1096 @@ mod tests {
         assert!(hops.contains(&Some(0)), "{hops:?}");
         // The supply packet has somewhere to go now.
         assert!(network.run.len() >= 2, "no supply run over a live pair");
+    }
+
+    /// The whole resource chain, end to end.
+    ///
+    /// The unit tests in [`nuclonium`] prove the arithmetic -- the drop rate, the
+    /// claim rules, the walk down a route -- and [`pylon`]'s prove the graph the
+    /// route is read off. What none of them can reach is the *wiring*: that an
+    /// idle Mario is actually handed an errand, that it walks far enough to pick
+    /// a ball up, that a mast recognises the hand-over, and that the shipment
+    /// makes it to a machine and is counted. Every one of those is a system
+    /// boundary, and a chain of five is exactly the kind of thing that compiles
+    /// and does nothing.
+    #[test]
+    fn a_ball_is_fetched_by_a_mario_and_shipped_down_the_beams_to_a_machine() {
+        let mut app = headless();
+        app.update();
+        // A machine, a mast inside its reach, a Mario standing by the mast, and
+        // a ball on the ground a few metres away. Placed relative to wherever
+        // the player is standing on the castle, so this test does not carry a
+        // second copy of where the level's ground happens to be.
+        let here = {
+            let mut player = app.world_mut().query_filtered::<&Transform, With<Player>>();
+            player.single(app.world()).unwrap().translation
+        };
+        let mast_at = here + Vec3::new(6.0, 0.0, 0.0);
+        // Out of Luna's reach and out of the mast's, so the only thing that can
+        // collect it is the Mario -- see `nuclonium::MAGNET_RANGE` and
+        // `nuclonium::MAST_REACH`, both of which would otherwise do this test's
+        // job for it and prove nothing about the squad.
+        let ball_at = here + Vec3::new(0.0, 0.0, 10.0);
+        app.world_mut()
+            .run_system_once(
+                move |mut commands: Commands,
+                      assets: Res<AssetServer>,
+                      art: Res<nuclonium::Art>| {
+                    stellarator::spawn(&mut commands, &assets, here, 0.0, 0.5);
+                    pylon::spawn(&mut commands, &assets, mast_at, 0.0);
+                    squad::spawn_ally(
+                        &mut commands,
+                        &assets,
+                        ActiveCharacter::Mario,
+                        here + Vec3::new(1.0, 0.0, 1.0),
+                        0.0,
+                    );
+                    nuclonium::spawn(
+                        &mut commands,
+                        &art,
+                        nuclonium::Kind::Nuclonium,
+                        ball_at,
+                        0.0,
+                    );
+                },
+            )
+            .unwrap();
+        app.update();
+        assert!(
+            app.world().resource::<pylon::Network>().powered(0),
+            "the mast beside the machine never lit"
+        );
+
+        // Long enough for a Mario to walk a few metres twice over, at the
+        // squad's marching pace, and for the shipment to fly a short beam.
+        for _ in 0..400 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().resource::<nuclonium::Bank>().stored,
+            1,
+            "the ball never reached the machine"
+        );
+        let mut loose = app.world_mut().query::<&nuclonium::Nuclonium>();
+        assert_eq!(
+            loose.iter(app.world()).count(),
+            0,
+            "the ball was delivered and is still lying about as well"
+        );
+        let mut flying = app.world_mut().query::<&nuclonium::Shipment>();
+        assert_eq!(
+            flying.iter(app.world()).count(),
+            0,
+            "the shipment arrived and was not cleared away"
+        );
+    }
+
+    /// A mast picks up what is lying at its foot, with nobody sent for it.
+    ///
+    /// The rule that makes a network worth building next to where the fighting
+    /// happens rather than only worth building: what falls inside it is
+    /// collected. No ally is involved -- the squad the castle spawns is left
+    /// standing where it is, and the machine is far enough away that its own
+    /// reach is not what did this.
+    #[test]
+    fn a_ball_under_a_live_mast_is_taken_up_by_the_mast() {
+        let mut app = headless();
+        app.update();
+        let here = {
+            let mut player = app.world_mut().query_filtered::<&Transform, With<Player>>();
+            player.single(app.world()).unwrap().translation
+        };
+        let mast_at = here + Vec3::new(12.0, 0.0, 0.0);
+        // At the mast's foot, and a long way from Luna, so the only thing that
+        // can have collected it is the mast.
+        let ball_at = mast_at + Vec3::new(2.0, 0.0, 0.0);
+        app.world_mut()
+            .run_system_once(
+                move |mut commands: Commands,
+                      assets: Res<AssetServer>,
+                      art: Res<nuclonium::Art>| {
+                    stellarator::spawn(&mut commands, &assets, here, 0.0, 0.5);
+                    pylon::spawn(&mut commands, &assets, mast_at, 0.0);
+                    nuclonium::spawn(
+                        &mut commands,
+                        &art,
+                        nuclonium::Kind::Nuclonium,
+                        ball_at,
+                        0.0,
+                    );
+                },
+            )
+            .unwrap();
+        for _ in 0..200 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().resource::<nuclonium::Bank>().stored,
+            1,
+            "a ball lying under a live mast was never taken up"
+        );
+    }
+
+    /// A ball is snatched up off the ground rather than appearing in a hand.
+    ///
+    /// The other half of "balls should not abruptly change location". Being
+    /// picked up used to be a write: the tick a Mario got within reach, the
+    /// ball was assigned to a point a metre and a half over its head, having
+    /// crossed the gap in no time at all. Now `nuclonium::haul` decides it is
+    /// held and `nuclonium::swim` flies it into the Mario's hands over the next
+    /// few frames, on the same easing the train uses.
+    #[test]
+    fn a_ball_is_snatched_off_the_ground_rather_than_appearing_in_a_hand() {
+        let mut app = headless();
+        app.update();
+        let here = {
+            let mut player = app.world_mut().query_filtered::<&Transform, With<Player>>();
+            player.single(app.world()).unwrap().translation
+        };
+        // Out of Luna's magnet, with one Mario of our own beside it.
+        let ball_at = here + Vec3::new(0.0, 0.0, 10.0);
+        app.world_mut()
+            .run_system_once(
+                move |mut commands: Commands,
+                      assets: Res<AssetServer>,
+                      art: Res<nuclonium::Art>| {
+                    squad::spawn_ally(
+                        &mut commands,
+                        &assets,
+                        ActiveCharacter::Mario,
+                        ball_at + Vec3::new(1.0, 0.0, 0.0),
+                        0.0,
+                    );
+                    nuclonium::spawn(
+                        &mut commands,
+                        &art,
+                        nuclonium::Kind::Nuclonium,
+                        ball_at,
+                        0.0,
+                    );
+                },
+            )
+            .unwrap();
+        let ball = loop {
+            app.update();
+            let mut balls = app
+                .world_mut()
+                .query_filtered::<Entity, With<nuclonium::Nuclonium>>();
+            if let Some(ball) = balls.iter(app.world()).next() {
+                break ball;
+            }
+        };
+        // The frame it changes hands, and where it is at that moment.
+        let mut carrier = None;
+        for _ in 0..400 {
+            app.update();
+            if let nuclonium::Held::Carried(mario) =
+                app.world().get::<nuclonium::Nuclonium>(ball).unwrap().held
+            {
+                carrier = Some(mario);
+                break;
+            }
+        }
+        let carrier = carrier.expect("nobody ever picked the ball up");
+        let hands = |app: &App| {
+            app.world().get::<Transform>(carrier).unwrap().translation
+                + Vec3::Y * nuclonium::CARRY_HEIGHT
+        };
+        let grabbed = app.world().get::<Transform>(ball).unwrap().translation;
+        assert!(
+            grabbed.distance(hands(&app)) > 0.5,
+            "the ball was in the Mario's hands on the tick it was claimed, having
+             crossed {} m in no time",
+            grabbed.distance(hands(&app))
+        );
+        // And it gets there, promptly, which is the other half of easing rather
+        // than teleporting: a pull that never arrives is a ball being dragged.
+        for _ in 0..30 {
+            app.update();
+        }
+        let carried = app.world().get::<Transform>(ball).unwrap().translation;
+        assert!(
+            carried.distance(hands(&app)) < 0.35,
+            "the ball never caught its carrier up: {} m behind",
+            carried.distance(hands(&app))
+        );
+    }
+
+    /// A ball handed in at a mast flies to the mast rather than from it.
+    ///
+    /// **Nothing made of nuclonium may change place without travelling.** The
+    /// route the network hands back starts at the mast's own head, several
+    /// metres up and up to `MAST_REACH` away from the ball it just took -- so
+    /// the ball used to vanish from the grass and reappear at the top of the
+    /// tower on the following tick, which is the "abruptly appears in the pylon
+    /// network" this is against. Now the flight starts where the ball was
+    /// lying and climbs into the beams. See `nuclonium::deliver`.
+    #[test]
+    fn a_ball_taken_up_by_a_mast_flies_from_where_it_was_lying() {
+        let mut app = headless();
+        app.update();
+        let here = {
+            let mut player = app.world_mut().query_filtered::<&Transform, With<Player>>();
+            player.single(app.world()).unwrap().translation
+        };
+        let mast_at = here + Vec3::new(12.0, 0.0, 0.0);
+        // Out at the edge of the mast's reach, so the gap between where the
+        // ball is and where the network starts is the whole point.
+        let ball_at = mast_at + Vec3::new(nuclonium::MAST_REACH - 0.5, 0.0, 0.0);
+        app.world_mut()
+            .run_system_once(
+                move |mut commands: Commands,
+                      assets: Res<AssetServer>,
+                      art: Res<nuclonium::Art>| {
+                    stellarator::spawn(&mut commands, &assets, here, 0.0, 0.5);
+                    pylon::spawn(&mut commands, &assets, mast_at, 0.0);
+                    nuclonium::spawn(
+                        &mut commands,
+                        &art,
+                        nuclonium::Kind::Nuclonium,
+                        ball_at,
+                        0.0,
+                    );
+                },
+            )
+            .unwrap();
+        // As soon as there is something in the air, look at where it is.
+        let mut started: Option<Vec3> = None;
+        for _ in 0..200 {
+            app.update();
+            let mut flying = app
+                .world_mut()
+                .query_filtered::<&Transform, With<nuclonium::Shipment>>();
+            if let Ok(at) = flying.single(app.world()) {
+                started = Some(at.translation);
+                break;
+            }
+        }
+        let started = started.expect("the mast never sent anything home");
+        // A frame is a tick or three of flight, so the first sight of it is
+        // still near the grass it was picked up off -- nearer to that, at any
+        // rate, than to the head of the mast it is on its way to. Before the
+        // prepended leg it started *at* the mast head, five and a half metres
+        // away and several metres up, on the frame it appeared.
+        let mast_top = {
+            let network = app.world().resource::<pylon::Network>();
+            network
+                .nodes
+                .iter()
+                .map(|node| node.top)
+                .min_by(|a, b| a.distance(mast_at).total_cmp(&b.distance(mast_at)))
+                .expect("no mast was planted")
+        };
+        assert!(
+            started.distance(ball_at) < started.distance(mast_top),
+            "the ball appeared {} m from where it was lying and {} m from the mast head",
+            started.distance(ball_at),
+            started.distance(mast_top)
+        );
+    }
+
+    /// A ball Luna walks past joins her, and comes off her at a mast.
+    ///
+    /// The whole of "near Luna should follow Luna until near a pylon", end to
+    /// end, and it is two rules rather than one: the magnet that recruits it
+    /// and the mast that takes it. Luna is teleported rather than driven --
+    /// this is about the balls, and steering her with a fake input snapshot
+    /// would be a test of the input snapshot.
+    #[test]
+    fn a_ball_luna_walks_over_follows_her_and_comes_off_at_a_mast() {
+        let mut app = headless();
+        app.update();
+        let here = {
+            let mut player = app.world_mut().query_filtered::<&Transform, With<Player>>();
+            player.single(app.world()).unwrap().translation
+        };
+        // The squad would fetch this ball long before Luna reached it, and
+        // this test is about Luna. Sent home, and the tuning with them, or
+        // `squad::maintain_population` puts them straight back.
+        {
+            let mut allies = app
+                .world_mut()
+                .query_filtered::<Entity, With<squad::Ally>>();
+            let marios: Vec<Entity> = allies.iter(app.world()).collect();
+            for mario in marios {
+                app.world_mut().entity_mut(mario).despawn();
+            }
+            app.world_mut()
+                .resource_mut::<console::GameTuning>()
+                .ally_count = 0.0;
+        }
+        let mast_at = here + Vec3::new(14.0, 0.0, 0.0);
+        // Out of the mast's reach, out of Luna's, and out of the machine's.
+        let ball_at = here + Vec3::new(0.0, 0.0, 12.0);
+        app.world_mut()
+            .run_system_once(
+                move |mut commands: Commands,
+                      assets: Res<AssetServer>,
+                      art: Res<nuclonium::Art>| {
+                    stellarator::spawn(&mut commands, &assets, here, 0.0, 0.5);
+                    pylon::spawn(&mut commands, &assets, mast_at, 0.0);
+                    nuclonium::spawn(
+                        &mut commands,
+                        &art,
+                        nuclonium::Kind::Nuclonium,
+                        ball_at,
+                        0.0,
+                    );
+                },
+            )
+            .unwrap();
+        app.update();
+
+        // Walk Luna onto it.
+        let put = |app: &mut App, at: Vec3| {
+            let mut player = app
+                .world_mut()
+                .query_filtered::<&mut Transform, With<Player>>();
+            player.single_mut(app.world_mut()).unwrap().translation = at;
+        };
+        put(&mut app, ball_at);
+        for _ in 0..10 {
+            app.update();
+        }
+        {
+            let mut balls = app.world_mut().query::<&nuclonium::Nuclonium>();
+            let following = balls
+                .iter(app.world())
+                .filter(|ball| matches!(ball.held, nuclonium::Held::Following(_)))
+                .count();
+            assert_eq!(following, 1, "the ball Luna stood on did not join her");
+        }
+        assert_eq!(
+            app.world().resource::<nuclonium::Bank>().stored,
+            0,
+            "it was banked without ever reaching a mast"
+        );
+
+        // And now carry it to the mast.
+        put(&mut app, mast_at + Vec3::new(1.0, 0.0, 0.0));
+        for _ in 0..120 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().resource::<nuclonium::Bank>().stored,
+            1,
+            "the ball following Luna was never handed in at the mast"
+        );
+    }
+
+    /// Luna's train glides on the frames the simulation skips.
+    ///
+    /// **This is the stutter, written as a test.** The fixed step runs thirty
+    /// times a second and the frames come faster than that, so most frames are
+    /// drawn *between* two ticks -- which is exactly what
+    /// `player::sync_visual` interpolates Luna across, and why she glides. A
+    /// train solved on the fixed step is therefore a train that stands still on
+    /// every frame the simulation skipped and jumps on the ones it did not,
+    /// behind a leader who did neither. Nothing about the spring was wrong; it
+    /// was being solved at the wrong rate.
+    ///
+    /// So this looks for a frame the fixed step did not tick on, and asks
+    /// whether the ball moved on it anyway. See `nuclonium::swim`.
+    #[test]
+    fn a_ball_in_lunas_train_glides_on_the_frames_between_two_ticks() {
+        let mut app = headless();
+        app.update();
+        let here = {
+            let mut player = app.world_mut().query_filtered::<&Transform, With<Player>>();
+            player.single(app.world()).unwrap().translation
+        };
+        // The squad would pick this up before her magnet reached it, and this
+        // test is about her train. Sent home, and the tuning with them, or
+        // `squad::maintain_population` puts them straight back.
+        {
+            let mut allies = app
+                .world_mut()
+                .query_filtered::<Entity, With<squad::Ally>>();
+            let marios: Vec<Entity> = allies.iter(app.world()).collect();
+            for mario in marios {
+                app.world_mut().entity_mut(mario).despawn();
+            }
+            app.world_mut()
+                .resource_mut::<console::GameTuning>()
+                .ally_count = 0.0;
+        }
+        // Dropped at her feet, so her magnet has it within a tick or two.
+        app.world_mut()
+            .run_system_once(move |mut commands: Commands, art: Res<nuclonium::Art>| {
+                nuclonium::spawn(&mut commands, &art, nuclonium::Kind::Nuclonium, here, 0.0);
+            })
+            .unwrap();
+        for _ in 0..6 {
+            app.update();
+        }
+        let ball = {
+            let mut balls = app
+                .world_mut()
+                .query_filtered::<Entity, With<nuclonium::Nuclonium>>();
+            balls.single(app.world()).unwrap()
+        };
+        assert!(
+            matches!(
+                app.world().get::<nuclonium::Nuclonium>(ball).unwrap().held,
+                nuclonium::Held::Following(_)
+            ),
+            "the ball Luna is standing on never joined her"
+        );
+        // Somewhere to swim to.
+        {
+            let mut player = app
+                .world_mut()
+                .query_filtered::<&mut Transform, With<Player>>();
+            player.single_mut(app.world_mut()).unwrap().translation =
+                here + Vec3::new(4.0, 0.0, 0.0);
+        }
+        let ticks = |app: &App| app.world().resource::<Time<Fixed>>().elapsed();
+        let mut glided = false;
+        for _ in 0..40 {
+            let (before, was) = (
+                app.world().get::<Transform>(ball).unwrap().translation,
+                ticks(&app),
+            );
+            app.update();
+            let after = app.world().get::<Transform>(ball).unwrap().translation;
+            // A frame with no tick in it: whatever moved the ball here was not
+            // the simulation.
+            if ticks(&app) == was && after.distance(before) > 1e-4 {
+                glided = true;
+                break;
+            }
+        }
+        assert!(
+            glided,
+            "the train only ever moved on ticks, which is the judder"
+        );
+    }
+
+    /// And so does a Mario, which is the same defect one leader further out.
+    ///
+    /// The squad walks on the fixed step like everything else, and until now it
+    /// was *drawn* on the fixed step too: the same pose held for two or three
+    /// frames and then a whole tick's stride at once, beside a leader gliding
+    /// smoothly past it. What could not be done about it is the interesting
+    /// part -- a Mario's `Transform` is where the Mario is, read by the fight,
+    /// the planner and the walk, so it cannot simply be smoothed in place
+    /// without feeding a drawn half-step back into the next tick's arithmetic.
+    ///
+    /// So the pose is banked and put back. This asks the question from the
+    /// outside: on a frame the simulation did not tick, did a Mario move
+    /// anyway? See `squad::Glide`.
+    #[test]
+    fn a_mario_glides_on_the_frames_between_two_ticks() {
+        let mut app = headless();
+        // Long enough for the field to be standing and for some of it to have
+        // grown bored and started ambling.
+        for _ in 0..30 {
+            app.update();
+        }
+        let marios = |app: &mut App| -> Vec<(Entity, Vec3)> {
+            let mut allies = app
+                .world_mut()
+                .query_filtered::<(Entity, &Transform), With<squad::Ally>>();
+            allies
+                .iter(app.world())
+                .map(|(entity, at)| (entity, at.translation))
+                .collect()
+        };
+        assert!(
+            !marios(&mut app).is_empty(),
+            "the field has no Marios in it"
+        );
+        let ticks = |app: &App| app.world().resource::<Time<Fixed>>().elapsed();
+        let mut glided = false;
+        for _ in 0..240 {
+            let (before, was) = (marios(&mut app), ticks(&app));
+            app.update();
+            if ticks(&app) != was {
+                // The simulation ran: whatever moved is allowed to have moved.
+                continue;
+            }
+            let after = marios(&mut app);
+            glided = before
+                .iter()
+                .zip(after.iter())
+                .any(|(before, after)| before.0 == after.0 && after.1.distance(before.1) > 1e-5);
+            if glided {
+                break;
+            }
+        }
+        assert!(
+            glided,
+            "the squad only ever moved on ticks, which is the stutter"
+        );
+    }
+
+    /// A red ball comes to you rather than being had at arm's length.
+    ///
+    /// Two halves that fail differently. One is a medkit that teleports into
+    /// your health bar from two metres away, which is what this replaced: no
+    /// moment, nothing on the screen joining the ball to the number going up.
+    /// The other is a medkit that notices and then never arrives.
+    #[test]
+    fn a_medkit_comes_to_whoever_needs_it_rather_than_being_had_at_arms_length() {
+        let mut app = headless();
+        app.update();
+        let here = {
+            let mut player = app.world_mut().query_filtered::<&Transform, With<Player>>();
+            player.single(app.world()).unwrap().translation
+        };
+        // Inside the lure and well outside the touch.
+        let kit_at = here + Vec3::new(3.0, 0.0, 0.0);
+        app.world_mut()
+            .run_system_once(move |mut commands: Commands, art: Res<nuclonium::Art>| {
+                nuclonium::spawn(&mut commands, &art, nuclonium::Kind::Medkit, kit_at, 0.0);
+            })
+            .unwrap();
+        {
+            let mut player = app
+                .world_mut()
+                .query_filtered::<&mut health::Health, With<Player>>();
+            player.single_mut(app.world_mut()).unwrap().current = 10;
+        }
+        let where_is_it = |app: &mut App| {
+            let mut kits = app
+                .world_mut()
+                .query_filtered::<&Transform, With<health::Medkit>>();
+            kits.single(app.world()).map(|at| at.translation).ok()
+        };
+        let started = where_is_it(&mut app).expect("the medkit was never spawned");
+        for _ in 0..4 {
+            app.update();
+        }
+        let moved = where_is_it(&mut app).expect("the medkit was taken at three metres");
+        assert!(
+            moved.distance(here) < started.distance(here) - 0.05,
+            "the medkit noticed a hurt Luna and did not come towards her"
+        );
+        // And then it arrives and is absorbed.
+        for _ in 0..60 {
+            app.update();
+        }
+        assert!(
+            where_is_it(&mut app).is_none(),
+            "the medkit drifted in and then never landed"
+        );
+        let mut player = app
+            .world_mut()
+            .query_filtered::<&health::Health, With<Player>>();
+        assert_eq!(
+            player.single(app.world()).unwrap().current,
+            10 + health::MEDKIT_HEAL,
+            "it was absorbed and put nothing back"
+        );
+    }
+
+    /// Holding the grab button opens a circle, growing it, and letting go shuts
+    /// it again.
+    ///
+    /// Driven through `InputState` rather than through the keyboard, because
+    /// `input_pipeline` is wired up in `main` and does not run in a headless
+    /// app -- which is also why this is not a test of the picker. That X
+    /// reaches this flag at all is `action::aim`'s, and has its own test there.
+    #[test]
+    fn holding_the_grab_button_opens_a_circle_that_grows() {
+        let mut app = headless();
+        app.update();
+        assert!(
+            app.world().resource::<nuclonium::Grab>().held_for.is_none(),
+            "a circle was open before anything was pressed"
+        );
+        app.world_mut().resource_mut::<input::InputState>().grab = true;
+        app.update();
+        let opened = app.world().resource::<nuclonium::Grab>().radius;
+        assert!(
+            app.world().resource::<nuclonium::Grab>().held_for.is_some(),
+            "holding the grab button opened no circle"
+        );
+        assert!(
+            opened >= nuclonium::grab_radius(0.0),
+            "the circle opened at {opened}, inside its own smallest size"
+        );
+        for _ in 0..30 {
+            app.update();
+        }
+        let grown = app.world().resource::<nuclonium::Grab>().radius;
+        assert!(
+            grown > opened,
+            "holding it longer did not grow the circle: {opened} then {grown}"
+        );
+        {
+            let mut input = app.world_mut().resource_mut::<input::InputState>();
+            input.grab = false;
+            input.grab_released = true;
+        }
+        app.update();
+        assert!(
+            app.world().resource::<nuclonium::Grab>().held_for.is_none(),
+            "letting go left the circle open"
+        );
+    }
+
+    /// A red ball is hit points, and only for somebody who needs them.
+    ///
+    /// Both halves matter and they fail differently: one is a pickup that does
+    /// nothing, the other is a pickup that is thrown away. See
+    /// [`health::mend`].
+    #[test]
+    fn a_medkit_mends_whoever_needs_it_and_waits_for_somebody_who_does() {
+        let mut app = headless();
+        app.update();
+        let here = {
+            let mut player = app.world_mut().query_filtered::<&Transform, With<Player>>();
+            player.single(app.world()).unwrap().translation
+        };
+        app.world_mut()
+            .run_system_once(move |mut commands: Commands, art: Res<nuclonium::Art>| {
+                nuclonium::spawn(&mut commands, &art, nuclonium::Kind::Medkit, here, 0.0);
+            })
+            .unwrap();
+        for _ in 0..10 {
+            app.update();
+        }
+        // Nobody is hurt, so it is still lying there.
+        {
+            let mut kits = app.world_mut().query::<&health::Medkit>();
+            assert_eq!(
+                kits.iter(app.world()).count(),
+                1,
+                "a medkit was spent on somebody at full health"
+            );
+        }
+
+        // Now hurt Luna, standing on it.
+        {
+            let mut player = app
+                .world_mut()
+                .query_filtered::<&mut health::Health, With<Player>>();
+            player.single_mut(app.world_mut()).unwrap().current = 10;
+        }
+        for _ in 0..10 {
+            app.update();
+        }
+        let mut kits = app.world_mut().query::<&health::Medkit>();
+        assert_eq!(
+            kits.iter(app.world()).count(),
+            0,
+            "a hurt Luna standing on a medkit did not pick it up"
+        );
+        let mut player = app
+            .world_mut()
+            .query_filtered::<&health::Health, With<Player>>();
+        assert_eq!(
+            player.single(app.world()).unwrap().current,
+            10 + health::MEDKIT_HEAL,
+            "the medkit was taken and put nothing back"
+        );
+    }
+
+    /// What a *kill* leaves behind is collectable, which is not the same test.
+    ///
+    /// The one above hands the squad a ball placed on the ground, and it has
+    /// passed all along while the squad visibly ignored what the fighting
+    /// dropped. The difference is where the ball ends up: a kill is resolved at
+    /// the dying thing's own origin, or at the point a round landed on it, and
+    /// nothing in this game falls -- so a ball shed by a body was left hanging
+    /// at the height it died at. A Mario walked underneath it, arrived, and
+    /// could not reach it, because the reach was a straight three-dimensional
+    /// distance and the walk had already spent three quarters of it getting
+    /// there.
+    ///
+    /// So this drops one the way a kill does, a metre and a bit off the floor,
+    /// and asks for it back. Both halves of the fix are needed for it to pass
+    /// and either alone would do it, which is why it is written against the
+    /// outcome rather than against a height.
+    #[test]
+    fn a_ball_shed_by_a_kill_off_the_ground_is_still_collected() {
+        let mut app = headless();
+        app.update();
+        let here = {
+            let mut player = app.world_mut().query_filtered::<&Transform, With<Player>>();
+            player.single(app.world()).unwrap().translation
+        };
+        let mast_at = here + Vec3::new(6.0, 0.0, 0.0);
+        // Where a slime's middle is, rather than where its feet were.
+        let died_at = here + Vec3::new(2.0, 1.2, 3.0);
+        app.world_mut()
+            .run_system_once(
+                move |mut commands: Commands,
+                      assets: Res<AssetServer>,
+                      mut drops: ResMut<nuclonium::Drops>| {
+                    stellarator::spawn(&mut commands, &assets, here, 0.0, 0.5);
+                    pylon::spawn(&mut commands, &assets, mast_at, 0.0);
+                    squad::spawn_ally(
+                        &mut commands,
+                        &assets,
+                        ActiveCharacter::Mario,
+                        here + Vec3::new(1.0, 0.0, 1.0),
+                        0.0,
+                    );
+                    // Through the one die in the game rather than round it, so
+                    // this is the path a real kill takes. One roll in twenty
+                    // lands; twenty rolls is one ball.
+                    for _ in 0..20 {
+                        if drops.maybe(died_at) == Some(nuclonium::Kind::Nuclonium) {
+                            break;
+                        }
+                    }
+                },
+            )
+            .unwrap();
+        for _ in 0..400 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().resource::<nuclonium::Bank>().stored,
+            1,
+            "the ball a kill dropped was never collected"
+        );
+    }
+
+    /// A mast is something that can be lost.
+    ///
+    /// The point of the whole [`structure`] module: an ant that has noticed a
+    /// pylon stands on it and wears it down, and the network it was part of
+    /// rebuilds around the hole. What this proves past the unit tests is that a
+    /// pylon is a *target* at all -- that `enemy::alert` picks a building out of
+    /// the field on the strength of its `Side` alone, with no targeting code
+    /// written for it.
+    #[test]
+    fn a_crowd_takes_a_planted_mast_down_and_the_network_closes_over_it() {
+        let mut app = headless();
+        app.update();
+        let here = {
+            let mut player = app.world_mut().query_filtered::<&Transform, With<Player>>();
+            player.single(app.world()).unwrap().translation
+        };
+        // Well away from the player, so what the ants notice is the mast rather
+        // than him -- `enemy_sight` is 14 m and this is comfortably past it.
+        let mast_at = here + Vec3::new(40.0, 0.0, 0.0);
+        app.world_mut()
+            .run_system_once(move |mut commands: Commands, assets: Res<AssetServer>| {
+                let mast = pylon::spawn(&mut commands, &assets, mast_at, 0.0);
+                let _ = mast;
+                for step in 0..4 {
+                    enemy::spawn(
+                        &mut commands,
+                        &assets,
+                        enemy::Kind::Ant,
+                        mast_at + Vec3::new(2.0 + step as f32 * 0.4, 0.0, 1.0),
+                        step as f32,
+                    );
+                }
+            })
+            .unwrap();
+        app.update();
+        assert_eq!(
+            app.world().resource::<pylon::Network>().nodes.len(),
+            1,
+            "the mast never joined the network"
+        );
+
+        // A hundred and twenty points at three a blow, one blow every third of a
+        // second however many ants turned up: fourteen seconds if the siege
+        // never lets up, and longer than that in practice, because `enemy::spread`
+        // and the weave keep shoving individual ants in and out of arm's reach.
+        // The budget is generous for that reason -- what is being proved here is
+        // that a mast *can* be lost, not the rate.
+        let mut standing = true;
+        for _ in 0..1600 {
+            app.update();
+            let mut masts = app.world_mut().query::<&pylon::Pylon>();
+            if masts.iter(app.world()).next().is_none() {
+                standing = false;
+                break;
+            }
+        }
+        assert!(
+            !standing,
+            "four ants stood on a mast and never took it down: {} points left",
+            app.world_mut()
+                .query_filtered::<&health::Health, With<pylon::Pylon>>()
+                .iter(app.world())
+                .next()
+                .map_or(-1, |health| health.current)
+        );
+        // And the network noticed, rather than keeping a node for a mast that
+        // is not there.
+        app.update();
+        assert_eq!(
+            app.world().resource::<pylon::Network>().nodes.len(),
+            0,
+            "the network still holds a mast that has been knocked over"
+        );
+    }
+
+    /// A nest is an objective.
+    ///
+    /// Two things at once, and both are wiring the unit tests cannot see. That
+    /// a warp pipe placed by the level is standing there as something with hit
+    /// points and a side -- so the sword finds it at all -- and that one held
+    /// swing spends *one* blow against it rather than one a tick. The second is
+    /// the whole reason `structure::demolish` takes a rising edge: against a
+    /// creature the difference is invisible, because a swing one-shots
+    /// everything the game places, and against a pipe it is six swings or one.
+    #[test]
+    fn a_warp_pipe_takes_a_swing_at_a_time_and_can_be_knocked_down() {
+        let mut app = headless();
+        app.update();
+        // Whichever hostile pipe the castle put down, and where it is.
+        let nest = {
+            let mut pipes = app
+                .world_mut()
+                .query::<(Entity, &Transform, &pipe::WarpPipe, &enemy::Side)>();
+            pipes
+                .iter(app.world())
+                .find(|(_, _, _, side)| **side == enemy::Side::Hostile)
+                .map(|(entity, at, _, _)| (entity, at.translation))
+        };
+        let (nest, standing_at) = nest.expect("the castle has no enemy warp pipe on it");
+        let full = app
+            .world()
+            .get::<health::Health>(nest)
+            .expect("a pipe with no hit points")
+            .max;
+        assert_eq!(full, health::WARP_PIPE_HEALTH);
+
+        // The squad off the field first. A Mario that notices a hostile pipe
+        // walks over and punches it -- which is the feature working, and which
+        // would make the arithmetic below about two attackers rather than one.
+        {
+            let mut allies = app
+                .world_mut()
+                .query_filtered::<Entity, With<squad::Ally>>();
+            let marios: Vec<Entity> = allies.iter(app.world()).collect();
+            for mario in marios {
+                app.world_mut().entity_mut(mario).despawn();
+            }
+            app.world_mut()
+                .resource_mut::<console::GameTuning>()
+                .ally_count = 0.0;
+        }
+        // Stood against it, so every swing is in reach.
+        {
+            let mut player = app
+                .world_mut()
+                .query_filtered::<&mut Transform, With<Player>>();
+            player.single_mut(app.world_mut()).unwrap().translation = standing_at;
+        }
+        // One swing, held for as long as the player actually holds one.
+        let swing = |app: &mut App| {
+            app.world_mut()
+                .run_system_once(|mut player: Query<&mut Controller, With<Player>>| {
+                    if let Ok(mut ctrl) = player.single_mut() {
+                        ctrl.attack_left = 0.55;
+                    }
+                })
+                .unwrap();
+            // Long enough for the window to have opened and closed again, so
+            // the next call is a fresh swing rather than the same one.
+            for _ in 0..60 {
+                app.update();
+            }
+        };
+        swing(&mut app);
+        assert_eq!(
+            app.world().get::<health::Health>(nest).map(|it| it.current),
+            Some(full - health::PLAYER_DAMAGE),
+            "one held swing did not spend exactly one blow"
+        );
+        // And the rest of them finish it.
+        for _ in 0..(full / health::PLAYER_DAMAGE) {
+            if app.world().get_entity(nest).is_err() {
+                break;
+            }
+            swing(&mut app);
+        }
+        assert!(
+            app.world().get_entity(nest).is_err(),
+            "the nest survived a pool's worth of swings"
+        );
+    }
+
+    /// The fetch decision under the condition it actually runs in: a fight.
+    ///
+    /// **Both halves of the rule, in one staging, because they are one rule.**
+    /// A Mario must not walk away from something it can see to pick a ball up
+    /// -- and it must not be paralysed by the memory of something it noticed
+    /// once and can no longer reach. Those pull in opposite directions and the
+    /// game has been wrong in each direction in turn:
+    ///
+    ///   * Deciding began as a priority list with the fight above the ball. But
+    ///     aggro in this game is *never given up*, so in any level with enemies
+    ///     standing about every Mario acquires a target within seconds and keeps
+    ///     it for the session. No ball was ever fetched, and the ones already in
+    ///     hand were carried around the castle for ever.
+    ///   * Scoring the two against each other fixed that and bought the opposite
+    ///     complaint, which is the one a player actually sees: a Mario with a
+    ///     slime on it turning its back to go and collect something.
+    ///
+    /// So [`goap::choose`] strikes hauling off the list while the quarry is
+    /// within sight and scores it normally past that. This test is that
+    /// sentence in the running game: a slime ten metres off, then the same slime
+    /// forty metres off, with the same ball at the Mario's feet throughout.
+    ///
+    /// The integration test above stages an empty corner of the lawn and would
+    /// miss both failures.
+    #[test]
+    fn a_mario_fights_what_it_can_see_and_fetches_once_it_cannot() {
+        let mut app = headless();
+        app.update();
+        let here = {
+            let mut player = app.world_mut().query_filtered::<&Transform, With<Player>>();
+            player.single(app.world()).unwrap().translation
+        };
+        // The squad the castle spawns is somewhere else and would muddy the
+        // count; this test is about one Mario. The tuning has to come down with
+        // them, or `squad::maintain_population` puts the other seven straight
+        // back -- and it is set to one rather than zero because the Mario spawned
+        // below is the one it is then asked to keep.
+        {
+            let mut allies = app
+                .world_mut()
+                .query_filtered::<Entity, With<squad::Ally>>();
+            let marios: Vec<Entity> = allies.iter(app.world()).collect();
+            for mario in marios {
+                app.world_mut().entity_mut(mario).despawn();
+            }
+            app.world_mut()
+                .resource_mut::<console::GameTuning>()
+                .ally_count = 1.0;
+        }
+        // Well clear of Luna, and that spacing is load-bearing rather than
+        // decoration: a ball inside `nuclonium::MAGNET_RANGE` of her follows her
+        // instead of waiting for a Mario, and one inside `MAST_REACH` of a live
+        // mast is taken up by the mast. Either would answer this test without a
+        // Mario ever deciding anything.
+        let mario_at = here + Vec3::new(9.0, 0.0, 0.0);
+        let ball_at = here + Vec3::new(10.0, 0.0, 0.0);
+        // Ten metres off the Mario: inside `enemy_sight`, so it is noticed at
+        // once, and ten times further away than the ball -- which is exactly
+        // the gap a score hands to the ball and the rule has to hand to the
+        // slime.
+        let slime_at = here + Vec3::new(9.0, 0.0, 10.0);
+        let slime = app
+            .world_mut()
+            .run_system_once(
+                move |mut commands: Commands,
+                      assets: Res<AssetServer>,
+                      art: Res<nuclonium::Art>| {
+                    stellarator::spawn(&mut commands, &assets, here, 0.0, 0.5);
+                    pylon::spawn(&mut commands, &assets, here + Vec3::new(0.0, 0.0, 3.0), 0.0);
+                    squad::spawn_ally(
+                        &mut commands,
+                        &assets,
+                        ActiveCharacter::Mario,
+                        mario_at,
+                        0.0,
+                    );
+                    nuclonium::spawn(
+                        &mut commands,
+                        &art,
+                        nuclonium::Kind::Nuclonium,
+                        ball_at,
+                        0.0,
+                    );
+                    enemy::spawn(&mut commands, &assets, enemy::Kind::Slime, slime_at, 0.0)
+                },
+            )
+            .unwrap();
+        // Given a pool it cannot lose. This test is about what the Mario
+        // *plans*, not about who wins: a slime that dies half way through takes
+        // the fight away with it, and both halves below need the same live
+        // target throughout.
+        {
+            let mut pool = app.world_mut().entity_mut(slime);
+            let mut health = pool.get_mut::<health::Health>().unwrap();
+            *health = health::Health::new(1_000_000);
+        }
+
+        // Settle first, then watch. `goap::plan` runs before `enemy::alert` in
+        // the fixed step, so on the tick a slime is first noticed the plan
+        // standing is one tick old by construction -- and a frame loop does not
+        // run one fixed tick, it runs however many are owed. Asserting from the
+        // first frame is asserting that the squad reads the future.
+        for _ in 0..60 {
+            app.update();
+        }
+        let sight = app.world().resource::<console::GameTuning>().enemy_sight;
+        let mut watched = 0;
+        for _ in 0..90 {
+            app.update();
+            let mut marios = app
+                .world_mut()
+                .query::<(&squad::Ally, &enemy::Aggro, &Transform)>();
+            for (ally, aggro, at) in marios.iter(app.world()) {
+                // Only while it is actually in the fight. A slime it has killed
+                // or lost is the other half of this test, below.
+                if aggro.target.is_none() || at.translation.distance(aggro.at) > sight {
+                    continue;
+                }
+                watched += 1;
+                assert!(
+                    !matches!(
+                        ally.plan,
+                        goap::Goal::Fetch { .. } | goap::Goal::Deliver { .. }
+                    ),
+                    "a Mario {} m from what it has noticed went for the ball anyway: {:?}",
+                    at.translation.distance(aggro.at),
+                    ally.plan
+                );
+            }
+        }
+        assert!(
+            watched > 10,
+            "the slime was never noticed, so nothing above was tested"
+        );
+
+        // Now put the same slime out past sight without letting go of it. This
+        // is the state every Mario in a populated level is really in -- holding
+        // a target it noticed once -- and the squad has to get on with its work
+        // in it. Moved rather than killed, precisely so that the target stays.
+        app.world_mut()
+            .entity_mut(slime)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation = here + Vec3::new(9.0, 0.0, 40.0);
+        let mut held_a_grudge = false;
+        for _ in 0..400 {
+            app.update();
+            let mut marios = app.world_mut().query::<(&squad::Ally, &enemy::Aggro)>();
+            held_a_grudge |= marios.iter(app.world()).any(|(ally, aggro)| {
+                aggro.target.is_some()
+                    && matches!(
+                        ally.plan,
+                        goap::Goal::Fetch { .. } | goap::Goal::Deliver { .. }
+                    )
+            });
+            if app.world().resource::<nuclonium::Bank>().stored > 0 {
+                break;
+            }
+        }
+        assert!(
+            held_a_grudge,
+            "a Mario holding a distant target never planned to fetch -- \
+             the grudge is standing in for a fight again"
+        );
+        assert_eq!(
+            app.world().resource::<nuclonium::Bank>().stored,
+            1,
+            "the ball never reached the machine with a slime on the lawn"
+        );
+        // And what reached the machine is showing inside it: the field a
+        // stellarator draws is its stock. See `stellarator::stock`.
+        let mut stores = app.world_mut().query::<&stellarator::Store>();
+        assert_eq!(
+            stores
+                .iter(app.world())
+                .map(|store| store.held)
+                .sum::<u32>(),
+            1,
+            "the machine banked it without taking it in"
+        );
     }
 
     /// The jetpack is metered, end to end.
@@ -1915,6 +3138,8 @@ mod tests {
             // The menu's level page asks for levels, and reads which one is up.
             .init_resource::<world::LevelId>()
             .init_resource::<world::LevelLoad>()
+            // The Tab picker rides in the same pipeline now.
+            .init_resource::<action::Action>()
             .add_message::<world::LoadLevel>()
             .add_systems(PreUpdate, input_pipeline());
         app.edit_schedule(PreUpdate, |schedule| {

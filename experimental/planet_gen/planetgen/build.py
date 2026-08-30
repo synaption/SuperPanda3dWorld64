@@ -82,6 +82,12 @@ class Planet:
         self.material = material
         self.slope = slope
         self.all_triangles = tris
+        traversal = surface.traversal_classes(
+            positions, tris, altitude, m["sea_level"], m["ground_normal"],
+            m["farm_slope_cos"], m["farm_min_altitude"],
+            m["farm_max_altitude"])
+        self.traversal = surface.enforce_topology(
+            positions, tris, traversal, m["farm_min_area"])
         return self
 
     def tile(self, face, tu, tv, depth=None, res=None):
@@ -95,8 +101,22 @@ class Planet:
                               u0:u0 + res * stride + 1:stride]
         ids = block.ravel()
         local = tile_quad_indices(res)
-        walk = surface.walkable_triangles(self.positions[ids], local,
-                                          self.m["ground_normal"])
+        traversal = surface.traversal_classes(
+            self.positions[ids], local, self.altitude[ids],
+            self.m["sea_level"], self.m["ground_normal"],
+            self.m["farm_slope_cos"], self.m["farm_min_altitude"],
+            self.m["farm_max_altitude"])
+        # LOD0 navigation is classified planet-wide. That is where a flat
+        # candidate becomes a real farm only after proving it has a shoreline
+        # route and enough connected area to use.
+        if stride == 1 and depth == self.m["depth"]:
+            j, i = np.meshgrid(np.arange(res), np.arange(res), indexing="ij")
+            quads = ((v0 + j) * self.n + (u0 + i)).ravel()
+            base = face * 2 * self.n * self.n
+            global_triangles = np.stack(
+                [base + quads, base + self.n * self.n + quads], axis=1).ravel()
+            for field in traversal:
+                traversal[field] = self.traversal[field][global_triangles]
         return {
             "tile": np.array([face, depth, tu, tv], dtype=np.int32),
             "vertex_ids": ids.astype(np.int64),
@@ -105,7 +125,7 @@ class Planet:
             "material": self.material[ids].astype(np.uint8),
             "altitude": self.altitude[ids].astype(np.float32),
             "triangles": local.astype(np.uint32),
-            "walkable": walk,
+            **traversal,
         }
 
     def write_tiles(self, lod=0):

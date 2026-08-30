@@ -658,7 +658,12 @@ fn stars() -> Mesh {
 ///
 /// `texel` is handed the pixel's place in the square, running -1 to 1 on both
 /// axes, so a disc is a test on its length.
-fn texture(size: u32, mut texel: impl FnMut(f32, f32) -> [u8; 4]) -> Image {
+///
+/// Shared out of this module rather than copied into the next one that wants a
+/// small generated picture: [`crate::nuclonium`] draws its glow with the same three
+/// lines, and two identical loops writing RGBA into a `Vec` is exactly the
+/// duplication this port spends its comments refusing.
+pub(crate) fn texture(size: u32, mut texel: impl FnMut(f32, f32) -> [u8; 4]) -> Image {
     let across = size as f32;
     let mut pixels = Vec::with_capacity((size * size * 4) as usize);
     for y in 0..size {

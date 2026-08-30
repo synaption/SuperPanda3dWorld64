@@ -135,7 +135,10 @@ once and neither has to be selected.
 | Aim | hold `F` or right mouse | right trigger |
 | Switch weapon (sword / pistol) | `Y` | left shoulder |
 | Recenter camera | `R` | right shoulder |
-| Squad: hold to whistle, tap to send | `X` | west (X) |
+| Action, aimed by the picker below | `X` | west (X) |
+|  Squad: hold to whistle, tap to send | | |
+|  Nuclonium: hold to open a circle, release to call what is in it | | |
+| Aim the action button (the picker) | `Tab`, `←`/`→`, `1`–`4` | — |
 | Build a stellarator: hold to grow it, tap for the smallest | `B` | Select |
 | Plant a pylon: hold to open a site, release to plant | `G` | right stick click |
 | Switch Luna/Mario in place | `F2` | Start |
@@ -576,23 +579,381 @@ Two things you build, on two keys, aimed the same way the squad is ordered —
 the ray out of the middle of the screen, marched until it meets ground.
 
 **A stellarator** (`B`) is the thing that makes power. Hold the key and a
-footprint ring opens on the ground and the machine grows inside it up to the
-size it was authored at; let go and it is built, unless the ring is red, which
-means another machine is already standing there. What is drawn inside its coils
-is not the plasma mesh in the glTF — that is hidden as it arrives — but sixty-
-four streaks riding the same flux surface the mesh describes. See
+footprint ring opens on the ground where you are looking; let go and a machine
+is built there, unless the ring is red, which means another one is already
+standing on the spot. **Every machine is the same size** — the size the model
+was authored at. The hold used to grow it between half and full, which looked
+like a feature and played like a mistake: none of the sizes meant anything, a
+small stellarator being neither cheaper nor weaker, and machines came out
+different depending on how long a thumb rested on a key. The hold aims; it does
+not size. What is drawn inside its coils
+is not the plasma mesh in the glTF — that is hidden as it arrives — but the
+nuclonium the machine has been sent, riding the same flux surface the mesh
+describes. A new machine is therefore dark; see "the beams are a road" below.
 `src/stellarator.rs`.
 
 **A pylon** (`G`) is how that power gets anywhere. Each mast strings a beam to
-every other mast within 42 m that it can see, head to head against the level's
-own collision — a beam eight metres up clears a hedge a walker would have to go
-round — and power floods outward from whatever machine can reach a mast at all.
-The ring under the crosshair says which of three things the site is: red for
-blocked by something already standing, amber for legal but joined to nothing,
-cyan for legal and wired in. A live mast breathes and its beams are lit; a dark
-one stands still. Standing near a live mast fills the jetpack bar four times
-faster, which is the reason to push a network outward rather than ring the
+every other mast it can *see*, head to head against the level's own collision —
+a beam eight metres up clears a hedge a walker would have to go round — and
+power floods outward from whatever machine can reach a mast at all. The range
+limit is 150 m, which is most of the castle grounds: long enough that what you
+are planning around is the terrain rather than the number, short enough that the
+cheap test still runs before the expensive ray for every pair. The ring under
+the crosshair says which of three things the site is: red for blocked by
+something already standing, amber for legal but joined to nothing, cyan for
+legal and wired in. A live mast breathes and its beams are lit; a dark one
+stands still. Standing near a live mast fills the jetpack bar four times faster,
+which is one of two reasons to push a network outward rather than ring the
 machine with masts and stop.
+
+The other is that the beams are a **road**. One enemy kill in twenty leaves a
+ball of **nuclonium** on the ground — the substance the whole economy runs on,
+drawn as a little glowing green sphere for now, with ore patches to mine still
+to come. A Mario walks over, picks it up, carries it over its head to the
+nearest live mast, and hands it in, and the mast then ships it back down the
+beams to a machine — mast to mast, downhill along the same hop counts that
+decided which masts were lit in the first place, and along the beam the machine
+feeds that last mast with. The count of what has arrived is on the debug HUD.
+
+**Four things can collect a ball, and only one of them is a Mario.** Luna picks
+up anything she walks within four and a half metres of, and it swims along
+behind her on a spring until she passes a mast; the action button pointed at
+Nuclonium opens a **circle on the ground** where she is looking and calls
+everything loose inside it to heel, which is how a battlefield gets cleared
+without walking over each thing in turn; and a live mast simply takes what is
+lying within six metres of its foot, with nobody sent for it at all. All four end at the same hand-over — one function, because
+a second copy of it is a second place to forget the bank. A ball is also worth
+picking up whether or not there is anywhere to take it: with the network dark
+a Mario holds one until a mast lights.
+
+The whistle is the **squad's own gesture** pointed at the ground instead of at
+the Marios: hold to open a circle where the view lands, hold longer to grow it
+to twelve metres, release to take what is standing in it. It shares
+`squad::aim_point`, `squad::in_circle` and the ring mesh with the squad whistle,
+in the balls' green rather than the squad's yellow, because one button now does
+four jobs and four jobs that answered to four different shapes of press would be
+four things to learn. It replaced a flat twenty-five-metre sweep around Luna's
+own feet, which drew nothing — so the only way to find out what a press would
+take was to press it — and could not be pointed at the far side of a fight, or
+at one heap of balls rather than the heap beside it.
+
+**Luna's train glides; it does not step.** Where a following ball swims to is
+decided once per *drawn frame*, against the interpolated pose in
+`player::RenderPose`, not once per fixed tick against the simulation transform.
+The simulation runs thirty times a second and Luna is drawn between two of its
+ticks — that interpolation is what makes her glide at all — so a train solved on
+the fixed step stood still on every frame the simulation skipped and jumped on
+the ones it did not, behind a leader who did neither. Nothing about the spring
+was wrong; it was being solved at the wrong rate and drawn without
+interpolation. `nuclonium::escort` keeps every decision (what joins, what leaves,
+what a mast takes) because those must happen the same number of times a second
+on every machine; only the gliding moved. `nuclonium::swim` does the same for a
+red ball drifting towards somebody who needs it, since it is the same easing
+aimed at a different point.
+
+**And so does the squad.** A Mario walks on the fixed step like everything else
+and was *drawn* on it too — the same pose held for two or three frames, then a
+whole tick's stride at once, beside a leader gliding smoothly past it. What
+cannot be done about that is to smooth the ally's `Transform` in place, because
+that transform is not a picture: it is where the Mario is, and the fight, the
+planner and the walk all read it. A drawn half-step fed back into the next
+tick's arithmetic is a simulation whose answers depend on the frame rate.
+
+So the pose is banked instead — `squad::Glide`, and three systems around it.
+`squad::bank` runs last in the tick and writes down where the tick left each
+ally; `squad::steady` runs *first* in the next one and puts that exact pose back
+before anything reads it; `squad::glide` draws whatever is in between, once per
+frame, off the same `overstep_fraction` that carries Luna. Every system in the
+fixed step sees the numbers it always saw. A move too big to be a walk — a warp
+pipe, a respawn, a level swapping underneath — is not interpolated at all, or
+the body would be drawn sliding across the map through everything in between.
+
+`main.rs` places `steady` at the very top of the tick and `bank` at the very
+bottom, and both placements are correctness rather than tidiness.
+
+**Nothing made of nuclonium changes place without travelling there.** Four
+things used to teleport, and each one is a write that took no time at all:
+
+* Being picked up put the ball a metre and a half over the Mario's head on the
+  tick it was claimed. `nuclonium::haul` now decides only *whose* it is, and
+  `nuclonium::swim` flies it into the Mario's hands over the next few frames on
+  the same easing the train uses, against the pose that Mario is drawn at.
+* Being handed in at a mast started the flight at the mast's own head, up to six
+  metres away and several metres up. The ball's own position is prepended to the
+  route, so the flight begins where the ball is lying and climbs into the beams.
+  It is prepended at the hand-over rather than inside `Network::supply_route`,
+  because where the network carries something from a mast is a property of the
+  network and where the ball happened to be lying is not.
+* Being put down — dropped by a Mario that was killed, or let go when the leader
+  a train was following disappeared — wrote the ground's height into the
+  transform from over a dead Mario's head. `Orb::drop_to` records the gap
+  instead and `nuclonium::shimmer` eases it away, so the ball falls. It is kept
+  as an offset rather than by easing the transform towards the bob, because the
+  bob is a moving target and a first-order filter chasing a sine comes out
+  shallower and late — that would quietly change how every ball in the level
+  floats in order to fix how one of them is put down.
+* Arriving at a machine spawned the mote on its flux surface, so the substance
+  the player had watched cross the valley finished by blinking out at the feed
+  point and back in a metre away. A new mote now starts exactly where the flight
+  ended and swims out to its orbit over six tenths of a second — and since a
+  mote carries the same trail a ball does, the swim draws its own wake into the
+  coils.
+
+**A ball nobody comes for goes.** Three minutes of lying about untouched and it
+shrinks out of the world over the last two seconds — long enough that what a
+fight dropped is still there after the fight and the walk back, short enough
+that an afternoon of skirmishing across a valley does not leave a thousand of
+them lit up on the lawn. Every kind of interest resets that clock: a Mario's
+claim, Luna's magnet, the whistle, a mast reaching for it. It shrinks rather
+than fading because there is one material per kind shared by every ball in the
+level, so a ball cannot fade on its own without a material of its own — while
+scale is per-entity and free, and the glow is a child that comes with it.
+
+**A ball a kill dropped used to be uncollectable, and that is the bug behind
+"the Marios walk past everything".** A kill is resolved at the dying thing's own
+origin, or at the point a round landed on it, and nothing in this game falls —
+so a ball shed by a body hung in the air at the height it died at. Reaching for
+one was a straight three-dimensional distance, and the walk that got the Mario
+there had already spent three quarters of it, which left about a third of a
+metre of the budget for height. The Mario arrived, stood underneath, and could
+not reach. Balls the console scatters are snapped to the floor, which is exactly
+why every test passed. Both halves are fixed: a drop is put on the floor under
+where the kill happened, and reaching is flat with a separate allowance up and
+down, so a ball that ends up somewhere odd anyway is still collectable.
+
+Fetching is also offered whether or not there is anywhere to take it. It used to
+be struck off while the network was dark — a ball is only worth having because
+there is a mast to hand it to — and that is one more way for the squad to look
+broken to a player who has not linked their masts up yet, or whose last mast has
+just come down. A Mario picks one up and holds it; the moment a mast lights, it
+delivers.
+
+**A stellarator's plasma is its stock.** What turns inside the coils is the
+nuclonium that has been delivered to that machine, riding the same flux surface
+the .glb's plasma skin describes — one mote per unit, laid down the golden angle
+apart so the field is evenly spread at every count and the hundredth arrival
+lands in the gap the first ninety-nine left. Five sparks read as five sparks; a
+full machine is a solid turning band of green you can read from across the
+valley. There were streaks of light here before, on the same surface, and they
+were prettier — but a machine holding nothing and a machine holding four hundred
+looked exactly alike, and a stock gauge is worth more than the streaks were.
+An empty reactor being dark is the point rather than a regression.
+
+The motes ride *nested* flux surfaces rather than the outermost one, so the
+field fills the tube instead of tiling its skin — and how far out they are
+allowed to go is derived rather than chosen, from how much room one glow needs
+against how fat the tube is at its narrowest. It has to be the glow and not the
+little sphere at the middle of it: a field fitted to the balls hangs its halos
+out through the coils, which is what the first version did.
+
+Anything made of nuclonium that **moves** draws a trail, and a trail is the path
+the thing actually took: a short history of where it has been, kept on the ball
+and rebuilt each frame into one shared world-space mesh that every trail in the
+level is drawn out of. One mesh rather than one per ball, because the
+alternative at five hundred motes is five hundred dynamic meshes uploaded every
+frame. Each rung of the ribbon is turned to face the camera on its own, so the
+strip reads as a tube of light however far the path bends.
+
+A ball lying in a field floats nearly a metre up and down at half a hertz, and
+that bob is the only thing it does — so it is what its trail is drawn from, and
+the bob was made much bigger for exactly that reason. Two things had to be right
+for it to read: the path is marked finely enough that a slow float lays a
+continuous line rather than one lonely mark at a time, and coincident points are
+dropped rather than drawn. A rung of the ribbon is turned by the direction from
+it to the next point, so two points on top of each other give it no direction,
+and *any* substitute is a full-width bar of glow lying across the ball — which
+is the smear above and below a ball that had stopped moving. There is no
+orientation that is right for a segment with no length; the only correct thing
+to do with one is not draw it.
+
+**The far end slides; it does not hop.** The history keeps one mark past its
+life on purpose, and the ribbon's last rung is slid up that final segment to the
+point that is exactly 0.45 seconds old. Ending it at the oldest mark that had
+not yet expired instead meant the drawn length sawtoothed by a whole mark's
+worth of ground — the tail sat still while the marks aged and then snapped back,
+twenty times a trail. At walking pace that is a couple of centimetres; on a
+shipment crossing the valley at eighteen metres a second it is half a metre,
+which is the abrupt transition you could see. The interpolated end also lands on
+an alpha of exactly zero, so a trail always ends in nothing rather than in
+whatever the oldest surviving mark happened to have.
+
+**The head closes over the ball.** A ribbon that stops at the ball stops at a
+wall: the strip is as wide there as it ever gets, at full brightness, and the
+last thing drawn is a rung square across the direction of travel with nothing
+past it — a bright bar with a corner at each end, laid over a round glowing
+ball. So the strip carries on past the ball and closes on a circular profile,
+`sqrt(1 - t²)`, which is the outline of a sphere seen side-on. The dome is never
+longer than half the wake behind it, because a ball that is barely moving should
+not grow a bright wedge out of the front of its glow — that is the artefact in a
+smaller size rather than the fix.
+
+**And it comes out from under the glow rather than starting on top of it.** A
+glow is a soft disc a couple of ball-widths across whose alpha falls to nothing
+at the rim. A ribbon drawn at full brightness through the middle of one is not
+part of it — it is a second, harder object lying across it, and every edge it
+has shows against the falloff it is drawn over. The trail's brightness is
+therefore veiled to a quarter near the ball and lifts to full about a
+glow-radius behind it, which is where the glow itself has faded out, so the eye
+is handed one continuous falloff instead of two overlapping ones with a boundary
+between them. The floor is not zero, and that is for the slow case: a ball
+hovering in a field has a whole trail shorter than the veil, and at zero the
+wake `next.md` asked to be able to see would be veiled out of existence.
+
+**The hard edge across the bottom of a glowing ball was the depth buffer.** The
+glow is a card aimed at the camera, so it stands *through* whatever its ball is
+floating over, and the line where the two surfaces cross is drawn as a
+ruler-straight bite out of a soft round picture — a ball hanging beside a wall
+is the same photograph turned on its side. The card is now drawn a fifth of its own
+radius nearer than it hangs, scaled about the eye the way `shadow::FLOAT` lifts a
+shadow off a hillside: under a perspective projection that leaves it on exactly
+the pixels it was on at exactly the size, and changes only the depth it is
+tested at. The ceiling on that number is the ball rather than the ground — what
+hides the opaque middle of the card is the little sphere in front of it, which
+reaches `1 / HALO_SCALE` of the glow's radius, and a float past that turns a
+white ball with a green glow into a flat green disc.
+
+**Nothing sets how long a trail is.** Its length is however much ground was
+covered in the last 0.45 seconds, so twice the speed is twice the trail with no
+rate and no cap in it, and something that stops has its trail eaten from the
+tail until there is none of it left — which is what hanging in the air and going
+out looks like. The path is marked by distance rather than every frame, measured
+against the glow's own width, so a ball bobbing where it lies lays nothing at
+all, and five hundred motes drifting cost far less than five hundred racing. A
+floor on how often a mark may be laid keeps the buffer from ever being the thing
+that decides the length.
+
+The first version of this was the glow itself, leaned over and stretched along
+the direction of travel — no extra entities, two multiplies, and wrong three
+ways you could see. It was straight, so it could not follow anything turning;
+its length came out of a formula on the speed rather than out of ground covered,
+so it was the same length whatever the ball had been doing; and it flickered,
+which was the tell. The stretched card is a *child* of the ball, so the offset it
+was pushed back by last frame was part of the position it measured its own speed
+from this frame — a quantity feeding back into its own input, oscillating. The
+history is taken from the ball now, whose transform is written by the game
+rather than by the thing measuring it.
+
+**A ball lights the ground it is lying on**, and that is what "emissive" has to
+mean here. There is no light entity in this game and no shader that would read
+one: every surface in the world is on `n64::N64Material`, whose whole lighting
+model is one key direction and an ambient floor shared by the entire level, so a
+`PointLight` beside a ball would be a component nothing looks at — and the two
+ways a `StandardMaterial` can put `emissive` on the screen are missing as well,
+which is why the glow is a textured card in the first place.
+
+The console had the same problem with shadows and answered it with geometry: a
+soft disc laid on the floor under the thing, faded by how high up it was. That
+is `src/shadow.rs`, and the light pools are that idea with the sign flipped — a
+bright disc **added** to the ground rather than multiplied into it, laid under
+something that gives off light instead of under something that blocks it. Both
+ask `shadow::place` where the floor is and which way it leans, because that is
+one question with one right answer. The pool dims as the square of how far the
+ball has floated above its floor, so it breathes with the bob and a ball carried
+over a Mario's head paints nothing. Being added rather than blended is what
+makes it light rather than paint: it can only ever brighten what is under it, so
+it disappears in daylight and pools green on the grass at night.
+
+The nearest sixteen balls to the camera get one, and that number bounds the
+*ground queries* rather than the drawing: every pool in the level is one mesh and
+one draw call, the trails' own trick, but each one has to ask the collision
+where the floor beneath it is, and five hundred motes turning inside a machine
+would be five hundred of those a frame for a picture the size of a coin. The
+last quarter of the range fades to nothing so that the sixteenth and seventeenth
+swapping places as the camera turns is not a pool blinking on and off. The disc
+carries a large `depth_bias` instead of being floated toward the eye: it is six
+metres across on ground that is never flat, so without one its uphill half is
+inside the hill and what the player sees is a straight line where the two
+surfaces cross.
+
+A stellarator is **16 m** across, and that number lives in
+`tools/generate_stellarator.py` rather than in the game: the model is written by
+a script and *measured* by the port, so re-baking it at another size moves the
+footprint ring, the overlap test and the height the plasma sits at with no Rust
+change. It was 32 m, which is as wide as the castle.
+
+Above **500** the machine stops adding motes and goes on counting: a
+five-hundred-and-first is a mote nobody can pick out of the ring it joins, and
+the alternative is a fifty thousandth one. What is *held* is never capped, so
+the HUD and any future cost see the true number. `nuclonium store 500` in the
+console loads every machine on the map, which is the only practical way to look
+at a full one.
+
+Whether a Mario actually goes is not decided by that module. `src/goap.rs`
+scores every job an ally could be doing this tick — fight, obey an order, fetch
+a ball, deliver the one it is holding, amble — as one function of two numbers:
+what the job is worth at arm's length, and how far off it is. A creature in
+front of a Mario is the most pressing thing in the world and the same creature
+across the lawn is somebody else's problem, so fighting is worth the most and
+falls away the fastest; an order is worth nearly as much and reaches furthest,
+which is what makes it an order; fetching is worth less and reaches a very long
+way, which is what makes collecting the squad's standing job rather than an
+interruption to it.
+
+**A formation slot is not an order, and scoring it as one was a bug worth
+writing down.** An ally following the player is by definition standing right
+next to its slot, so an order-strength follow scored about 0.89 every tick for
+ever — while fetching tops out at 0.75 with the Mario stood *on* the ball. A
+Mario holding formation could therefore never collect anything at any range, and
+the only allies that ever did were the ones a fight had knocked far enough out
+of position for the follow to have decayed. From outside that looks exactly like
+"they only pick things up near where the fighting happens", which is how it was
+reported. Following is now a weak, long pull — about a third of an order up
+close, so nearly any real job outbids it, but slow enough to decay that a Mario
+left forty metres behind still comes. A whistle-send keeps the full weight.
+
+**This replaced a priority chain, and the chain's failure is the reason the
+squad looked unwired.** The rule was: a fight beats an order, an order beats an
+errand, an errand beats standing about. Every line reads sensibly and the whole
+thing never ran, because `enemy::alert` never lets a creature *stop* having a
+target — aggro is given up only by the target dying. In any level with enemies
+standing about, every Mario is permanently in the top bracket and nothing below
+it is ever reached. No amount of reordering fixes that: a chain compares kinds
+of thing, and what actually decides this is how far away each one is. See
+`src/goap.rs`, whose tests are the specification. `nuclonium 8` in the console
+scatters some balls to watch the chain with, and `nuclonium clear` sweeps them
+up; `src/nuclonium.rs` owns the balls themselves.
+
+**One rule sits above the scoring: a Mario in a fight does not haul.** Fetching
+and delivering are struck off the list outright while the quarry is within
+sight, rather than being outbid by a large number — because a score, however
+large, is still a distance at which a ball wins, and a Mario turning its back on
+the slime that is hitting it is wrong at every one of those distances. That gate
+can be absolute only because of where the line is drawn: *within sight* is a
+fight the Mario is in, and anything further off is the grudge every Mario in a
+populated level is carrying for ever, which is the exact thing that made the
+priority chain never fetch anything. An order is deliberately not gated — the
+whistle is the player speaking, and a squad that cannot be called off a slime is
+worse than one that leaves a fight when told to.
+
+Water is part of the same score rather than a rule beside it. A ball in the moat
+is worth having, just worth **a third** of the same ball on grass — so given two
+the squad takes the dry one, and given one and nothing else to do somebody swims
+out for it. Getting *round* a pond on the way to something past it is
+`squad::skirt`, which bends a step outward in ten-degree deflections until it
+finds a dry one and gives up rather than refuses: a Mario already in the water
+would otherwise be pinned there, since every heading is wet. And an ally out of
+its depth swims — the same depth threshold, float height and clip the player
+uses, so a Mario in the squad and the Mario you are driving cross the moat
+together.
+
+The glow on a ball is a camera-facing quad with an alpha falloff painted into
+it, not an `emissive` on its material. Nothing in this build can show an
+emissive: an `unlit` material never reaches the code that applies one, and a
+value over 1.0 only reads as light once a bloom pass smears it, which wants an
+HDR camera this game does not have. The texture comes out of the same
+`sky::texture` helper that draws the sun.
+
+**And a mast can be lost.** A pylon stands as a `structure::Structure` on the
+friendly side, and a warp pipe stands as one on the side of whatever comes out
+of it. That is the whole of what makes buildings part of the fight: `enemy::alert`
+asks what side a thing is on and how far away it is, and never asks whether it
+can walk — so the crowd comes for your masts and for the Mario pipe, and your
+squad and your sword come for the slime and ant nests, with no targeting code
+written for any of it. A crowd standing on a building takes turns, one blow
+every third of a second, so its damage is a rate you can hear and answer rather
+than a number that grows with how many of them arrived; a sword swing, a Mario's
+punch and a bullet are each a discrete blow and land in full. Buildings wear a
+health bar once they have taken a scratch. See `src/structure.rs`.
 
 The network shares its algorithms with the pathing rather than having its own.
 `src/route.rs` holds both: `flood`, the breadth-first walk that spreads power
@@ -734,6 +1095,62 @@ hit him and comes back down on its head, so without it every enemy that touches
 somebody standing perfectly still stomps itself within a couple of seconds —
 and a warp pipe whose every slime destroys itself before you turn round is a
 warp pipe that appears to spawn nothing at all.
+
+**About one kill in twenty-five leaves a red ball instead of a green one, and
+that is hit points.** A quarter of Luna's pool, and her Marios take them too — a
+Mario's whole pool is smaller than one kit, so one always mends a Mario
+completely, which is the right shape for a unit you have eight of and no way to
+heal individually.
+
+**It is not had at arm's length.** A red ball notices the nearest body within
+four and a half metres that any of it would do some good to, drifts in to chest
+height on the same easing Luna's train swims with, and is absorbed when it is
+touching. It used to vanish at two metres: the ball was there, and then the
+number went up, with nothing on the screen joining the two. Now there is a
+moment — half a second of the thing visibly coming to you, which is also what
+makes one dropped in the middle of a scrap readable as an arrival rather than as
+something that quietly disappeared. It re-points as it comes, so a kit halfway
+to Luna turns for the Mario that stumbles in front of it bleeding.
+
+**Something at full health is not somebody it notices**, so it never drifts
+towards one and then declines: a body already full is not a candidate at all.
+A red ball on the grass with nobody hurt near it is inert, and is still there
+after the fight that makes you want it.
+
+Both kinds of drop come off *one* roll of the one die in the game, each with its
+own band of the interval. Two dice would be two Weyl sequences advancing in
+lockstep, which is the one way to make that trick fail: the same step from two
+offsets is the same sequence, so a kill that dropped nuclonium would be a kill
+that always dropped a medkit as well.
+
+A red ball and a green one are the same object to draw — a small bright sphere
+inside a glow, floating, with a wake behind it — and differ only in what happens
+when somebody touches one. So a ball is a `Kind` and a colour rather than two
+kinds of entity, and the trail mesh every one of them shares carries its colour
+on the vertices rather than on the material. A third kind of ball is a colour.
+
+## What X does, and the Tab picker
+
+Four things are worth doing with one hand — command the squad, plant a mast,
+build a machine, whistle up what a fight left on the ground — and the first three
+were bound to three keys as each arrived. That works at a desk and nowhere else:
+a pad has one comfortable face button left. So there is **one** action button
+and a picker that says what it is aimed at: `Tab` opens it, left and right walk
+it, `1`–`4` jump straight to one, and `Tab`, `Enter` or `Escape` close it. `B`
+and `G` still work, because taking a shortcut away from somebody who has learned
+it buys nothing.
+
+**Four modes rather than the three that were asked for.** "Builds buildings" is
+two buildings, laid out differently and wanted at different moments, and one
+button cannot ask which without a second gesture — which is the thing the picker
+exists to remove.
+
+Nothing in `src/action.rs` decides what a mode *does*. It routes one held button
+and one release onto whichever pair of flags in `InputState` the chosen mode's
+own system already reads, so the whistle, the pylon placer and the stellarator
+placer are untouched and do not know a picker exists. The press that closes the
+picker is swallowed rather than fired, which is the one way a picker like this
+goes wrong.
 
 ## The debug console
 

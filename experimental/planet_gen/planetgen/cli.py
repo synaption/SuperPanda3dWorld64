@@ -17,7 +17,8 @@ def cmd_init_faces(args):
     m = manifest.load(ROOT)
     if args.seed is not None:
         m["seed"] = args.seed
-    for key in ("relief", "detail", "detail_frequency"):
+    for key in ("relief", "detail", "detail_frequency", "terrace_steps",
+                "terrace_flatness", "route_width", "seabed_relief"):
         if getattr(args, key, None) is not None:
             m[key] = getattr(args, key)
     manifest.save(ROOT, m)
@@ -26,7 +27,9 @@ def cmd_init_faces(args):
     directions = [face_directions(f, n) for f in range(6)]
     fields = rasters.seed_elevation(directions, m["seed"], m["relief"],
                                     m["detail"], m["detail_frequency"],
-                                    m["detail_octaves"])
+                                    m["detail_octaves"], m["terrace_steps"],
+                                    m["terrace_flatness"], m["route_width"],
+                                    m["seabed_relief"])
     for face, field in enumerate(fields):
         path = rasters.face_path(ROOT, rasters.ELEVATION, face)
         rasters.save_elevation(path, field)
@@ -50,7 +53,7 @@ def cmd_build(args):
 
     # First build writes paintable material maps; later builds read whatever is
     # there, so a hand edit survives a rebuild.
-    _sync_material_rasters(planet, m)
+    _sync_material_rasters(planet, m, reclassify=args.reclassify_materials)
 
     for lod in (0, 1):
         written = planet.write_tiles(lod=lod)
@@ -70,7 +73,7 @@ def cmd_build(args):
     return 0
 
 
-def _sync_material_rasters(planet, m):
+def _sync_material_rasters(planet, m, reclassify=False):
     res = m["face_map_res"]
     # Sampled at the vertex grid, not the raster: the face map is a 2x
     # supersample (513 px against 257 vertices), so its own resolution is the
@@ -78,7 +81,7 @@ def _sync_material_rasters(planet, m):
     t = np.linspace(-1.0, 1.0, planet.n + 1)
     for face in range(6):
         path = rasters.face_path(ROOT, rasters.MATERIAL, face)
-        if path.is_file():
+        if path.is_file() and not reclassify:
             painted = rasters.load_index(path)
             planet.material[planet.grid.ids[face]] = rasters.sample_nearest(
                 painted,
@@ -89,10 +92,13 @@ def _sync_material_rasters(planet, m):
         step = planet.n / (res - 1)
         pick = np.clip(np.rint(np.arange(res) * step).astype(int), 0, planet.n)
         rasters.save_index(path, planet.material[ids[np.ix_(pick, pick)]])
-        print(f"  wrote {path.relative_to(ROOT)} (paint it; rebuilds read it back)")
+        action = "reclassified" if reclassify else "wrote"
+        print(f"  {action} {path.relative_to(ROOT)} "
+              "(paint it; ordinary rebuilds read it back)")
 
 
 def cmd_check(args):
+    m = manifest.load(ROOT)
     tiles = check.load_tiles(ROOT, lod=args.lod)
     if not tiles:
         print("no tiles; run `build` first", file=sys.stderr)
@@ -107,14 +113,41 @@ def cmd_check(args):
     ok = not seams["failures"]
 
     if args.traversal:
-        t = check.traversal_report(tiles)
-        print(f"traversal: {t['walkable_triangles']:,} walkable triangles in "
-              f"{t['regions']} regions")
-        print(f"  largest region {t['largest']:,} triangles "
-              f"({100 * t['largest'] / max(t['walkable_triangles'], 1):.1f}% of walkable, "
-              f"{t['largest_area']:,.0f} m2)")
-        print(f"  isolated pockets under 8 triangles: {t['slivers']}")
-        print(f"  ten largest: {t['sizes']}")
+        for field, label in (("mario_walkable", "Mario land"),
+                             ("luna_walkable", "Luna terrain")):
+            t = check.traversal_report(tiles, field=field)
+            print(f"{label}: {t['walkable_triangles']:,} triangles in {t['regions']} regions")
+            print(f"  largest {t['largest']:,} triangles "
+                  f"({100 * t['largest'] / max(t['walkable_triangles'], 1):.1f}%, "
+                  f"{t['largest_area']:,.0f} m2); {t['slivers']} tiny pockets")
+        topology = check.topology_report(tiles)
+        print(f"farming: {topology['farmable_area']:,.0f} m2; "
+              f"{100 * topology['reachable_farm_fraction']:.1f}% reachable from "
+              "a shoreline")
+        print(f"shore: {topology['shore_triangles']:,} approaches; "
+              f"{100 * topology['mario_water_access_fraction']:.1f}% of Mario ground "
+              "can reach one")
+        print("underwater: "
+              f"{100 * topology['luna_underwater_walkable_fraction']:.1f}% walkable by Luna")
+        print("ants: dry routes preferred; water remains safe" if
+              topology["ant_prefers_dry"] and topology["ant_water_is_safe"] else
+              "ants: FAIL traversal costs")
+        if args.lod == 0:
+            promises = {
+                "at least one field-sized farm":
+                    topology["farmable_area"] >= m["farm_min_area"],
+                "every farm reaches a shoreline":
+                    topology["reachable_farm_fraction"] >= 1.0 - 1e-6,
+                "the seabed is walkable by Luna":
+                    topology["luna_underwater_walkable_fraction"] >= 1.0 - 1e-6,
+                "Mario has a shoreline approach": topology["shore_triangles"] > 0,
+                "ants prefer dry ground": topology["ant_prefers_dry"],
+                "water is safe fallback terrain for ants": topology["ant_water_is_safe"],
+            }
+            for promise, kept in promises.items():
+                if not kept:
+                    print(f"  FAIL {promise}")
+                    ok = False
     return 0 if ok else 1
 
 
@@ -127,9 +160,16 @@ def main(argv=None):
     i.add_argument("--relief", type=float)
     i.add_argument("--detail", type=float)
     i.add_argument("--detail-frequency", type=float)
+    i.add_argument("--terrace-steps", type=int)
+    i.add_argument("--terrace-flatness", type=float)
+    i.add_argument("--route-width", type=float)
+    i.add_argument("--seabed-relief", type=float)
     i.set_defaults(func=cmd_init_faces)
 
     b = sub.add_parser("build", help="rasters -> tiles")
+    b.add_argument(
+        "--reclassify-materials", action="store_true",
+        help="replace painted material maps from the current elevation and slopes")
     b.set_defaults(func=cmd_build)
 
     c = sub.add_parser("check", help="validate the written tiles")

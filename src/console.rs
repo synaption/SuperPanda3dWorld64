@@ -266,11 +266,13 @@ pub const SPECS: &[TunableSpec] = &[
         step: 0.2,
         doc: "ally walking speed",
     },
-    // The stellarator's plasma, which is drawn as streaks riding its flux
-    // surface rather than as the skin the .glb carries. Both of these are on
-    // sliders for `tracer_width`'s reason: what a field turning at a given rate
-    // and flaring at a given brightness actually looks like is not something
-    // either number predicts from a still frame.
+    // The stellarator's plasma, which is the nuclonium the machine is holding
+    // going round its flux surfaces rather than the skin the .glb carries. Both
+    // of these are on sliders for `tracer_width`'s reason: what a field turning
+    // at a given rate and glowing at a given brightness actually looks like is
+    // not something either number predicts from a still frame -- and the spin
+    // now sets how long the motes' trails are as well, since a trail is however
+    // far the thing making it got in the last half second.
     TunableSpec {
         name: "stellarator_spin",
         low: 0.0,
@@ -658,8 +660,8 @@ impl Default for GameTuning {
             enemy_draw: 25.0,
             shadows: 1.0,
             frame_spin: 0.0,
-            enemy_rate: 7.0,
-            enemy_limit: 20.0,
+            enemy_rate: 1.0,
+            enemy_limit: 1000.0,
             pipe_brood: 5.0,
             // Five minutes a day: long enough that the light is not visibly
             // sliding while you play, short enough that you do not have to
@@ -905,6 +907,29 @@ pub enum Request {
     Pylons(usize),
     /// Take every planted mast off the map.
     ClearPylons,
+    /// Scatter this many nuclonium balls around the player.
+    ///
+    /// `pylon`'s reason, one link further along the chain: what a ball does is
+    /// get fetched by a Mario and shipped down a network, and waiting for a one
+    /// in twenty drop to watch that happen is not a way to look at it.
+    /// `nuclonium clear` sweeps them up again.
+    Nuclonium(usize),
+    /// Scatter this many medkits around the player.
+    ///
+    /// The red half of the same drop. Rarer than nuclonium in play, which is
+    /// exactly why looking at one wants a command rather than a war.
+    Medkits(usize),
+    /// Take every loose ball of nuclonium off the map. The red ones are swept
+    /// with `medkit 0`, which is the same thing said the other way.
+    ClearNuclonium,
+    /// Put this much straight into every stellarator's store.
+    ///
+    /// The only way to look at a full machine. A field is grown out of what has
+    /// been *delivered* -- see [`crate::stellarator::stock`] -- so the drawing
+    /// cap at five hundred is otherwise reachable only by playing until five
+    /// hundred balls have been carried in one at a time, which is not a way to
+    /// check that a cap works.
+    Stock(u32),
 }
 
 #[derive(Resource)]
@@ -1039,6 +1064,7 @@ impl ConsoleState {
         match words[0].to_ascii_lowercase().as_str() {
             "help" | "?" => self.echo("commands: <name> [value], vars, reset <name|all>, close <name|all>, clear\ncrowd <n> [slime|ant|mix] puts a whole field down at once; crowd clear takes it away.
 pylon <n> plants a line of masts and a machine to feed them; pylon clear takes them away.
+nuclonium <n> scatters balls for the squad to carry to the network; medkit <n> scatters the red ones; nuclonium store <n> loads the machines; nuclonium clear sweeps up.
 weapon <sword|pistol> puts one in Luna's hand; Y cycles it in play.\nLeft/Right/Home/End move the caret; Up/Down recall; Tab completes.\nSelect a variable then use [ and ] (Shift = 10x) to tune it. Wheel/PageUp/PageDown scroll the log."),
             "vars" | "list" => {
                 for spec in SPECS {
@@ -1048,6 +1074,8 @@ weapon <sword|pistol> puts one in Luna's hand; Y cycles it in play.\nLeft/Right/
             "clear" => self.log.clear(),
             "crowd" => self.crowd(&words[1..]),
             "pylon" | "pylons" | "grid" => self.pylons(&words[1..]),
+            "nuclonium" | "nuc" | "loot" | "resource" | "resources" => self.nuclonium(&words[1..]),
+            "medkit" | "medkits" | "health" => self.medkits(&words[1..]),
             "weapon" | "equip" => self.weapon(&words[1..]),
             "reset" => self.reset(&words[1..], tuning),
             "close" | "hide" => self.close(&words[1..]),
@@ -1132,6 +1160,47 @@ weapon <sword|pistol> puts one in Luna's hand; Y cycles it in play.\nLeft/Right/
         self.echo(format!("pylon: planting {count}"));
     }
 
+    /// `nuclonium <n>`, or `nuclonium clear`. Spelled `nuc`, `loot` or
+    /// `resources` as well, because the substance was called all four at
+    /// various points and a command that stops working when a thing is renamed
+    /// is a command nobody trusts.
+    ///
+    /// Scatters balls around the player so that the fetch-and-ship chain can be
+    /// watched end to end. It wants a live network and a Mario or two standing
+    /// near it to do anything: a ball with nowhere to go is a ball that lies
+    /// where it fell, which is itself worth being able to see.
+    fn nuclonium(&mut self, args: &[&str]) {
+        // `nuclonium store <n>` skips the whole road home and loads the
+        // machines directly, which is how the field and its cap get looked at.
+        if matches!(args.first(), Some(&"store") | Some(&"stock")) {
+            let held = args.get(1).and_then(|raw| raw.parse::<u32>().ok());
+            let Some(held) = held else {
+                self.echo("nuclonium: needs a count -- `nuclonium store 500`");
+                return;
+            };
+            self.pending.push(Request::Stock(held));
+            self.echo(format!("nuclonium: every machine now holds {held}"));
+            return;
+        }
+        if matches!(args.first(), Some(&"clear") | Some(&"none")) {
+            self.pending.push(Request::ClearNuclonium);
+            self.echo("nuclonium: sweeping up");
+            return;
+        }
+        let count = match args.first() {
+            None => 6,
+            Some(raw) => match raw.parse::<usize>() {
+                Ok(count) => count,
+                Err(_) => {
+                    self.echo("nuclonium: needs a count -- `nuclonium 8`, or `nuclonium clear`");
+                    return;
+                }
+            },
+        };
+        self.pending.push(Request::Nuclonium(count));
+        self.echo(format!("nuclonium: scattering {count}"));
+    }
+
     /// `crowd <n> [slime|ant|mix]`, or `crowd clear`.
     ///
     /// The benchmark command. `enemy_limit` and `enemy_rate` can already fill
@@ -1139,6 +1208,25 @@ weapon <sword|pistol> puts one in Luna's hand; Y cycles it in play.\nLeft/Right/
     /// field that arrives gradually is no way to compare two builds. This puts
     /// the whole crowd down at once, in the same places every time, so what
     /// changes between two runs is the build rather than the layout.
+    /// `medkit <n>`: the red drop, scattered where nuclonium would be.
+    ///
+    /// Its own word rather than an argument to `nuclonium`, because it is not
+    /// nuclonium -- it only looks like it. See [`crate::nuclonium::Kind`].
+    fn medkits(&mut self, args: &[&str]) {
+        let count = match args.first() {
+            None => 4,
+            Some(raw) => match raw.parse::<usize>() {
+                Ok(count) => count,
+                Err(_) => {
+                    self.echo("medkit: needs a count -- `medkit 4`");
+                    return;
+                }
+            },
+        };
+        self.pending.push(Request::Medkits(count));
+        self.echo(format!("medkit: scattering {count}"));
+    }
+
     fn crowd(&mut self, args: &[&str]) {
         if matches!(args.first(), Some(&"clear") | Some(&"none")) {
             self.pending.push(Request::ClearCrowd);

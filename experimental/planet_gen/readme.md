@@ -24,8 +24,9 @@ terrain and one sphere of water over it. Renders are in `out/`.
 ```bash
 python3 -m planetgen.cli init-faces          # seed the six elevation rasters
 python3 -m planetgen.cli build               # rasters -> tiles/lod0, tiles/lod1
+python3 -m planetgen.cli build --reclassify-materials  # after replacing elevation
 python3 -m planetgen.cli check --traversal   # validate seams and reachability
-python3 -m unittest discover -s tests        # 22 tests, no Blender needed
+python3 -m unittest discover -s tests        # 27 tests, no Blender needed
 
 blender --background --factory-startup --python blender/export_tiles.py
 blender --background --factory-startup --python blender/render_preview.py
@@ -38,7 +39,9 @@ Current planet, at the scale in [Scale](#scale):
 | Welded vertices | 393,218 (`6n^2 + 2` at n=256, exactly) |
 | Triangles | 786,432 across 96 LOD0 tiles, plus 49,152 of sea |
 | Land | 55.1% above sea level |
-| Walkable | 88.4% of triangles, 99.1% of it one connected region |
+| Walkable | 90.3% of triangles; the largest Luna region holds 93.4% |
+| Farmable | 16,918 m2, all connected to a Mario-accessible shoreline |
+| Seabed | 100% walkable by Luna |
 | Seam disagreement | **0** — position, normal and material, at both LODs |
 
 ### How the seam guarantee is actually met
@@ -407,24 +410,70 @@ the collision mesh. The table is a small committed file listing the handful of
 `reference/`, which the [source-of-truth policy](../../docs/pipeline.md) puts
 out of bounds.
 
+### Generated topology
+
+The seeded elevation is deliberately not ordinary fractal noise. Land is
+shaped into four broad altitude benches with steep shoulders between them.
+Low zero-contours from a second, independent field cut selected shoulders back
+to the original broad slope, making approaches through the cliffs without
+turning every side into a ramp. Fine detail fades out across the low farm belt
+and returns in the optional highlands. The result keeps elevation variation
+and real cliffs while producing useful level ground rather than merely
+triangles that scrape under the walking limit.
+
+The seabed follows a different rule. It has gentle broad relief and no
+terracing, because a submerged cliff would remove Luna's walking route without
+meaningfully affecting Mario, who swims over it.
+
+`planet.json` owns the level-design controls:
+
+| Setting | Meaning |
+|---|---|
+| `terrace_steps`, `terrace_flatness` | number and width of the flat benches |
+| `route_width` | width of the ramps cut through bench shoulders |
+| `seabed_relief` | maximum normalized relief below sea level |
+| `farm_slope_cos` | stricter farming slope (0.978 is about 12 degrees) |
+| `farm_min_altitude`, `farm_max_altitude` | dry lowland farming band |
+| `farm_min_area` | smallest connected field, currently 400 m2 |
+
+### Actor traversal classes
+
+Every LOD0 tile stores gameplay masks beside `walkable`:
+
+- `mario_walkable` is dry floor. `mario_accessible` narrows it to dry
+  components with at least one shoreline approach; water joins those
+  components because Mario swims.
+- `luna_walkable` includes both dry floor and the seabed. Luna walks or wades
+  there rather than switching to Mario's swimming topology.
+- `farmable` is dry lowland under the farming slope, then filtered to
+  connected patches of at least `farm_min_area` with a Mario route to shore.
+  Isolated high benches remain valid terrain but are not promised as farms.
+- `ant_preferred` is dry walkable ground. `ant_allowed` also includes
+  walkable submerged ground, so water carries an avoidance cost rather than
+  becoming a lethal or missing part of the navigation mesh.
+
 ### The reachability check
 
 ```
 planetgen check --traversal
 ```
 
-Flood-fills the walkable triangles across the whole planet, crossing tile
-seams, and reports:
+Flood-fills the actor-specific triangles across the whole planet, crossing
+tile seams, and reports:
 
+- Mario dry regions and which ones have a shoreline route.
+- Luna's connected terrain and underwater walking coverage.
+- Farmable area and the fraction reachable from a shoreline.
+- The ant dry-preference and water-safe fallback contract.
 - Disconnected walkable regions — a plateau nothing reaches.
 - Walkable pockets below a minimum area — slivers the player cannot stand on.
 - Steep bands narrower than a step — terrain that reads as walkable and is not.
 - Cliff lines with no authored route around or over them.
 
-None of these are errors. They are a report, because "there is no way up
-there" is sometimes exactly the design. But they should be *chosen*, and on a
-planet the size of this one an unreachable region is very easy to create by
-accident and very hard to notice by eye.
+Inaccessible high terrain remains a report because "there is no way up there"
+is sometimes exactly the design. Farm and underwater guarantees are tests:
+they fail rather than quietly shipping unusable lowland or a seabed Luna
+cannot cross.
 
 ## Water
 
@@ -651,7 +700,9 @@ by eye:
 - **Apron** — a tile built with neighbours present and a tile built with only
   edge records produce identical normals on the boundary row.
 - **LOD agreement** — LOD1 vertices lie within tolerance of the LOD0 surface.
-- **Traversal** — a known-good planet has exactly one walkable region.
+- **Traversal** — farms are field-sized and shoreline-reachable, every seabed
+  triangle is Luna-walkable, Mario has shore approaches, and ants prefer dry
+  ground while retaining a safe water fallback.
 - **Authored ring** — an authored tile's boundary conforms before import.
 - **Sea** — every vertex of it is exactly at sea level, it winds outward, and
   the terrain agrees with it about which vertices are under water. The game has
@@ -684,7 +735,7 @@ level page puts it up. What the game does with it:
 - **The sea is water.** [`src/level.rs`](../../src/level.rs) answers "how far
   under the surface is this point" for a sphere of water as readily as for the
   castle's boxes, measured along the local up either way, so Mario swims in the
-  ocean, the Hero wades in it, and the camera takes the underwater fog with it
+  ocean, Luna wades in it, and the camera takes the underwater fog with it
   when it goes under. The spawn search picks the lowest dry land against sea
   level, which puts the player on a beach.
 

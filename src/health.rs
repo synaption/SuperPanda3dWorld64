@@ -40,6 +40,44 @@ use crate::{display::DisplaySettings, enemy::Enemy, player::Player, squad::Ally}
 
 /// What each actor can take before it goes down.
 pub const PLAYER_HEALTH: i32 = 100;
+
+/// What a red ball puts back.
+///
+/// A quarter of Luna's pool, which is worth going out of your way for and is
+/// not a full heal: three of them undo a bad fight and one of them does not.
+/// A Mario's whole pool is smaller than this, so one always mends a Mario
+/// completely -- which is the right shape for a unit you have eight of and no
+/// way to heal individually.
+pub const MEDKIT_HEAL: i32 = 25;
+
+/// How near somebody who needs it a red ball starts drifting towards them, how
+/// near it has to get to be absorbed, how far up the body it aims, and how hard
+/// it is pulled.
+///
+/// **A red ball is no longer spent the instant somebody is within reach of
+/// it**, and the difference is a moment. It used to vanish at two metres: the
+/// ball was there, and then the number went up, with nothing on the screen
+/// joining the two. Now it notices, drifts in, and is absorbed on contact --
+/// which is half a second of the thing visibly coming to you, and is also what
+/// makes one dropped in the middle of a scrap readable as an arrival rather
+/// than as something that quietly disappeared.
+///
+/// The lure is generous next to [`crate::nuclonium::PICKUP_RANGE`] and on
+/// purpose: nobody is ever *sent* for one of these, so it has to be had by
+/// fighting near it. The touch is small, because it is meant to be the moment
+/// the ball reaches the body rather than a second reach in disguise.
+///
+/// [`MEDKIT_HEIGHT`] is roughly chest height. A ball that aimed at a body's
+/// origin would dive into the grass on its way in, since that origin is between
+/// the feet.
+///
+/// The pull is stiffer than [`crate::nuclonium`]'s escort spring: a train
+/// following Luna should lag and swing, and a pickup should not -- something
+/// that dawdled on its way in would read as bait rather than as a medkit.
+pub const MEDKIT_LURE: f32 = 4.5;
+pub const MEDKIT_TOUCH: f32 = 0.75;
+pub const MEDKIT_HEIGHT: f32 = 1.0;
+pub const MEDKIT_PULL: f32 = 7.0;
 pub const MARIO_HEALTH: i32 = 20;
 pub const ANT_HEALTH: i32 = 10;
 pub const SLIME_HEALTH: i32 = 5;
@@ -56,6 +94,32 @@ pub const PLAYER_DAMAGE: i32 = 10;
 pub const MARIO_DAMAGE: i32 = 5;
 pub const ANT_DAMAGE: i32 = 3;
 pub const SLIME_DAMAGE: i32 = 2;
+
+/// What the things that stand still can take.
+///
+/// A structure is not an actor and its number does not come off the same
+/// reasoning. What decides it is *how long it takes to lose one while you are
+/// somewhere else*, because that is the only thing a destructible building
+/// changes about the game: a pylon is a thing you planted and walked away from,
+/// and the question the crowd is asking of it is whether you get back in time.
+///
+/// The two are attacked by different things at different rates, so they are two
+/// unrelated numbers rather than a scale.
+///
+/// **A pylon is only ever attacked by the crowd**, which takes turns -- one blow
+/// every [`crate::structure::RECOVERY`], however many of them arrived. Forty ant
+/// blows is about fourteen seconds of being stood on: long enough to hear it
+/// happening and get back across the map on the jetpack, short enough that
+/// ignoring it costs you the mast and the beams through it. Forty was five
+/// seconds, and five seconds is not a warning, it is an outcome.
+///
+/// **A warp pipe is only ever attacked by discrete blows** -- the sword, a
+/// Mario's fist, a bullet -- which all land in full. Six of the player's own
+/// swings, so clearing a nest is a thing you commit to rather than something
+/// that happens in passing, and about a dozen of a squad's punches, so sending
+/// four Marios at one is a plan.
+pub const PYLON_HEALTH: i32 = 120;
+pub const WARP_PIPE_HEALTH: i32 = 60;
 
 /// The relationships between the two tables that the fights are built on.
 ///
@@ -81,6 +145,16 @@ const _: () = {
     // three hearts this replaced.
     assert!(PLAYER_HEALTH / SLIME_DAMAGE > 10);
     assert!(PLAYER_HEALTH / ANT_DAMAGE > 10);
+    // Neither building falls to one blow of anything, or a mast planted in
+    // front of a pipe would be gone before its beams were drawn.
+    assert!(PYLON_HEALTH > PLAYER_DAMAGE && WARP_PIPE_HEALTH > PLAYER_DAMAGE);
+    // A mast is defensible: dozens of the crowd's blows, and the crowd takes
+    // turns, so what it survives is measured in seconds rather than in how many
+    // of them turned up.
+    assert!(PYLON_HEALTH / ANT_DAMAGE >= 30);
+    // A nest is an objective: several swings and not one, so knocking one down
+    // is a thing you decide to do.
+    assert!(WARP_PIPE_HEALTH / PLAYER_DAMAGE >= 5);
 };
 
 /// An actor's pool of hit points, and what it started with.
@@ -119,6 +193,20 @@ impl Health {
     /// Back to full, which is what respawning is.
     pub fn refill(&mut self) {
         self.current = self.max;
+    }
+
+    /// Puts `amount` back, and reports whether any of it was wanted.
+    ///
+    /// The report is the useful half. A medkit is spent by whoever picks it up,
+    /// and something at full health picking one up spends it on nothing -- so
+    /// the thing that decides *whether* to pick one up asks this, and a body
+    /// that needs no mending walks past it and leaves it for one that does.
+    pub fn mend(&mut self, amount: i32) -> bool {
+        if self.current >= self.max {
+            return false;
+        }
+        self.current = (self.current + amount).min(self.max);
+        true
     }
 
     pub fn dead(&self) -> bool {
@@ -481,6 +569,15 @@ pub fn draw_unit_bars(
     // simulation last wrote.
     enemies: Query<(Entity, &GlobalTransform, &Health, &Enemy)>,
     allies: Query<(Entity, &GlobalTransform, &Health), With<Ally>>,
+    // The masts and the nests. A building being worn down is the one thing in
+    // this game that happens somewhere the player is not, so a bar over it is
+    // not decoration -- it is how you find out a pylon is going before it goes.
+    buildings: Query<(
+        Entity,
+        &GlobalTransform,
+        &Health,
+        &crate::structure::Structure,
+    )>,
     mut bars: Query<
         (
             &mut Node,
@@ -587,6 +684,30 @@ pub fn draw_unit_bars(
                 health.fraction(),
             );
         }
+        for (unit, at, health, structure) in &buildings {
+            // A building at full health has nothing to say. The pool is a fixed
+            // pool that only ever falls, unlike a creature's -- creatures are
+            // spawned, fight and die inside the bar's own fade -- so without
+            // this every mast on the map wears a full green bar forever and the
+            // pool of ninety-six is spent on scenery.
+            if health.current >= health.max {
+                continue;
+            }
+            let foot = at.translation();
+            let away = foot.distance(from);
+            if away > BAR_RANGE {
+                continue;
+            }
+            // Over the top of it, off the size it was placed with rather than a
+            // height written here. See [`crate::structure::head`].
+            consider(
+                unit,
+                foot,
+                crate::structure::head(foot, structure),
+                away,
+                health.fraction(),
+            );
+        }
         // Nearest first, so a pool smaller than the crowd spends itself on the
         // creatures whose bars can actually be read. Without the sort, which
         // units got one would be query order -- which is stable enough to look
@@ -641,6 +762,132 @@ pub fn draw_unit_bars(
 /// only arithmetic in it worth a test.
 fn advanced(previous: Option<f32>, step: f32) -> f32 {
     (previous.unwrap_or(0.0) + step).clamp(0.0, 1.0)
+}
+
+/// A red ball lying about: hit points for whoever runs over it.
+///
+/// A marker and nothing else. Everything about *being* a ball -- the sphere,
+/// the glow, the float, the wake -- belongs to [`crate::nuclonium::Orb`], which
+/// draws the green ones the same way. What this component says is only what
+/// happens when somebody touches it, which is the entire difference between the
+/// two kinds of drop.
+#[derive(Component)]
+pub struct Medkit;
+
+/// A red ball on its way to somebody, and who that is.
+///
+/// The medkit's half of [`crate::nuclonium::Held::Following`], and it exists
+/// for the same reason that does: the thing that *decides* a ball is coming to
+/// you runs on the fixed step, and the thing that moves it has to run per drawn
+/// frame or the ball judders in behind a player who does not. So this is the
+/// decision, written down where [`crate::nuclonium::swim`] can act on it every
+/// frame until [`mend`] takes it away again.
+#[derive(Component)]
+pub struct Drawn {
+    pub toward: Entity,
+}
+
+/// Everything a medkit can be picked up by: Luna, and her Marios.
+///
+/// A named type for clippy's sake. The `Without` is load-bearing as well as
+/// tidy -- a medkit has a `Transform` too, and two `Transform` queries in one
+/// system have to name each other or the schedule refuses to build.
+type Bodies<'w, 's> = Query<
+    'w,
+    's,
+    (Entity, &'static Transform, &'static mut Health),
+    (Without<Medkit>, Or<(With<Player>, With<Ally>)>),
+>;
+
+/// Whether a red ball at `kit` is near enough `body` to start drifting to it.
+///
+/// Flat, with a band above and below, exactly as
+/// [`crate::nuclonium::within_reach`] is and for the same reason: a ball
+/// floats, and a rule measured straight through the air is a rule you can stand
+/// underneath and not satisfy.
+pub fn lured(kit: Vec3, body: Vec3) -> bool {
+    let apart = kit - body;
+    Vec3::new(apart.x, 0.0, apart.z).length() <= MEDKIT_LURE
+        && apart.y <= crate::player::PLAYER_HEIGHT + 1.0
+        && apart.y >= -1.6
+}
+
+/// Hands out the red balls: notices, draws in, absorbs.
+///
+/// Luna and her Marios alike, because a squad that cannot be healed is a squad
+/// that is spent after one bad fight, and there is nothing else in the game
+/// that puts a Mario's hit points back. A kit picks the nearest body that any
+/// of it would do some good to, so one dropped between a hurt Mario and a
+/// healthy Luna goes to the Mario.
+///
+/// **Something at full health leaves one alone**, and now does so without ever
+/// having touched it: a body already full is not a candidate, so it is not
+/// something a kit drifts towards and then declines. A red ball on the grass
+/// with nobody hurt near it is inert, and is still there after the fight that
+/// makes you want it.
+///
+/// Only the decisions are here. The drifting itself is
+/// [`crate::nuclonium::swim`] -- see there for why a follow that is solved on
+/// the fixed step is a follow the player can see stepping.
+pub fn mend(
+    mut commands: Commands,
+    mut sounds: ResMut<crate::audio::SoundQueue>,
+    mut kits: Query<
+        (
+            Entity,
+            &Transform,
+            &mut crate::nuclonium::Orb,
+            Option<&Drawn>,
+        ),
+        With<Medkit>,
+    >,
+    mut bodies: Bodies,
+) {
+    for (kit, at, mut orb, drawn) in &mut kits {
+        // The nearest body this would be worth anything to. Measured to where
+        // the ball is aimed rather than to the body's feet, so "nearest" means
+        // the same thing here as the absorb below means by it.
+        let wanted = bodies
+            .iter()
+            .filter(|(_, body, health)| {
+                health.current < health.max && lured(at.translation, body.translation)
+            })
+            .min_by(|a, b| {
+                let reach = |body: &Transform| {
+                    (body.translation + Vec3::Y * MEDKIT_HEIGHT).distance_squared(at.translation)
+                };
+                reach(a.1).total_cmp(&reach(b.1))
+            })
+            .map(|(who, body, _)| (who, body.translation + Vec3::Y * MEDKIT_HEIGHT));
+        let Some((who, reach)) = wanted else {
+            // Nobody near it needs it any more -- healed by another kit, or
+            // walked off, or killed. It stops chasing and floats where it got
+            // to, which is where it bobs from now on: `Orb::settle` exists so
+            // that handover is a single call rather than a field poked from
+            // another module.
+            if drawn.is_some() {
+                commands.entity(kit).remove::<Drawn>();
+                orb.settle(at.translation.y);
+            }
+            continue;
+        };
+        if at.translation.distance(reach) <= MEDKIT_TOUCH {
+            if let Ok((_, _, mut health)) = bodies.get_mut(who) {
+                health.mend(MEDKIT_HEAL);
+            }
+            commands.entity(kit).despawn();
+            // The weapon-swap sound, borrowed: it is the one noise in the set
+            // that already means "you now have this", and a pickup with no
+            // sound at all reads as a pickup that did not happen.
+            sounds.push_at(crate::audio::Sfx::Draw, at.translation);
+            continue;
+        }
+        // Re-pointed rather than left on its first choice, so a kit halfway to
+        // Luna turns for the Mario that stumbled in front of it bleeding.
+        if drawn.is_none_or(|drawn| drawn.toward != who) {
+            commands.entity(kit).insert(Drawn { toward: who });
+        }
+    }
 }
 
 #[cfg(test)]

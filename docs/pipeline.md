@@ -170,23 +170,22 @@ Eight stages, and `--only <stage>` runs just one of them:
 Luna source needs Blender 5.x. Successful runs replace the files the game
 already loads; no Rust changes or asset registration step is required.
 
-**Two actors are written by a script rather than modelled**, and are not in
-that table because nothing about them changes between runs:
+**The stellarator is written by a script rather than modelled**, and is not in
+that table because nothing about it changes between runs:
 
 ```bash
 python3 tools/generate_stellarator.py assets/actors/stellarator.glb
-python3 tools/generate_pylon.py            # writes assets/actors/pylon.glb
 ```
 
-Both take their shape from a handful of numbers at the top of the generator,
-both write in the game's own axes standing on their own origin, and both are
+It takes its shape from a handful of numbers at the top of the generator and
+writes in the game's own axes standing on its own origin. `MACHINE_WIDTH` is
+the one that says how big one is — 16 m — and it is baked into the vertices
+rather than applied by the game, so changing it means re-running the line above. The pylon is instead
+exported from `assets/actors/pylon.blend` by the `actors` stage above. Both are
 *measured* by the game rather than described to it — `stellarator::machine`
-and `pylon::mast` read the size, the footprint and where the beams hang back
-out of the file's own accessor bounds. Re-export either at another size and the
-ring drawn on the ground, the overlap test and everything hung off the model
-follow it with no Rust change at all. `--blend` on the pylon generator writes
-an editable `.blend` beside the `.glb` for anyone who would rather push the
-vertices around by hand.
+and `pylon::mast` read their size and footprint back out of the runtime file's
+accessor bounds. Re-export either at another size and the ring drawn on the
+ground and the overlap test follow it with no Rust change at all.
 
 Blender's `.blend1` backups are no longer tracked. They are written
 automatically beside every save and are worth 67 MB of history for nothing; the

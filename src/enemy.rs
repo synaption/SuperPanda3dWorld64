@@ -705,6 +705,17 @@ impl Threats {
 const STAND_OFF: f32 = 0.6;
 const STAND_OFF_SPREAD: f32 = 1.6;
 
+/// The furthest past two bodies that [`Quirk::stand_off`] will ever park one
+/// creature from what it is chasing.
+///
+/// Published because **anything that lands a blow has to reach at least this
+/// far**, or the chaser walks to where it is allowed to stand and then cannot
+/// hit what it walked to. That is the trap [`MARIO_REACH`] documents, and
+/// [`crate::structure::REACH`] was in it: a berth of up to 2.2 m against a reach
+/// of 1.6 meant the share of a crowd that drew a wide berth stood round a pylon
+/// swinging at air, and a siege stalled with the mast on its last few points.
+pub const CLOSEST_STAND: f32 = STAND_OFF + STAND_OFF_SPREAD;
+
 /// How far off the straight line to its goal an enemy wanders, and how quickly
 /// that wander swings from one side to the other.
 const WEAVE_WIDTH: f32 = 0.9;
@@ -1232,6 +1243,11 @@ type Creatures<'w, 's> = Query<
         // How big it is, for whatever ends up chasing it. The player and the
         // Marios are not `Enemy` and answer with a Mario's own radius.
         Option<&'static Enemy>,
+        // And nor is a pylon or a warp pipe, which are metres across and would
+        // otherwise be walked to as though they were a Mario -- a crowd that
+        // spends the whole fight standing *inside* the mast it is knocking
+        // down. See `Aggro::room`, which is the field this fills.
+        Option<&'static crate::structure::Structure>,
     ),
 >;
 
@@ -1431,8 +1447,8 @@ pub fn alert(
     crowd.extend(
         everyone
             .iter()
-            .filter(|(_, _, _, detail, _)| detailed(*detail))
-            .map(|(entity, transform, side, _, _)| (entity, transform.translation, *side)),
+            .filter(|(_, _, _, detail, _, _)| detailed(*detail))
+            .map(|(entity, transform, side, _, _, _)| (entity, transform.translation, *side)),
     );
     // Everyone who does the noticing, with last tick's attention aged. The
     // decay is what keeps a fight current rather than settling it on whoever
@@ -1497,7 +1513,7 @@ pub fn alert(
         // margin buys a delay rather than a decision: something that already
         // has a creature's attention *and* is standing on it has to be harder
         // to pull it away from than something that has only the second.
-        if let Some((_, held, _, _, _)) = target.and_then(|held| everyone.get(held).ok()) {
+        if let Some((_, held, _, _, _, _)) = target.and_then(|held| everyone.get(held).ok()) {
             let range = at.distance(held.translation);
             if range < sight {
                 hunt.commitment += tuning.threat_near * (1.0 - range / sight);
@@ -1534,7 +1550,7 @@ pub fn alert(
     // the same corner to turn a crowd -- which is exactly the moment a squad of
     // Marios ought to become the more pressing problem.
     for act in threats.acts.iter() {
-        let Ok((_, _, done_by, _, _)) = everyone.get(act.by) else {
+        let Ok((_, _, done_by, _, _, _)) = everyone.get(act.by) else {
             continue;
         };
         earshot_grid.near(act.at, nearby);
@@ -1672,9 +1688,16 @@ pub fn alert(
         // Where that target is now, and how wide, for the movement step to
         // walk towards the edge of rather than into.
         match verdict.target.and_then(|target| everyone.get(target).ok()) {
-            Some((_, seen, _, _, kind)) => {
+            Some((_, seen, _, _, kind, building)) => {
                 aggro.at = seen.translation;
-                aggro.room = kind.map_or(crate::player::PLAYER_RADIUS, |it| it.kind.body().0);
+                // Whatever the thing actually is: a creature's cylinder, a
+                // building's footprint, or -- for the player and the Marios,
+                // which are neither -- a Mario's own radius.
+                aggro.room = match (kind, building) {
+                    (Some(enemy), _) => enemy.kind.body().0,
+                    (None, Some(structure)) => structure.radius,
+                    (None, None) => crate::player::PLAYER_RADIUS,
+                };
             }
             None => aggro.at = transform.translation,
         }
@@ -2814,6 +2837,7 @@ pub fn combat(
     mut commands: Commands,
     mut sounds: ResMut<SoundQueue>,
     mut threats: ResMut<Threats>,
+    mut drops: ResMut<crate::nuclonium::Drops>,
     mut player: Query<(Entity, &Transform, &mut Controller, &mut Health), With<Player>>,
     mut enemies: Query<(Entity, &Enemy, &Transform, &Detail, Option<&mut Health>), Without<Player>>,
 ) {
@@ -2872,6 +2896,7 @@ pub fn combat(
             let felled = health::strike(health.as_deref_mut(), health::PLAYER_DAMAGE);
             if felled {
                 commands.entity(entity).despawn();
+                drops.maybe(transform.translation);
                 sounds.push_at(Sfx::Defeat, transform.translation);
             } else {
                 sounds.push_at(Sfx::Hurt, transform.translation);
@@ -2908,6 +2933,7 @@ pub fn combat(
             // having done nothing at all.
             if health::strike(health.as_deref_mut(), health::PLAYER_DAMAGE) {
                 commands.entity(entity).despawn();
+                drops.maybe(transform.translation);
                 sounds.push_at(Sfx::Defeat, transform.translation);
             } else {
                 sounds.push_at(Sfx::Hurt, transform.translation);
@@ -2941,6 +2967,39 @@ pub fn combat(
 const MARIO_SWING: f32 = 0.45;
 const MARIO_REACH: f32 = 1.3;
 
+/// What a Mario's fist can land on: the crowd, and the buildings on the other
+/// side.
+///
+/// Two aliases rather than two inline query types, because between them they
+/// carry four filters and every one is load-bearing. The `Without`s against each
+/// other are what let both hold `Health` in one system -- Bevy proves two
+/// mutable accesses disjoint from the filters alone, and an enemy is never a
+/// building. `Without<Ally>` is the one about sides, and it is
+/// [`crate::weapon::Targets`]'s: the Marios are hostile to the same things the
+/// player is, and one must never be able to punch another.
+type Quarry<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static Transform,
+        &'static Enemy,
+        Option<&'static mut Health>,
+    ),
+    (Without<Ally>, Without<crate::structure::Structure>),
+>;
+
+/// The nests, as a Mario sees them. See [`Quarry`] for what the filters buy.
+type Nests<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static Transform,
+        &'static crate::structure::Structure,
+        &'static mut Health,
+    ),
+    (Without<Ally>, Without<Enemy>),
+>;
+
 /// The Marios' half of the fight: a Mario stood over what it has noticed hits
 /// it, and what it hits dies.
 ///
@@ -2956,17 +3015,29 @@ pub fn ally_combat(
     mut commands: Commands,
     mut sounds: ResMut<SoundQueue>,
     mut threats: ResMut<Threats>,
+    mut drops: ResMut<crate::nuclonium::Drops>,
     mut allies: Query<(Entity, &mut Ally, &Transform, &Aggro)>,
-    mut enemies: Query<(&Transform, &Enemy, Option<&mut Health>), Without<Ally>>,
+    mut enemies: Quarry,
+    // The nests. Folded into this system rather than run beside it as a second
+    // one, and that is not tidiness: a Mario has *one* swing timer and now two
+    // kinds of thing it might be swinging at, and two systems counting the same
+    // timer down is a Mario that throws every punch twice.
+    mut buildings: Nests,
 ) {
     for (mario, mut ally, transform, aggro) in &mut allies {
+        // What it is standing over, as one answer whichever kind of thing it
+        // turned out to be: where it is, how wide it is, and whether hitting it
+        // goes through a building's recovery window.
         let quarry = aggro.target.and_then(|target| {
-            enemies
+            if let Ok((at, enemy, _)) = enemies.get(target) {
+                return Some((target, at.translation, enemy.kind.body().0, false));
+            }
+            buildings
                 .get(target)
                 .ok()
-                .map(|(at, enemy, _)| (target, at.translation, enemy.kind.body().0))
+                .map(|(at, structure, _)| (target, at.translation, structure.radius, true))
         });
-        let in_reach = quarry.is_some_and(|(_, at, radius)| {
+        let in_reach = quarry.is_some_and(|(_, at, radius, _)| {
             let apart = at - transform.translation;
             // Past its body, so a punch reaches whatever the squad is allowed
             // to stand next to. See [`MARIO_REACH`].
@@ -2977,16 +3048,42 @@ pub fn ally_combat(
             ally.state.motion = Motion::Attack;
             ally.state.still_for = 0.0;
             if ally.swing_left == 0.0 && in_reach {
-                let (target, at, _) = quarry.expect("in reach of nothing");
+                let (target, at, _, is_building) = quarry.expect("in reach of nothing");
                 // A Mario's fist is worth half what the player's sword is, so
                 // an ant takes two of them and is hitting back in between. That
                 // gap is what a squad is *for*: alone a Mario trades with an
                 // ant, and four of them do not.
-                let health = enemies
-                    .get_mut(target)
-                    .ok()
-                    .and_then(|(_, _, health)| health);
-                if health::strike(health.map(Mut::into_inner), health::MARIO_DAMAGE) {
+                //
+                // Against a warp pipe the same fist is worth the same five
+                // points, spent against a pool an order of magnitude bigger:
+                // clearing a nest is what a squad is sent to do rather than
+                // something that happens on the way past.
+                let felled = if is_building {
+                    let Ok((_, _, mut health)) = buildings.get_mut(target) else {
+                        continue;
+                    };
+                    // Straight against the pool. A punch has already been paced
+                    // by the Mario's own swing timer, so putting it through the
+                    // building's [`crate::structure::RECOVERY`] as well would be
+                    // pacing it twice -- and would mean a squad of eight took a
+                    // nest down no faster than one of them. See that module's
+                    // preamble for the split.
+                    health.hurt(health::MARIO_DAMAGE)
+                } else {
+                    let health = enemies
+                        .get_mut(target)
+                        .ok()
+                        .and_then(|(_, _, health)| health);
+                    let felled = health::strike(health.map(Mut::into_inner), health::MARIO_DAMAGE);
+                    if felled {
+                        // One kill in twenty leaves something behind, and a
+                        // Mario's kills are most of a field's. See
+                        // [`crate::nuclonium::Drops::maybe`].
+                        drops.maybe(at);
+                    }
+                    felled
+                };
+                if felled {
                     commands.entity(target).despawn();
                     // The squad fights spread out across the field, so where one
                     // of them landed a punch is worth hearing.
@@ -4602,6 +4699,10 @@ mod tests {
     fn duel_with(kind: Kind, apart: f32) -> (World, Entity, Entity) {
         let mut world = World::new();
         world.init_resource::<Threats>();
+        // The one die in the game. Every path that kills something rolls it --
+        // see `nuclonium::Drops::maybe` -- so a world that means to resolve a fight
+        // has to have it, exactly as it has to have the threat queue.
+        world.init_resource::<crate::nuclonium::Drops>();
         world.insert_resource(SoundQueue::default());
         let mario = world
             .spawn((
@@ -5040,6 +5141,10 @@ mod tests {
     fn world(player_y: f32, velocity: Vec3) -> (World, Entity) {
         let mut world = World::new();
         world.init_resource::<Threats>();
+        // The one die in the game. Every path that kills something rolls it --
+        // see `nuclonium::Drops::maybe` -- so a world that means to resolve a fight
+        // has to have it, exactly as it has to have the threat queue.
+        world.init_resource::<crate::nuclonium::Drops>();
         world.insert_resource(SoundQueue::default());
         let mut controller = Controller::default();
         controller.velocity = velocity;

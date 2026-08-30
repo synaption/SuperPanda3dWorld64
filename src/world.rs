@@ -26,8 +26,9 @@ use crate::{
     flow::FlowField,
     furniture,
     gravity::Gravity,
+    health,
     level::{self, LevelData},
-    pipe, player, pylon, squad, stellarator, water, weapon,
+    nuclonium, pipe, player, pylon, squad, stellarator, structure, water, weapon,
 };
 use bevy::{
     gltf::{Gltf, GltfMesh, GltfNode},
@@ -161,7 +162,6 @@ pub fn spawn(
     assets: &AssetServer,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
-    art: &stellarator::FieldArt,
     load: &mut LevelLoad,
 ) {
     commands.insert_resource(id);
@@ -200,7 +200,7 @@ pub fn spawn(
             commands.insert_resource(collision);
             commands.insert_resource(furniture.gravity());
             commands.insert_resource(Respawn(furniture.spawn()));
-            spawn_inhabitants(&furniture, commands, assets, art);
+            spawn_inhabitants(&furniture, commands, assets);
             load.pending = None;
         }
         LevelId::Planet => {
@@ -233,7 +233,6 @@ fn spawn_inhabitants(
     furniture: &furniture::Furniture,
     commands: &mut Commands,
     assets: &AssetServer,
-    art: &stellarator::FieldArt,
 ) {
     // The phase is what keeps two of anything from moving in step, and it is
     // an index rather than a random number so a whole run stays reproducible
@@ -263,16 +262,27 @@ fn spawn_inhabitants(
     for prop in furniture.props() {
         match prop.kind {
             furniture::PropKind::Stellarator => {
-                stellarator::spawn(commands, assets, art, prop.at, prop.yaw, prop.scale);
+                stellarator::spawn(commands, assets, prop.at, prop.yaw, prop.scale);
             }
         }
     }
     for (index, pipe) in furniture.pipes().into_iter().enumerate() {
+        // As a thing that can be fought: the size the .blend drew it at, which
+        // is what the swing has to cover, and whose side it is on, which is what
+        // decides who comes to swing.
+        let (radius, height) = pipe::body(pipe.at.scale.x);
         commands.spawn((
             LevelEntity,
             // The enemy pipes have their interval overwritten from the console
             // every tick; the Mario pipe keeps the one the .blend gave it.
             pipe::WarpPipe::new(pipe.spawns, pipe.interval, index as f32),
+            // A nest is an objective now rather than scenery. The squad comes
+            // for a hostile pipe and the crowd comes for the Mario one, both
+            // through `enemy::alert`, which asks nothing of a target but what
+            // side it is on -- see [`pipe::Spawn::side`].
+            pipe.spawns.side(),
+            structure::Structure::new(radius, height),
+            health::Health::new(health::WARP_PIPE_HEALTH),
             WorldAssetRoot(assets.load(format!("{}#Scene0", pipe::MODEL))),
             // The whole transform the .blend drew it with, scale included.
             // Nothing here corrects the model's size: `pipe::MODEL` is a three
@@ -303,6 +313,12 @@ type LevelContents = Or<(
     // naming both here is one rule rather than two.
     With<pylon::Pylon>,
     With<pylon::Beam>,
+    // And what the squad was carrying between the two. A ball is spawned by a
+    // kill rather than by the level, so like the enemies it is found by what it
+    // is; leaving one behind is a green ball hanging in the sky over the next
+    // level, exactly as a mast would be.
+    With<nuclonium::Nuclonium>,
+    With<nuclonium::Shipment>,
     With<weapon::Bullet>,
     With<weapon::Tracer>,
     With<pipe::Launched>,
@@ -321,7 +337,6 @@ pub fn switch(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut load: ResMut<LevelLoad>,
-    art: Res<stellarator::FieldArt>,
     mut squad: ResMut<squad::Squad>,
     current: Res<LevelId>,
     contents: Query<Entity, LevelContents>,
@@ -349,7 +364,6 @@ pub fn switch(
         &assets,
         &mut meshes,
         &mut materials,
-        &art,
         &mut load,
     );
     // A level that is ready now puts the player down now. The planet cannot --
@@ -750,15 +764,9 @@ mod tests {
         .expect("that should parse");
         let mut app = crate::tests::headless();
         app.world_mut()
-            .run_system_once(
-                move |mut commands: Commands,
-                      assets: Res<AssetServer>,
-                      mut meshes: ResMut<Assets<Mesh>>,
-                      mut materials: ResMut<Assets<StandardMaterial>>| {
-                    let art = stellarator::prepare(&mut commands, &mut meshes, &mut materials);
-                    spawn_inhabitants(&level, &mut commands, &assets, &art);
-                },
-            )
+            .run_system_once(move |mut commands: Commands, assets: Res<AssetServer>| {
+                spawn_inhabitants(&level, &mut commands, &assets);
+            })
             .expect("that should run");
         app.update();
         let mut machines = app

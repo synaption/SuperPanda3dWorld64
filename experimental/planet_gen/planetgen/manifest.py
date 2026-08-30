@@ -15,13 +15,21 @@ DEFAULTS = {
     "snow_line": 22.0,
     "steep_cos": 0.55,
     "ground_normal": 0.7,
+    "farm_slope_cos": 0.9781476007,
+    "farm_min_altitude": 2.0,
+    "farm_max_altitude": 11.0,
+    "farm_min_area": 400.0,
     "lod1_depth": 0,
     "seed": 20260822,
     "relief": 1.0,
     "detail": 0.22,
     "detail_frequency": 4.5,
     "detail_octaves": 5,
-    "generator_version": 1,
+    "terrace_steps": 4,
+    "terrace_flatness": 0.72,
+    "route_width": 0.08,
+    "seabed_relief": 0.16,
+    "generator_version": 2,
 }
 
 

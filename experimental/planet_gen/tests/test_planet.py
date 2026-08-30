@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from planetgen import check, manifest, ocean, rasters, surface     # noqa: E402
 from planetgen.cubesphere import (VertexGrid, face_directions,      # noqa: E402
                                   grid_parameters, tile_quad_indices,
-                                  tiles_at, warp)
+                                  tiles_at, warp, welded_triangles)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -136,6 +136,81 @@ class TestSurface(unittest.TestCase):
                 walk = surface.walkable_triangles(tri, np.array([[0, 1, 2]]), 0.7)
                 with self.subTest(axis=axis, sign=sign):
                     self.assertTrue(bool(walk[0]))
+
+    def test_water_is_a_cost_not_a_hole_in_the_navigation_mesh(self):
+        # Two tangent floors at the north pole, one dry and one submerged.
+        # Their geometry is intentionally identical: the movement difference
+        # comes from the actor and medium, never from deleting the seabed.
+        dry = np.array([[-2.0, 305.0, -2.0], [2.0, 305.0, 2.0],
+                        [2.0, 305.0, -2.0]])
+        wet = np.array([[-2.0, 295.0, -2.0], [2.0, 295.0, 2.0],
+                        [2.0, 295.0, -2.0]])
+        positions = np.concatenate([dry, wet])
+        triangles = np.array([[0, 1, 2], [3, 4, 5]])
+        altitude = np.array([5.0, 5.0, 5.0, -5.0, -5.0, -5.0])
+        classes = surface.traversal_classes(
+            positions, triangles, altitude, sea_level=0.0,
+            ground_normal=0.7, farm_slope_cos=0.978,
+            farm_min_altitude=2.0, farm_max_altitude=11.0)
+
+        np.testing.assert_array_equal(classes["mario_walkable"], [True, False])
+        np.testing.assert_array_equal(classes["luna_walkable"], [True, True])
+        np.testing.assert_array_equal(classes["farmable"], [True, False])
+        np.testing.assert_array_equal(classes["ant_preferred"], [True, False])
+        np.testing.assert_array_equal(classes["ant_allowed"], [True, True])
+
+
+class TestPlayableSeed(unittest.TestCase):
+    """The seed is level design, not merely attractive noise."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = manifest.load(ROOT)
+        cls.n = 64
+        cls.grid = VertexGrid(cls.n)
+        directions = [face_directions(face, cls.n) for face in range(6)]
+        fields = rasters.seed_elevation(
+            directions, cls.m["seed"], cls.m["relief"], cls.m["detail"],
+            cls.m["detail_frequency"], cls.m["detail_octaves"],
+            cls.m["terrace_steps"], cls.m["terrace_flatness"],
+            cls.m["route_width"], cls.m["seabed_relief"])
+        h01 = np.zeros(cls.grid.count)
+        for face in reversed(range(6)):
+            h01[cls.grid.ids[face]] = fields[face]
+        cls.altitude = (cls.m["min_altitude"] + h01
+                        * (cls.m["max_altitude"] - cls.m["min_altitude"]))
+        cls.positions = cls.grid.directions * (
+            cls.m["radius"] + cls.altitude)[:, np.newaxis]
+        cls.triangles = check_triangles = welded_triangles(cls.grid)
+        geometric = surface.traversal_classes(
+            cls.positions, check_triangles, cls.altitude, cls.m["sea_level"],
+            cls.m["ground_normal"], cls.m["farm_slope_cos"],
+            cls.m["farm_min_altitude"], cls.m["farm_max_altitude"])
+        cls.classes = surface.enforce_topology(
+            cls.positions, check_triangles, geometric, cls.m["farm_min_area"])
+        cls.tile = {
+            "vertex_ids": np.arange(cls.grid.count),
+            "positions": cls.positions,
+            "triangles": cls.triangles,
+            **cls.classes,
+        }
+
+    def test_it_keeps_farms_cliffs_and_large_elevation_changes(self):
+        self.assertGreater(float(self.classes["farmable"].mean()), 0.005)
+        self.assertGreater(float((~self.classes["walkable"]).mean()), 0.03)
+        self.assertGreater(float(np.ptp(self.altitude)), 35.0)
+
+    def test_luna_can_walk_the_seeded_seabed(self):
+        wet = self.classes["water"]
+        self.assertTrue(np.all(self.classes["luna_walkable"][wet]))
+
+    def test_farms_have_a_mario_route_to_water(self):
+        report = check.topology_report({"planet": self.tile})
+        self.assertGreater(report["farmable_area"], 5_000.0)
+        self.assertGreater(report["reachable_farm_fraction"], 0.97)
+        self.assertGreater(report["shore_triangles"], 0)
+        self.assertTrue(report["ant_prefers_dry"])
+        self.assertTrue(report["ant_water_is_safe"])
 
 
 class TestMaterialRasterRoundTrip(unittest.TestCase):
@@ -293,6 +368,23 @@ class TestBuiltPlanet(unittest.TestCase):
         report = check.traversal_report(self.tiles[0])
         share = report["largest"] / report["walkable_triangles"]
         self.assertGreater(share, 0.9)
+
+    def test_gameplay_topology_keeps_its_actor_promises(self):
+        report = check.topology_report(self.tiles[0])
+        self.assertGreater(report["farmable_area"], 10_000.0)
+        self.assertAlmostEqual(report["reachable_farm_fraction"], 1.0)
+        self.assertAlmostEqual(report["luna_underwater_walkable_fraction"], 1.0)
+        self.assertGreater(report["shore_triangles"], 0)
+        self.assertTrue(report["ant_prefers_dry"])
+        self.assertTrue(report["ant_water_is_safe"])
+        m = manifest.load(ROOT)
+        for tile in self.tiles[0].values():
+            farm = tile["farmable"]
+            self.assertTrue(np.all(tile["mario_accessible"][farm]))
+            self.assertTrue(np.all(~tile["water"][farm]))
+            self.assertTrue(np.all(surface.triangle_slope(
+                tile["positions"], tile["triangles"])[farm]
+                > m["farm_slope_cos"]))
 
 
 if __name__ == "__main__":
