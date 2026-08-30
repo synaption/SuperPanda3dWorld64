@@ -3,7 +3,7 @@
 //!
 //! **Nuclonium is the substance; a ball is only what it looks like today.**
 //! One is drawn as a small glowing green sphere because that reads at a
-//! distance and costs two entities, and everything in this module is written
+//! distance and costs one gameplay/render entity, and everything in this module is written
 //! about *a unit of nuclonium* rather than about a sphere -- which is what will
 //! let the ore patches `next.md` wants (a seam in the ground, mined by a Mario
 //! standing over it rather than dropped by a corpse) hand their output to the
@@ -47,13 +47,20 @@
 use std::collections::VecDeque;
 
 use bevy::{
-    asset::RenderAssetUsages,
+    asset::{embedded_asset, RenderAssetUsages},
     camera::visibility::NoFrustumCulling,
-    mesh::{Indices, PrimitiveTopology},
+    mesh::{Indices, PrimitiveTopology, VertexAttributeValues},
+    pbr::{Material, MaterialPipeline, MaterialPipelineKey, MaterialPlugin},
     prelude::*,
+    render::render_resource::{
+        AsBindGroup, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
+    },
+    shader::ShaderRef,
 };
 
 use crate::{level::LevelData, player::FIXED_DT, pylon::Network, squad::Ally};
+
+const GLOW_SHADER: &str = "embedded://space_crusaders/nuclonium.wgsl";
 
 /// How often a kill leaves something behind, and how often that something is a
 /// medkit instead.
@@ -166,9 +173,9 @@ const GRAB_GROW_SECONDS: f32 = 1.0;
 /// It shrinks rather than blinking out, and it shrinks rather than fading
 /// because of how these are drawn: there is one material per [`Kind`], shared
 /// by every ball in the level, so a ball cannot fade on its own without a
-/// material of its own. Scale is per-entity and free -- the glow is a child and
-/// comes with it, and a trail's width is read off the same transform -- so the
-/// whole thing dwindles together.
+/// material of its own. Scale is per-entity and free -- the pooled glow and a
+/// trail's width are both read off the same transform -- so the whole thing
+/// dwindles together.
 pub const IDLE_LIFE: f32 = 180.0;
 const IDLE_FADE: f32 = 2.0;
 
@@ -188,23 +195,15 @@ const BALL_LIFT: f32 = 0.80;
 pub const CARRY_HEIGHT: f32 = 1.9;
 
 /// How much wider than the ball its glow reaches, how far that swells as it
-/// breathes, and how many texels across the picture of it is.
+/// breathes, and how many texels across the shared trail/wash falloff is.
 ///
-/// **The glow is a textured quad, and it has to be, because nothing else in this
-/// renderer can draw one.** An `emissive` on a `StandardMaterial` reaches the
-/// screen two ways in Bevy and this port has neither: the lit path folds it into
-/// the shading, which an `unlit` material skips outright -- `pbr.wgsl` writes
-/// `out.color = base_color` and never calls `apply_pbr_lighting` -- and a value
-/// over 1.0 only *reads* as light because a bloom pass smears it, which wants an
-/// HDR camera this game does not have. So the first version of these balls was a
-/// flat green circle wearing an `emissive` field no shader ever looked at.
-///
-/// The second was a translucent sphere around the core, and that was worse in an
-/// instructive way: a sphere at a constant alpha has a hard silhouette, so what
-/// it drew was a bigger flat circle behind a smaller one. **A glow is a falloff.**
-/// It has to be a picture with alpha going to nothing at its edge, on a quad
-/// turned to face the camera -- which is what [`crate::sky`] draws the sun with,
-/// out of the same [`crate::sky::texture`] helper.
+/// **A glow is HDR energy with a radial falloff, not a light entity.** Every
+/// orb and mote contributes a camera-facing card to one world-space mesh; the
+/// custom material writes values above one and bloom scatters those values on
+/// screen. This keeps thousands of sources to one transparent render entity
+/// and one draw call without asking the level shader to evaluate thousands of
+/// lights. The same falloff is baked into a tiny texture for trails and ground
+/// washes, whose standard material still samples it.
 const HALO_SCALE: f32 = 3.2;
 
 /// How far the glow reaches from the middle of a ball drawn at full size.
@@ -249,6 +248,20 @@ const HALO_TEXELS: u32 = 64;
 /// a steep curve spends that half on nothing.
 const HALO_FALLOFF: f32 = 1.5;
 
+/// How much HDR energy the soft body and hot centre of a glow put into bloom.
+///
+/// These are deliberately above one. The world remains display-referred, but
+/// this material is light rather than paint: [`bevy::post_process::bloom::Bloom`]
+/// scatters the excess before the camera writes its eight-bit target.
+const HALO_EMISSION: f32 = 1.3;
+const HOT_EMISSION: f32 = 2.1;
+const CORE_EMISSION: f32 = 1.6;
+
+/// How brightly a full-sized ball lights the world around it, and how far that
+/// light carries. See [`lamp`], which is where both are argued.
+const LAMP_STRENGTH: f32 = 0.55;
+const LAMP_REACH: f32 = 2.5;
+
 /// How fast and how far a loose ball bobs.
 ///
 /// Much further than it was, and slower, because a bob is now the only thing a
@@ -266,8 +279,8 @@ const HALO_FALLOFF: f32 = 1.5;
 ///
 /// There is no spin here, and there was: a sphere in one flat colour looks
 /// exactly the same at every rotation, so turning it was work nobody could see.
-/// Worse, it was work in the way -- the glow is a child quad aimed at the
-/// camera, and a parent that rotates is a rotation the child has to undo.
+/// Worse, it was work in the way -- the pooled glow already derives its card
+/// from the ball's world transform, so a meaningless spin only dirties it.
 const BOB_HZ: f32 = 0.55;
 const BOB_RISE: f32 = 0.40;
 
@@ -297,9 +310,9 @@ pub const SHIP_SPEED: f32 = 18.0;
 /// oscillates, and it did.
 ///
 /// So a trail is now a short history of where the thing has been, in world
-/// space, taken from the **ball** rather than from the glow hanging on it --
-/// which is what makes the measurement honest, because a ball's transform is
-/// written by the game and the glow's is written by the thing measuring it.
+/// space, taken from the **ball** rather than from any render geometry -- which
+/// is what makes the measurement honest, because a ball's transform is written
+/// by the game and its shared picture is rebuilt from that result.
 ///
 /// **Nothing here sets how long a trail is.** Its length is however much ground
 /// was covered in the last [`TRAIL_LIFE`] seconds: twice the speed is twice the
@@ -667,20 +680,22 @@ pub struct Bank {
     pub stored: u32,
 }
 
-/// The quad that makes a ball look lit.
+/// One source written into the pooled glow mesh.
 ///
-/// A child of the ball rather than a second top-level entity, so it is carried,
-/// bobbed and despawned by whatever happens to the ball with nothing here to
-/// keep in step. Its phase is copied from its ball's at spawn, so the core and
-/// the glow breathe together.
-///
-/// It relies on its parent never being rotated -- see [`BOB_HZ`] -- which is
-/// what lets [`shimmer`] write a world-space heading straight into its local
-/// rotation instead of cancelling the parent's first, the way
-/// [`crate::billboard::aim`] has to for a quad inside a skeleton.
-#[derive(Component)]
-pub struct Halo {
+/// It sits on the gameplay entity rather than on a child card. Ten thousand
+/// sources are therefore still one transparent render entity and one draw;
+/// this component contributes only its colour and breathing phase to that
+/// shared picture.
+#[derive(Component, Clone, Copy)]
+pub struct Glow {
+    kind: Kind,
     phase: f32,
+}
+
+impl Glow {
+    pub fn new(kind: Kind, phase: f32) -> Self {
+        Self { kind, phase }
+    }
 }
 
 /// Somewhere a unit of nuclonium has been, and how long ago it was there.
@@ -1099,31 +1114,164 @@ impl Ribbon {
     }
 }
 
+/// The single render entity holding every orb and mote halo.
+#[derive(Component)]
+pub struct GlowCloud;
+
+/// The four values the HDR particle shader needs.
+#[derive(Clone, Copy, ShaderType)]
+struct GlowUniform {
+    shape: Vec4,
+}
+
+/// An unlit additive material whose output is intentionally brighter than the
+/// display target. It illuminates no geometry; bloom is what makes that excess
+/// energy visible around the particle.
+#[derive(Asset, AsBindGroup, TypePath, Clone)]
+pub struct GlowMaterial {
+    #[uniform(0)]
+    uniform: GlowUniform,
+}
+
+impl Material for GlowMaterial {
+    fn vertex_shader() -> ShaderRef {
+        GLOW_SHADER.into()
+    }
+
+    fn fragment_shader() -> ShaderRef {
+        GLOW_SHADER.into()
+    }
+
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Add
+    }
+
+    fn enable_shadows() -> bool {
+        false
+    }
+
+    fn enable_prepass() -> bool {
+        false
+    }
+
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &bevy::mesh::MeshVertexBufferLayoutRef,
+        _key: MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        descriptor.primitive.cull_mode = None;
+        Ok(())
+    }
+}
+
+/// Registers the pooled glow material and embeds its shader in packaged builds.
+pub struct VfxPlugin;
+
+impl Plugin for VfxPlugin {
+    fn build(&self, app: &mut App) {
+        embedded_asset!(app, "nuclonium.wgsl");
+        app.add_plugins(MaterialPlugin::<GlowMaterial>::default());
+    }
+}
+
+/// One frame's worth of camera-facing glow cards.
+#[derive(Default)]
+pub struct Glows {
+    positions: Vec<[f32; 3]>,
+    uvs: Vec<[f32; 2]>,
+    colours: Vec<[f32; 4]>,
+    indices: Vec<u32>,
+}
+
+impl Glows {
+    fn clear(&mut self) {
+        self.positions.clear();
+        self.uvs.clear();
+        self.colours.clear();
+        self.indices.clear();
+    }
+
+    fn spark(&mut self, at: Vec3, eye: Vec3, radius: f32, tint: [f32; 3]) {
+        if radius <= 0.0 {
+            return;
+        }
+        let Some(toward) = (eye - at).try_normalize() else {
+            return;
+        };
+
+        // Move the card toward the eye to clear nearby floors and walls, then
+        // shrink it by exactly the same perspective ratio. This is the pooled
+        // form of the old child halo's transform and leaves it on the same
+        // screen pixels while changing only its depth test.
+        let clearance = radius * HALO_FLOAT;
+        let near = crate::shadow::float_toward(eye, at, clearance);
+        let centre = at + toward * clearance;
+        let radius = radius * near;
+        let rotation = Quat::from_rotation_arc(Vec3::Z, toward);
+        let across = rotation * Vec3::X * radius;
+        let up = rotation * Vec3::Y * radius;
+        let base = self.positions.len() as u32;
+        for (side, rise, uv) in [
+            (-1.0, -1.0, [0.0, 0.0]),
+            (1.0, -1.0, [1.0, 0.0]),
+            (-1.0, 1.0, [0.0, 1.0]),
+            (1.0, 1.0, [1.0, 1.0]),
+        ] {
+            self.positions
+                .push((centre + across * side + up * rise).to_array());
+            self.uvs.push(uv);
+            self.colours.push([tint[0], tint[1], tint[2], 1.0]);
+        }
+        self.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 1, base + 3]);
+    }
+
+    fn lay(&mut self, mesh: &mut Mesh) {
+        // Swap instead of replace so the vectors extracted last frame become
+        // this frame's scratch space. Once the field reaches its high-water
+        // mark, rebuilding thousands of particles performs no CPU allocation.
+        let Some(VertexAttributeValues::Float32x3(positions)) =
+            mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
+        else {
+            return;
+        };
+        std::mem::swap(positions, &mut self.positions);
+        let Some(VertexAttributeValues::Float32x2(uvs)) = mesh.attribute_mut(Mesh::ATTRIBUTE_UV_0)
+        else {
+            return;
+        };
+        std::mem::swap(uvs, &mut self.uvs);
+        let Some(VertexAttributeValues::Float32x4(colours)) =
+            mesh.attribute_mut(Mesh::ATTRIBUTE_COLOR)
+        else {
+            return;
+        };
+        std::mem::swap(colours, &mut self.colours);
+        let Some(Indices::U32(indices)) = mesh.indices_mut() else {
+            return;
+        };
+        std::mem::swap(indices, &mut self.indices);
+    }
+}
+
 /// The meshes and materials every ball is drawn with.
 ///
 /// Built once and shared, exactly like [`crate::pylon::GridArt`]: a kill should
-/// cost a couple of entities and no allocation.
+/// cost one entity and no per-spawn render allocation.
 #[derive(Resource, Clone)]
 pub struct Art {
     ball: Handle<Mesh>,
-    /// The glow's quad, already the size the glow is drawn at, so nothing has
-    /// to scale it except the breathing.
-    card: Handle<Mesh>,
+    /// Every live glow, rebuilt into this one world-space mesh each frame.
+    glows: Handle<Mesh>,
     /// The one mesh every trail in the world is written into, rebuilt each
     /// frame by [`trail`]. See [`Ribbons`].
     trails: Handle<Mesh>,
-    /// And the one every pool of light on the ground is written into, rebuilt
-    /// each frame by [`spill`]. See [`Washes`].
-    washes: Handle<Mesh>,
-    /// What those pools are drawn with: the same falloff the glows wear, added
-    /// to the ground rather than blended over it. See [`SPILLS`].
-    wash: Handle<StandardMaterial>,
     /// What every trail in the level is painted with: white, so the colour can
     /// come off the vertices. See [`Kind::tint`].
     paint: Handle<StandardMaterial>,
-    /// One core and one glow per [`Kind`], indexed by [`Kind::slot`].
+    /// One solid core per [`Kind`], indexed by [`Kind::slot`].
     core: [Handle<StandardMaterial>; 2],
-    halo: [Handle<StandardMaterial>; 2],
 }
 
 /// Builds the shared art. Called from the game's own startup, beside the
@@ -1132,6 +1280,7 @@ pub fn prepare(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
+    glow_materials: &mut Assets<GlowMaterial>,
     images: &mut Assets<Image>,
 ) -> Art {
     // The falloff, once, shared by every glow and every trail. White in the
@@ -1142,122 +1291,77 @@ pub fn prepare(
         let fade = (1.0 - (u * u + v * v).sqrt()).clamp(0.0, 1.0);
         [255, 255, 255, (255.0 * fade.powf(HALO_FALLOFF)) as u8]
     }));
-    // Added rather than blended, which is the whole difference between
-    // light falling on the grass and paint lying on it: a blended disc
-    // replaces what is under it and washes the grass out towards its own
-    // colour, and an added one can only ever make it brighter. Colourless
-    // in the material for the trails' reason -- one mesh holds the green
-    // pools and the red ones, so the colour rides on the vertices.
-    //
-    // Fog off, for the reason [`crate::shadow::prepare`] turns it off: fog
-    // replaces a surface's colour with the sky's, and what a haze does to a
-    // patch of light is make it fainter rather than sky-coloured.
-    let wash = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        base_color_texture: Some(falloff.clone()),
-        alpha_mode: AlphaMode::Add,
-        depth_bias: SPILL_BIAS,
-        unlit: true,
-        fog_enabled: false,
-        double_sided: true,
-        cull_mode: None,
-        ..default()
-    });
-    // One material, in one colour, with or without the falloff on it. The
-    // cores are opaque and the glows are not, and that difference is the whole
-    // of the branch: a core has to write depth, or the glow hanging behind it
-    // shows straight through the sphere it is supposed to be lighting.
-    let mut paint = |tint: Color, texture: Option<Handle<Image>>| {
-        let lit = texture.is_some();
-        let mut material = StandardMaterial {
-            base_color: tint,
-            base_color_texture: texture,
-            // Unlit, the way the beams and the supply packet are: a ball lying
-            // in a shadow still has to read as a thing worth walking to, and
-            // the renderer this port draws through flattens everything else.
-            //
-            // No `emissive` anywhere here, and its absence is deliberate rather
-            // than an oversight -- see [`HALO_SCALE`] for the two reasons this
-            // build cannot show one, and for what is doing that job instead.
-            unlit: true,
-            ..default()
-        };
-        if lit {
-            // A glow is seen from behind as well as in front, and casts
-            // nothing: it is light, and a shadow cast by one is the tell that
-            // it is a disc of glass.
-            material.alpha_mode = AlphaMode::Blend;
-            material.double_sided = true;
-            material.cull_mode = None;
-        }
-        materials.add(material)
+    let empty = || {
+        Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, Vec::<[f32; 3]>::new())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, Vec::<[f32; 2]>::new())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, Vec::<[f32; 4]>::new())
+        .with_inserted_indices(Indices::U32(Vec::new()))
     };
+    let core = Kind::ALL.map(|kind| {
+        let tint = kind.colours().0;
+        materials.add(StandardMaterial {
+            base_color: tint,
+            // The opaque middle writes depth and supplies the hottest pixels
+            // to bloom. It stays on StandardMaterial so Bevy can instance the
+            // shared sphere mesh; the transparent halo is the part pooled
+            // below because that is where one render entity per mote hurts.
+            emissive: tint.to_linear() * CORE_EMISSION,
+            ..default()
+        })
+    });
     let art = Art {
         ball: meshes.add(Sphere::new(BALL_RADIUS)),
-        card: meshes.add(Rectangle::new(
-            BALL_RADIUS * 2.0 * HALO_SCALE,
-            BALL_RADIUS * 2.0 * HALO_SCALE,
-        )),
+        glows: meshes.add(empty()),
         // Empty, and kept in the main world as well as on the card: `trail`
         // rewrites it from the CPU every frame, the same way `sky::repaint`
         // keeps the dome it recolours.
-        trails: meshes.add(
-            Mesh::new(
-                PrimitiveTopology::TriangleList,
-                RenderAssetUsages::default(),
-            )
-            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, Vec::<[f32; 3]>::new())
-            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, Vec::<[f32; 2]>::new())
-            .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, Vec::<[f32; 4]>::new())
-            .with_inserted_indices(Indices::U32(Vec::new())),
-        ),
-        washes: meshes.add(
-            Mesh::new(
-                PrimitiveTopology::TriangleList,
-                RenderAssetUsages::default(),
-            )
-            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, Vec::<[f32; 3]>::new())
-            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, Vec::<[f32; 2]>::new())
-            .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, Vec::<[f32; 4]>::new())
-            .with_inserted_indices(Indices::U32(Vec::new())),
-        ),
-        wash,
-        paint: paint(Color::WHITE, Some(falloff.clone())),
-        core: Kind::ALL.map(|kind| paint(kind.colours().0, None)),
-        halo: Kind::ALL.map(|kind| paint(kind.colours().1, Some(falloff.clone()))),
+        trails: meshes.add(empty()),
+        paint: materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            base_color_texture: Some(falloff.clone()),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            double_sided: true,
+            cull_mode: None,
+            ..default()
+        }),
+        core,
     };
     commands.insert_resource(art.clone());
-    // The one thing every trail is drawn by. It sits at the origin and never
-    // moves, because the vertices [`trail`] writes into it are already in world
-    // space -- which is the point: a single mesh can hold the trails of things
-    // that have nothing else to do with each other.
+    // The one thing every glow is drawn by. It sits at the origin and never
+    // moves, because the vertices [`glow`] writes into it are already in world
+    // space -- which is the point: a single mesh can hold particles whose
+    // gameplay entities have nothing else to do with each other.
     //
     // Never culled, for the same reason. Its bounds are whatever the trails in
     // it happen to span this frame, which is a box that changes every frame and
     // is usually most of the level; asking the renderer to keep that up to date
     // costs more than drawing a few thousand transparent triangles.
     //
-    // Wearing the glow's own material, so a trail is the same green as the
-    // thing making it by construction rather than by two numbers being kept in
-    // step.
+    // Wearing the HDR material that makes the values above one bloom.
+    commands.spawn((
+        GlowCloud,
+        bevy::light::NotShadowCaster,
+        NoFrustumCulling,
+        Mesh3d(art.glows.clone()),
+        MeshMaterial3d(glow_materials.add(GlowMaterial {
+            uniform: GlowUniform {
+                shape: Vec4::new(HALO_EMISSION, HOT_EMISSION, 1.0 / HALO_SCALE, HALO_FALLOFF),
+            },
+        })),
+        Transform::default(),
+        Visibility::default(),
+    ));
     commands.spawn((
         Ribbons,
         bevy::light::NotShadowCaster,
         NoFrustumCulling,
         Mesh3d(art.trails.clone()),
         MeshMaterial3d(art.paint.clone()),
-        Transform::default(),
-        Visibility::default(),
-    ));
-    // And the one every pool of light on the ground is drawn by, on the same
-    // terms and for the same reasons: world-space vertices, never culled, one
-    // draw call for every glowing thing in the level at once. See [`spill`].
-    commands.spawn((
-        Washes,
-        bevy::light::NotShadowCaster,
-        NoFrustumCulling,
-        Mesh3d(art.washes.clone()),
-        MeshMaterial3d(art.wash.clone()),
         Transform::default(),
         Visibility::default(),
     ));
@@ -1320,7 +1424,9 @@ pub fn spawn(commands: &mut Commands, art: &Art, kind: Kind, at: Vec3, phase: f3
                 idle: 0.0,
                 slack: 0.0,
             },
+            Glow::new(kind, phase),
             core(art, kind),
+            lamp(kind),
             Transform::from_translation(at + Vec3::Y * BALL_LIFT),
             Visibility::default(),
         ))
@@ -1337,7 +1443,6 @@ pub fn spawn(commands: &mut Commands, art: &Art, kind: Kind, at: Vec3, phase: f3
             commands.entity(ball).insert(crate::health::Medkit);
         }
     }
-    commands.entity(ball).with_child(halo(art, kind, phase));
     ball
 }
 
@@ -1362,22 +1467,46 @@ pub fn core(art: &Art, kind: Kind) -> impl Bundle + use<> {
     )
 }
 
-/// The glow that hangs on a ball, as a bundle. Spawn it as a child of the core.
+/// The light one loose unit of nuclonium puts on the world around it.
 ///
-/// Its own function because three places need one, for [`core`]'s reason, and a
-/// glow assembled three times is a glow that ends up different in one of them.
-pub fn halo(art: &Art, kind: Kind, phase: f32) -> impl Bundle + use<> {
-    let (card, material) = (&art.card, &art.halo[kind.slot()]);
-    (
-        Halo { phase },
-        bevy::light::NotShadowCaster,
-        Mesh3d(card.clone()),
-        MeshMaterial3d(material.clone()),
-        // Centred on the ball. [`shimmer`] turns it to face the camera every
-        // frame, so the rotation here is only what it wears for the one frame
-        // before that runs.
-        Transform::default(),
-    )
+///
+/// **This is the illumination half of being emissive, and it is a different
+/// job from the screen half.** The HDR glow card and bloom are what make an
+/// orb *look* like it is giving off light: they are pixels on the camera's
+/// target and they touch nothing in the scene. What makes the grass under one
+/// go green is this -- a [`crate::n64::Lamp`], read by the level's own shader
+/// and added to the same `ambient + key * cos` every surface in the game is
+/// already shaded by.
+///
+/// There is no `PointLight` here and there cannot be, because there is no
+/// renderer in this game that would read one: `bevy_pbr`'s light list belongs
+/// to `StandardMaterial`, and every surface in the world is on
+/// [`crate::n64::N64Material`] instead. What there is instead is sixteen
+/// lamps in one buffer that shader does read -- see [`crate::n64::LAMPS`].
+///
+/// Two and a half metres is deliberately short. The glow reads at any
+/// distance; the *light* is a pool a couple of paces across, so a ball on the
+/// lawn is a lamp on a table rather than a floodlight, and a Mario carrying
+/// one lights the ground it walks over without lighting the castle. The
+/// strength is well under the ambient it is added to, for the same reason: a
+/// lamp brightens grass that is already lit rather than replacing the day.
+///
+/// It rides on the ball's own scale, so a ball fading out over its last two
+/// seconds fades its light out with it.
+///
+/// **Loose is the operative word, and it is why this is not in [`core`] with
+/// the rest of what a unit of nuclonium looks like.** A ball on the lawn, a
+/// ball over a Mario's head and a ball flying down a beam are each one light
+/// in a place of their own. Five hundred motes turning inside a stellarator
+/// are not five hundred lights a metre apart; they are one glowing band, and
+/// the machine owns it -- see [`crate::stellarator::Hearth`]. Sixteen lamps is
+/// all the shader walks, and a field of motes would take every one of them the
+/// moment you stood near a reactor.
+pub fn lamp(kind: Kind) -> crate::n64::Lamp {
+    crate::n64::Lamp {
+        glow: Vec3::from_array(kind.tint()) * LAMP_STRENGTH,
+        reach: LAMP_REACH,
+    }
 }
 
 /// Spawns whatever the tick's kills left behind.
@@ -1900,19 +2029,14 @@ fn deliver(
     if legs.first().is_some_and(|first| first.distance(at) > 1e-3) {
         legs.insert(0, at);
     }
-    let shipment = commands
-        .spawn((
-            Shipment { legs, along: 0.0 },
-            core(art, Kind::Nuclonium),
-            Transform::from_translation(at),
-            Visibility::default(),
-        ))
-        .id();
-    // Wearing the same glow, so what the player follows across the valley looks
-    // like the thing that was handed in.
-    commands
-        .entity(shipment)
-        .with_child(halo(art, Kind::Nuclonium, 0.0));
+    commands.spawn((
+        Shipment { legs, along: 0.0 },
+        Glow::new(Kind::Nuclonium, 0.0),
+        core(art, Kind::Nuclonium),
+        lamp(Kind::Nuclonium),
+        Transform::from_translation(at),
+        Visibility::default(),
+    ));
 }
 
 /// Flies delivered balls home along the beams, and hands what arrives to the
@@ -1999,7 +2123,7 @@ pub fn point_along(legs: &[Vec3], along: f32) -> Option<Vec3> {
     None
 }
 
-/// Bobs the loose balls and turns every glow to face the camera.
+/// Bobs the loose balls and breathes their scale.
 ///
 /// Render rate, because it is only how a thing looks. A carried one is left
 /// alone: it is pinned over its Mario's head by [`haul`], and bobbing it as well
@@ -2010,81 +2134,21 @@ pub fn point_along(legs: &[Vec3], along: f32) -> Option<Vec3> {
 /// world position and writes its own offset is a loop. Speed is now somebody
 /// else's question entirely -- [`trail`] asks it of the ball, which is the thing
 /// that actually moves.
-#[allow(clippy::type_complexity)]
 pub fn shimmer(
     time: Res<Time>,
-    camera: Query<&GlobalTransform, (With<Camera3d>, Without<Halo>)>,
-    mut balls: Query<
-        (
-            &mut Orb,
-            Option<&Nuclonium>,
-            Option<&crate::health::Drawn>,
-            &mut Transform,
-        ),
-        Without<Halo>,
-    >,
-    mut halos: Query<(&Halo, &ChildOf, &mut Transform), (Without<Nuclonium>, Without<Camera3d>)>,
-    // Whatever each glow is hanging on, read rather than written: where the
-    // card goes is a question about where its ball *is*, and taking that off
-    // the card's own transform is the feedback loop described at
-    // [`TRAIL_LIFE`]. Read-only, so it conflicts with nothing above.
-    hangs_on: Query<&GlobalTransform, Without<Halo>>,
+    mut balls: Query<(
+        &mut Orb,
+        Option<&Nuclonium>,
+        Option<&crate::health::Drawn>,
+        &mut Transform,
+    )>,
 ) {
     let elapsed = time.elapsed_secs();
-    // The glows breathe whatever their ball is doing -- carried, loose or flying
-    // home -- because one that stopped pulsing the moment somebody picked it up
-    // would read as the thing having been switched off.
-    //
-    // Turned to face the camera as well, which is the half that makes it a glow
-    // rather than a card seen edge-on. `Rectangle` faces local +Z, and the
-    // parent is never rotated (see [`Halo`]), so the world heading goes straight
-    // into the local rotation. The position is last frame's -- a `GlobalTransform`
-    // written before this ball moved -- which for a radially symmetric picture is
-    // a fraction of a degree nobody can see.
-    if let Ok(view) = camera.single() {
-        let eye = view.translation();
-        for (halo, hanging, mut at) in &mut halos {
-            let Ok(ball) = hangs_on.get(hanging.parent()) else {
-                continue;
-            };
-            let ball = ball.compute_transform();
-            let Some(toward) = (eye - ball.translation).try_normalize() else {
-                continue;
-            };
-            let swell =
-                1.0 + HALO_SWELL * (elapsed * std::f32::consts::TAU * BOB_HZ + halo.phase).sin();
-            at.rotation = Quat::from_rotation_arc(Vec3::Z, toward);
-            // Drawn nearer than it hangs, by its own radius. **This is the
-            // hard edge across the bottom of a glowing ball**, and it is the
-            // depth buffer rather than anything about the picture: a card
-            // aimed at the camera is a flat plane standing through the thing
-            // it is drawn on, so the half of it below the ball is inside the
-            // ground and the half above is not, and what the eye gets is a
-            // soft round glow with a ruler-straight bite out of it along the
-            // line where the two surfaces cross. A ball floating beside a wall
-            // is the same picture turned on its side.
-            //
-            // Scaled about the eye, exactly as [`crate::shadow::FLOAT`] lifts a
-            // shadow off a hillside: under a perspective projection that leaves
-            // the card on precisely the pixels it was on at precisely the size,
-            // and changes only the depth it is tested at. How far is
-            // [`HALO_FLOAT`], and it is bounded by the ball rather than by the
-            // ground.
-            let reach = GLOW_RADIUS * ball.scale.y * swell * HALO_FLOAT;
-            let near = crate::shadow::float_toward(eye, ball.translation, reach);
-            at.scale = Vec3::splat(swell * near);
-            // The offset is in the ball's own units, which is what makes it
-            // right for a mote a fiftieth the size as well: the parent's scale
-            // multiplies it back into the world.
-            at.translation = toward * (GLOW_RADIUS * swell * HALO_FLOAT);
-        }
-    }
     let dt = time.delta_secs();
     for (mut orb, ball, drawn, mut at) in &mut balls {
         // Every ball dwindles, whoever is holding it -- a ball nobody came for
         // is a ball nobody came for even if a mast is about to reach it. See
-        // [`dwindle`]; the glow is a child and shrinks with it, and the trail
-        // reads its width off this same scale.
+        // [`dwindle`]; the pooled glow and trail both read this same scale.
         at.scale = Vec3::splat(dwindle(orb.idle));
         // Anything in somebody's hands, swimming along behind Luna, or drifting
         // towards somebody who needs it is placed by whoever is moving it --
@@ -2106,6 +2170,49 @@ pub fn shimmer(
         at.translation.y = orb.rest
             + orb.slack
             + BOB_RISE * (elapsed * std::f32::consts::TAU * BOB_HZ + orb.phase).sin();
+    }
+}
+
+/// Rebuilds every orb and mote halo into one HDR additive mesh.
+///
+/// The gameplay entities remain separate because they move and mean separate
+/// things. Their transparent render work does not: four vertices per visible
+/// source are appended here, then the renderer extracts one mesh entity and
+/// issues one draw call however many thousands of sources contributed.
+pub fn glow(
+    time: Res<Time>,
+    art: Res<Art>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    camera: Query<&GlobalTransform, With<Camera3d>>,
+    sources: Query<(&Glow, &GlobalTransform, Option<&InheritedVisibility>)>,
+    mut glows: Local<Glows>,
+) {
+    glows.clear();
+    let Ok(view) = camera.single() else {
+        if let Some(mut mesh) = meshes.get_mut(&art.glows) {
+            glows.lay(&mut mesh);
+        }
+        return;
+    };
+    let eye = view.translation();
+    let elapsed = time.elapsed_secs();
+    for (glow, world, visible) in &sources {
+        if visible.is_some_and(|visible| !visible.get()) {
+            continue;
+        }
+        let transform = world.compute_transform();
+        let scale = transform.scale.max_element().max(0.0);
+        let swell =
+            1.0 + HALO_SWELL * (elapsed * std::f32::consts::TAU * BOB_HZ + glow.phase).sin();
+        glows.spark(
+            transform.translation,
+            eye,
+            GLOW_RADIUS * scale * swell,
+            glow.kind.tint(),
+        );
+    }
+    if let Some(mut mesh) = meshes.get_mut(&art.glows) {
+        glows.lay(&mut mesh);
     }
 }
 
@@ -2148,204 +2255,6 @@ pub fn trail(
     }
     if let Some(mut mesh) = meshes.get_mut(&art.trails) {
         ribbon.lay(&mut mesh);
-    }
-}
-
-/// The light a ball throws on the ground under it: how many balls do it at
-/// once, how far out from the camera one still does, how wide the pool is
-/// beside the glow making it, how bright it starts, and how far the ball can
-/// float above the floor before there is none of it left.
-///
-/// **This is what "emissive" has to mean in this renderer, and it is not a
-/// compromise.** There is no light entity in this game and no shader that would
-/// read one: every surface in the world is on [`crate::n64::N64Material`],
-/// whose whole lighting model is one key direction and an ambient floor shared
-/// by the entire level -- see that module, which says plainly why there is no
-/// `DirectionalLight` either. A `PointLight` next to a ball would be a
-/// component nothing looks at. And the two ways a `StandardMaterial` can put
-/// `emissive` on the screen are both missing as well, for the reasons written
-/// out at [`HALO_SCALE`].
-///
-/// The console had exactly this problem and answered it the same way. It could
-/// not cast a shadow either, so a shadow was *geometry*: a soft disc laid on
-/// the floor under the thing, faded by how high up it was. That is
-/// [`crate::shadow`], and this is that idea with the sign flipped -- a bright
-/// disc, added to the ground rather than multiplied into it, laid under
-/// something that gives off light instead of under something that blocks it.
-/// The two even share the placement, because "where is the floor under this,
-/// and which way does it lean" is one question with one right answer:
-/// [`crate::shadow::place`] is what both ask.
-///
-/// What it buys is that a ball lying in the dark now reads as a lamp rather
-/// than as a sticker: the grass under it is green, the pool breathes as the
-/// ball bobs, and a Mario carrying one lights the ground as it walks. What it
-/// does not do is light a wall the ball is floating beside -- for the same
-/// reason a shadow in this game never falls on one.
-///
-/// Sixteen at a time, nearest the camera first. The count is a bound on the
-/// ground queries rather than on the drawing: every pool in the level is one
-/// mesh and one draw call -- the trails' trick, and for the trails' reason --
-/// but each one has to ask the collision where the floor under it is, and five
-/// hundred motes turning inside a machine would be five hundred of those a
-/// frame for a picture the size of a coin.
-const SPILLS: usize = 16;
-const SPILL_RANGE: f32 = 30.0;
-const SPILL_SPREAD: f32 = 3.4;
-const SPILL_STRENGTH: f32 = 0.55;
-const SPILL_REACH: f32 = 4.0;
-const SPILL_BIAS: f32 = 500.0;
-
-/// How bright the pool under a ball `drop` metres above its floor is, as a
-/// share of [`SPILL_STRENGTH`].
-///
-/// Squared rather than linear, which is what a light falling off with distance
-/// does and also what makes the bob visible: a ball at the top of its float is
-/// noticeably dimmer on the grass than one at the bottom, so the pool breathes
-/// with it instead of sitting there at a constant brightness while the thing
-/// making it moves.
-pub fn pooled(drop: f32) -> f32 {
-    let left = (1.0 - drop / SPILL_REACH).clamp(0.0, 1.0);
-    left * left
-}
-
-/// How much of its light a ball `apart` metres from the camera still lays down.
-///
-/// Only the [`SPILLS`] nearest balls get a pool at all, so without this the
-/// sixteenth and seventeenth swap places as the camera turns and a pool blinks
-/// on and off in the distance. Fading the last quarter of the range to nothing
-/// means the two that swap are both at nothing when they do it.
-pub fn far_off(apart: f32) -> f32 {
-    let start = SPILL_RANGE * 0.75;
-    (1.0 - (apart - start) / (SPILL_RANGE - start)).clamp(0.0, 1.0)
-}
-
-/// The one mesh every pool of light in the world is drawn out of. See
-/// [`Ribbons`], which is the same arrangement for the same reason.
-#[derive(Component)]
-pub struct Washes;
-
-/// One frame's worth of pools, being built.
-///
-/// Its own type beside [`Ribbon`], filled by a pure method, so what a pool
-/// actually looks like can be asserted without a camera, a mesh or a frame.
-#[derive(Default)]
-pub struct Wash {
-    positions: Vec<[f32; 3]>,
-    uvs: Vec<[f32; 2]>,
-    colours: Vec<[f32; 4]>,
-    indices: Vec<u32>,
-}
-
-impl Wash {
-    /// Adds one pool: a square of the glow's own picture, lying flat on the
-    /// ground at `lying` and turned to face along `normal`.
-    ///
-    /// Square rather than a fan of triangles because the picture is round
-    /// already -- the falloff reaches nothing well before the corners, so what
-    /// is drawn is a circle and the corners cost four vertices rather than
-    /// twenty-four. The same reason the glow itself is a card.
-    pub fn pour(&mut self, lying: Vec3, normal: Vec3, radius: f32, tint: [f32; 3], strength: f32) {
-        if radius <= 0.0 || strength <= 0.0 {
-            return;
-        }
-        // Any two directions across the ground will do: the picture is
-        // radially symmetric, so which way round the square is laid cannot be
-        // seen.
-        let across = normal.any_orthonormal_vector();
-        let along = normal.cross(across);
-        let base = self.positions.len() as u32;
-        for (side, up) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-            let at = lying + across * (radius * side) + along * (radius * up);
-            self.positions.push([at.x, at.y, at.z]);
-            self.uvs.push([side * 0.5 + 0.5, up * 0.5 + 0.5]);
-            let [red, green, blue] = tint;
-            self.colours.push([red, green, blue, strength]);
-        }
-        self.indices
-            .extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 1, base + 3]);
-    }
-
-    /// How many pools are in it. For the tests.
-    #[cfg(test)]
-    pub fn pools(&self) -> usize {
-        self.indices.len() / 6
-    }
-
-    /// The brightness each pool was poured at, in the order they were poured.
-    /// For the tests.
-    #[cfg(test)]
-    pub fn strengths(&self) -> Vec<f32> {
-        self.colours
-            .chunks_exact(4)
-            .map(|quad| quad[0][3])
-            .collect()
-    }
-
-    /// Writes what has been poured over the shared mesh. [`Ribbon::lay`]'s
-    /// twin, and whole-attribute for its reason.
-    pub fn lay(self, mesh: &mut Mesh) {
-        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, self.positions);
-        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, self.uvs);
-        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, self.colours);
-        mesh.insert_indices(Indices::U32(self.indices));
-    }
-}
-
-/// Lays down the light every ball throws on the ground beneath it.
-///
-/// Render rate, beside [`trail`] and for the same reason: it is a picture of
-/// where everything is right now, and a picture is owed one per frame.
-///
-/// The nearest [`SPILLS`] balls to the camera and no others -- see there. The
-/// pick is a partial sort rather than a full one: nothing here cares what order
-/// the sixteen come in, only which sixteen they are, so the list is split about
-/// the sixteenth in linear time and the rest is left as it lies.
-pub fn spill(
-    level: Res<LevelData>,
-    gravity: Res<crate::gravity::Gravity>,
-    art: Res<Art>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    camera: Query<&GlobalTransform, (With<Camera3d>, Without<Orb>)>,
-    balls: Query<(&Orb, &GlobalTransform)>,
-) {
-    let Ok(view) = camera.single() else {
-        return;
-    };
-    let eye = view.translation();
-    let mut lit: Vec<(f32, Vec3, f32, Kind)> = balls
-        .iter()
-        .map(|(orb, global)| {
-            let here = global.translation();
-            let scale = global.compute_transform().scale.y;
-            (here.distance(eye), here, scale, orb.kind)
-        })
-        .filter(|(apart, _, scale, _)| *apart < SPILL_RANGE && *scale > 0.0)
-        .collect();
-    if lit.len() > SPILLS {
-        lit.select_nth_unstable_by(SPILLS, |a, b| a.0.total_cmp(&b.0));
-        lit.truncate(SPILLS);
-    }
-    let mut wash = Wash::default();
-    for (apart, here, scale, kind) in lit {
-        let up = gravity.up(here);
-        // The same question the shadow asks, asked the same way: where is the
-        // floor under this, and which way does it lean.
-        let Some((floor, slope)) = crate::shadow::place(&level, here, up) else {
-            continue;
-        };
-        let drop = (here - floor).dot(up).max(0.0);
-        let radius = GLOW_RADIUS * scale * SPILL_SPREAD;
-        let lying = floor + slope * crate::shadow::LIFT;
-        wash.pour(
-            lying,
-            slope,
-            radius,
-            kind.tint(),
-            SPILL_STRENGTH * pooled(drop) * far_off(apart),
-        );
-    }
-    if let Some(mut mesh) = meshes.get_mut(&art.washes) {
-        wash.lay(&mut mesh);
     }
 }
 
@@ -2410,7 +2319,152 @@ pub fn command(
 mod tests {
     use super::*;
     use bevy::ecs::system::RunSystemOnce;
-    use std::f32::consts::SQRT_2;
+
+    /// The custom particle shader is exercised by a real render pipeline.
+    ///
+    /// Rust can type-check a material while its WGSL still contains an import,
+    /// binding or vertex-layout error. This offscreen app forces Bevy to build
+    /// the exact pipeline used by the pooled mesh and then inspects its cache.
+    #[test]
+    fn the_glow_shader_compiles_on_a_real_renderer() {
+        use bevy::{
+            asset::RenderAssetUsages,
+            camera::{Hdr, RenderTarget},
+            core_pipeline::tonemapping::Tonemapping,
+            render::{
+                render_resource::{
+                    CachedPipelineState, Extent3d, PipelineCache, PipelineDescriptor,
+                    TextureDimension, TextureFormat, TextureUsages,
+                },
+                RenderApp,
+            },
+            window::ExitCondition,
+        };
+
+        let mut app = App::new();
+        app.add_plugins(
+            DefaultPlugins
+                .build()
+                .disable::<bevy::winit::WinitPlugin>()
+                .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>()
+                .set(WindowPlugin {
+                    primary_window: None,
+                    exit_condition: ExitCondition::DontExit,
+                    close_when_requested: false,
+                    ..default()
+                })
+                .set(bevy::render::RenderPlugin {
+                    synchronous_pipeline_compilation: true,
+                    ..default()
+                }),
+        )
+        .add_plugins(VfxPlugin);
+
+        let mut target = Image::new_fill(
+            Extent3d {
+                width: 64,
+                height: 64,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[0, 0, 0, 255],
+            TextureFormat::Bgra8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        target.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_DST
+            | TextureUsages::RENDER_ATTACHMENT;
+        let target = app.world_mut().resource_mut::<Assets<Image>>().add(target);
+
+        let mut mesh = Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, Vec::<[f32; 3]>::new())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, Vec::<[f32; 2]>::new())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, Vec::<[f32; 4]>::new())
+        .with_inserted_indices(Indices::U32(Vec::new()));
+        let mut particles = Glows::default();
+        particles.spark(Vec3::ZERO, Vec3::Z * 4.0, 1.0, Kind::Nuclonium.tint());
+        particles.lay(&mut mesh);
+        let mesh = app.world_mut().resource_mut::<Assets<Mesh>>().add(mesh);
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<GlowMaterial>>()
+            .add(GlowMaterial {
+                uniform: GlowUniform {
+                    shape: Vec4::new(HALO_EMISSION, HOT_EMISSION, 1.0 / HALO_SCALE, HALO_FALLOFF),
+                },
+            });
+        app.world_mut()
+            .spawn((Mesh3d(mesh), MeshMaterial3d(material), Transform::default()));
+        app.world_mut().spawn((
+            Camera3d::default(),
+            Hdr,
+            RenderTarget::Image(target.into()),
+            Tonemapping::None,
+            Transform::from_xyz(0.0, 0.0, 4.0).looking_at(Vec3::ZERO, Vec3::Y),
+        ));
+
+        app.finish();
+        app.cleanup();
+        for _ in 0..8 {
+            app.update();
+        }
+
+        let shader = app
+            .world()
+            .resource::<AssetServer>()
+            .load::<bevy::shader::Shader>(GLOW_SHADER)
+            .id();
+        let render = app.sub_app(RenderApp);
+        let cache = render.world().resource::<PipelineCache>();
+        let ours: Vec<_> = cache
+            .pipelines()
+            .filter(|pipeline| match &pipeline.descriptor {
+                PipelineDescriptor::RenderPipelineDescriptor(descriptor) => {
+                    descriptor.vertex.shader.id() == shader
+                }
+                PipelineDescriptor::ComputePipelineDescriptor(_) => false,
+            })
+            .collect();
+        assert!(!ours.is_empty(), "no glow pipeline was requested");
+        let broken: Vec<_> = ours
+            .iter()
+            .filter_map(|pipeline| match &pipeline.state {
+                CachedPipelineState::Err(error) => Some(format!("{error}")),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            broken.is_empty(),
+            "the glow shader did not compile:\n{broken:#?}"
+        );
+        assert!(
+            ours.iter()
+                .any(|pipeline| matches!(pipeline.state, CachedPipelineState::Ok(_))),
+            "the glow pipeline was requested but never built"
+        );
+    }
+
+    /// Particle count changes vertex count, not transparent draw count.
+    #[test]
+    fn ten_thousand_glows_fit_in_the_one_pooled_mesh() {
+        let mut glows = Glows::default();
+        for i in 0..10_000 {
+            glows.spark(
+                Vec3::new(i as f32 * 0.01, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 100.0),
+                GLOW_RADIUS,
+                Kind::Nuclonium.tint(),
+            );
+        }
+        assert_eq!(glows.positions.len(), 40_000);
+        assert_eq!(glows.uvs.len(), 40_000);
+        assert_eq!(glows.colours.len(), 40_000);
+        assert_eq!(glows.indices.len(), 60_000);
+        assert_eq!(glows.indices.last(), Some(&39_999));
+    }
 
     /// The far end of a trail recedes; it does not hop.
     ///
@@ -2944,105 +2998,34 @@ mod tests {
     /// that swells as the camera walks up to it. See [`HALO_FLOAT`].
     #[test]
     fn a_glow_is_drawn_in_front_of_its_ball_at_the_size_it_would_have_been() {
-        let mut world = World::new();
-        let mut clock: Time = Time::default();
-        clock.advance_by(std::time::Duration::from_millis(16));
-        world.insert_resource(clock);
         let apart = 10.0;
-        world.spawn((
-            Camera3d::default(),
-            GlobalTransform::from(Transform::from_xyz(0.0, 0.0, apart)),
-        ));
-        let ball = world
-            .spawn((Transform::default(), GlobalTransform::default()))
-            .id();
-        let halo = world
-            .spawn((
-                Halo { phase: 0.0 },
-                Transform::default(),
-                GlobalTransform::default(),
-                ChildOf(ball),
-            ))
-            .id();
-        world.run_system_once(shimmer).unwrap();
-        let card = *world.get::<Transform>(halo).unwrap();
+        let eye = Vec3::Z * apart;
         // However far through its breath the one advanced frame left it. See
         // [`HALO_SWELL`]: a glow that is a fraction bigger is brought a
         // fraction further forward, because what has to clear the ground is
         // the size it is actually drawn at.
         let swell = 1.0 + HALO_SWELL * (0.016 * std::f32::consts::TAU * BOB_HZ).sin();
+        let radius = GLOW_RADIUS * swell;
+        let mut glows = Glows::default();
+        glows.spark(Vec3::ZERO, eye, radius, Kind::Nuclonium.tint());
+        let corners: Vec<Vec3> = glows.positions.iter().copied().map(Vec3::from).collect();
+        assert_eq!(corners.len(), 4);
+        let centre = corners.iter().copied().sum::<Vec3>() / corners.len() as f32;
         // Straight at the camera, by its own radius times the float.
         assert!(
-            (card.translation - Vec3::Z * (GLOW_RADIUS * swell * HALO_FLOAT)).length() < 1e-3,
-            "the glow was not brought forward: {:?}",
-            card.translation
+            (centre - Vec3::Z * (radius * HALO_FLOAT)).length() < 1e-3,
+            "the glow was not brought forward: {centre:?}",
         );
         // And smaller in the same proportion, which is what leaves it the same
         // size on the screen: a card at `d - f` drawn at `scale` covers the same
         // pixels as one at `d` drawn at `scale * d / (d - f)`.
         let seen = |scale: f32, at: f32| scale / at;
+        let drawn_radius = (corners[0] - centre).length() / 2.0_f32.sqrt();
         assert!(
-            (seen(card.scale.x, apart - card.translation.z) - seen(swell, apart)).abs() < 1e-4,
-            "the glow changed size as it came forward: {} at {}",
-            card.scale.x,
-            apart - card.translation.z
+            (seen(drawn_radius, apart - centre.z) - seen(radius, apart)).abs() < 1e-4,
+            "the glow changed size as it came forward: {drawn_radius} at {}",
+            apart - centre.z,
         );
-    }
-
-    /// A ball lays light on the ground under it, and less of it the higher it
-    /// floats.
-    ///
-    /// The pool is what "emissive" means in a renderer with no lights in it at
-    /// all -- see [`SPILLS`] -- and the two things worth pinning about it are
-    /// that it is brightest with the ball on the deck and that it is gone by
-    /// the time the ball is well above the floor. The second is what stops a
-    /// ball carried over a Mario's head painting the grass it walks over.
-    #[test]
-    fn the_light_under_a_ball_fades_as_it_rises() {
-        assert!(
-            (pooled(0.0) - 1.0).abs() < 1e-6,
-            "a ball on the ground is dim"
-        );
-        assert_eq!(pooled(SPILL_REACH), 0.0, "the pool never quite goes out");
-        assert_eq!(pooled(SPILL_REACH * 4.0), 0.0, "it came back on");
-        let mut last = pooled(0.0);
-        for step in 1..=20 {
-            let now = pooled(SPILL_REACH * step as f32 / 20.0);
-            assert!(now <= last, "the pool brightened as the ball rose");
-            last = now;
-        }
-        // And the far end of the pool of *balls* is faded rather than switched:
-        // only the nearest [`SPILLS`] get one, so the ones that swap places at
-        // the edge have to be at nothing when they do it.
-        assert!((far_off(0.0) - 1.0).abs() < 1e-6);
-        assert_eq!(far_off(SPILL_RANGE), 0.0);
-    }
-
-    /// One pool is a flat square of light lying on the ground it was poured on.
-    #[test]
-    fn a_pool_of_light_lies_flat_on_the_ground_it_is_poured_on() {
-        let mut wash = Wash::default();
-        let lying = Vec3::new(3.0, 1.0, -2.0);
-        wash.pour(lying, Vec3::Y, 2.0, Kind::Nuclonium.tint(), 0.5);
-        assert_eq!(wash.pools(), 1, "a pool did not reach the mesh");
-        assert_eq!(
-            wash.strengths(),
-            vec![0.5],
-            "the brightness was not carried"
-        );
-        for corner in &wash.positions {
-            let at = Vec3::from(*corner);
-            assert!((at.y - lying.y).abs() < 1e-5, "a corner left the ground");
-            assert!(
-                (Vec3::new(at.x, lying.y, at.z).distance(lying) - 2.0 * SQRT_2).abs() < 1e-4,
-                "the pool was not two radii across: {at:?}"
-            );
-        }
-        // Nothing to see is nothing drawn, rather than a square of black.
-        let mut dark = Wash::default();
-        dark.pour(lying, Vec3::Y, 2.0, Kind::Nuclonium.tint(), 0.0);
-        dark.pour(lying, Vec3::Y, 0.0, Kind::Nuclonium.tint(), 1.0);
-        assert_eq!(dark.pools(), 0, "an invisible pool was drawn anyway");
     }
 
     /// The head of a trail closes over the ball rather than stopping at it.

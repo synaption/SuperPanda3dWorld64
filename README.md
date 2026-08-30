@@ -49,20 +49,25 @@ will turn in, drawing its own wake into the coils.
 
 A stellarator's field *is* its stock, so an empty reactor is dark, a full one
 is a solid green band, and you can read what you have banked from across the
-valley. Five hundred is as many as it will draw; past that it keeps counting.
-Nuclonium that is moving — carried over a Mario's head, flying home down a
-beam, turning in a machine — draws a trail along the path it actually took, as
-long as the ground it covered in the last half second and no longer, hanging
-in the air a moment after it stops. The far end of one slides back along the
-path rather than dropping a mark at a time, so a trail at a steady speed is
-the same length every frame; the near end closes over the ball in a dome and
-comes out from under its glow rather than starting on top of it, so there is
-no edge where the two meet. Each ball also **lights the ground** it is
-floating over — a green pool on the grass at night, gone in daylight — which
-is as close to emissive as a renderer with no lights in it gets, and it is the
-shadow's own trick with the sign flipped. A ball nobody comes for shrinks away
-after three minutes; any interest at all — a claim, a whistle, a magnet, a
-mast — puts that clock back to nothing.
+valley — in light as well as in motes, since the field lights its own coils
+and the ground it stands on as it fills. Five hundred is as many as it will
+draw; past that it keeps counting. Nuclonium that is moving — carried over a
+Mario's head, flying home down a beam, turning in a machine — draws a trail
+along the path it actually took, as long as the ground it covered in the last
+half second and no longer, hanging in the air a moment after it stops. The far
+end of one slides back along the path rather than dropping a mark at a time,
+so a trail at a steady speed is the same length every frame; the near end
+closes over the ball in a dome and comes out from under its glow rather than
+starting on top of it, so there is no edge where the two meet. Each ball is
+also a **light**, not just a bright picture of one: it puts its own green on
+the ground it floats over, on the wall beside it and on the Mario carrying it
+— plain at night, gone in daylight — alongside its HDR emissive core and bloom
+halo. All orb and reactor-mote halos are rebuilt into one transparent mesh and
+one draw call, so thousands do not become thousands of transparent entities,
+and the sixteen nearest the camera light the world out of one buffer every
+surface in the game already reads. A ball nobody comes for shrinks away after
+three minutes; any interest at all — a claim, a whistle, a magnet, a mast —
+puts that clock back to nothing.
 
 Whether a Mario goes for one is goal-oriented action planning — `src/goap.rs`
 scores fighting, obeying, fetching, delivering and ambling against each other
@@ -187,3 +192,4 @@ PBR materials
 ## Design
 
 energy is green, luna's hair is green
+nuclonium theme is like stranger things main theme mixed with all quiet on the western front.  

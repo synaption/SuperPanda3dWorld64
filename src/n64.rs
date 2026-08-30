@@ -15,18 +15,28 @@
 //! light is three numbers in a uniform, and a `DirectionalLight` would only be
 //! a second place for them to live. And there is no shadow map, because asking
 //! for one is asking for exactly the modern look this replaces.
+//!
+//! What *is* here beside the sun is [`Lamp`]: the small moving lights that
+//! things which glow give off. They cannot live in a material's uniform for
+//! the reason the sun can -- they move -- so they live in one shared storage
+//! buffer instead, and the shader adds them to the same `ambient + key * cos`
+//! at the same vertex. Still one equation and still no shadow map; just more
+//! than one light in it.
 
 use bevy::{
-    asset::embedded_asset,
+    asset::{embedded_asset, uuid_handle},
     ecs::{schedule::ScheduleConfigs, system::ScheduleSystem},
     mesh::MeshVertexBufferLayoutRef,
     pbr::{MaterialPipeline, MaterialPipelineKey, MaterialPlugin},
     prelude::*,
-    render::render_resource::{
-        AsBindGroup, Face, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
-        TextureFormat,
+    render::{
+        render_resource::{
+            AsBindGroup, Face, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
+            TextureFormat,
+        },
+        storage::ShaderBuffer,
     },
-    shader::ShaderRef,
+    shader::{ShaderDefVal, ShaderRef},
 };
 use std::collections::HashMap;
 
@@ -140,6 +150,215 @@ impl Default for N64Lighting {
             shading: Shading::Vertex,
         }
     }
+}
+
+/// How many small local lights the shader walks, and how far out from the
+/// camera one is still worth carrying.
+///
+/// **This is the second light in a renderer built around having one.** The key
+/// and the ambient above are the whole level's, they live in every material's
+/// own uniform, and moving them means rewriting every material -- which is
+/// exactly why a *moving* light cannot live there. A ball of nuclonium rolling
+/// across the lawn is a light that moves every frame, and there may be a
+/// hundred of them.
+///
+/// So the lamps live somewhere else: one storage buffer, shared by every
+/// material in the world, rewritten once a frame by [`lamplight`] and read by
+/// the shader through a binding the materials all point at. Nothing about a
+/// material changes when a ball moves, so no material is rewritten, no bind
+/// group is rebuilt and no pipeline is re-specialised -- the buffer's contents
+/// change underneath a binding that stays exactly where it was.
+///
+/// Sixteen is a bound on the *shader's* loop rather than on how many things in
+/// the level may glow: any number of them can carry a [`Lamp`], and the
+/// nearest sixteen to the camera are the ones written. [`far_off`] is what
+/// keeps the sixteenth and the seventeenth from blinking as they swap.
+pub const LAMPS: usize = 16;
+const LAMP_RANGE: f32 = 34.0;
+
+/// The shader def that carries [`LAMPS`] across into the shader, so the array
+/// the WGSL declares and the array Rust writes are one number.
+const LAMP_COUNT_DEF: &str = "N64_LAMPS";
+
+/// The one buffer every material's lamp binding points at.
+///
+/// A fixed id rather than a handle passed around, because there is exactly one
+/// of these for the lifetime of the process and every material in the game
+/// wants it. A `Handle::Uuid` is not reference counted: it names an asset that
+/// simply exists, which is what this is.
+///
+/// Its *size* never changes either, and that is load-bearing rather than
+/// tidiness. Bevy reuses the GPU buffer when a rewritten storage asset comes
+/// back the same size, so the bind groups pointing at it stay valid; a buffer
+/// that grew would be a new buffer, and every material in the world would have
+/// to be prepared again on the frame a seventeenth ball was dropped.
+pub const LAMPLIGHT: Handle<ShaderBuffer> = uuid_handle!("8b1f2a4e-3c67-4d95-9a02-6f5b7c8d1e30");
+
+/// A small light that moves: carried by the thing giving it off.
+///
+/// A component rather than a list somewhere, so that anything which glows
+/// lights the world by *being* the thing that glows -- a unit of nuclonium
+/// lying on the grass, riding over a Mario's head, flying home down a beam or
+/// turning inside a stellarator's coils is one bundle in one place, and the
+/// light comes along with it. Composition: nothing has to be told about the
+/// lamp list, and nothing has to be taken off it when it dies.
+///
+/// Both numbers are read at the entity's own scale, which is what makes a mote
+/// a fiftieth of a ball's size a fiftieth of a ball's lamp without a second
+/// constant anywhere.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Lamp {
+    /// What it adds to a surface at its own middle. The same units as
+    /// [`N64Lighting::key`]: a multiplier on the surface's own colour, so a
+    /// green lamp on green grass is bright green grass and a green lamp on a
+    /// grey wall barely moves it. That is the console's combiner and not a
+    /// mistake -- light in this renderer has only ever been able to multiply.
+    pub glow: Vec3,
+    /// How far its light carries, in metres, at scale one. Beyond this it is
+    /// exactly nothing rather than nearly nothing, so a lamp leaving the list
+    /// takes nothing with it.
+    pub reach: f32,
+}
+
+/// One lamp as the shader reads it.
+#[derive(Clone, Copy, ShaderType, Default, Debug, PartialEq)]
+pub struct LampTerm {
+    /// `xyz` where it is, in world space. `w` how far it reaches -- and zero
+    /// reach is how an unused slot says it is unused, which is why the shader
+    /// needs no count.
+    pub at: Vec4,
+    /// `rgb` what it adds at its middle, already faded by [`far_off`]. `a` is
+    /// unused and exists because a uniform's fields align to sixteen bytes
+    /// whatever their size, which is [`N64Uniform`]'s reasoning again.
+    pub glow: Vec4,
+}
+
+/// Every lamp the shader can see this frame.
+#[derive(Clone, ShaderType, Default, Debug)]
+pub struct Lamplight {
+    pub lamps: [LampTerm; LAMPS],
+}
+
+impl Lamplight {
+    /// Reads one back out of the bytes the GPU would have been handed.
+    ///
+    /// For the tests, and it is the whole chain rather than a shortcut through
+    /// it: what a test that stopped at [`nearest`] would not catch is the
+    /// buffer never being written, being written somewhere else, or being
+    /// written in a layout the shader does not read.
+    #[cfg(test)]
+    pub fn read(buffer: &ShaderBuffer) -> Self {
+        use bevy::render::render_resource::encase;
+        let bytes = buffer.data.clone().unwrap_or_default();
+        encase::StorageBuffer::new(bytes)
+            .create()
+            .expect("the lamp buffer was not a field of lamps")
+    }
+
+    /// The lamps in it that are actually on, in the order they were written.
+    #[cfg(test)]
+    pub fn lit(&self) -> Vec<LampTerm> {
+        self.lamps
+            .iter()
+            .copied()
+            .filter(|lamp| lamp.at.w > 0.0)
+            .collect()
+    }
+}
+
+/// How much of its light a lamp `apart` metres from the camera still lays
+/// down.
+///
+/// Only the [`LAMPS`] nearest the camera are written at all, so without this
+/// the sixteenth and the seventeenth swap places as the camera turns and a
+/// patch of ground blinks in the distance. Fading the last quarter of the
+/// range to nothing means the two that swap are both at nothing when they do
+/// it.
+pub fn far_off(apart: f32) -> f32 {
+    let start = LAMP_RANGE * 0.75;
+    (1.0 - (apart - start) / (LAMP_RANGE - start)).clamp(0.0, 1.0)
+}
+
+/// Picks the [`LAMPS`] lamps nearest `eye` and writes them as the shader reads
+/// them.
+///
+/// Pure, and separate from the system below, because what is worth asserting
+/// is the pick and the fade rather than the buffer: which lamps survive a
+/// crowd, that one out of range is dropped entirely, and that one on its way
+/// out of range is on its way to nothing rather than at full strength.
+///
+/// The pick is a partial sort rather than a full one: nothing downstream cares
+/// what order the sixteen come in, only which sixteen they are, so the list is
+/// split about the sixteenth in linear time and the rest is left as it lies.
+pub fn nearest(eye: Vec3, mut lit: Vec<(Vec3, f32, Lamp)>) -> Lamplight {
+    // A lamp with no reach or no light in it is not a lamp. Dropped before the
+    // pick rather than written as an empty slot, because the shader walks a
+    // fixed sixteen and a dark one must not hold one of them -- an empty
+    // stellarator standing beside you would otherwise put out a ball.
+    lit.retain(|(at, scale, lamp)| {
+        *scale > 0.0
+            && lamp.reach > 0.0
+            && lamp.glow.max_element() > 0.0
+            && at.distance(eye) < LAMP_RANGE
+    });
+    if lit.len() > LAMPS {
+        lit.select_nth_unstable_by(LAMPS, |a, b| {
+            a.0.distance_squared(eye)
+                .total_cmp(&b.0.distance_squared(eye))
+        });
+        lit.truncate(LAMPS);
+    }
+    // Filled from the front, and the shader depends on it: it stops at the
+    // first empty slot rather than walking all sixteen, so a gap in the middle
+    // of this would be every lamp past the gap going dark.
+    let mut field = Lamplight::default();
+    for (slot, (at, scale, lamp)) in lit.into_iter().enumerate() {
+        field.lamps[slot] = LampTerm {
+            at: at.extend(lamp.reach * scale),
+            glow: (lamp.glow * scale * far_off(at.distance(eye))).extend(0.0),
+        };
+    }
+    field
+}
+
+/// Rewrites the one buffer every material's lamp binding points at.
+///
+/// Render rate, beside the rest of [`drawing`](crate::drawing), because it is
+/// a picture of where the lights are right now. It reads `GlobalTransform`, so
+/// a mote inside a machine and a ball on the lawn are the same case; the value
+/// is one frame old, which is what every other thing drawn out of a
+/// `GlobalTransform` in this game already accepts and is invisible on a soft
+/// additive light.
+///
+/// The buffer is written even with nothing lit and even with no camera, and
+/// that is deliberate: a material whose binding points at an asset that does
+/// not exist yet cannot have its bind group built at all, and would be a
+/// surface that does not draw rather than a surface that is not lamplit.
+pub fn lamplight(
+    mut buffers: ResMut<Assets<ShaderBuffer>>,
+    camera: Query<&GlobalTransform, With<Camera3d>>,
+    lit: Query<(&Lamp, &GlobalTransform, Option<&InheritedVisibility>)>,
+) {
+    let field = match camera.iter().next() {
+        Some(view) => {
+            let eye = view.translation();
+            nearest(
+                eye,
+                lit.iter()
+                    .filter(|(_, _, visible)| visible.is_none_or(|seen| seen.get()))
+                    .map(|(lamp, world, _)| {
+                        let posed = world.compute_transform();
+                        (posed.translation, posed.scale.max_element().max(0.0), *lamp)
+                    })
+                    .collect(),
+            )
+        }
+        None => Lamplight::default(),
+    };
+    // Replaced rather than edited in place: the asset is one fixed-size block
+    // of plain data, so a whole new one is the same write and says what is
+    // meant. The size is what keeps the GPU buffer -- see [`LAMPLIGHT`].
+    let _ = buffers.insert(&LAMPLIGHT, ShaderBuffer::from(field));
 }
 
 /// What the shader reads. Laid out as `vec4`s because a uniform's fields align
@@ -258,6 +477,11 @@ pub struct N64Material {
     #[sampler(2)]
     #[dependency]
     pub base_color_texture: Option<Handle<Image>>,
+    /// The lamps, shared by every material in the world. See [`LAMPLIGHT`]:
+    /// this is a pointer at one buffer rather than a copy of anything, which
+    /// is what lets a hundred moving lights cost no material writes at all.
+    #[storage(3, read_only)]
+    pub lamps: Handle<ShaderBuffer>,
     pub alpha_mode: AlphaMode,
     /// Drawn from both sides. True for every billboarded quad, because which of
     /// its faces was authored towards the viewer is not something this port can
@@ -341,6 +565,15 @@ impl Material for N64Material {
             if let Some(fragment) = descriptor.fragment.as_mut() {
                 fragment.shader_defs.push(PER_PIXEL_DEF.into());
             }
+        }
+        // Unconditional, and on both stages, because the lamp array is
+        // declared at module scope in the shader: every pipeline built from
+        // this file has to agree on how long it is. One number, in Rust, read
+        // by the WGSL -- see [`LAMPS`].
+        let count = ShaderDefVal::UInt(LAMP_COUNT_DEF.into(), LAMPS as u32);
+        descriptor.vertex.shader_defs.push(count.clone());
+        if let Some(fragment) = descriptor.fragment.as_mut() {
+            fragment.shader_defs.push(count);
         }
         Ok(())
     }
@@ -630,6 +863,7 @@ pub fn translate(
             fogged: 1.0,
         },
         base_color_texture: source.base_color_texture.clone(),
+        lamps: LAMPLIGHT,
         alpha_mode,
         double_sided: source.cull_mode.is_none(),
         shading: lighting.shading,
@@ -638,10 +872,15 @@ pub fn translate(
 
 /// Pushes a changed [`N64Lighting`] into every material already made.
 ///
-/// The light lives in each material's own uniform rather than in a bind group
-/// of its own, which is what keeps the shader down to one buffer and no light
-/// list to walk. The cost is this: moving the sun means rewriting every
-/// material, so it is only done on the frames the resource actually changes.
+/// The sun lives in each material's own uniform rather than in a bind group of
+/// its own, which is what keeps a surface's own lighting down to one buffer
+/// read. The cost is this: moving the sun means rewriting every material, so
+/// it is only done on the frames the resource actually changes -- dusk, dawn,
+/// and the display option.
+///
+/// A [`Lamp`] is the case that cost rules out. It moves every frame, so it is
+/// not written here at all: see [`lamplight`], which rewrites one shared
+/// buffer instead and leaves every material alone.
 pub fn relight(lighting: Res<N64Lighting>, mut materials: ResMut<Assets<N64Material>>) {
     if !lighting.is_changed() || lighting.is_added() {
         return;
@@ -682,8 +921,21 @@ impl Plugin for N64Plugin {
         embedded_asset!(app, "n64.wgsl");
         app.init_resource::<N64Lighting>()
             .init_resource::<Converted>()
+            // Before anything is drawn, and that is not tidiness. Every
+            // material in the world binds the lamp buffer, and a material
+            // whose binding names an asset that does not exist yet has no bind
+            // group at all -- so a level whose first materials arrived before
+            // the first `lamplight` ran would be a level that draws nothing
+            // for a frame. See [`LAMPLIGHT`].
+            .add_systems(Startup, kindle)
             .add_plugins(MaterialPlugin::<N64Material>::default());
     }
+}
+
+/// Puts an empty lamp buffer in the world before the first material asks for
+/// one. See the `Startup` registration above.
+pub fn kindle(mut buffers: ResMut<Assets<ShaderBuffer>>) {
+    let _ = buffers.insert(&LAMPLIGHT, ShaderBuffer::from(Lamplight::default()));
 }
 
 /// The swap runs where [`crate::billboard::two_sided`] leaves off, and that
@@ -693,7 +945,7 @@ impl Plugin for N64Plugin {
 /// and every scuttlebug's eyes would be culled from half the angles they are looked
 /// at from.
 pub fn systems() -> ScheduleConfigs<ScheduleSystem> {
-    (soften, convert, relight).chain()
+    (soften, convert, relight, lamplight).chain()
 }
 
 #[cfg(test)]
@@ -706,6 +958,170 @@ mod tests {
             unlit,
             ..default()
         }
+    }
+
+    /// What the lamps cost the CPU each frame, at a field size nothing in the
+    /// game can exceed.
+    ///
+    /// The whole of the per-frame CPU work is here: walk every `Lamp` in the
+    /// world, split the list about the sixteenth, and encode 512 bytes. The
+    /// GPU half cannot be measured on this machine -- WSL has no GPU, and a
+    /// software rasteriser's fragment timings say nothing about a real one.
+    ///
+    /// `cargo test bench_lamplight -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_lamplight() {
+        let eye = Vec3::ZERO;
+        // Five hundred is a full stellarator's field, and the field is the
+        // largest crowd of glowing things this game can produce.
+        let crowd: Vec<_> = (0..500)
+            .map(|step| {
+                let along = step as f32 * 0.137;
+                glowing(Vec3::new(along.sin() * 20.0, 0.0, along.cos() * 20.0), 1.0)
+            })
+            .collect();
+        let rounds = 1000;
+        let start = std::time::Instant::now();
+        let mut sink = 0.0f32;
+        for _ in 0..rounds {
+            sink += nearest(eye, crowd.clone()).lamps[0].glow.y;
+        }
+        println!(
+            "picking the nearest sixteen of {}: {:?} a frame ({sink})",
+            crowd.len(),
+            start.elapsed() / rounds,
+        );
+
+        // What the system does before it can call the above: decompose each
+        // lamp's `GlobalTransform`, which is where its place and its size come
+        // from. Timed separately because it is the part that grows with the
+        // crowd rather than with the shader's sixteen.
+        let posed: Vec<(GlobalTransform, Lamp)> = crowd
+            .iter()
+            .map(|(at, _, lamp)| (GlobalTransform::from_translation(*at), *lamp))
+            .collect();
+        let start = std::time::Instant::now();
+        let mut gathered = 0usize;
+        for _ in 0..rounds {
+            let list: Vec<_> = posed
+                .iter()
+                .map(|(world, lamp)| {
+                    let there = world.compute_transform();
+                    (there.translation, there.scale.max_element().max(0.0), *lamp)
+                })
+                .collect();
+            gathered += list.len();
+        }
+        println!(
+            "reading {} lamps off their transforms: {:?} a frame ({gathered})",
+            posed.len(),
+            start.elapsed() / rounds,
+        );
+        // And the encode, which is the other half and does not depend on how
+        // many lamps there were.
+        let field = nearest(eye, crowd);
+        let rounds = 1000;
+        let start = std::time::Instant::now();
+        for _ in 0..rounds {
+            std::hint::black_box(ShaderBuffer::from(field.clone()));
+        }
+        println!(
+            "encoding {} bytes: {:?} a frame",
+            Lamplight::min_size().get(),
+            start.elapsed() / rounds,
+        );
+    }
+
+    /// One lamp, as a thing standing in the world at some size.
+    fn glowing(at: Vec3, scale: f32) -> (Vec3, f32, Lamp) {
+        (
+            at,
+            scale,
+            Lamp {
+                glow: Vec3::new(0.2, 1.0, 0.4),
+                reach: 2.0,
+            },
+        )
+    }
+
+    /// The shader walks a fixed sixteen slots, so a field with more lamps than
+    /// that in it has to choose -- and what it must choose is the ones the
+    /// player is standing among.
+    #[test]
+    fn a_crowd_of_lamps_comes_down_to_the_ones_nearest_the_camera() {
+        let eye = Vec3::ZERO;
+        // Forty in a line, a metre apart, the nearest one metre out. Every one
+        // of them is inside the range, so the only thing that can cut them
+        // down to sixteen is the pick.
+        let field = nearest(
+            eye,
+            (1..=40)
+                .map(|step| glowing(Vec3::X * step as f32, 1.0))
+                .collect(),
+        );
+        let lit = field.lit();
+        assert_eq!(lit.len(), LAMPS, "the shader's slots were not filled");
+        let furthest = lit.iter().map(|lamp| lamp.at.x).fold(0.0_f32, f32::max);
+        assert_eq!(
+            furthest, LAMPS as f32,
+            "a lamp further off than the sixteenth was written"
+        );
+    }
+
+    /// A lamp out of range is not written at all, and one on its way out is on
+    /// its way to nothing.
+    ///
+    /// The second half is what keeps the sixteenth and the seventeenth from
+    /// blinking as the camera turns and they swap places: both are at nothing
+    /// by the time either can be dropped. See [`far_off`].
+    #[test]
+    fn a_lamp_leaves_by_fading_rather_than_by_going_out() {
+        let eye = Vec3::ZERO;
+        let far = nearest(eye, vec![glowing(Vec3::X * (LAMP_RANGE + 1.0), 1.0)]);
+        assert!(far.lit().is_empty(), "a lamp out of range was written");
+
+        let near = nearest(eye, vec![glowing(Vec3::X, 1.0)]);
+        let leaving = nearest(eye, vec![glowing(Vec3::X * (LAMP_RANGE * 0.95), 1.0)]);
+        let (near, leaving) = (near.lit()[0], leaving.lit()[0]);
+        assert!(
+            leaving.glow.y > 0.0 && leaving.glow.y < near.glow.y * 0.5,
+            "the far lamp was not most of the way out: {} against {}",
+            leaving.glow.y,
+            near.glow.y,
+        );
+        // And the fade is on the light rather than on the reach: a lamp that
+        // got *smaller* as it went would light a smaller patch of ground the
+        // further away it was, which is not what distance does.
+        assert_eq!(leaving.at.w, near.at.w, "the reach faded with the light");
+    }
+
+    /// Both of a lamp's numbers ride on the scale of the thing carrying it.
+    ///
+    /// This is what lets five hundred motes turning inside a stellarator share
+    /// one constant with a ball lying on the lawn: a mote is a fiftieth the
+    /// size and is therefore a fiftieth the lamp, with no second number
+    /// anywhere and nothing to keep in step.
+    #[test]
+    fn a_small_thing_is_a_small_lamp() {
+        let eye = Vec3::ZERO;
+        let whole = nearest(eye, vec![glowing(Vec3::X, 1.0)]).lit()[0];
+        let mote = nearest(eye, vec![glowing(Vec3::X, 0.02)]).lit()[0];
+        assert!(
+            (mote.at.w - whole.at.w * 0.02).abs() < 1e-5,
+            "a mote reached as far as a ball"
+        );
+        assert!(
+            (mote.glow.y - whole.glow.y * 0.02).abs() < 1e-5,
+            "a mote was as bright as a ball"
+        );
+        // And a thing that has shrunk to nothing -- a ball at the end of its
+        // three minutes -- is not a lamp at all rather than a lamp of zero
+        // reach dividing by itself in the shader.
+        assert!(
+            nearest(eye, vec![glowing(Vec3::X, 0.0)]).lit().is_empty(),
+            "something with no size left was still lighting the world"
+        );
     }
 
     /// The castle's baked vertex colours must not be lit a second time, and the

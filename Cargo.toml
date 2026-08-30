@@ -18,6 +18,10 @@ bevy = { version = "0.19", default-features = false, features = [
     "std", "async_executor",
     "multi_threaded", "bevy_asset", "bevy_scene", "bevy_winit",
     "bevy_core_pipeline", "bevy_pbr", "bevy_gltf", "bevy_render",
+    # The nuclonium field is rendered as HDR emissive particles. Bloom is the
+    # camera pass that turns values above one into a visible halo rather than
+    # clipping them to the eight-bit presentation target.
+    "bevy_post_process",
     "bevy_text", "bevy_ui", "png", "x11",
     # `bevy_ui` is layout only: it measures and positions nodes and draws none
     # of them. The pass that puts a UI node on the screen lives in

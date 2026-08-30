@@ -833,37 +833,103 @@ from this frame — a quantity feeding back into its own input, oscillating. The
 history is taken from the ball now, whose transform is written by the game
 rather than by the thing measuring it.
 
-**A ball lights the ground it is lying on**, and that is what "emissive" has to
-mean here. There is no light entity in this game and no shader that would read
-one: every surface in the world is on `n64::N64Material`, whose whole lighting
-model is one key direction and an ambient floor shared by the entire level, so a
-`PointLight` beside a ball would be a component nothing looks at — and the two
-ways a `StandardMaterial` can put `emissive` on the screen are missing as well,
-which is why the glow is a textured card in the first place.
+**A ball is visibly emissive without becoming a light.** Its opaque core carries
+HDR emissive energy and its soft radial body comes from a custom additive HDR
+material; the camera's bloom pass scatters values above one into a halo. Every
+ball and stellarator mote contributes four vertices to one shared world-space
+mesh, so thousands of particles remain one transparent render entity and one
+draw call. The vectors behind that mesh are swapped and reused each frame, so
+the CPU stops allocating once the field reaches its high-water mark.
 
-The console had the same problem with shadows and answered it with geometry: a
-soft disc laid on the floor under the thing, faded by how high up it was. That
-is `src/shadow.rs`, and the light pools are that idea with the sign flipped — a
-bright disc **added** to the ground rather than multiplied into it, laid under
-something that gives off light instead of under something that blocks it. Both
-ask `shadow::place` where the floor is and which way it leans, because that is
-one question with one right answer. The pool dims as the square of how far the
-ball has floated above its floor, so it breathes with the bob and a ball carried
-over a Mario's head paints nothing. Being added rather than blended is what
-makes it light rather than paint: it can only ever brighten what is under it, so
-it disappears in daylight and pools green on the grass at night.
+That screen-space emission still does not illuminate nearby surfaces, and a
+`PointLight` beside a ball cannot make it do so: every surface in the world is
+on `n64::N64Material`, and `bevy_pbr`'s light list belongs to
+`StandardMaterial`. So the second half of being emissive is a second light in
+this game's own shader — `n64::Lamp`.
 
-The nearest sixteen balls to the camera get one, and that number bounds the
-*ground queries* rather than the drawing: every pool in the level is one mesh and
-one draw call, the trails' own trick, but each one has to ask the collision
-where the floor beneath it is, and five hundred motes turning inside a machine
-would be five hundred of those a frame for a picture the size of a coin. The
-last quarter of the range fades to nothing so that the sixteenth and seventeenth
-swapping places as the camera turns is not a pool blinking on and off. The disc
-carries a large `depth_bias` instead of being floated toward the eye: it is six
-metres across on ground that is never flat, so without one its uphill half is
-inside the hill and what the player sees is a straight line where the two
-surfaces cross.
+**One light lives in a uniform; sixteen moving ones cannot.** The key, the
+ambient and the sun's direction live in every material's own uniform, which is
+why moving the sun means rewriting every material and `n64::relight` only does
+it on the frames the resource changes. A ball rolling across the lawn moves
+every frame and there may be a hundred of them, so the lamps live somewhere
+else: one `ShaderBuffer` at a fixed asset id (`n64::LAMPLIGHT`) that every
+material in the world binds at binding 3, rewritten once a frame by
+`n64::lamplight`. Its *size* never changes, which is the load-bearing part —
+Bevy reuses the GPU buffer when a rewritten storage asset comes back the same
+size, so the bind groups pointing at it stay valid and nothing is
+re-specialised. A material that pointed at a missing buffer would have no bind
+group at all and draw nothing, which is why `n64::kindle` puts an empty one in
+the world at startup.
+
+The lamp is a **component**, so a thing lights the world by carrying one: a
+ball on the lawn, a ball over a Mario's head and a ball flying home down a beam
+each have their own, and both its numbers are read at the entity's own scale,
+so a ball fading out over its last two seconds fades its light out with it.
+Only the nearest sixteen to the camera are written, and the last quarter of the
+range fades to nothing so that the sixteenth and seventeenth swapping places as
+the camera turns is not a patch of ground blinking. A lamp with no light left
+in it is dropped before the pick rather than written as an empty slot, because
+a dark one must not hold one of the sixteen.
+
+**Five hundred motes turning inside a stellarator are one light, not five
+hundred.** That is why the lamp is not in `nuclonium::core` with the rest of
+what a unit of nuclonium looks like: a field of motes a metre apart would take
+every slot the shader has the moment you walked past a reactor, and put out
+every ball on the lawn behind it, for a picture no different from the one light
+the band actually is. So the machine owns it — `stellarator::Hearth`, a child
+entity sitting at the middle of the plasma ring, which turns and scales with
+the machine because it is parented to it. `stellarator::hearth` does nothing
+but set how bright it is, from the stock: an empty machine is not a lamp at
+all, a machine at a tenth is a dim green wash on its own coils, and a full one
+lights the lawn it stands on. Square-rooted rather than linear because it is a
+brightness rather than a count — fifty motes already read as a lit band, and a
+machine that stayed dark until it was half full would spend most of its life
+looking broken.
+
+**The lamps are resolved per fragment, and that is not a compromise on the
+look.** A lamp reaches two and a half metres. The castle grounds are one mesh
+whose triangles are tens of metres across, so a lamp evaluated at their corners
+is a lamp evaluated nowhere near itself — the ball lies in the middle of a
+triangle and lights none of it. Vertex lighting works for the sun because the
+sun is the same everywhere on that triangle, and fails for a lamp for exactly
+that reason. So the key light is still Gouraud and still breaks along the
+facets, and the lamps — which the console had no equivalent of at all — are
+worked out where they can be seen. The vertex stage hands the fragment stage
+the surface's *unlit* colour alongside the shaded one, so a surface ends up at
+`base * (shade + lamps) * texture`: with no lamp in reach that is the same
+arithmetic and the same picture the shader always drew.
+
+**What it costs.** The CPU side is the whole of `n64::lamplight`: reading five
+hundred lamps off their `GlobalTransform`s is 1.4 µs, splitting that list about
+the sixteenth is 1.4 µs, and encoding the 512-byte buffer is 29 ns — about
+2.8 µs a frame at a crowd size nothing in the game can exceed, which is two
+hundredths of one percent of a 60 Hz frame. `n64::tests::bench_lamplight` is
+where those numbers come from; run it with `--ignored --nocapture`.
+
+The GPU side is a per-fragment loop, and its shape matters more than any single
+number. `nearest` fills the buffer's slots from the front, so the loop **breaks**
+at the first empty one rather than skipping it: with nothing glowing on screen
+— most frames of most sessions — every fragment in the world pays one 16-byte
+read and one compare, and that is all. Each live lamp past that costs about a
+dozen scalar operations to reject on distance, and about forty to accept; only
+fragments within two and a half metres of a lamp ever run the second path. The
+vertex side is two more interpolators on every pipeline in the game (the world
+normal, which the vertex-lit path already computed and threw away, and the
+surface's unlit colour), and the binding itself costs nothing per frame: the
+buffer is reused, so no bind group is ever rebuilt.
+
+These are counts and CPU measurements rather than frame times. The development
+machine is WSL with no GPU, where a fragment shader runs on a software
+rasteriser — a number from there would say nothing about the Windows build the
+game is actually played on.
+
+Being **added** to the shade rather than blended over the surface is what makes
+it light rather than paint. A lamp can only ever brighten, and it brightens by
+multiplying the surface's own colour — the console's combiner and not a
+shortcut — so a green lamp on green grass is bright green grass, it fades out
+in daylight, and it pools green on the lawn at night. Unlike the ground discs
+this replaced, it reaches walls, warp pipes and the Marios standing beside a
+ball, because it is lighting rather than a decal laid on the floor.
 
 A stellarator is **16 m** across, and that number lives in
 `tools/generate_stellarator.py` rather than in the game: the model is written by
@@ -936,12 +1002,14 @@ its depth swims — the same depth threshold, float height and clip the player
 uses, so a Mario in the squad and the Mario you are driving cross the moat
 together.
 
-The glow on a ball is a camera-facing quad with an alpha falloff painted into
-it, not an `emissive` on its material. Nothing in this build can show an
-emissive: an `unlit` material never reaches the code that applies one, and a
-value over 1.0 only reads as light once a bloom pass smears it, which wants an
-HDR camera this game does not have. The texture comes out of the same
-`sky::texture` helper that draws the sun.
+The glow on a ball is a camera-facing card inside the shared nuclonium mesh.
+Its shader computes the radial falloff directly, writes HDR colour above one,
+and lets bloom provide the soft screen-space spread. It is intentionally not a
+`PointLight`: scene geometry uses the custom N64 material and does not evaluate
+Bevy lights, while making each of thousands of motes a real light would defeat
+the pooled rendering path. What the ball throws on the world around it is an
+`n64::Lamp` instead — a light the game's own shader does read, and one that
+costs no render entity at all.
 
 **And a mast can be lost.** A pylon stands as a `structure::Structure` on the
 friendly side, and a warp pipe stands as one on the side of whatever comes out

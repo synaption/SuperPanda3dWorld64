@@ -82,9 +82,26 @@ struct N64Material {
     fogged: f32,
 }
 
+// One small moving light. See `n64.rs`'s `Lamp` for what fills these in and
+// why they cannot live in the uniform above with the sun.
+struct N64Lamp {
+    // xyz: where it is, in world space. w: how far it reaches, in metres. A
+    // reach of zero is an empty slot, which is why there is no count to carry.
+    at: vec4<f32>,
+    // rgb: what it adds to a surface at its middle.
+    glow: vec4<f32>,
+}
+
+struct N64Lamplight {
+    lamps: array<N64Lamp, #{N64_LAMPS}>,
+}
+
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> material: N64Material;
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var base_color_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var base_color_sampler: sampler;
+// Every material in the world binds the *same* buffer here. It is rewritten
+// once a frame; no material is touched when a light moves.
+@group(#{MATERIAL_BIND_GROUP}) @binding(3) var<storage, read> lamplight: N64Lamplight;
 
 // What the vertex stage hands the fragment stage.
 //
@@ -93,17 +110,31 @@ struct N64Material {
 // the lighting is already done. The world position is still carried because the
 // fog needs the distance from the camera.
 //
-// The per-pixel pipeline is the case that does need the normal, and it is the
-// only one that carries it -- an interpolator the console's path would spend on
-// a value it never reads.
+// The normal and the surface's own unlit colour cross as well, and both are
+// there for the lamps rather than for the key light.
+//
+// **The lamps are resolved per fragment even in the console's own pipeline,
+// and that is not a compromise on the look.** A lamp reaches a couple of
+// metres. The castle grounds are one mesh whose triangles are tens of metres
+// across, so a lamp evaluated at their corners is a lamp evaluated nowhere
+// near itself: the ball lies in the middle of a triangle and lights none of
+// it. Vertex lighting works for the sun because the sun is the same everywhere
+// on that triangle, and fails for a lamp for exactly the reason the sun works.
+//
+// So the key light is still Gouraud and still breaks along the facets, and the
+// lamps -- which the console had no equivalent of at all -- are worked out
+// where they can be seen. The unlit colour is what makes that addition exact:
+// a surface ends up at `base * (shade + lamps) * texture`, and `color` already
+// carries `base * shade` with the shade interpolated per vertex, so the second
+// term needs `base` on its own. With no lamp in reach this is the same
+// arithmetic and the same picture it always was.
 struct N64VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) world_position: vec4<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
-#ifdef N64_PER_PIXEL_LIGHT
     @location(3) world_normal: vec3<f32>,
-#endif
+    @location(4) unlit: vec3<f32>,
 }
 
 // `ambient + key * cos`, the one lighting equation this game has, wherever it
@@ -115,6 +146,59 @@ fn n64_shade(normal: vec3<f32>) -> vec3<f32> {
     // the light.
     let lambert = max(dot(normal, material.to_light.xyz), 0.0);
     return material.ambient.rgb + material.light.rgb * lambert;
+}
+
+// What the small moving lights add at `world_position`.
+//
+// The same equation as the sun, once per lamp, with two differences: the
+// direction is towards a point rather than fixed, and it falls off. Summed and
+// *added* to whatever the surface was already shaded by, so a lamp can only
+// ever make a surface brighter -- which is what light does and what the
+// combiner could express.
+//
+// `normal` may be the zero vector, which is a mesh with no normals on it. Such
+// a surface takes the lamp's light without a direction rather than none of it:
+// the alternative is a wall that is lit and a floor beside it that is not, for
+// a reason nothing in the picture explains.
+fn n64_lamplight(world_position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    var sum = vec3<f32>(0.0, 0.0, 0.0);
+    let oriented = dot(normal, normal) > 0.0;
+    for (var slot = 0u; slot < #{N64_LAMPS}u; slot += 1u) {
+        let lamp = lamplight.lamps[slot];
+        let reach = lamp.at.w;
+        // `break`, not `continue`, and that is load-bearing: `n64::nearest`
+        // fills the slots from the front and leaves the rest at zero, so the
+        // first empty one means there are no more. It is what makes this loop
+        // cost one compare on a screen with nothing glowing on it, rather than
+        // sixteen -- which is most frames of most sessions.
+        if reach <= 0.0 {
+            break;
+        }
+        let toward = lamp.at.xyz - world_position;
+        let apart = length(toward);
+        if apart >= reach {
+            continue;
+        }
+        // Squared rather than linear, because that is the shape light falling
+        // away from a point has -- but bounded, reaching exactly nothing at
+        // `reach` rather than merely nearly nothing. A lamp dropped from the
+        // list has to be dropped from a surface that was already unlit by it,
+        // or leaving the list is a visible step.
+        let left = 1.0 - apart / reach;
+        var facing = 1.0;
+        if oriented {
+            let lambert = max(dot(normalize(normal), toward / max(apart, 1e-4)), 0.0);
+            // Not all of it is direct. A quarter is kept whichever way the
+            // surface faces, standing in for the light that would have come
+            // back off everything else in the room -- without it the side of a
+            // wall away from a ball goes to nothing while the ground under the
+            // ball is bright, which reads as a spotlight rather than a glow.
+            let bounce = 0.25;
+            facing = bounce + (1.0 - bounce) * lambert;
+        }
+        sum += lamp.glow.rgb * (left * left * facing);
+    }
+    return sum;
 }
 
 @vertex
@@ -171,10 +255,13 @@ fn vertex(vertex: Vertex) -> N64VertexOutput {
     let world_normal = vec3<f32>(0.0, 0.0, 0.0);
 #endif
 
+    // Wanted by the fragment stage whichever pipeline this is: see the struct.
+    out.world_normal = world_normal;
+    out.unlit = tint.rgb;
+
 #ifdef N64_PER_PIXEL_LIGHT
     // Nothing is resolved here: the colour handed across is the surface's own,
     // and the light is taken against the interpolated normal per fragment.
-    out.world_normal = world_normal;
     out.color = tint;
 #else
     // One diffuse light and one ambient, summed at the vertex, and the last
@@ -219,6 +306,20 @@ fn fragment(in: N64VertexOutput) -> @location(0) vec4<f32> {
         tint = vec4<f32>(tint.rgb * n64_shade(normalize(in.world_normal)), tint.a);
     }
 #endif
+
+    // And the lamps, on top of whatever the surface was already shaded by --
+    // including the baked surfaces, which is the case that matters most: the
+    // castle and its grounds are what a ball of nuclonium is lying *on*. Their
+    // vertex colours were baked under a sun that knew nothing about it, and a
+    // light added afterwards is exactly what the combiner could still do to
+    // them.
+    //
+    // Not the luminous case, which is the sky. The sky is where light comes
+    // from rather than something light falls on.
+    if material.light.a >= 0.0 {
+        let lamps = n64_lamplight(in.world_position.xyz, in.world_normal);
+        tint = vec4<f32>(tint.rgb + in.unlit * lamps, tint.a);
+    }
 
     // The interpolated vertex colour modulated by the texture: the combiner
     // step, and the last thing the console did before the blender.

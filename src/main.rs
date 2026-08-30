@@ -51,6 +51,7 @@ use bevy::{
     diagnostic::{DiagnosticsStore, EntityCountDiagnosticsPlugin, FrameTimeDiagnosticsPlugin},
     ecs::{schedule::ScheduleConfigs, system::ScheduleSystem},
     input::InputSystems,
+    post_process::bloom::{Bloom, BloomPrefilter},
     prelude::*,
     render::view::Msaa,
     window::{
@@ -375,7 +376,7 @@ pub fn add_game(app: &mut App) {
     game_resources(app);
     // The whole world is drawn by this one material, so it goes on directly
     // after the plugins it is built out of.
-    app.add_plugins(n64::N64Plugin)
+    app.add_plugins((n64::N64Plugin, nuclonium::VfxPlugin))
         // Enough raw history for the chart's four-second window at 240 Hz.
         .add_plugins(FrameTimeDiagnosticsPlugin::new(960))
         // The other half of the benchmark readout: an enemy is a whole scene of
@@ -714,12 +715,8 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
             nuclonium::call,
             nuclonium::swim,
             nuclonium::shimmer,
+            nuclonium::glow,
             nuclonium::trail,
-            // And last, the light all of that throws on the ground it is
-            // moving over -- after `shimmer`, because a ball's pool of light is
-            // measured from where the bob left it this frame. See
-            // [`nuclonium::SPILLS`].
-            nuclonium::spill,
         )
             .chain(),
         water::drift,
@@ -832,6 +829,7 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut sprites: ResMut<Assets<n64::N64Material>>,
+    mut glows: ResMut<Assets<nuclonium::GlowMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut console: ResMut<console::ConsoleState>,
     mut load: ResMut<world::LevelLoad>,
@@ -868,9 +866,15 @@ fn setup(
     // The pylon's own preview ring and the beams' shared art, put up once for
     // the same reason: what you build with outlives the level you build it on.
     pylon::prepare(&mut commands, &mut meshes, &mut materials);
-    // And the one mesh every resource ball is drawn with, for the same reason
-    // again: a kill should cost an entity and no allocation.
-    nuclonium::prepare(&mut commands, &mut meshes, &mut materials, &mut images);
+    // And the shared core, glow, trail and wash art, for the same reason again:
+    // a kill should cost one gameplay entity and no render-side allocation.
+    nuclonium::prepare(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        &mut glows,
+        &mut images,
+    );
     commands.insert_resource(animation::CharacterAnimations::load(&assets));
     audio::preload(&mut commands, &assets);
     // The level itself -- its collision, its gravity, its scenery and its
@@ -960,6 +964,16 @@ fn setup(
             ..default()
         }),
         FollowCamera::default(),
+        // Only values above the display range contribute: the world keeps its
+        // authored N64 colours, while the HDR nuclonium material supplies the
+        // energy this old-school bloom scatters around each orb and mote.
+        Bloom {
+            prefilter: BloomPrefilter {
+                threshold: 1.1,
+                threshold_softness: 0.2,
+            },
+            ..Bloom::OLD_SCHOOL
+        },
         // N64 colours are already display-referred bytes. Filmic HDR grading
         // would alter their contrast, saturation, and hue a second time.
         Tonemapping::None,
@@ -1263,6 +1277,11 @@ mod tests {
             // which `MaterialPlugin` would bring along with a render world
             // this app does not have.
             .init_asset::<n64::N64Material>()
+            .init_asset::<nuclonium::GlowMaterial>()
+            // The one buffer the lamps live in. Its store is part of the
+            // renderer in a real build, and `n64::lamplight` writes it every
+            // frame here as it does there.
+            .init_asset::<bevy::render::storage::ShaderBuffer>()
             .init_resource::<n64::N64Lighting>()
             .init_resource::<n64::Converted>()
             .init_asset::<WorldAsset>()
@@ -1692,6 +1711,83 @@ mod tests {
             app.world().resource::<nuclonium::Bank>().stored,
             1,
             "a ball lying under a live mast was never taken up"
+        );
+    }
+
+    /// A ball lying in a field lights the field.
+    ///
+    /// **The illumination half of "the orbs need to be emissive".** The HDR
+    /// glow card and the bloom pass are the half that makes an orb *look* like
+    /// a light; this is the half that puts its colour on the grass. It ends up
+    /// in one storage buffer that every material in the world binds, and the
+    /// vertex stage adds it to `ambient + key * cos` -- see [`n64::LAMPS`].
+    ///
+    /// So what is asserted is the whole chain rather than any link of it: a
+    /// ball spawned by the game's own spawn, through the bundle it shares with
+    /// the motes and the shipments, through the pick, into the exact bytes the
+    /// shader is handed. A test that stopped at `n64::nearest` would still
+    /// pass with the buffer never written, written somewhere else, or written
+    /// in a layout the shader does not read.
+    ///
+    /// Two things are said out loud here that the renderer would otherwise
+    /// say: where the ball is in the world, and that it can be seen. Both are
+    /// worked out in `PostUpdate` by systems this app has no renderer to
+    /// bring, so without them everything in it stands at the origin and reads
+    /// as hidden. Written into the test rather than taken out of
+    /// [`n64::lamplight`], which is where they belong.
+    #[test]
+    fn a_ball_lying_in_a_field_lights_the_field() {
+        use bevy::render::storage::ShaderBuffer;
+
+        let mut app = headless();
+        app.update();
+        let lamps = |app: &App| {
+            n64::Lamplight::read(
+                app.world()
+                    .resource::<Assets<ShaderBuffer>>()
+                    .get(&n64::LAMPLIGHT)
+                    .expect("nothing ever put a lamp buffer in the world"),
+            )
+        };
+        // It is written even with nothing glowing, because a material whose
+        // binding names a missing asset has no bind group and draws nothing at
+        // all.
+        assert!(
+            lamps(&app).lit().is_empty(),
+            "an empty world was already lamplit"
+        );
+
+        // A couple of paces from the camera, which is at the origin here for
+        // the reason above.
+        let spot = Vec3::new(1.5, 0.0, 0.0);
+        app.world_mut()
+            .run_system_once(move |mut commands: Commands, art: Res<nuclonium::Art>| {
+                let ball =
+                    nuclonium::spawn(&mut commands, &art, nuclonium::Kind::Nuclonium, spot, 0.0);
+                commands.entity(ball).insert((
+                    GlobalTransform::from_translation(spot),
+                    InheritedVisibility::VISIBLE,
+                ));
+            })
+            .unwrap();
+        app.update();
+
+        let lit = lamps(&app).lit();
+        assert_eq!(lit.len(), 1, "the ball did not reach the shader's buffer");
+        let lamp = lit[0];
+        assert!(
+            lamp.at.truncate().distance(spot) < 1e-3,
+            "the lamp was not where the ball is: {} against {spot}",
+            lamp.at.truncate(),
+        );
+        assert!(lamp.at.w > 0.0, "the lamp reached nowhere");
+        // Green, because that is what nuclonium is. The colour is what makes
+        // the grass under a ball green rather than merely brighter: the
+        // console's combiner could only ever multiply a surface's own colour.
+        assert!(
+            lamp.glow.y > lamp.glow.x && lamp.glow.y > lamp.glow.z,
+            "the lamp was not the ball's own colour: {}",
+            lamp.glow,
         );
     }
 

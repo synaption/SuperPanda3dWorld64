@@ -492,10 +492,10 @@ impl Build {
 /// Deliberately **not** under a [`bevy::world_serialization::WorldAssetRoot`].
 /// `n64::convert` restyles what it finds inside a loaded scene, and a mote of
 /// nuclonium is not level geometry that was lit offline -- it is drawn with the
-/// same unlit core and camera-facing glow a ball on the lawn wears, so it keeps
-/// its standard material and is left alone. This is why the machine's own model
-/// hangs off a *child* of the machine: the walk up to a scene root has to miss
-/// the motes and find the .glb.
+/// same emissive core and pooled camera-facing glow a ball on the lawn wears,
+/// so it keeps its runtime material and is left alone. This is why the
+/// machine's own model hangs off a *child* of the machine: the walk up to a
+/// scene root has to miss the motes and find the .glb.
 ///
 /// There are no mote handles in here. They live in [`crate::nuclonium::Art`],
 /// which is the whole point -- what turns in the coils has to be visibly the
@@ -514,7 +514,8 @@ pub struct FieldArt {
 /// about forty metres of ring and a mote is a few centimetres across, so at
 /// this count they are shoulder to shoulder and the machine is a solid turning
 /// band of green. Adding a five hundred and first changes nothing anybody could
-/// see and costs two entities, every frame, for the rest of the session.
+/// see and still adds simulation, core geometry and four rebuilt glow vertices
+/// every frame for the rest of the session.
 ///
 /// The count itself is not capped -- see [`Store`] -- so a player who banks ten
 /// thousand has banked ten thousand and the HUD says so. This is a drawing
@@ -688,6 +689,7 @@ fn mote(art: &crate::nuclonium::Art, index: u32) -> impl Bundle + use<> {
             // [`Orbit::settling`].
             settling: 1.0,
         },
+        crate::nuclonium::Glow::new(crate::nuclonium::Kind::Nuclonium, phase),
         crate::nuclonium::core(art, crate::nuclonium::Kind::Nuclonium),
         // Placed by `orbit` on the first frame it runs; this is what it wears
         // for the one frame before that.
@@ -727,6 +729,26 @@ pub fn spawn(
             Visibility::default(),
         ))
         .id();
+    // The light the field throws, as one thing rather than as five hundred.
+    //
+    // A child rather than a component on the machine because a lamp lights the
+    // world from where it *is*, and where this one is is the middle of the
+    // plasma ring rather than the patch of lawn the coils are standing on.
+    // Everything else about it follows for free: it turns and scales with the
+    // machine because it is parented to it, and [`hearth`] does nothing but
+    // set how bright it is.
+    commands.entity(built).with_child((
+        Hearth,
+        crate::n64::Lamp {
+            // Dark until something arrives. A machine that has just gone up is
+            // a machine with an empty field, and this is that same truth said
+            // to the renderer.
+            glow: Vec3::ZERO,
+            reach: HEARTH_REACH,
+        },
+        Transform::from_translation(Vec3::Y * machine().lift),
+        Visibility::default(),
+    ));
     commands.entity(built).with_child((
         bevy::world_serialization::WorldAssetRoot(assets.load(MODEL)),
         // Nothing. The model is upright in the file and stands on its own
@@ -945,16 +967,7 @@ pub fn stock(
         let wanted = Store::drawn(store.held);
         while store.shown < wanted {
             let index = store.shown;
-            let born = commands.spawn((mote(&art, index), ChildOf(machine))).id();
-            // The same glow a ball on the lawn wears, aimed at the camera every
-            // frame by `nuclonium::shimmer` along with all the others -- there
-            // is nothing stellarator-shaped about a mote's appearance, and that
-            // is the point of it looking like what the Marios carried in.
-            commands.entity(born).with_child(crate::nuclonium::halo(
-                &art,
-                crate::nuclonium::Kind::Nuclonium,
-                index as f32 * GOLDEN_ANGLE,
-            ));
+            commands.spawn((mote(&art, index), ChildOf(machine)));
             store.shown += 1;
         }
         if store.shown > wanted {
@@ -970,6 +983,54 @@ pub fn stock(
             }
             store.shown = wanted;
         }
+    }
+}
+
+/// How far a full machine's light carries, and how bright it is at the middle
+/// of the ring.
+///
+/// The reach is a little wider than the machine, so what a working reactor
+/// lights is its own coils, the ground it stands on and whoever is walking
+/// past it -- and nothing across the valley. The strength is well under the
+/// ambient it is added to: this is a big soft green glow on the things around
+/// it rather than a floodlight, and the band itself is already the brightest
+/// thing on the screen.
+const HEARTH_REACH: f32 = 11.0;
+const HEARTH_GLOW: f32 = 0.85;
+
+/// The one light a machine's whole field gives off. See [`hearth`].
+#[derive(Component)]
+pub struct Hearth;
+
+/// Sets how brightly each machine's field lights what is around it.
+///
+/// **A stellarator's field is its stock, and so is the light off it.** An empty
+/// machine is dark, a machine at a tenth is a dim green wash on its own coils,
+/// and a full one lights the lawn it stands on -- which is the same sentence
+/// as "you can read what you have banked from across the valley", said in
+/// light instead of in motes.
+///
+/// Square-rooted rather than linear because it is a brightness rather than a
+/// count: fifty motes already read as a lit band, and a machine that stayed
+/// dark until it was half full would spend most of its life looking broken.
+///
+/// The reach goes to nothing with the light, so an empty machine is not a lamp
+/// at all -- the shader walks sixteen slots, and a dark one must not hold one.
+pub fn hearth(
+    machines: Query<&Store>,
+    mut hearths: Query<(&ChildOf, &mut crate::n64::Lamp), With<Hearth>>,
+) {
+    for (parent, mut lamp) in &mut hearths {
+        let Ok(store) = machines.get(parent.parent()) else {
+            continue;
+        };
+        let full = Store::drawn(store.held) as f32 / ORBIT_CAP as f32;
+        lamp.glow = Vec3::from_array(crate::nuclonium::Kind::Nuclonium.tint())
+            * (HEARTH_GLOW * full.sqrt());
+        lamp.reach = match full > 0.0 {
+            true => HEARTH_REACH,
+            false => 0.0,
+        };
     }
 }
 
@@ -1037,12 +1098,122 @@ pub fn command(mut console: ResMut<crate::console::ConsoleState>, mut machines: 
 
 /// Aiming and drawing, in the order one frame does them.
 pub fn systems() -> bevy::ecs::schedule::ScheduleConfigs<bevy::ecs::system::ScheduleSystem> {
-    (place, stock, orbit, float_coils).chain()
+    (place, stock, hearth, orbit, float_coils).chain()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty machine is dark and a full one lights the lawn it stands on.
+    ///
+    /// The same sentence as "a stellarator's field *is* its stock", said in
+    /// light instead of in motes: what a machine is holding is readable off
+    /// the ground around it before you are close enough to count anything.
+    #[test]
+    fn a_machines_light_is_what_it_is_holding() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        let lit = |world: &mut World, held: u32| {
+            let machine = world.spawn(Store { held, shown: 0 }).id();
+            let light = world
+                .spawn((
+                    Hearth,
+                    crate::n64::Lamp {
+                        glow: Vec3::ZERO,
+                        reach: HEARTH_REACH,
+                    },
+                    ChildOf(machine),
+                ))
+                .id();
+            world.run_system_once(hearth).expect("that should run");
+            *world.get::<crate::n64::Lamp>(light).unwrap()
+        };
+        let dark = lit(&mut world, 0);
+        assert_eq!(dark.glow, Vec3::ZERO, "an empty machine was glowing");
+        assert_eq!(
+            dark.reach, 0.0,
+            "a dark machine was still holding one of the shader's sixteen slots"
+        );
+
+        let full = lit(&mut world, ORBIT_CAP);
+        assert!(full.glow.y > 0.0, "a full machine was dark");
+        assert!(
+            full.glow.y > full.glow.x && full.glow.y > full.glow.z,
+            "the light was not nuclonium green: {}",
+            full.glow,
+        );
+        assert_eq!(full.reach, HEARTH_REACH);
+
+        // It grows with the stock, and faster at the start than at the end: a
+        // tenth of a field is fifty motes and already reads as lit.
+        let tenth = lit(&mut world, ORBIT_CAP / 10);
+        assert!(tenth.glow.y > 0.0 && tenth.glow.y < full.glow.y);
+        assert!(
+            tenth.glow.y > full.glow.y * 0.1,
+            "the light came on linearly rather than as a brightness"
+        );
+        // And past the cap it stops, because past the cap the field stops.
+        let overfull = lit(&mut world, ORBIT_CAP * 4);
+        assert_eq!(
+            overfull.glow, full.glow,
+            "an over-full machine got brighter"
+        );
+    }
+
+    /// A mote is not a lamp of its own. The machine holding it is.
+    ///
+    /// Five hundred lights a metre apart inside one machine would take every
+    /// one of the shader's sixteen slots the moment the player walked past a
+    /// reactor, and put out every ball on the lawn behind it -- for a picture
+    /// no different from the one light the field actually is. See [`Hearth`].
+    #[test]
+    fn the_motes_in_a_field_are_one_light_between_them() {
+        use bevy::ecs::system::RunSystemOnce;
+
+        let mut app = crate::tests::headless();
+        app.update();
+        app.world_mut()
+            .run_system_once(|mut commands: Commands, assets: Res<AssetServer>| {
+                spawn(&mut commands, &assets, Vec3::new(0.0, 0.0, 8.0), 0.0, 1.0);
+            })
+            .expect("that should run");
+        app.update();
+        // Enough frames for `stock` to grow a field one tick at a time.
+        app.world_mut()
+            .run_system_once(|mut machines: Query<&mut Store>| {
+                for mut store in &mut machines {
+                    store.held = ORBIT_CAP;
+                }
+            })
+            .expect("that should run");
+        for _ in 0..ORBIT_CAP + 4 {
+            app.update();
+        }
+
+        let world = app.world_mut();
+        let mut motes = world.query_filtered::<Option<&crate::n64::Lamp>, With<Orbit>>();
+        let found: Vec<_> = motes.iter(world).collect();
+        assert!(!found.is_empty(), "the machine grew no field at all");
+        assert!(
+            found.iter().all(Option::is_none),
+            "{} of {} motes were lighting the world on their own account",
+            found.iter().filter(|lamp| lamp.is_some()).count(),
+            found.len(),
+        );
+
+        // And the one light the whole field does give off is the machine's.
+        let mut hearths = world.query_filtered::<&crate::n64::Lamp, With<Hearth>>();
+        let lights: Vec<_> = hearths.iter(world).collect();
+        assert_eq!(
+            lights.len(),
+            1,
+            "a machine is one lamp, not {}",
+            lights.len()
+        );
+        assert!(lights[0].glow.y > 0.0, "a full machine was dark");
+    }
 
     /// Holding the button aims the machine. It does not size it.
     #[test]
@@ -1176,7 +1347,8 @@ mod tests {
     /// The arithmetic on its own, because the two halves fail in ways that look
     /// nothing alike: a cap applied to `held` is a player whose bank quietly
     /// stops going up at five hundred, and a cap not applied to the field is a
-    /// machine that spawns two entities a ball for the rest of the session.
+    /// machine that keeps spawning and updating motes for the rest of the
+    /// session.
     #[test]
     fn the_field_stops_growing_long_before_the_count_does() {
         assert_eq!(Store::drawn(0), 0, "an empty machine draws an empty field");
@@ -1210,6 +1382,7 @@ mod tests {
         let mut world = World::new();
         world.insert_resource(Assets::<Mesh>::default());
         world.insert_resource(Assets::<StandardMaterial>::default());
+        world.insert_resource(Assets::<crate::nuclonium::GlowMaterial>::default());
         world.insert_resource(Assets::<Image>::default());
         // The motes are drawn out of `nuclonium`'s own art, which is the point
         // of them: what turns in the coils is the substance the Marios carried
@@ -1219,11 +1392,13 @@ mod tests {
                 |mut commands: Commands,
                  mut meshes: ResMut<Assets<Mesh>>,
                  mut materials: ResMut<Assets<StandardMaterial>>,
+                 mut glows: ResMut<Assets<crate::nuclonium::GlowMaterial>>,
                  mut images: ResMut<Assets<Image>>| {
                     crate::nuclonium::prepare(
                         &mut commands,
                         &mut meshes,
                         &mut materials,
+                        &mut glows,
                         &mut images,
                     );
                 },

@@ -542,6 +542,11 @@ fn shell(texture: Option<Handle<Image>>, alpha_mode: AlphaMode) -> N64Material {
     N64Material {
         uniform: N64Uniform::luminous(0.0).beyond_the_fog(),
         base_color_texture: texture,
+        // Never read either: the shader adds a lamp's light to everything but
+        // a luminous surface, and this is the one luminous surface there is.
+        // The binding still has to be filled -- a material pointing at nothing
+        // has no bind group and draws no pixels at all.
+        lamps: crate::n64::LAMPLIGHT,
         alpha_mode,
         double_sided: true,
         // Never read: an unlit surface is drawn by the same pipeline whichever

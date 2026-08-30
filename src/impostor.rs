@@ -484,6 +484,12 @@ pub fn prepare(
             // the body, at `opacity` -- well clear of `ALPHA_CUTOFF`.
             uniform: N64Uniform::unlit(ALPHA_CUTOFF).faded(opacity),
             base_color_texture: Some(atlas),
+            // The same lamps everything else in the world reads. A sheet is a
+            // baked picture, so it takes no key light -- but a lamp is added
+            // rather than resolved into a bake, and an enemy standing beside a
+            // ball of nuclonium at the swap distance ought to catch its glow
+            // the same way the model just behind it does.
+            lamps: crate::n64::LAMPLIGHT,
             alpha_mode: match opacity < 1.0 {
                 true => AlphaMode::Blend,
                 false => AlphaMode::Mask(ALPHA_CUTOFF),
