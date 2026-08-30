@@ -38,7 +38,7 @@ use bevy::prelude::*;
 /// width -- fine enough that a crowd streams round a wall rather than through
 /// its corner, and coarse enough that a whole sweep is nine thousand cells and
 /// costs well under a millisecond.
-const WIDTH: usize = 96;
+pub const WIDTH: usize = 96;
 
 /// How far a step may climb or drop before it stops being a step.
 ///
@@ -95,6 +95,33 @@ pub struct FlowField {
     /// Ground height per cell, and whether there is any.
     ground: Vec<f32>,
     walkable: Vec<bool>,
+    /// Whether a body standing on this cell's ground would be out of its depth.
+    ///
+    /// Surveyed once beside the ground, from the same query [`crate::squad`]
+    /// asks per step, and it exists for [`FlowField::route`]: a route that
+    /// prices the moat goes round it, and a route that cannot see the moat at
+    /// all is a route that sends the squad swimming across the middle of the
+    /// map because that happened to be the straight line. The crowd tier does
+    /// not read it -- a slime is welcome in the water -- so it costs one query
+    /// per cell at load and nothing afterwards.
+    wet: Vec<bool>,
+    /// How many cells of daylight there are between this one and the nearest
+    /// thing a body could scrape against, capped at [`ROOM_CAP`].
+    ///
+    /// **This is what stops a route running with its shoulder along a fence.**
+    /// A* over cells with no idea of room takes the cheapest chain there is,
+    /// and the cheapest chain round a corner clips it as tightly as the grid
+    /// allows -- so a squad routed past the moat railings walks *touching* the
+    /// railings, in single file, because there is exactly one cheapest line and
+    /// they all have it. Priced by [`Tolls::hug`], the same route bends a cell
+    /// or two out into the open, which costs a stride and leaves room for
+    /// twelve bodies to walk abreast.
+    ///
+    /// Surveyed once, by the same breadth-first walk [`crate::route::flood`]
+    /// sweeps everything else in this game with -- sourced at every cell that
+    /// touches something impassable, spreading outward over the ones that do
+    /// not.
+    clearance: Vec<u8>,
     /// Which of a cell's eight neighbours have something solid in the way, one
     /// bit each in [`STEPS`] order.
     ///
@@ -152,6 +179,77 @@ pub struct Guidance {
     pub walkable: bool,
 }
 
+/// What the survey knows about one cell, for anything drawing the grid.
+#[derive(Clone, Copy, Debug)]
+pub struct Survey {
+    pub walkable: bool,
+    pub wet: bool,
+    /// Cells of daylight to the nearest thing a body could scrape, capped at
+    /// [`ROOM_CAP`]. Nought means this cell touches something.
+    pub room: u8,
+    /// Which of the eight neighbours have something solid in the way, one bit
+    /// each in the order [`FlowField::step_offset`] counts in.
+    pub blocked: u8,
+    /// Cells of walking from the player, or `None` where the sweep never got.
+    pub steps: Option<u32>,
+}
+
+/// What a route is willing to pay to keep away from things, in metres of
+/// detour.
+///
+/// Both are *prices* rather than rules, which is the same shape every other
+/// preference in this game takes: a Mario given nowhere dry still swims, and a
+/// Mario given nowhere roomy still squeezes through the gate. What the numbers
+/// buy is which way it goes when it has a choice.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Tolls {
+    /// What a cell of deep water is worth going round. Scaled per body by
+    /// [`crate::goap::Goal::caution`], so an order wades where an errand walks
+    /// to the bridge.
+    pub wet: f32,
+    /// What a cell pressed up against a wall is worth going round.
+    ///
+    /// Small on purpose. This is not "avoid walls" -- a route that would not go
+    /// near one could not go through a gate -- it is "do not walk along one
+    /// when there is open ground a stride to the left". At the castle's cell
+    /// size, stepping out one cell and back in costs about a metre and a half
+    /// of extra diagonal, so a toll of a metre pays for itself after two cells
+    /// of wall and never buys a detour worth noticing.
+    pub hug: f32,
+}
+
+/// How much room a cell can be counted as having, in cells.
+///
+/// Two is the whole of what a route needs to tell apart: touching something,
+/// one clear of it, or out in the open. Beyond that the price is zero and
+/// counting further would only make [`Tolls::hug`] harder to reason about.
+const ROOM_CAP: u8 = 2;
+
+/// A route, and what finding it cost.
+#[derive(Clone, Debug)]
+pub struct Routed {
+    /// Points to walk at in turn, the destination last. Never empty.
+    pub legs: Vec<Vec3>,
+    /// How many cells the search settled to find it.
+    pub settled: usize,
+    /// Whether it stops short of where it was asked to go. See
+    /// [`crate::route::Found::partial`].
+    pub partial: bool,
+    /// Whether it stops short because there is no way there at all rather than
+    /// because the search ran out of budget. See
+    /// [`crate::route::Found::exhausted`].
+    pub exhausted: bool,
+}
+
+/// How far out [`FlowField::nearest_walkable`] looks for standable ground
+/// before it gives up, in cells.
+///
+/// Seven is about twelve metres on the castle's grid: enough to find the bank
+/// from the middle of the moat, or the lawn from inside the castle's own
+/// footprint, and short enough that asking for a route to the far side of the
+/// sea is refused rather than answered with somewhere else entirely.
+const SNAP_RINGS: usize = 7;
+
 impl FlowField {
     /// Surveys the level once. Every floor query the crowd will ever need is
     /// asked here, and none of them again.
@@ -161,6 +259,7 @@ impl FlowField {
         let cell = (span.x.max(span.y) / WIDTH as f32).max(0.001);
         let mut ground = vec![0.0; WIDTH * WIDTH];
         let mut walkable = vec![false; WIDTH * WIDTH];
+        let mut wet = vec![false; WIDTH * WIDTH];
         for z in 0..WIDTH {
             for x in 0..WIDTH {
                 let at = low + Vec2::new(x as f32 + 0.5, z as f32 + 0.5) * cell;
@@ -170,6 +269,12 @@ impl FlowField {
                 if let Some((height, _)) = level.ground_at(Vec3::new(at.x, SKY, at.y)) {
                     ground[z * WIDTH + x] = height;
                     walkable[z * WIDTH + x] = true;
+                    // Measured at the ground rather than at the sky the query
+                    // was asked from, which is the whole of the difference
+                    // between the bed of the moat and the air above it.
+                    wet[z * WIDTH + x] = level
+                        .water_depth(Vec3::new(at.x, height, at.y))
+                        .is_some_and(|depth| depth > crate::squad::SWIMMING_DEPTH);
                 }
             }
         }
@@ -178,6 +283,8 @@ impl FlowField {
             cell,
             ground,
             walkable,
+            wet,
+            clearance: vec![0; WIDTH * WIDTH],
             blocked: vec![0; WIDTH * WIDTH],
             steps: vec![FAR; WIDTH * WIDTH],
             flow: vec![Vec2::ZERO; WIDTH * WIDTH],
@@ -186,7 +293,52 @@ impl FlowField {
             swept_from: None,
         };
         field.survey_walls(level);
+        // After the walls, and not before: what counts as being up against
+        // something is partly which edges have a fence across them, and that is
+        // what the pass above has just worked out.
+        field.survey_room();
         field
+    }
+
+    /// Works out how much room each cell has, once the walls are known.
+    ///
+    /// A cell is up against something if any of the eight directions out of it
+    /// is a step it could not take -- off the grid, onto ground nothing can
+    /// stand on, or through a fence. Those are the sources, at nought; the
+    /// sweep spreads out from them over everything else, so a cell's number is
+    /// how many cells of walking it is from the nearest edge of the walkable
+    /// world.
+    ///
+    /// Capped at [`ROOM_CAP`] because the middle of a lawn is the middle of a
+    /// lawn: what a route needs to know is "up against it", "one clear" or
+    /// "plenty", and counting to fifty across an open field would only make the
+    /// number harder to price.
+    fn survey_room(&mut self) {
+        let against: Vec<usize> = (0..WIDTH * WIDTH)
+            .filter(|&here| {
+                self.walkable[here]
+                    && (0..STEPS.len()).any(|step| match neighbour(here, step) {
+                        None => true,
+                        Some(there) => !self.passable(here, step, there),
+                    })
+            })
+            .collect();
+        let swept = {
+            let grid = &*self;
+            crate::route::flood(WIDTH * WIDTH, against, |here| {
+                neighbours(here)
+                    .filter(move |&(step, there)| grid.passable(here, step, there))
+                    .map(|(_, there)| there)
+            })
+        };
+        for here in 0..WIDTH * WIDTH {
+            self.clearance[here] = match swept.steps(here) {
+                Some(steps) => steps.min(ROOM_CAP as u32) as u8,
+                // Never reached, which for a walkable cell means an island with
+                // no edge at all -- there is nothing to scrape against on it.
+                None => ROOM_CAP,
+            };
+        }
     }
 
     /// Records what has something solid standing across it, once the ground is
@@ -231,9 +383,54 @@ impl FlowField {
             let flat = self.origin + Vec2::new(x + 0.5, z + 0.5) * self.cell;
             Vec3::new(flat.x, self.ground[index] + KNEE, flat.y)
         };
-        level
-            .surface_hit(at(here), at(there))
-            .is_some_and(|(_, normal)| normal.y.abs() <= crate::level::GROUND_NORMAL_Y)
+        let (ground_here, ground_there) = (at(here), at(there));
+        // **The ground between them, before anything is cast at all.** A cell
+        // boundary can hold a knee-high lip -- the bottom of a bank, the edge of
+        // a path -- that is too steep to *be* ground and too tall to step over,
+        // and neither end of the edge knows anything about it: both cells are
+        // good lawn, the rise between their middles is well inside [`CLIMB`],
+        // and a ray at knee height following the ground sails over the top of
+        // it. A body meets it head on, `resolve_walls` refuses, and it slides
+        // along the lip for the rest of the session with a perfectly good route
+        // in hand. Uphill only, because falling off one is not climbing it.
+        //
+        // Ties broken on the cell number rather than left to the argument
+        // order, so that asking about an edge from one end and from the other
+        // gives one answer. Two cells at exactly the same height are common --
+        // any two on a flat lawn -- and a march that started from a different
+        // end of the same pair would sample different points along it and could
+        // disagree about a lip in the middle.
+        let uphill = (ground_here.y, here) <= (ground_there.y, there);
+        let (low, high) = match uphill {
+            true => (ground_here, ground_there),
+            false => (ground_there, ground_here),
+        };
+        if !level.climbable(low - Vec3::Y * KNEE, high - Vec3::Y * KNEE) {
+            return true;
+        }
+        let (from, to) = (ground_here, ground_there);
+        // **A body's width, not a line.** One ray down the middle of a step
+        // answers whether a *point* could take it, and nothing in this game is
+        // a point: a Mario is held a radius clear of every wall by
+        // `LevelData::resolve_walls`, so a gap the centre line slips through
+        // between two fence posts is a gap it cannot walk. On this castle 325
+        // of the 23,223 walkable edges are like that -- seventy per cent again
+        // on top of the 468 a single ray finds -- and every one of them is a
+        // place the search will happily route somebody straight into a fence
+        // and leave them pressed against it.
+        //
+        // Three rays a radius apart rather than a swept capsule, because the
+        // thing being caught is a post or a jamb standing *in* the gap, and
+        // something a body's width across cannot hide between three lines that
+        // span a body's width. Paid once, at load, on an edge that also gets a
+        // floor query -- see the survey timing in `bench_survey`.
+        let along = (to - from).normalize_or_zero();
+        let across = Vec3::new(-along.z, 0.0, along.x) * crate::player::PLAYER_RADIUS;
+        [Vec3::ZERO, across, -across].iter().any(|offset| {
+            level
+                .surface_hit(from + *offset, to + *offset)
+                .is_some_and(|(_, normal)| normal.y.abs() <= crate::level::GROUND_NORMAL_Y)
+        })
     }
 
     /// The cell a world position falls in, clamped to the grid.
@@ -317,6 +514,301 @@ impl FlowField {
     /// rather than in steps.
     pub fn cell_size(&self) -> f32 {
         self.cell
+    }
+
+    /// The world position of a cell's centre, at the ground the survey found
+    /// there.
+    pub fn centre_of(&self, cell: usize) -> Vec3 {
+        let (x, z) = ((cell % WIDTH) as f32, (cell / WIDTH) as f32);
+        let flat = self.origin + Vec2::new(x + 0.5, z + 0.5) * self.cell;
+        Vec3::new(flat.x, self.ground[cell.min(self.ground.len() - 1)], flat.y)
+    }
+
+    /// The cell a world position falls in, clamped to the grid.
+    pub fn cell_at(&self, at: Vec3) -> usize {
+        self.index(at)
+    }
+
+    /// Everything the survey knows about one cell, for anything drawing the
+    /// grid rather than walking it. See [`crate::path::draw`].
+    pub fn survey_of(&self, cell: usize) -> Survey {
+        Survey {
+            walkable: self.walkable[cell],
+            wet: self.wet[cell],
+            room: self.clearance[cell],
+            blocked: self.blocked[cell],
+            steps: match self.steps[cell] {
+                FAR => None,
+                steps => Some(steps),
+            },
+        }
+    }
+
+    /// The nearest spot to `at` something could actually stand on, or `None`
+    /// when there is nothing standable anywhere near it.
+    ///
+    /// The public face of [`Self::nearest_walkable`], for anything *placing* a
+    /// body rather than routing one. [`crate::squad::Squad::send`] lays a
+    /// cluster of spots out with it, and the difference between a spot the
+    /// survey will vouch for and one it will not is the difference between an
+    /// order a Mario can carry out and an order to go and stand in mid-air.
+    pub fn standable(&self, at: Vec3) -> Option<Vec3> {
+        self.nearest_walkable(at).map(|cell| self.centre_of(cell))
+    }
+
+    /// The nearest cell to `at` that something could actually stand on.
+    ///
+    /// Wanted at both ends of a route and for the same reason: the thing asking
+    /// is very often *not* standing on the grid's idea of ground. A Mario in
+    /// the moat, a ball on a ledge between two cells, a slot in a cluster that
+    /// landed inside the castle's footprint -- each of them indexes to a cell
+    /// the sweep will not enter, and a route from or to one of those is a route
+    /// that fails for a reason the player would call "it is right there".
+    ///
+    /// Rings outward rather than sweeping the grid, so the common answer -- the
+    /// cell itself -- costs one array read and the uncommon one costs the few
+    /// cells actually nearby. `None` past [`SNAP_RINGS`], which over this grid
+    /// is a body a dozen metres from anything walkable and is genuinely
+    /// somewhere a route cannot start.
+    fn nearest_walkable(&self, at: Vec3) -> Option<usize> {
+        let here = self.index(at);
+        if self.walkable[here] {
+            return Some(here);
+        }
+        let (cx, cz) = ((here % WIDTH) as isize, (here / WIDTH) as isize);
+        for ring in 1..=SNAP_RINGS as isize {
+            let mut best: Option<(f32, usize)> = None;
+            for dz in -ring..=ring {
+                for dx in -ring..=ring {
+                    // Only the rim of the square, so a cell is considered once
+                    // -- on the ring it first falls on, which is the one that
+                    // orders the search by distance.
+                    if dx.abs() != ring && dz.abs() != ring {
+                        continue;
+                    }
+                    let (x, z) = (cx + dx, cz + dz);
+                    if x < 0 || z < 0 || x >= WIDTH as isize || z >= WIDTH as isize {
+                        continue;
+                    }
+                    let cell = z as usize * WIDTH + x as usize;
+                    if !self.walkable[cell] {
+                        continue;
+                    }
+                    // Nearest by true distance rather than by ring, so the
+                    // corner of a ring never beats the middle of the same one.
+                    let range = self.centre_of(cell).distance_squared(at);
+                    if best.is_none_or(|(shortest, _)| range < shortest) {
+                        best = Some((range, cell));
+                    }
+                }
+            }
+            if let Some((_, cell)) = best {
+                return Some(cell);
+            }
+        }
+        None
+    }
+
+    /// A walkable route from one point to another, as a short list of points to
+    /// walk at in turn.
+    ///
+    /// **This is the answer to a body that walks into the wrong side of a wall
+    /// and stays there.** Steering -- [`crate::squad::steer`] -- can only see a
+    /// stride and a half ahead, so it bends round a fence and drives straight
+    /// into a courtyard; it has no way to know that the way to the far side of
+    /// the castle is back the way it came. A route knows, because it is a search
+    /// over the whole grid, and the steering then has nothing harder to do than
+    /// get to the next corner it can see.
+    ///
+    /// Priced rather than counted. A diagonal step costs what a diagonal step is
+    /// -- so a route across open lawn is a straight line rather than a staircase
+    /// with the same number of hops -- and a step into deep water costs `wet`
+    /// metres extra, which is how "prefer not to swim" is said to a search. Pass
+    /// a small `wet` for a body that has been ordered somewhere and a large one
+    /// for a body with nothing better to do; it is the same preference
+    /// [`crate::goap::Goal::caution`] expresses to the steering, one scale up.
+    ///
+    /// `budget` is handed straight to [`crate::route::astar`] and is the promise
+    /// that this cannot eat a frame. What comes back when it runs out is a route
+    /// to the nearest the search got, which is a body walking usefully while it
+    /// waits to be asked again.
+    ///
+    /// The points are **corners, not cells**. A* answers in cells and a cell
+    /// chain walked literally is a body shuffling from one square's middle to
+    /// the next; what comes back here is that chain pulled taut against the
+    /// walls, so a run across the lawn is two points and a route round the
+    /// castle is one per corner. See [`FlowField::clear`], which is the same
+    /// test the sweep built the route with.
+    pub fn route(
+        &self,
+        search: &mut crate::route::Search,
+        from: Vec3,
+        to: Vec3,
+        budget: usize,
+        tolls: Tolls,
+    ) -> Option<Routed> {
+        let start = self.nearest_walkable(from)?;
+        let goal = self.nearest_walkable(to)?;
+        let (gx, gz) = ((goal % WIDTH) as f32, (goal / WIDTH) as f32);
+        let cell = self.cell;
+        // Octile distance in metres: the exact cost of walking there over empty
+        // ground, and never more than the cost of walking there over real
+        // ground, which is what makes the first route found the cheapest one.
+        // Both tolls only ever add, so neither can break that.
+        let heuristic = |node: usize| {
+            let (x, z) = ((node % WIDTH) as f32, (node / WIDTH) as f32);
+            let (dx, dz) = ((x - gx).abs(), (z - gz).abs());
+            (dx.max(dz) + (std::f32::consts::SQRT_2 - 1.0) * dx.min(dz)) * cell
+        };
+        let found = crate::route::astar(
+            search,
+            WIDTH * WIDTH,
+            start,
+            goal,
+            budget,
+            |here| {
+                neighbours(here)
+                    .filter(move |&(step, there)| self.passable(here, step, there))
+                    .map(move |(step, there)| {
+                        let (dx, dz) = STEPS[step];
+                        let stride = if dx != 0 && dz != 0 {
+                            cell * std::f32::consts::SQRT_2
+                        } else {
+                            cell
+                        };
+                        (there, stride + self.toll(there, tolls))
+                    })
+            },
+            heuristic,
+        )?;
+        Some(Routed {
+            legs: self.pull(from, &found.nodes, to, found.partial),
+            settled: found.settled,
+            partial: found.partial,
+            exhausted: found.exhausted,
+        })
+    }
+
+    /// What stepping into a cell costs on top of the stride, in metres.
+    ///
+    /// The room half is graded rather than a threshold: a cell that touches
+    /// something pays the whole toll, one with a cell of daylight pays a third
+    /// of it, and anything roomier pays nothing. Graded because a threshold
+    /// would make the route indifferent between scraping a wall and standing
+    /// one clear of it -- which is most of what this is for -- and because a
+    /// cliff in the cost is a place for two routes to swap every time the
+    /// search runs.
+    fn toll(&self, cell: usize, tolls: Tolls) -> f32 {
+        let wet = if self.wet[cell] { tolls.wet } else { 0.0 };
+        let room = match self.clearance[cell] {
+            0 => tolls.hug,
+            1 => tolls.hug / 3.0,
+            _ => 0.0,
+        };
+        wet + room
+    }
+
+    /// Whether a body could walk straight from one point to the other *without
+    /// scraping anything on the way*.
+    ///
+    /// [`Self::clear`] with one line added, and the line is what stops the pull
+    /// undoing the routing. A* is what puts a route a cell or two out from a
+    /// wall; pulling the result taut is what would put it straight back --
+    /// straightening a dog-leg round a corner is exactly the operation that
+    /// takes the corner as tightly as the geometry allows. So the pull is not
+    /// allowed to straighten *through* the cells that touch things.
+    ///
+    /// **The bar is what the route already managed**, rather than a number of
+    /// its own, and that is the whole of making this safe. A route through a
+    /// gate runs through cells with no room by definition; a pull that insisted
+    /// on room there would refuse to straighten anything near one and hand back
+    /// the raw staircase. Asked instead to keep whatever the chain it is
+    /// replacing had, the pull can shorten a route and cannot tighten it --
+    /// which is the only property it needs.
+    fn roomy(&self, from: Vec3, to: Vec3, wanted: u8) -> bool {
+        self.along(from, to, |here, step, there| {
+            let passable = match step {
+                Some(step) => self.passable(here, step, there),
+                None => {
+                    self.walkable[there] && (self.ground[there] - self.ground[here]).abs() <= CLIMB
+                }
+            };
+            passable && self.clearance[there] >= wanted
+        })
+    }
+
+    /// Pulls a chain of cells taut, so what comes back is corners rather than
+    /// squares.
+    ///
+    /// Greedy and forward-only: hold an anchor, run along the chain while the
+    /// cell after next is still in sight of it, and commit the last one that
+    /// was. That is one visibility test per cell rather than the one per *pair*
+    /// a best-possible smoothing would want, and on a route of a hundred cells
+    /// the difference is a hundred tests against ten thousand.
+    ///
+    /// The real destination is put back on the end, and the real start is where
+    /// the pull begins -- so a body half way across a cell is not first asked to
+    /// walk back to that cell's middle. A partial route has no destination to
+    /// put back: it ends where the search ran out, and the last cell centre is
+    /// the honest answer for where to walk to next.
+    fn pull(&self, from: Vec3, cells: &[usize], to: Vec3, partial: bool) -> Vec<Vec3> {
+        let mut legs = Vec::new();
+        let mut anchor = from;
+        let mut index = 1;
+        while index < cells.len() {
+            let mut furthest = index;
+            // The least room anything on the stretch being replaced had --
+            // counting only what the straight line would cut *out*, not the two
+            // ends it keeps. A route that starts or finishes against a wall
+            // genuinely does start or finish against a wall, and holding the
+            // straight line to that would be holding it to nothing. What is
+            // worth protecting is the room the chain went out of its way to
+            // find in between. See [`Self::roomy`].
+            let mut worst = ROOM_CAP;
+            while furthest + 1 < cells.len() {
+                // Extending past `furthest` is what makes that cell an interior
+                // one, so that is the moment its room joins the bar.
+                let wanted = worst.min(self.clearance[cells[furthest]]);
+                if !self.roomy(anchor, self.centre_of(cells[furthest + 1]), wanted) {
+                    break;
+                }
+                worst = wanted;
+                furthest += 1;
+            }
+            let corner = self.centre_of(cells[furthest]);
+            legs.push(corner);
+            anchor = corner;
+            index = furthest + 1;
+        }
+        if partial {
+            return legs;
+        }
+        // The point actually asked for, rather than the middle of the cell it
+        // fell in -- **but only where the field agrees it can be walked to.**
+        // A destination is very often a little off the grid's idea of ground: a
+        // ball on a ledge, a slot in a cluster that landed inside a wall, a spot
+        // the player pointed at across a step. Substituting one of those in
+        // unconditionally puts a leg on the end of the route that the search
+        // never proved and the sweep would refuse, which is the follower walking
+        // into the thing the route was supposed to get it round.
+        //
+        // Replacing the last corner rather than following it, where the corner
+        // is the one the destination sits in: they are the same place to within
+        // half a cell, and two waypoints that close read as a stutter at the end
+        // of every walk.
+        let anchor = match legs.len() {
+            0 | 1 => from,
+            len => legs[len - 2],
+        };
+        if self.clear(anchor, to) {
+            match legs.last_mut() {
+                Some(last) => *last = to,
+                None => legs.push(to),
+            }
+        } else if legs.last().is_some_and(|last| self.clear(*last, to)) {
+            legs.push(to);
+        }
+        legs
     }
 
     /// Whether a body standing in `here` may move into the cell `step` away
@@ -564,6 +1056,21 @@ const STEPS: [(isize, isize); 8] = [
     (1, 1),
 ];
 
+impl FlowField {
+    /// Which way one of the eight steps points, in cells. The order the bits of
+    /// [`Survey::blocked`] are in, so a caller drawing blocked edges can turn a
+    /// bit back into a direction.
+    pub fn step_offset(step: usize) -> IVec2 {
+        let (dx, dz) = STEPS[step % STEPS.len()];
+        IVec2::new(dx as i32, dz as i32)
+    }
+
+    /// How many steps there are, which is how many bits [`Survey::blocked`] has.
+    pub fn step_count() -> usize {
+        STEPS.len()
+    }
+}
+
 /// The way back along a step.
 fn opposite(step: usize) -> usize {
     STEPS.len() - 1 - step
@@ -593,6 +1100,276 @@ fn neighbours(here: usize) -> impl Iterator<Item = (usize, usize)> {
 mod tests {
     use super::*;
     use bevy::ecs::system::RunSystemOnce;
+
+    /// Every leg of a route is a walk the field itself would allow.
+    ///
+    /// This is the property the whole thing rests on: [`FlowField::pull`] takes
+    /// a chain of cells the sweep proved passable and throws most of them away,
+    /// and a pull that cuts a corner through a fence has produced a route that
+    /// looks shorter and cannot be walked. `clear` is the same test the sweep
+    /// used, asked again of the taut version.
+    fn every_leg_is_walkable(field: &FlowField, from: Vec3, routed: &Routed) {
+        let mut anchor = from;
+        for (index, leg) in routed.legs.iter().enumerate() {
+            assert!(
+                field.clear(anchor, *leg),
+                "leg {index} of {} runs through something: {anchor:?} -> {leg:?}",
+                routed.legs.len()
+            );
+            anchor = *leg;
+        }
+    }
+
+    #[test]
+    fn a_route_across_open_lawn_is_a_straight_line() {
+        let (level, _) = crate::level::load();
+        let field = FlowField::new(&level);
+        let mut search = crate::route::Search::default();
+        // Two points on the flat lawn in front of the castle, twenty metres
+        // apart, with nothing between them.
+        let from = Vec3::new(-13.28, 2.6, 38.64);
+        let to = Vec3::new(-13.28, 2.6, 50.64);
+        let routed = field
+            .route(&mut search, from, to, 4000, Tolls::default())
+            .expect("no route across the lawn");
+        assert!(!routed.partial, "{routed:?}");
+        // Pulled taut, an unobstructed walk is one leg: the destination.
+        assert_eq!(routed.legs.len(), 1, "{routed:?}");
+        assert!(routed.legs[0].distance(to) < 0.01);
+        // And the search did not settle the whole grid to work that out.
+        assert!(
+            routed.settled < WIDTH * WIDTH / 4,
+            "settled {} of {} cells for a straight line",
+            routed.settled,
+            WIDTH * WIDTH
+        );
+        every_leg_is_walkable(&field, from, &routed);
+    }
+
+    /// **The case a beeline cannot answer.** Two points with the castle between
+    /// them: the straight line runs through the building, and the only way there
+    /// is round -- which is a thing no amount of looking a stride ahead can work
+    /// out.
+    #[test]
+    fn a_route_round_the_castle_goes_round_it() {
+        let (level, _) = crate::level::load();
+        let field = FlowField::new(&level);
+        let mut search = crate::route::Search::default();
+        let from = Vec3::new(-13.28, 2.6, 46.64);
+        // Straight through the castle and out the back.
+        let to = Vec3::new(-13.28, 2.6, -30.0);
+        let Some(routed) = field.route(&mut search, from, to, 8000, Tolls::default()) else {
+            return; // nowhere to stand at the far end on this castle
+        };
+        every_leg_is_walkable(&field, from, &routed);
+        if routed.partial {
+            return; // the far side is genuinely cut off, which is a fine answer
+        }
+        // A way round is longer than the way through, and that difference is
+        // the whole value of the search.
+        let walked: f32 = routed
+            .legs
+            .iter()
+            .fold((from, 0.0), |(last, total), leg| {
+                (*leg, total + last.distance(*leg))
+            })
+            .1;
+        assert!(
+            walked > from.distance(to),
+            "the route is shorter than the straight line, so it went through: {routed:?}"
+        );
+        assert!(
+            routed.legs.len() > 1,
+            "one leg through a castle: {routed:?}"
+        );
+    }
+
+    /// Water is a price on the route, exactly as it is a price on the step.
+    #[test]
+    fn a_priced_route_keeps_out_of_water_it_could_have_crossed() {
+        let (level, _) = crate::level::load();
+        let field = FlowField::new(&level);
+        let mut search = crate::route::Search::default();
+        // A pair of points chosen by the survey itself rather than by hand: the
+        // castle's moat moves whenever the level does, and a test that names
+        // coordinates in it is a test that quietly stops testing anything.
+        let wet_cells: Vec<usize> = (0..WIDTH * WIDTH)
+            .filter(|&cell| field.walkable[cell] && field.wet[cell])
+            .collect();
+        assert!(!wet_cells.is_empty(), "the castle has no water in it");
+        // Somewhere with water in the middle: step across a wet cell to the
+        // dry ground on the far side of it.
+        let Some((from, to)) = wet_cells.iter().find_map(|&wet| {
+            let (x, z) = (wet % WIDTH, wet / WIDTH);
+            (4..WIDTH - 4).contains(&x).then_some(())?;
+            let near = z * WIDTH + x - 3;
+            let far = z * WIDTH + x + 3;
+            (field.walkable[near] && !field.wet[near] && field.walkable[far] && !field.wet[far])
+                .then(|| (field.centre_of(near), field.centre_of(far)))
+        }) else {
+            return; // no stretch of this castle's water is shaped like that
+        };
+        let free = field
+            .route(&mut search, from, to, 8000, Tolls::default())
+            .unwrap();
+        let priced = field
+            .route(
+                &mut search,
+                from,
+                to,
+                8000,
+                Tolls {
+                    wet: 40.0,
+                    ..Tolls::default()
+                },
+            )
+            .unwrap();
+        every_leg_is_walkable(&field, from, &priced);
+        let wetness = |routed: &Routed| {
+            routed
+                .legs
+                .iter()
+                .filter(|leg| field.wet[field.index(**leg)])
+                .count()
+        };
+        assert!(
+            wetness(&priced) <= wetness(&free),
+            "pricing the water did not steer it out: {priced:?} against {free:?}"
+        );
+    }
+
+    /// **A route that runs alongside a wall does not run along it.**
+    ///
+    /// This is the one in the screenshot: a squad routed past the moat railings
+    /// walks *touching* the railings, because the straight line is the cheapest
+    /// line and a wall beside it costs nothing at all. Priced by [`Tolls::hug`],
+    /// the same route bows a couple of cells out into the open -- which over a
+    /// long run costs almost nothing in distance, and is the difference between
+    /// a file of Marios scraping a fence and a group walking beside one.
+    #[test]
+    fn a_priced_route_walks_beside_a_wall_rather_than_along_it() {
+        // A lawn with a wall down the middle of it, and a walk from one end of
+        // that wall to the other, starting and finishing right against it.
+        let mut vertices = vec![
+            Vec3::new(-60., 0., -60.),
+            Vec3::new(60., 0., -60.),
+            Vec3::new(60., 0., 60.),
+            Vec3::new(-60., 0., 60.),
+        ];
+        let mut indices = vec![[0u32, 1, 2], [0, 2, 3]];
+        {
+            let base = vertices.len() as u32;
+            vertices.extend([
+                Vec3::new(-40., 0., 0.),
+                Vec3::new(40., 0., 0.),
+                Vec3::new(40., 6., 0.),
+                Vec3::new(-40., 6., 0.),
+            ]);
+            indices.push([base, base + 1, base + 2]);
+            indices.push([base, base + 2, base + 3]);
+        }
+        let level = LevelData::new(vertices, indices, Vec::new());
+        let field = FlowField::new(&level);
+        let mut search = crate::route::Search::default();
+        let from = Vec3::new(-35.0, 0.0, -0.7);
+        let to = Vec3::new(35.0, 0.0, -0.7);
+        // How near the wall the route ever gets, in metres. Sampled along the
+        // legs rather than at them, because what is being asked about is the
+        // walk and not its corners.
+        let standoff = |routed: &Routed| {
+            let mut anchor = from;
+            let mut nearest = f32::INFINITY;
+            for leg in &routed.legs {
+                for step in 0..=20 {
+                    let at = anchor.lerp(*leg, step as f32 / 20.0);
+                    // The middle of the run only. Both ends are *at* the wall
+                    // because that is where the walk was asked to start and
+                    // finish, and a route is not hugging anything by arriving
+                    // where it was sent.
+                    if at.x.abs() < 25.0 {
+                        nearest = nearest.min(at.z.abs());
+                    }
+                }
+                anchor = *leg;
+            }
+            nearest
+        };
+        let tight = field
+            .route(&mut search, from, to, 8000, Tolls::default())
+            .expect("no way along the wall");
+        let wide = field
+            .route(
+                &mut search,
+                from,
+                to,
+                8000,
+                Tolls {
+                    hug: 1.0,
+                    ..Tolls::default()
+                },
+            )
+            .expect("no way along the wall when it costs something");
+        every_leg_is_walkable(&field, from, &wide);
+        assert!(
+            standoff(&tight) < field.cell_size(),
+            "the unpriced route already kept its distance, so this staging \
+             proves nothing: {} m off, {tight:?}",
+            standoff(&tight)
+        );
+        assert!(
+            standoff(&wide) > standoff(&tight) + field.cell_size(),
+            "pricing the wall did not push the route off it: {} m against {} m, \
+             {wide:?}",
+            standoff(&wide),
+            standoff(&tight)
+        );
+    }
+
+    /// The budget is a promise about the frame, so it has to actually bind.
+    #[test]
+    fn a_route_out_of_budget_comes_back_partial_rather_than_late() {
+        let (level, _) = crate::level::load();
+        let field = FlowField::new(&level);
+        let mut search = crate::route::Search::default();
+        let from = Vec3::new(-13.28, 2.6, 46.64);
+        let to = Vec3::new(-13.28, 2.6, -30.0);
+        let routed = field
+            .route(&mut search, from, to, 20, Tolls::default())
+            .unwrap();
+        assert!(
+            routed.partial,
+            "twenty cells crossed the castle? {routed:?}"
+        );
+        assert!(routed.settled <= 21, "the budget did not bind: {routed:?}");
+        assert!(
+            !routed.legs.is_empty(),
+            "a partial route with nowhere to go"
+        );
+        every_leg_is_walkable(&field, from, &routed);
+    }
+
+    /// A body that is not standing on the grid's idea of ground can still be
+    /// routed -- which is every Mario in the moat and every ball on a ledge.
+    #[test]
+    fn a_route_can_start_and_end_off_the_walkable_grid() {
+        let (level, _) = crate::level::load();
+        let field = FlowField::new(&level);
+        let mut search = crate::route::Search::default();
+        let lawn = Vec3::new(-13.28, 2.6, 46.64);
+        // High over the lawn, which no cell is walkable at.
+        let sky = lawn + Vec3::Y * 40.0;
+        assert!(!field.walkable[field.index(sky)] || field.index(sky) == field.index(lawn));
+        let routed = field
+            .route(
+                &mut search,
+                sky,
+                lawn + Vec3::new(12.0, 0.0, 0.0),
+                4000,
+                Tolls::default(),
+            )
+            .expect("a body above the lawn could not be routed off it");
+        assert!(!routed.legs.is_empty());
+    }
 
     /// The survey has to find real ground over the castle, or every enemy the
     /// field guides walks at a height of zero.
@@ -811,7 +1588,12 @@ mod tests {
             let (x, z) = ((index % WIDTH) as isize, (index / WIDTH) as isize);
             let next = ((z + towards.y.round() as isize) * WIDTH as isize
                 + (x + towards.x.round() as isize)) as usize;
-            if field.wall_between(&level, index, next) {
+            // Asked from both sides. A cast that grazes the very end of a wall
+            // can find it from one direction and miss it from the other, and a
+            // single graze is not the thing this test is about: what it is
+            // about is the flow pointing across something the survey plainly
+            // calls a wall.
+            if field.wall_between(&level, index, next) && field.wall_between(&level, next, index) {
                 through.push((index, next));
             }
         }

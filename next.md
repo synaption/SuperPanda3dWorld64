@@ -94,6 +94,18 @@ need a way to spawn mario
 
 portals
 
-marios have a similar stutter when they are following luna.  the ball trail still starts so abruptly.  I don't like the visibale transition.  it should be a smooth transition that wraps around the ball.  the balls should not abrupty change location.  they should always smoothly transition.  for instance when they go into a pylon they should not abruptly aprear in the pylon network.  they should physically travel from where they are to the network.  the orbs need to be emissive.  they should liket their suroundings slightly
+VRR support?
+
+orbs need to obey gravity and fall if an enemy dies on a wall for instance.  
+
+marios have a hard time punching things that are farther away.  enemies should generally prefer to target other marios that are targeting them rather than chasing after units that have a different goal.  
 
 vfx needs lightning/electricity
+
+environmental clouds (prerendered asthetic), lightning, fog, better ground textures.  bumpmaps.  
+
+tree shadows clip, but unit shadows never do.  
+
+nuclonium orbs in the stellarator should have an individual slight modifier to their speed of +- 1%
+
+enemies need the A* too.  this is why I asked for groupings, so it could handle a lot of units at once.  

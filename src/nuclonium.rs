@@ -1952,6 +1952,9 @@ pub fn call(
             camera.translation,
             Vec3::from(camera.forward()),
             leader.translation,
+            // A machine is put down within sight of the person putting it
+            // down. See [`crate::squad::PLACE_REACH`].
+            crate::squad::PLACE_REACH,
         );
     }
     if input.grab {

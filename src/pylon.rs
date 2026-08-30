@@ -770,6 +770,9 @@ pub fn place(
             camera.translation,
             Vec3::from(camera.forward()),
             leader.translation,
+            // A machine is put down within sight of the person putting it
+            // down. See [`crate::squad::PLACE_REACH`].
+            squad::PLACE_REACH,
         );
         plant.held_for = Some(plant.held_for.unwrap_or(0.0) + time.delta_secs());
         let taken: Vec<_> = planted

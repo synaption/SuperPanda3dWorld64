@@ -23,6 +23,17 @@ bevy = { version = "0.19", default-features = false, features = [
     # clipping them to the eight-bit presentation target.
     "bevy_post_process",
     "bevy_text", "bevy_ui", "png", "x11",
+    # Immediate-mode debug lines, which is how the pathing is looked at: a
+    # route is a handful of points that exist for a second or two, and drawing
+    # one as real entities means spawning and despawning a mesh per leg per
+    # replan. `path_debug` in the console is the only thing that turns them on,
+    # so in an ordinary session this feature costs the plugin and nothing else.
+    # Two halves and both are needed: `bevy_gizmos` is the buffer a system
+    # draws into, and `bevy_gizmos_render` is the pass that puts it on the
+    # screen. With only the first, `path::draw` runs, fills its buffer, and
+    # nothing appears -- no error, no warning, just an overlay that does not
+    # overlay.
+    "bevy_gizmos", "bevy_gizmos_render",
     # `bevy_ui` is layout only: it measures and positions nodes and draws none
     # of them. The pass that puts a UI node on the screen lives in
     # `bevy_ui_render`, which `DefaultPlugins` adds behind this feature -- so

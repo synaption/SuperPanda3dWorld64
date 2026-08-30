@@ -104,6 +104,10 @@ src/
   enemy.rs       slimes and ants: behaviour, LOD, hit resolution
   pipe.rs        warp pipes, and the arc they throw their brood out on
   squad.rs       aiming at the ground, and the Marios whistled up and sent out
+  goap.rs        what a Mario decides to do with itself, scored rather than ranked
+  route.rs       graph search: a breadth-first sweep, A*, and a travelling salesman
+  flow.rs        the navigation grid: the crowd's flow field, and the routes over it
+  path.rs        who gets a route, how often, and how it is drawn
   water.rs       the water sheets and the underwater view
   sky.rs         the day and night cycle: sun, moon, stars and the sky dome
   audio.rs       gameplay sound events -> layered samples
@@ -573,6 +577,298 @@ field with one or the other a decision rather than a colour choice. Two counts
 rather than a share of one, so asking for Lunas never quietly takes Marios
 away.
 
+## Finding the way
+
+**Steering answers "which way now" and cannot answer "which way at all".**
+`squad::steer` looks a stride and a half ahead. That is enough to swing round a
+fence and nowhere near enough to know that the fence runs for forty metres and
+the way past it is back the way you came. A Mario sent to the far side of the
+castle sets off through the wall of it, is held out by collision, slides along
+the stone until the wall turns a corner it did not want, and stands there — and
+every part of that is the correct behaviour of a rule that cannot see further
+than its own feet. So there is a second tier: work the route out once, over the
+whole map, and then follow it.
+
+`route::astar` is the search. It is the third algorithm in that file and it is
+there for the case the other two answer badly: `flood` is *every* node's
+distance from a source, which is unbeatable when a thousand enemies all want the
+same destination and absurd when one Mario wants one ball — it sweeps nine
+thousand cells to use forty. A* pops whichever open node looks most promising,
+so the worst honest route on the castle settles about 1,500 cells instead of all
+of them.
+
+**It runs over the grid the crowd already navigates by.** `flow::FlowField` has
+surveyed the castle at load: ground height per cell, whether anything can stand
+there, and a bit per neighbour saying whether a fence stands between. That is a
+navigation graph, and `FlowField::route` is A* over it with a price on each
+step — a diagonal costs what a diagonal is, so a run across the lawn comes out a
+straight line rather than a staircase, and a step into deep water costs extra
+metres, which is how "prefer not to swim" is said to a search rather than to a
+stride. The survey gained one array for it, `wet`, filled from the same query
+the walk step asks per step.
+
+What comes back is **corners, not cells**. A cell chain walked literally is a
+body shuffling between squares' middles; `FlowField::pull` runs the chain taut
+with the field's own visibility test, so a route across open ground is one point
+and a route round the castle is one per corner. Every leg is then a place the
+body can *see* from the one before, which means the local steering is only ever
+asked the easy version of its question.
+
+### Room, and why a route that is merely *shortest* looks wrong
+
+The cheapest chain past an obstacle takes it as tightly as the grid allows, so
+the first version routed the squad along the moat railings **touching** the
+railings. That is the correct answer to the question it was asked, and the
+question was wrong: a wall beside you costs nothing in distance and quite a lot
+in how it looks.
+
+So the survey gained a second array beside `wet` — `clearance`, how many cells
+of daylight there are between each cell and the nearest thing a body could
+scrape, capped at two and filled by the same `route::flood` that sweeps
+everything else in this game, sourced at every cell that touches something
+impassable. `Tolls::hug` prices it: a cell against a wall pays the whole toll, a
+cell one clear of it a third, anything roomier nothing. The default is a metre,
+and the size is argued from the grid — stepping out of a wall's way and back
+costs about a metre and a half of extra diagonal, so it pays for itself after two
+cells of hugging and never buys a detour anybody would notice. Over a long run
+beside a fence, bowing two cells out costs almost nothing in distance and saves
+the toll on every cell of it, so the route bows.
+
+**The pull had to learn the same lesson, because straightening a dog-leg round a
+corner is exactly the operation that takes the corner as tightly as the geometry
+allows.** `FlowField::roomy` is the visibility test with one line added: the
+straight line must be at least as roomy as the stretch of chain it replaces —
+counting the cells it would cut *out*, not the two ends it keeps. Both of those
+qualifications are load-bearing. Held to a fixed standard it would refuse to
+straighten anything near a gate, where there is no room by definition, and hand
+back the raw staircase; held to the whole chain including its ends, a route that
+starts against a wall would be held to nothing and straightened flat. Asked to
+keep what the middle of the chain found, the pull can shorten a route and cannot
+tighten it.
+
+### One journey, one search
+
+**Bodies going the same way are making one journey, and one journey is one
+search.** A squad of eight whistled at one spot is eight bodies wanting eight
+spots a few metres apart — the same walk by any reasonable reading — and working
+that out eight times is the thing caching a route was supposed to avoid.
+
+So the bodies that need a search are bucketed on a block of cells at each end
+(four cells, about seven metres) and served as groups: one search from the
+middle of the group to the middle of where it is going, and the answer copied to
+every member. Where they part company is the last stretch, which they steer
+themselves — the shared route ends within a block of each body's own spot, and
+the last few metres are exactly what local steering is good at. A shared route
+is planned to the standard of **whoever in the group minds most**: the harshest
+water and wall tolls of any member, so a careful body is never dragged through
+the moat by a bold one.
+
+A group is capped at `path_group`, ten by default, and a bucket bigger than that
+divides **evenly** — fourteen is seven and seven, not ten and four. The cap is
+not about search cost, it is about what a group is: past about ten, "they move
+together" stops describing what is on screen. They arrive over several seconds,
+the ones at the back walk through the ones at the front, and one route stops
+being a good answer for all of them. Two groups of seven behave like two squads;
+one of fourteen behaves like a crowd.
+
+Measured on the castle, twenty Marios whistled and sent: twenty queued, **three
+groups, three searches** — against twenty searches spread over five ticks
+before. Two hundred come out as seventy-four groups, because `Squad::send`
+spreads their spots over a radius of nearly thirty metres and those really are
+different destinations.
+
+### Every "can I get from A to B" has to be asked about a body
+
+**Three of these were points, and every one of them stranded a Mario.** They are
+worth listing together because the symptom is identical each time -- a Mario
+pressed against something with a perfectly good route in hand, sliding, for the
+rest of the session -- and because the fix is the same sentence three times.
+
+* **The wall survey cast one ray down the middle of each step.** That answers
+  whether a *point* could take it, and nothing here is a point: a Mario is a
+  cylinder that `resolve_walls` holds a radius clear of everything. Measured on
+  the castle, **325 of its 23,223 walkable edges** are passable to a centre line
+  and impassable to a body — seventy per cent again on top of the 468 a single
+  ray finds — and each is somewhere the search will route a squad straight into
+  a fence post. Three rays a radius apart now; something a body's width across
+  cannot hide between three lines that span a body's width.
+* **`squad::steer` cast one ray too**, so a heading that threaded the centre line
+  past the end of a wall walked the body's shoulder into it. Same three rays.
+* **Both tiers measured a step by its two ends.** A stride that rises eighty
+  centimetres over a metre and a half is a gentle slope by the numbers and may
+  have a knee-high lip at the bottom of it: too steep to *be* ground, too tall to
+  step over, invisible to a rise-over-run test and to a knee-height ray that
+  follows the ground and sails over the top of it. `LevelData::climbable` marches
+  the ground between two points instead, sampling every 30 cm and asking each
+  time for the highest ground within a climbable step of where the walk has got
+  to. A short steep face shows up as *no ground found at all* — the face is too
+  steep to be ground and what is on top of it is out of reach.
+
+That last one was the reported bug: **it was not the fence, it was the bank
+behind it.** Ordered across it, a Mario walked to the foot of the bank and
+stopped; following the player over the same ground it was fine, because a
+follower's destination moves and any bad route self-corrects within a second,
+while a fixed order re-plans the identical bad route for ever.
+
+The survey costs 3.9 ms → 14.3 ms at load for all three, and loses **30 of 4,356
+reachable cells** — it refuses a few genuine squeezes and no regions. Walking
+costs 0.045 → 0.055 ms a tick for twenty Marios and 0.95 → 1.06 ms for two
+hundred.
+
+There is a fourth, in the follower rather than the collision: **a corner counts
+as turned only when the next one is in sight.** Near is not enough, because
+`REACHED` is a metre and a half: a body that lets go of a corner early walks at
+the one after it from somewhere the obstacle is still in the way, which is a
+Mario pinned against the inside of a fence with a route that goes round it.
+
+### Why a group would otherwise walk in single file
+
+A route is a handful of points, and every body sent the same way is handed
+points within a metre of each other — the corners come off cell centres, and the
+cheapest chain past an obstacle is *one* chain. So a squad all steers at the same
+spot, `enemy::spread` shoves whoever arrives first out of the way of whoever is
+behind, and what comes out is a queue. Every part of that is each system doing
+its job.
+
+`Route::lane` is the one number that breaks the tie: each body's **place in the
+line**, counted out from the middle — −3.5 to 3.5 for a group of seven — assigned
+when the group is served, so nobody swaps places mid-march. It is multiplied by
+`path_spread` where it is used, which makes that row *metres between neighbours*
+rather than a fixed width: the band comes out as wide as the group needs, and
+dragging the row widens a march already under way. A fixed width is the thing
+that does not work — three metres is a comfortable front for two and a queue for
+eight.
+
+The offset is taken **across the leg**, from the corner behind to the corner
+ahead, and not across the body's own bearing. Taken from the bearing it swings
+round as the corner is approached, so the laned point orbits it and the offset
+has to be faded out over the last stretch — which collapses the whole group onto
+the corner exactly where it most wants to still be a group, and every corner
+squeezes the band back into a file. Across the leg it is a fixed point on a line
+parallel to the route, and it needs no fading at all.
+
+The **last** corner is never laned: everything routed to the same place already
+has its own spot when it gets there — a slot in the cluster, a ball of its own —
+and nudging a body off the spot it was sent to is a different and worse bug than
+the one the lane is fixing.
+
+This one is pinned by a unit test on the offset itself rather than by measuring
+the shape of a marching crowd, and that is worth saying because two attempts at
+the latter went in the bin. Every axis-free measure of "how much of a line is
+this" scores a file and a rank abreast the same — they are the same points
+measured along different axes — and every measure that picks an axis has to pick
+it from something, which while half the group has turned a corner and half has
+not is nothing at all.
+
+Two details, both of which were bugs first. The lane is **faded out over the last
+stretch of each leg**, clamped to half the distance left, because the offset is
+taken across the body's *current* bearing and would otherwise swing round with
+it — a body circling its own corner at the lane's width for ever. `enemy::update`
+has the same clamp on its weave, for the same reason and after the same bug. And
+the **last** corner is never laned: everything routed to the same place already
+has its own spot when it gets there — a slot in the cluster, a ball of its own —
+and nudging a body off the spot it was sent to is a different and worse bug than
+the one the lane is fixing.
+
+### Nothing here runs per body per frame
+
+That is the rule the whole of `src/path.rs` exists to enforce, and it is
+enforced in four places rather than trusted:
+
+* **A search is only asked for when the straight line is blocked.**
+  `FlowField::clear` is three array reads a sample and answers the question that
+  matters most of the time — can this body simply walk at the thing? On open
+  lawn it can, and no search happens at all. Routing is what obstruction costs,
+  not what walking costs.
+* **A route is trusted for a while**: `path_refresh` seconds, and until the
+  destination has moved more than three metres. A Mario chasing a slime does not
+  re-plan because the slime took a step.
+* **A tick serves at most `path_budget` searches** over the whole field, handed
+  out from a rotating cursor so a body passed over is served next tick rather
+  than never. Twenty Marios whistled at once are routed over five ticks.
+* **A search that runs long is stopped** and hands back the best start it found,
+  marked partial, to be re-asked from wherever the body gets to.
+
+Measured in a release build: the worst route on the castle — one corner of the
+grounds to the far side of the building, 180 m of walking against 80 as the crow
+flies — settles 1,545 cells in 0.11 ms, and a walk across the lawn takes
+0.011 ms. Twenty Marios marching cost 0.011 ms a tick without routing and
+0.045 ms with it; two hundred cost 0.13 ms and 0.95 ms. The budget is four
+searches a tick, which is a ceiling on the worst tick rather than a rate — the
+moment it is set against is the one where a whole squad is whistled at once.
+
+A body with no route walks at its goal, which is what it did before any of this
+existed. That is the fallback everywhere — an unreachable goal, a search that
+ran out, a grid with no opinion. **Routing makes walking better and is never
+what makes walking possible.**
+
+### Two things it broke on the way in, both worth keeping written down
+
+**A budget that is too small does not degrade, it inverts.** A stopped search
+comes back partial, and a partial route ends at whichever cell the heuristic
+liked best — which, for a search stopped by a wall, is the cell pressed against
+the wall. At 1,200 settled cells the Mario walked confidently up to the near
+side of the castle, re-planned, walked to the same spot again, and stood there:
+the exact behaviour routing was added to remove, produced by the routing. A
+budget has to be above what the map actually asks for.
+
+**Near is not arrived when there is a wall in between.** A corner sits at a
+cell's middle, which can be most of a metre from a wall; a body is held a radius
+clear of the same wall from the other side. So a body pressed against the inside
+of a wall is within a corner's arrival radius of a corner on the *outside* of
+it, counts it as turned, and moves on to the leg after — which is back the way
+it came. Watched, that is a Mario walking to the mouth of a courtyard, turning
+round, walking back in, and doing it for ever. `Route::leg` therefore asks the
+field whether the two are on the same side of everything before it counts a
+corner as turned.
+
+There is a third, in `squad::update_goals`: the stall clock that retires an
+order nobody can carry out has to measure progress **towards the corner being
+walked at**, not towards the spot. A route deliberately loses ground for a
+while — out of the courtyard before it can start crossing the lawn — and a clock
+measured against the spot retires the order half way through it being obeyed.
+
+### Looking at it
+
+`path_debug` in the console, and the three levels add to each other:
+
+1. **The routes.** A line per body from where it stands through every corner it
+   still has to turn, and a cross on the ground where it has been told to be.
+   Green for a whole route, amber for one that stopped short, red for a body
+   that could not be routed and is walking at its goal on faith. This is the
+   level that answers "why is that Mario going that way".
+2. **The grid** near the camera: a mark on every cell the survey found ground
+   on — blue where it is out of its depth, orange where it touches something and
+   amber one cell clear of it, green out in the open, grey where nothing can
+   reach it — and a red bar across every edge something solid stands in. This
+   answers both "why does it think it cannot get there", which is nearly always
+   a fence the survey found and the eye did not, and "why is it going the long
+   way", which is the orange.
+3. **The flow field**, an arrow per cell pointing the way the crowd reads.
+   Nothing to do with routing — it is the *other* navigation system in this
+   game, and having both drawn the same way is how you tell which of them a
+   given piece of behaviour came from.
+
+They are Bevy gizmos: immediate-mode lines, costing nothing while the row is
+zero and leaving nothing behind when it is turned off mid-session. Two features
+are needed and only one of them is obvious — `bevy_gizmos` is the buffer a
+system draws into and `bevy_gizmos_render` is the pass that puts it on the
+screen, and with only the first the overlay runs, fills its buffer and silently
+does not appear. The debug HUD grows a line of counters beside it: how many
+bodies are walking routes, how many wanted thinking about and how many distinct
+journeys that turned out to be, how many were searched for, how many were
+answered without a search, and how many came back partial or lost. `queued`
+against `groups` is the sharing, in one glance: eight queued in one group is
+eight Marios and one search. A field that is re-planning constantly and a field that is
+walking look the same from outside; those numbers are how you tell.
+
+`path::draw` is registered in `add_game` rather than in the shared system list,
+because `Gizmos` is backed by a plugin only `DefaultPlugins` brings, and a
+`Gizmos` parameter with nothing behind it does not quietly draw nothing — it
+fails validation and takes the frame with it. So the overlay is a thing the
+windowed game has and the headless test harness does not, exactly as the render
+passes are.
+
 ## Machines and the pylon network
 
 Two things you build, on two keys, aimed the same way the squad is ordered —
@@ -865,11 +1161,37 @@ The lamp is a **component**, so a thing lights the world by carrying one: a
 ball on the lawn, a ball over a Mario's head and a ball flying home down a beam
 each have their own, and both its numbers are read at the entity's own scale,
 so a ball fading out over its last two seconds fades its light out with it.
-Only the nearest sixteen to the camera are written, and the last quarter of the
-range fades to nothing so that the sixteenth and seventeenth swapping places as
-the camera turns is not a patch of ground blinking. A lamp with no light left
-in it is dropped before the pick rather than written as an empty slot, because
-a dark one must not hold one of the sixteen.
+Only the nearest so many to the camera are written, and the last quarter of the
+range fades to nothing so that the last one and the one behind it swapping
+places as the camera turns is not a patch of ground blinking. A lamp with no
+light left in it is dropped before the pick rather than written as an empty
+slot, because a dark one must not hold one of the slots.
+
+**How many and how far are both console rows**, `lamp_count` and `lamp_range`,
+because between them they are the whole of "which of the glowing things in
+front of me actually light the world" and neither answers it alone. They start
+at **500** and **140 m**, and `n64::LAMPS` caps the count at 2000 because the
+array's length is compiled into the shader and a slider cannot change it. They
+started at 16 and 34, and both numbers were wrong in the same way: a ball's
+light came on as you walked up to it. The range was the obvious half and the
+smaller half — past 34 m nothing was written at all — but the count was what
+made a lawn scattered with nuclonium light only in the corner nearest you,
+because the sixteen nearest took every slot and the rest were stickers.
+
+`lamp_count` is the one number in this system with a real price on it, which is
+the other reason it is a row: the shader walks the live lamps for every
+fragment of the world, so this is what to pull down if the frame chart moves
+when a field of the stuff is on screen.
+
+**What keeps five hundred affordable is `Lamplight::bounds`** — one sphere
+holding every lamp's whole reach, tested once per fragment in front of the
+loop. Lamps are not spread evenly: a scattering of nuclonium is a few dozen
+metres across and the castle grounds are hundreds, so on most frames that one
+compare pays for the whole of the screen that is not near any of it. It holds
+each lamp's *reach* rather than its middle, which is the part that goes wrong
+quietly — a sphere a metre too small does not draw anything obviously wrong, it
+shaves the outer rim off every lamp at the edge of the field and reads as the
+falloff having a hard circular edge.
 
 **Five hundred motes turning inside a stellarator are one light, not five
 hundred.** That is why the lamp is not in `nuclonium::core` with the rest of
@@ -900,19 +1222,22 @@ the surface's *unlit* colour alongside the shaded one, so a surface ends up at
 arithmetic and the same picture the shader always drew.
 
 **What it costs.** The CPU side is the whole of `n64::lamplight`: reading five
-hundred lamps off their `GlobalTransform`s is 1.4 µs, splitting that list about
-the sixteenth is 1.4 µs, and encoding the 512-byte buffer is 29 ns — about
-2.8 µs a frame at a crowd size nothing in the game can exceed, which is two
-hundredths of one percent of a 60 Hz frame. `n64::tests::bench_lamplight` is
+hundred lamps off their `GlobalTransform`s is 1.4 µs, picking from them is
+3.0 µs, and encoding the 64 KB buffer is 3.6 µs — about 8 µs a frame at a crowd
+size nothing in the game can exceed, which is five hundredths of one percent of
+a 60 Hz frame. `n64::tests::bench_lamplight` is
 where those numbers come from; run it with `--ignored --nocapture`.
 
 The GPU side is a per-fragment loop, and its shape matters more than any single
 number. `nearest` fills the buffer's slots from the front, so the loop **breaks**
 at the first empty one rather than skipping it: with nothing glowing on screen
 — most frames of most sessions — every fragment in the world pays one 16-byte
-read and one compare, and that is all. Each live lamp past that costs about a
-dozen scalar operations to reject on distance, and about forty to accept; only
-fragments within two and a half metres of a lamp ever run the second path. The
+read and one compare, and that is all. Each live lamp past that costs about ten
+scalar operations to reject on distance — a subtract, a dot product and a
+compare, deliberately squared so the reject path pays no square root, since it
+is the path nearly every lamp takes for nearly every fragment — and about forty
+to accept; only fragments within two and a half metres of a lamp ever run the
+second path. That per-lamp cost is what `lamp_count` is buying. The
 vertex side is two more interpolators on every pipeline in the game (the world
 normal, which the vertex-lit path already computed and threw away, and the
 surface's unlit colour), and the binding itself costs nothing per frame: the
@@ -922,6 +1247,13 @@ These are counts and CPU measurements rather than frame times. The development
 machine is WSL with no GPU, where a fragment shader runs on a software
 rasteriser — a number from there would say nothing about the Windows build the
 game is actually played on.
+
+What that machine *can* say is the shape, because on it the fragment shader is
+practically the whole cost. Two hundred frames of a four-hundred-ball night
+scene took 43 s of CPU with `lamp_count 0`, 57 s at 40, and 231 s at 500: the
+added work is linear in the number of live lamps, and five hundred of them is
+about ten times the per-frame lamp cost of forty. Read the ratio, never the
+magnitudes.
 
 Being **added** to the shade rather than blended over the surface is what makes
 it light rather than paint. A lamp can only ever brighten, and it brightens by
@@ -991,16 +1323,83 @@ priority chain never fetch anything. An order is deliberately not gated — the
 whistle is the player speaking, and a squad that cannot be called off a slime is
 worse than one that leaves a fight when told to.
 
+**An order that has been carried out is not still an order.** Arriving retires
+it into `goap::Goal::Hold` — the same spot, wanted the way a formation slot is
+wanted rather than the way a whistle is. Without that step a squad sent at a
+nest walked over, spread out around it, and stood there: a Mario on its ordered
+spot is at zero range from that order, which scores 0.90 for ever, while a slime
+four metres away scores 0.64. The order won at every range past about eighty
+centimetres — which is *inside* the reach of the punch — so the only Marios that
+ever swung were the ones whose slot in the cluster happened to land on top of
+something. They were doing exactly as they were told, and it looked like they
+were broken. As a post instead, anything the Mario can see outbids it, and it
+walks back to the spot when the fight is over.
+
+The other half of the same complaint is not a scoring bug at all: **an order can
+also be discharged by giving up on it.** A cluster is spread over whatever
+ground is under it, so some slots land behind railings or on the far bank, and
+an order that ends only in arrival keeps those Marios leaning on a fence at full
+strength for the rest of the session. `squad::Sent` therefore records the
+nearest each Mario has ever got to its spot, and six seconds without beating it
+retires the order the same way arriving does. Measured against its own record
+rather than against last tick, because a Mario swinging round a pond spends most
+of a detour not gaining ground and is not stuck.
+
+**Range is how far off a thing is as the crow flies, and a Mario is not a crow.**
+A ball eight metres away through a fence and across the moat outscores one twenty
+metres away on the same lawn, so the squad walks up to the railings and presses
+against them — which is the correct answer to the question, because the far side
+of a fence really is eight metres away. It is not *closer*. So an option carries
+whether the straight line to it is blocked, answered by `FlowField::clear`, and
+a blocked one is discounted the same way a wet one is. A real path length would
+be better and is not affordable per option per body per tick; what this costs is
+one grid walk for the candidates that could still win, and the ball loop prunes
+against the best score in hand before paying for it.
+
+The two discounts take the **harsher of the two rather than the product**. Both
+are saying the same thing from different angles — that the walk is not the simple
+one the range describes — and stacking them puts a ball that is both in the moat
+and behind a fence under the floor for standing about, which is a Mario ignoring
+the only thing on the lawn.
+
 Water is part of the same score rather than a rule beside it. A ball in the moat
-is worth having, just worth **a third** of the same ball on grass — so given two
-the squad takes the dry one, and given one and nothing else to do somebody swims
-out for it. Getting *round* a pond on the way to something past it is
-`squad::skirt`, which bends a step outward in ten-degree deflections until it
-finds a dry one and gives up rather than refuses: a Mario already in the water
-would otherwise be pinned there, since every heading is wet. And an ally out of
-its depth swims — the same depth threshold, float height and clip the player
-uses, so a Mario in the squad and the Mario you are driving cross the moat
-together.
+is worth having, just worth **a quarter** of the same ball on grass — so given
+two the squad takes the dry one, and given one and nothing else to do somebody
+swims out for it. And an ally out of its depth swims — the same depth threshold,
+float height and clip the player uses, so a Mario in the squad and the Mario you
+are driving cross the moat together.
+
+**Getting round what is in the way is `squad::steer`, and everything it finds is
+a price rather than a wall.** It looks a stride and a half ahead along the
+heading it wants and adds up what is there — a fence or a railing costs the
+most, a drop next, nothing to stand on the same, deep water the least — then
+tries deflections out to a right angle either side, each carrying the cost of
+the stride the detour throws away (`1 - cos(turn)`, so nothing for a shrug and a
+whole unit at ninety degrees). The cheapest heading wins. Two things fall out of
+scoring it rather than filtering it, and both are the behaviour the old
+first-dry-heading-wins rule could not express:
+
+* **How far out of its way a Mario will go depends on what it is doing.**
+  `goap::Goal::caution` is the multiplier on every hazard: an order swings about
+  seventy degrees to keep out of the moat and nearly a right angle to stay off a
+  cliff, and past that it wades or climbs down, because a squad that will not is
+  a squad that cannot be sent across water. An ambling Mario, at nearly three times
+  an order's caution, never gets its feet wet while there is any dry way at all.
+* **Nothing is ever refused.** With every heading hazardous the straight one
+  wins on the detour term, so a Mario standing in the pond swims out of it
+  rather than being pinned there — which is what the old rule needed an explicit
+  give-up branch for.
+
+Underneath it, a Mario is now stopped by walls as the same cylinder the player
+is stopped by, and falls at the enemies' falling speed rather than being
+assigned the height of whatever is below it. Between them those are the
+difference between a squad that walks round the castle and one that walks
+through the railings and reappears at the bottom of the moat.
+
+What steering cannot do at any quality is see past its own stride, so a Mario
+does not always walk at its goal: it walks at the next corner of a route worked
+out over the whole map. See **Finding the way** below, which is the tier that
+answers the questions this one cannot.
 
 The glow on a ball is a camera-facing card inside the shared nuclonium mesh.
 Its shader computes the radial falloff directly, writes HDR colour above one,
@@ -1024,10 +1423,11 @@ punch and a bullet are each a discrete blow and land in full. Buildings wear a
 health bar once they have taken a scratch. See `src/structure.rs`.
 
 The network shares its algorithms with the pathing rather than having its own.
-`src/route.rs` holds both: `flood`, the breadth-first walk that spreads power
-from mast to mast and that `flow::rebuild` sweeps the castle with to tell a
-crowd of thousands which way the player is, and `tour`, a nearest-neighbour
-travelling-salesman walk improved by 2-opt. The tour is what decides the order
+`src/route.rs` holds all three: `flood`, the breadth-first walk that spreads
+power from mast to mast and that `flow::rebuild` sweeps the castle with to tell
+a crowd of thousands which way the player is; `astar`, the one-body-one-journey
+search the squad routes with; and `tour`, a nearest-neighbour travelling-salesman
+walk improved by 2-opt. The tour is what decides the order
 the supply packet — the mote of light you can watch crossing the beams — calls
 at every live mast in, and each leg between two calls is expanded into the
 shortest chain of real beams by the same flood, so the packet never flies
@@ -1243,9 +1643,14 @@ Adjusting a pinned control used to be Left/Right while the console was open,
 which is why it is the brackets in both modes now: the arrow keys are the
 caret's.
 
-Movement, camera, water, enemy and spawning constants are backed by the tuning
-resource rather than copied at startup, so console changes apply on the next
-gameplay tick.
+Movement, camera, water, enemy, spawning and pathing constants are backed by the
+tuning resource rather than copied at startup, so console changes apply on the
+next gameplay tick. `path_debug 1` draws what the routing is doing over the
+world and puts its counters on the HUD. `path_budget` and `path_refresh` decide
+what routing costs; `path_toll` and `path_clearance` are how far a route will go
+round water and off walls; `path_spread` is how far apart two bodies walking
+abreast on one route stand, and `path_group` is how many may share one. See **Finding the
+way**.
 
 ## The pause menu and the internal render resolution
 

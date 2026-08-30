@@ -169,12 +169,42 @@ impl Default for N64Lighting {
 /// group is rebuilt and no pipeline is re-specialised -- the buffer's contents
 /// change underneath a binding that stays exactly where it was.
 ///
-/// Sixteen is a bound on the *shader's* loop rather than on how many things in
-/// the level may glow: any number of them can carry a [`Lamp`], and the
-/// nearest sixteen to the camera are the ones written. [`far_off`] is what
-/// keeps the sixteenth and the seventeenth from blinking as they swap.
-pub const LAMPS: usize = 16;
-const LAMP_RANGE: f32 = 34.0;
+/// This is a bound on the *shader's* loop rather than on how many things in the
+/// level may glow: any number of them can carry a [`Lamp`], and the nearest
+/// this many to the camera are the ones written. [`far_off`] is what keeps the
+/// last one and the one behind it from blinking as they swap.
+///
+/// **The number the player actually gets is [`Reach::most`], and this is only
+/// its ceiling.** It is the one number here with a real price on it -- the
+/// shader walks the live lamps for every fragment in the world -- so it is the
+/// console's `lamp_count` row rather than something decided here. Two thousand
+/// is where the array stops because the array's length is compiled into the
+/// shader and a slider cannot change it.
+///
+/// **Two thousand of anything in a forward loop is a lot, and two things keep
+/// it honest.** The loop stops at the first empty slot, so a session with three
+/// lamps lit pays for three whatever this says. And every fragment first tests
+/// itself against [`Lamplight::bounds`], the one sphere holding every lamp
+/// there is, so the whole loop is skipped for a fragment nothing can reach --
+/// which is most of a level, because glowing things cluster where the player
+/// is and the world does not.
+pub const LAMPS: usize = 2000;
+
+/// How far from the camera a lamp still lights the world, in metres, before
+/// the player has said otherwise.
+///
+/// Only the starting value: it is on the console's `lamp_range` slider, and
+/// [`lamplight`] reads it live. Worth being a slider rather than a constant
+/// because it is a trade rather than a setting -- sixteen lamps reach the
+/// shader at once, so a long range means a lit ball is still lit across the
+/// valley and a short one means more of the ones at your feet get to be lit at
+/// all. Which of those matters is a thing you have to stand in a field of them
+/// to decide.
+///
+/// Well over a hundred metres, because the failure it fixes is the one you can
+/// see: at a third of that a ball's light came on as you walked up to it,
+/// which reads as the world noticing you rather than as a lamp being a lamp.
+pub const LAMP_RANGE: f32 = 140.0;
 
 /// The shader def that carries [`LAMPS`] across into the shader, so the array
 /// the WGSL declares and the array Rust writes are one number.
@@ -234,9 +264,33 @@ pub struct LampTerm {
 }
 
 /// Every lamp the shader can see this frame.
-#[derive(Clone, ShaderType, Default, Debug)]
+#[derive(Clone, ShaderType, Debug)]
 pub struct Lamplight {
+    /// One sphere holding every lamp's whole reach: `xyz` its middle, `w` how
+    /// far it goes. A radius of zero is a world with no lamps in it.
+    ///
+    /// **The cheapest test there is, in front of the most expensive loop there
+    /// is.** A fragment further from this middle than `w` cannot be reached by
+    /// any lamp, so the shader stops there rather than proving it two thousand
+    /// times over. It is worth having because lamps are not spread evenly: a
+    /// scattering of nuclonium is a few dozen metres across and the castle
+    /// grounds are hundreds, so on most frames this one compare pays for the
+    /// whole of the screen that is not near any of it.
+    pub bounds: Vec4,
     pub lamps: [LampTerm; LAMPS],
+}
+
+/// Written by hand rather than derived: `Default` for an array stops at
+/// thirty-two elements, and there are sixty-four slots.
+impl Default for Lamplight {
+    fn default() -> Self {
+        Self {
+            // No lamps anywhere, which is a sphere of no size. The shader
+            // reads that as "stop" rather than needing to be told a count.
+            bounds: Vec4::ZERO,
+            lamps: [LampTerm::default(); LAMPS],
+        }
+    }
 }
 
 impl Lamplight {
@@ -274,9 +328,9 @@ impl Lamplight {
 /// patch of ground blinks in the distance. Fading the last quarter of the
 /// range to nothing means the two that swap are both at nothing when they do
 /// it.
-pub fn far_off(apart: f32) -> f32 {
-    let start = LAMP_RANGE * 0.75;
-    (1.0 - (apart - start) / (LAMP_RANGE - start)).clamp(0.0, 1.0)
+pub fn far_off(apart: f32, range: f32) -> f32 {
+    let start = range * 0.75;
+    (1.0 - (apart - start) / (range - start)).clamp(0.0, 1.0)
 }
 
 /// Picks the [`LAMPS`] lamps nearest `eye` and writes them as the shader reads
@@ -290,7 +344,44 @@ pub fn far_off(apart: f32) -> f32 {
 /// The pick is a partial sort rather than a full one: nothing downstream cares
 /// what order the sixteen come in, only which sixteen they are, so the list is
 /// split about the sixteenth in linear time and the rest is left as it lies.
-pub fn nearest(eye: Vec3, mut lit: Vec<(Vec3, f32, Lamp)>) -> Lamplight {
+/// How much lamplight the player has asked for: how far off one still counts,
+/// and how many of them the shader is allowed to walk.
+///
+/// The two together rather than separately because they are one decision made
+/// twice over. Sixteen lamps at thirty metres and sixty-four at a hundred and
+/// forty are both answers to "which of the glowing things in front of me
+/// actually light the world", and moving either without looking at the other
+/// is how you end up with a field where the near half is lit and the far half
+/// is a sticker. Both are console rows; see [`LAMPS`] and [`LAMP_RANGE`].
+#[derive(Clone, Copy, Debug)]
+pub struct Reach {
+    pub range: f32,
+    pub most: usize,
+}
+
+impl Reach {
+    /// What the player has the two rows set to. Clamped to the array the
+    /// shader was compiled with, because the row's ceiling and the array's
+    /// length are two numbers and only one of them is in the shader.
+    pub fn asked(tuning: &crate::console::GameTuning) -> Self {
+        Self {
+            range: tuning.lamp_range,
+            most: (tuning.lamp_count as usize).min(LAMPS),
+        }
+    }
+}
+
+impl Default for Reach {
+    fn default() -> Self {
+        Self {
+            range: LAMP_RANGE,
+            most: LAMPS,
+        }
+    }
+}
+
+pub fn nearest(eye: Vec3, asked: Reach, mut lit: Vec<(Vec3, f32, Lamp)>) -> Lamplight {
+    let Reach { range, most } = asked;
     // A lamp with no reach or no light in it is not a lamp. Dropped before the
     // pick rather than written as an empty slot, because the shader walks a
     // fixed sixteen and a dark one must not hold one of them -- an empty
@@ -299,25 +390,41 @@ pub fn nearest(eye: Vec3, mut lit: Vec<(Vec3, f32, Lamp)>) -> Lamplight {
         *scale > 0.0
             && lamp.reach > 0.0
             && lamp.glow.max_element() > 0.0
-            && at.distance(eye) < LAMP_RANGE
+            && at.distance(eye) < range
     });
-    if lit.len() > LAMPS {
-        lit.select_nth_unstable_by(LAMPS, |a, b| {
+    if lit.len() > most {
+        lit.select_nth_unstable_by(most, |a, b| {
             a.0.distance_squared(eye)
                 .total_cmp(&b.0.distance_squared(eye))
         });
-        lit.truncate(LAMPS);
     }
+    lit.truncate(most);
     // Filled from the front, and the shader depends on it: it stops at the
     // first empty slot rather than walking all sixteen, so a gap in the middle
     // of this would be every lamp past the gap going dark.
     let mut field = Lamplight::default();
+    // The sphere the shader tests against before it walks any of this. Grown
+    // one lamp at a time rather than fitted afterwards: what has to be inside
+    // it is each lamp's whole *reach*, not its middle, or the edge of the
+    // outermost lamp's light would be cut off by the very test meant to save
+    // walking to it.
+    let mut middle = Vec3::ZERO;
+    for (at, _, _) in &lit {
+        middle += *at;
+    }
+    if !lit.is_empty() {
+        middle /= lit.len() as f32;
+    }
+    let mut edge = 0.0f32;
     for (slot, (at, scale, lamp)) in lit.into_iter().enumerate() {
+        let reach = lamp.reach * scale;
+        edge = edge.max(middle.distance(at) + reach);
         field.lamps[slot] = LampTerm {
-            at: at.extend(lamp.reach * scale),
-            glow: (lamp.glow * scale * far_off(at.distance(eye))).extend(0.0),
+            at: at.extend(reach),
+            glow: (lamp.glow * scale * far_off(at.distance(eye), range)).extend(0.0),
         };
     }
+    field.bounds = middle.extend(edge);
     field
 }
 
@@ -335,6 +442,7 @@ pub fn nearest(eye: Vec3, mut lit: Vec<(Vec3, f32, Lamp)>) -> Lamplight {
 /// not exist yet cannot have its bind group built at all, and would be a
 /// surface that does not draw rather than a surface that is not lamplit.
 pub fn lamplight(
+    tuning: Res<crate::console::GameTuning>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
     camera: Query<&GlobalTransform, With<Camera3d>>,
     lit: Query<(&Lamp, &GlobalTransform, Option<&InheritedVisibility>)>,
@@ -344,6 +452,10 @@ pub fn lamplight(
             let eye = view.translation();
             nearest(
                 eye,
+                // Read live rather than captured, the same way
+                // `stellarator::orbit` reads its two: dragging a row has to
+                // change the picture while you are looking at it.
+                Reach::asked(&tuning),
                 lit.iter()
                     .filter(|(_, _, visible)| visible.is_none_or(|seen| seen.get()))
                     .map(|(lamp, world, _)| {
@@ -964,7 +1076,7 @@ mod tests {
     /// game can exceed.
     ///
     /// The whole of the per-frame CPU work is here: walk every `Lamp` in the
-    /// world, split the list about the sixteenth, and encode 512 bytes. The
+    /// world, split the list about the last slot, and encode the buffer. The
     /// GPU half cannot be measured on this machine -- WSL has no GPU, and a
     /// software rasteriser's fragment timings say nothing about a real one.
     ///
@@ -985,10 +1097,13 @@ mod tests {
         let start = std::time::Instant::now();
         let mut sink = 0.0f32;
         for _ in 0..rounds {
-            sink += nearest(eye, crowd.clone()).lamps[0].glow.y;
+            sink += nearest(eye, Reach::default(), crowd.clone()).lamps[0]
+                .glow
+                .y;
         }
         println!(
-            "picking the nearest sixteen of {}: {:?} a frame ({sink})",
+            "picking the nearest {} of {}: {:?} a frame ({sink})",
+            LAMPS,
             crowd.len(),
             start.elapsed() / rounds,
         );
@@ -996,7 +1111,7 @@ mod tests {
         // What the system does before it can call the above: decompose each
         // lamp's `GlobalTransform`, which is where its place and its size come
         // from. Timed separately because it is the part that grows with the
-        // crowd rather than with the shader's sixteen.
+        // crowd rather than with the shader's slots.
         let posed: Vec<(GlobalTransform, Lamp)> = crowd
             .iter()
             .map(|(at, _, lamp)| (GlobalTransform::from_translation(*at), *lamp))
@@ -1020,7 +1135,7 @@ mod tests {
         );
         // And the encode, which is the other half and does not depend on how
         // many lamps there were.
-        let field = nearest(eye, crowd);
+        let field = nearest(eye, Reach::default(), crowd);
         let rounds = 1000;
         let start = std::time::Instant::now();
         for _ in 0..rounds {
@@ -1045,28 +1160,87 @@ mod tests {
         )
     }
 
-    /// The shader walks a fixed sixteen slots, so a field with more lamps than
-    /// that in it has to choose -- and what it must choose is the ones the
+    /// The shader walks a fixed number of slots, so a field with more lamps in
+    /// it than that has to choose -- and what it must choose is the ones the
     /// player is standing among.
+    ///
+    /// Run at two counts, because how many is the console's `lamp_count` row
+    /// and the pick has to be that number rather than a constant. It is the
+    /// row that decides whether a lawn full of nuclonium is lit or only the
+    /// near corner of it is, which is the whole reason it is a row.
     #[test]
     fn a_crowd_of_lamps_comes_down_to_the_ones_nearest_the_camera() {
         let eye = Vec3::ZERO;
-        // Forty in a line, a metre apart, the nearest one metre out. Every one
-        // of them is inside the range, so the only thing that can cut them
-        // down to sixteen is the pick.
-        let field = nearest(
-            eye,
-            (1..=40)
-                .map(|step| glowing(Vec3::X * step as f32, 1.0))
-                .collect(),
+        // More than the array holds, in a line five centimetres apart, so the
+        // whole crowd is well inside the range and the only thing that can cut
+        // it down is the pick.
+        const APART: f32 = 0.05;
+        let crowd: Vec<_> = (1..=LAMPS + 500)
+            .map(|step| glowing(Vec3::X * (step as f32 * APART), 1.0))
+            .collect();
+        for most in [16, LAMPS] {
+            let asked = Reach { most, ..default() };
+            let lit = nearest(eye, asked, crowd.clone()).lit();
+            assert_eq!(lit.len(), most, "the shader's slots were not filled");
+            let furthest = lit.iter().map(|lamp| lamp.at.x).fold(0.0_f32, f32::max);
+            assert!(
+                (furthest - most as f32 * APART).abs() < 1e-3,
+                "a lamp further off than the {most}th was written: {furthest}"
+            );
+        }
+        // And nothing is not a crowd of one: a player who has turned the row
+        // all the way down gets no lamps rather than the nearest one.
+        assert!(
+            nearest(
+                eye,
+                Reach {
+                    most: 0,
+                    ..default()
+                },
+                crowd
+            )
+            .lit()
+            .is_empty(),
+            "the row was turned off and a lamp stayed lit"
         );
-        let lit = field.lit();
-        assert_eq!(lit.len(), LAMPS, "the shader's slots were not filled");
-        let furthest = lit.iter().map(|lamp| lamp.at.x).fold(0.0_f32, f32::max);
+    }
+
+    /// The sphere the shader tests before it walks anything holds every lamp's
+    /// whole reach, not just its middle.
+    ///
+    /// **This is the one that can go wrong quietly.** The bound exists to skip
+    /// the loop for a fragment nothing can reach, so a bound that is a metre
+    /// too small does not draw anything wrong -- it takes the outer rim off
+    /// every lamp at the edge of the field, which reads as the lights having a
+    /// hard circular edge somebody would spend an afternoon looking for in the
+    /// falloff.
+    #[test]
+    fn the_sphere_the_shader_tests_first_holds_every_lamps_whole_reach() {
+        let eye = Vec3::ZERO;
+        let spread: Vec<_> = [
+            Vec3::new(-8.0, 0.0, 3.0),
+            Vec3::new(9.0, 1.0, -4.0),
+            Vec3::new(0.0, 0.0, 12.0),
+        ]
+        .map(|at| glowing(at, 1.0))
+        .to_vec();
+        let field = nearest(eye, Reach::default(), spread.clone());
+        let (middle, edge) = (field.bounds.truncate(), field.bounds.w);
+        for (at, scale, lamp) in &spread {
+            let reach = lamp.reach * scale;
+            assert!(
+                middle.distance(*at) + reach <= edge + 1e-4,
+                "the far side of the lamp at {at} was outside the sphere",
+            );
+        }
+
+        // And an empty world is a sphere of no size, which is how the shader
+        // is told there is nothing to walk without being handed a count.
         assert_eq!(
-            furthest, LAMPS as f32,
-            "a lamp further off than the sixteenth was written"
+            nearest(eye, Reach::default(), Vec::new()).bounds,
+            Vec4::ZERO
         );
+        assert_eq!(Lamplight::default().bounds, Vec4::ZERO);
     }
 
     /// A lamp out of range is not written at all, and one on its way out is on
@@ -1078,11 +1252,19 @@ mod tests {
     #[test]
     fn a_lamp_leaves_by_fading_rather_than_by_going_out() {
         let eye = Vec3::ZERO;
-        let far = nearest(eye, vec![glowing(Vec3::X * (LAMP_RANGE + 1.0), 1.0)]);
+        let far = nearest(
+            eye,
+            Reach::default(),
+            vec![glowing(Vec3::X * (LAMP_RANGE + 1.0), 1.0)],
+        );
         assert!(far.lit().is_empty(), "a lamp out of range was written");
 
-        let near = nearest(eye, vec![glowing(Vec3::X, 1.0)]);
-        let leaving = nearest(eye, vec![glowing(Vec3::X * (LAMP_RANGE * 0.95), 1.0)]);
+        let near = nearest(eye, Reach::default(), vec![glowing(Vec3::X, 1.0)]);
+        let leaving = nearest(
+            eye,
+            Reach::default(),
+            vec![glowing(Vec3::X * (LAMP_RANGE * 0.95), 1.0)],
+        );
         let (near, leaving) = (near.lit()[0], leaving.lit()[0]);
         assert!(
             leaving.glow.y > 0.0 && leaving.glow.y < near.glow.y * 0.5,
@@ -1094,6 +1276,38 @@ mod tests {
         // got *smaller* as it went would light a smaller patch of ground the
         // further away it was, which is not what distance does.
         assert_eq!(leaving.at.w, near.at.w, "the reach faded with the light");
+
+        // The range is the caller's rather than a constant in here, because it
+        // is on the console's `lamp_range` row and the player drags it while
+        // looking at a field of them. The same lamp, in and out.
+        let twenty_out = || vec![glowing(Vec3::X * 20.0, 1.0)];
+        assert!(
+            nearest(
+                eye,
+                Reach {
+                    range: 10.0,
+                    ..default()
+                },
+                twenty_out()
+            )
+            .lit()
+            .is_empty(),
+            "a lamp past a shortened range still lit the world"
+        );
+        assert_eq!(
+            nearest(
+                eye,
+                Reach {
+                    range: 200.0,
+                    ..default()
+                },
+                twenty_out()
+            )
+            .lit()
+            .len(),
+            1,
+            "a lamp well inside a lengthened range did not"
+        );
     }
 
     /// Both of a lamp's numbers ride on the scale of the thing carrying it.
@@ -1105,8 +1319,8 @@ mod tests {
     #[test]
     fn a_small_thing_is_a_small_lamp() {
         let eye = Vec3::ZERO;
-        let whole = nearest(eye, vec![glowing(Vec3::X, 1.0)]).lit()[0];
-        let mote = nearest(eye, vec![glowing(Vec3::X, 0.02)]).lit()[0];
+        let whole = nearest(eye, Reach::default(), vec![glowing(Vec3::X, 1.0)]).lit()[0];
+        let mote = nearest(eye, Reach::default(), vec![glowing(Vec3::X, 0.02)]).lit()[0];
         assert!(
             (mote.at.w - whole.at.w * 0.02).abs() < 1e-5,
             "a mote reached as far as a ball"
@@ -1119,7 +1333,9 @@ mod tests {
         // three minutes -- is not a lamp at all rather than a lamp of zero
         // reach dividing by itself in the shader.
         assert!(
-            nearest(eye, vec![glowing(Vec3::X, 0.0)]).lit().is_empty(),
+            nearest(eye, Reach::default(), vec![glowing(Vec3::X, 0.0)])
+                .lit()
+                .is_empty(),
             "something with no size left was still lighting the world"
         );
     }

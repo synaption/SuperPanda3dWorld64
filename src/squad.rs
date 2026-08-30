@@ -32,23 +32,27 @@ use bevy::prelude::*;
 
 // -- aiming -----------------------------------------------------------------
 
-/// How near and how far the aim may land, measured out from the player in the
-/// horizontal plane. Beyond the far one the throw stops meaning anything, and
-/// inside the near one the circle is drawn around his own feet.
+/// How near the aim may land, measured out from the player in the horizontal
+/// plane. Inside it the circle is drawn around his own feet.
 const AIM_MIN_RANGE: f32 = 2.5;
-const AIM_MAX_RANGE: f32 = 26.0;
 
-/// The ray march that turns a view direction into a spot on the ground: how
-/// far apart the samples are, how many times the crossing is then halved, and
-/// how far above a sample the floor is looked for. The probe has to cover a
-/// whole step or a sample landing just under a slope reads as above it.
-const AIM_STEP: f32 = 1.5;
-const AIM_REFINE: u32 = 6;
-const AIM_PROBE: f32 = AIM_STEP + 0.8;
+/// How far the *placement* gestures reach: the build preview, the pylon and
+/// the nuclonium call. A machine is put down within sight of the person putting
+/// it down, and past this the gesture stops meaning anything.
+///
+/// **An order is not one of these and does not use it.** See [`order_reach`].
+pub const PLACE_REACH: f32 = 26.0;
 
-/// Walking the target back toward the player when the ray never met ground --
-/// which over the moat and off the edge of the map is the usual answer.
+/// Walking the target back toward the player when the ray met nothing at all,
+/// and how far out to start walking back from.
+///
+/// Aiming at the sky is the case: there is no spot up there to put anything on,
+/// so the aim is brought down to somewhere in front of him and walked in until
+/// there is floor under it. Bounded rather than taken from the reach, so an
+/// order -- whose reach is the whole level -- does not pay two hundred floor
+/// queries a frame for a view tilted at the horizon.
 const AIM_BACKOFF: f32 = 2.0;
+const AIM_SKY_RANGE: f32 = 26.0;
 
 /// Longer than a tap, in seconds. Under this the press is an order to the
 /// squad it already has; over it, a whistle for a new one.
@@ -59,6 +63,20 @@ pub const TAP_SECONDS: f32 = 0.18;
 const CIRCLE_MIN_RADIUS: f32 = 2.2;
 const CIRCLE_MAX_RADIUS: f32 = 11.0;
 const CIRCLE_GROW_SECONDS: f32 = 1.1;
+
+/// The mark left where an order landed: how long it stays up, how long it
+/// takes to pop open, and how much wider than the cluster it is drawn.
+///
+/// It fades rather than blinking out because the ring is an answer to "where
+/// did that go", and an answer that vanishes on a frame boundary reads as a
+/// glitch rather than as a mark expiring.
+const ORDER_RING_SECONDS: f32 = 1.6;
+const ORDER_RING_POP_SECONDS: f32 = 0.16;
+const ORDER_RING_MARGIN: f32 = 1.4;
+
+/// How solid a ring is drawn at full strength. Shared by both of them, so the
+/// order's mark at its freshest is exactly as present as the whistle's circle.
+const RING_ALPHA: f32 = 0.85;
 
 /// How far above his feet an ally may be and still be whistled. A circle is a
 /// flat thing drawn on the ground and reads as one, so the height is generous
@@ -128,7 +146,15 @@ const AMBLE_SPEED: f32 = crate::animation::MARIO_STRIDE_SPEED;
 
 /// An ally in the field. The only thing the squad writes onto one is its goal;
 /// an ally with none is nobody's business and goes back to ambling.
+///
+/// Every Mario has a [`crate::path::Route`] whether or not it is walking one,
+/// because the alternative is worse than it looks: the systems that decide and
+/// walk both ask for it, so a Mario spawned without one is not a Mario that
+/// walks straight -- it is a Mario that drops out of those queries entirely and
+/// stands still for ever, with nothing anywhere reporting a problem. Required
+/// rather than remembered, so that cannot be got wrong.
 #[derive(Component)]
+#[require(crate::path::Route)]
 pub struct Ally {
     /// Where it should be standing, and how near counts as there.
     pub goal: Option<(Vec2, f32)>,
@@ -218,6 +244,55 @@ impl Ally {
     }
 }
 
+/// One Mario, one spot it was sent to, and how that journey is going.
+///
+/// The last two fields are only ever read by [`update_goals`] and exist to
+/// answer one question: **is this Mario still on its way, or is it simply
+/// stuck?** Without asking it, an order is discharged by arrival and by nothing
+/// else, so a Mario whose slot in the cluster landed on the far side of a fence
+/// -- or in the moat, or under a wall -- walks into that fence for the rest of
+/// the session at full [`crate::goap::OBEY_APPEAL`], deaf to every slime beside
+/// it. That is one of the ways a squad "just stops and does nothing", and it is
+/// not a scoring bug: the Mario really has not arrived.
+///
+/// So the order is also discharged by giving up. [`Self::closest`] is the best
+/// the Mario has ever managed, and a stretch of [`STUCK_SECONDS`] without
+/// beating it by [`PROGRESS`] means the walk is not going anywhere. The order
+/// then counts as fulfilled -- see [`crate::goap::Goal::Hold`] for what that is
+/// worth -- which is the difference between a Mario pressed against a fence
+/// doing nothing and a Mario pressed against a fence hitting what is on its own
+/// side of it.
+#[derive(Clone, Copy, Debug)]
+pub struct Sent {
+    pub who: Entity,
+    /// The spot in the cluster it was given.
+    pub at: Vec2,
+    /// Whether it counts as having got there -- by arriving, or by having
+    /// spent long enough failing to.
+    pub arrived: bool,
+    /// What progress is currently being measured against: the corner of the
+    /// route it is walking at, or the spot itself when it is walking straight
+    /// there.
+    ///
+    /// **Against the corner and not against the spot, which is the difference
+    /// between a stall clock and a clock that runs out on every long way
+    /// round.** A route deliberately goes the wrong way for a while: out of the
+    /// courtyard before it can start crossing the lawn. Measured against the
+    /// spot, that Mario is losing ground for ten seconds and the order is
+    /// retired half way through being carried out -- precisely the behaviour
+    /// the routing exists to prevent, produced by the routing. Measured against
+    /// the corner it is walking at, it is doing fine.
+    towards: Vec2,
+    /// The nearest it has got to [`Self::towards`] since that became the thing
+    /// it was walking at.
+    closest: f32,
+    /// How long since it last beat that.
+    stuck_for: f32,
+    /// How long the pathfinder has been telling this Mario there is no way
+    /// there at all. See [`LOST_SECONDS`].
+    lost_for: f32,
+}
+
 /// Which allies are following and which have been sent somewhere.
 ///
 /// Entities rather than indices, so a Mario that is despawned mid-order drops
@@ -225,11 +300,11 @@ impl Ally {
 #[derive(Resource, Default)]
 pub struct Squad {
     pub members: Vec<Entity>,
-    /// Sent to a spot, and whether they are standing on it yet. They keep the
-    /// goal once they are: an ally sent somewhere holds it until whistled up
-    /// again, which is what makes sending them an order rather than a
+    /// Sent to a spot, and how they are getting on. They keep the spot once
+    /// they are standing on it: an ally sent somewhere holds it until whistled
+    /// up again, which is what makes sending them an order rather than a
     /// suggestion.
-    pub sent: Vec<(Entity, Vec2, bool)>,
+    pub sent: Vec<Sent>,
     /// Where the followers are gathering, kept between ticks so it can trail the
     /// leader rather than be recomputed from where he happens to be facing.
     ///
@@ -253,6 +328,218 @@ impl Whistle {
     }
 }
 
+/// The ring left on the ground where the last order landed.
+///
+/// **Separate from the whistle's own circle, and it has to be.** That one is
+/// live while the button is down and gone the instant it comes up -- which is
+/// the exact moment the player most wants to know where the order went. So the
+/// order leaves its own mark, sized to the cluster the squad is spreading into
+/// and fading out over [`ORDER_RING_SECONDS`].
+///
+/// Written by [`whistle`] on the release and read by [`order_ring`], both at
+/// the render rate: the mark is presentation and nothing in the simulation
+/// looks at it.
+#[derive(Resource, Default)]
+pub struct OrderMark {
+    /// Where the order landed -- the aim point itself, not a slot.
+    pub at: Vec3,
+    /// How wide to draw it, in world units.
+    pub radius: f32,
+    /// Seconds since it was left, or `None` when no order has been given yet.
+    pub age: Option<f32>,
+}
+
+impl OrderMark {
+    /// Leaves a fresh mark on the spot an order came to rest.
+    ///
+    /// Off the [`Landed`] the send answered rather than off the aim that was
+    /// pointed at, which is the difference between a ring that reports and a
+    /// ring that decorates: the Marios go to the cluster, so the cluster is
+    /// what gets ringed.
+    pub fn left_at(&mut self, landed: Landed) {
+        self.at = landed.at;
+        self.radius = landed.radius;
+        self.age = Some(0.0);
+    }
+
+    /// How solid the mark is drawn now: 1 when fresh, 0 once it is spent.
+    pub fn fade(&self) -> f32 {
+        match self.age {
+            Some(age) if age < ORDER_RING_SECONDS => 1.0 - age / ORDER_RING_SECONDS,
+            _ => 0.0,
+        }
+    }
+
+    /// How wide it is drawn now, which is not its final width for the first
+    /// few frames: it pops open from a little under so the mark reads as
+    /// something that just happened.
+    pub fn drawn_radius(&self) -> f32 {
+        let open = (self.age.unwrap_or(0.0) / ORDER_RING_POP_SECONDS).clamp(0.0, 1.0);
+        self.radius * (0.55 + 0.45 * open)
+    }
+}
+
+/// The order itself, put on the ground.
+///
+/// A crosshair now lands exactly where it is pointed -- part way up a wall, out
+/// over the moat -- and an order is a place to walk to, so it is worth putting
+/// on the ground before a cluster is laid out around it. See [`aim_point`].
+///
+/// **Kept where it was pointed whenever there is ground under it.** Snapping
+/// every order to the middle of a survey cell would move it up to half a cell
+/// from the thing the player was actually pointing at, every single time, to
+/// fix the case where it was pointed at nothing. So the snap is only for that
+/// case; otherwise the aim keeps its own x and z and takes only its height off
+/// the survey, which is what puts an order aimed at a wall at the foot of the
+/// wall rather than on its face.
+fn landing(field: &crate::flow::FlowField, aim: Vec3) -> Vec3 {
+    let cell = field.cell_at(aim);
+    if !field.survey_of(cell).walkable {
+        return field.standable(aim).unwrap_or(aim);
+    }
+    // The ray's own height is the exact ground under the crosshair; the
+    // survey's is an average over a couple of metres of cell. So the ray's is
+    // kept whenever the two agree, and the survey's is taken only when they do
+    // not -- which is the crosshair having stopped part way up something, a
+    // body's height or more above the ground at its foot.
+    let ground = field.centre_of(cell).y;
+    let y = match (aim.y - ground).abs() > PLAYER_HEIGHT {
+        true => ground,
+        false => aim.y,
+    };
+    Vec3::new(aim.x, y, aim.z)
+}
+
+/// Where the `count` members of a squad sent to `centre` should stand.
+///
+/// The golden-angle spiral [`slot`] draws, with the slots that will not hold a
+/// Mario thrown away and the spiral drawn further to make up the number. A
+/// cluster on a narrow bank therefore stretches along the bank instead of
+/// spilling into the water, and one landed against a wall packs into the ground
+/// in front of it -- the shape gives before the ground does, which is the right
+/// way round for a formation nobody authored.
+///
+/// **A slot holds a Mario when it can be walked to from the middle of the
+/// cluster in a straight line, and nothing weaker will do.** The obvious test
+/// -- ask the survey whether the cell is walkable -- is the one that let the
+/// targets out over the moat through, and it is worth being exact about why,
+/// because from outside it looks like the check simply was not running.
+/// `walkable` is built by dropping a query from the sky and asking what it
+/// hits, so it means *there is ground somewhere below this*, and over the moat
+/// there certainly is: the bed of it, eight metres down and under water. Every
+/// cell of open water on the castle is "walkable". So is the air over every
+/// ledge on the map, all the way down to whatever is at the bottom. Filtering
+/// on it moved the spots not one inch.
+///
+/// [`crate::flow::FlowField::clear`] asks the question that was actually meant.
+/// It walks the segment cell by cell and refuses any edge that climbs or drops
+/// more than the field's step limit, or that has a fence across it, or that
+/// leaves the ground altogether -- which is to say it refuses exactly the lip
+/// of the moat, the top of the parapet and the far side of the railings, in the
+/// same terms the pathfinder itself uses. A cluster whose every spot is `clear`
+/// of its middle is a cluster standing on one piece of ground.
+///
+/// Falls back to the bare arithmetic slot once [`CLUSTER_TRIES`] slots per
+/// member have been refused. That is a spot the size of a doorstep with a
+/// squad of twenty pointed at it, and an imperfect order is a better answer
+/// than no order.
+fn cluster(field: &crate::flow::FlowField, centre: Vec3, count: usize) -> Vec<Vec2> {
+    let flat = Vec2::new(centre.x, centre.z);
+    // `clear` has no opinion about two points in the same cell, so the cell
+    // itself is asked about separately -- otherwise a squad of one sent over a
+    // cliff would be placed on the cliff.
+    let holds = |spot: Vec2| {
+        let there = Vec3::new(spot.x, centre.y, spot.y);
+        field.survey_of(field.cell_at(there)).walkable && field.clear(centre, there)
+    };
+    let mut spots = Vec::with_capacity(count);
+    let mut index = 0;
+    while spots.len() < count && index < count * CLUSTER_TRIES {
+        let spot = flat + slot(index, SEND_SPACING);
+        if holds(spot) {
+            spots.push(spot);
+        }
+        index += 1;
+    }
+    // Whatever the ground would not take, put where it was asked for.
+    while spots.len() < count {
+        spots.push(flat + slot(spots.len(), SEND_SPACING));
+    }
+    spots
+}
+
+/// The sweep's answer to "can the squad get there from here", when it has one.
+///
+/// **A wrapper around one array read, and it exists to hold a caveat.** The
+/// flow field floods outward from the player every rebuild, so a cell it never
+/// reached is a cell with no way to it -- exactly the question an order needs
+/// answered, and answered without a budget, which is more than any per-body
+/// search can promise. But the field is only that witness *after* it has swept.
+/// A freshly built one has every cell at [`crate::route::UNREACHED`], and a
+/// system that read it straight would retire every order the squad was ever
+/// given on the grounds that nowhere at all is reachable.
+///
+/// So the sweep has to vouch for itself first, and the ground the player is
+/// standing on is how: he is the source it floods from, so a sweep that has run
+/// has reached his cell and one that has not has reached nothing. It errs the
+/// safe way in the one case where that is not exact -- a player in the air, in
+/// the water or on a ledge stands on a cell the survey calls unwalkable, which
+/// the flood seeds *around* rather than in, so for those ticks the sweep
+/// declines to say anything and no order is retired on its word.
+struct Swept<'a> {
+    field: &'a crate::flow::FlowField,
+    /// Whether the sweep has run at all. Nothing is refused when it has not.
+    ran: bool,
+    /// The height to look the ground up at, which is the player's -- an order
+    /// is a spot in the plane and the grid is indexed in the plane.
+    y: f32,
+}
+
+impl Swept<'_> {
+    fn of(field: &crate::flow::FlowField, player: Vec3) -> Swept<'_> {
+        Swept {
+            ran: field.survey_of(field.cell_at(player)).steps.is_some(),
+            field,
+            y: player.y,
+        }
+    }
+
+    /// Whether there is a way to `at`. `true` whenever the sweep cannot say.
+    fn reaches(&self, at: Vec2) -> bool {
+        if !self.ran {
+            return true;
+        }
+        let cell = self.field.cell_at(Vec3::new(at.x, self.y, at.y));
+        self.field.survey_of(cell).steps.is_some()
+    }
+}
+
+/// How many slots off the spiral may be refused per member before a cluster
+/// gives up and lays the rest down where the arithmetic put them.
+///
+/// Six is generous: a spiral at [`SEND_SPACING`] reaches about two metres times
+/// the square root of the index, so six tries a head is a squad of eight
+/// looking as far as sixteen metres out for eight standable spots. Past that
+/// the order was given somewhere there is genuinely nowhere to stand, and
+/// reaching further would only scatter the group across the map looking for
+/// ground.
+const CLUSTER_TRIES: usize = 6;
+
+/// What an order came to.
+///
+/// Where it landed rather than where it was pointed, because the two are not
+/// the same once the spot has been put on the ground -- and the ring the
+/// player is shown has to be drawn on the first of those. See [`OrderMark`].
+#[derive(Clone, Copy, Debug)]
+pub struct Landed {
+    /// The middle of the cluster, on ground something can stand on.
+    pub at: Vec3,
+    /// How wide the cluster actually came out, plus a margin -- so a squad that
+    /// had to stretch along a bank to find its footing is ringed by the ground
+    /// it took rather than by the ground a clear lawn would have given it.
+    pub radius: f32,
+}
+
 /// Offset of the index'th member of a loose cluster, in the plane.
 ///
 /// Not rotated to face anything: the cluster is placed by its caller, and the
@@ -270,85 +557,93 @@ pub fn circle_radius(held_for: f32) -> f32 {
     CIRCLE_MIN_RADIUS + (CIRCLE_MAX_RADIUS - CIRCLE_MIN_RADIUS) * grown
 }
 
-/// Is this point at or below the floor beneath it?
-fn underground(level: &LevelData, point: Vec3) -> bool {
-    level
-        .floor_height(point + Vec3::Y * AIM_PROBE)
-        .is_some_and(|height| point.y <= height)
+/// How far an order reaches: as far as the level goes.
+///
+/// **There is no range on an order and there should not be.** A whistle is the
+/// player pointing at a place and saying "go there", and the only honest answer
+/// to a place he can see across the courtyard is for the squad to walk across
+/// the courtyard. The old twenty-six metre cap did not refuse a long order, it
+/// silently *moved* it: the target was pulled back down the bearing to the cap
+/// and the squad marched off to a spot a third of the way to the thing he was
+/// pointing at, which reads as the order having been misunderstood.
+///
+/// The level's own diagonal, so the reach is "everywhere" without the raycast
+/// being handed an infinity it cannot make a segment out of.
+fn order_reach(level: &LevelData) -> f32 {
+    let (low, high) = level.bounds();
+    (high - low).length().max(AIM_SKY_RANGE)
 }
 
-/// Marches a ray until it goes underground, returning how far along it that
-/// happened.
+/// Where on the ground the crosshair is pointing, within `reach` of the eye.
 ///
-/// Coarse steps and then a handful of bisections rather than fine steps
-/// throughout: this runs every frame the button is held and each sample is a
-/// collision query. Six halvings of a 1.5-unit step land the crossing inside
-/// two and a half centimetres, far finer than anything downstream of it.
-fn ray_ground(
+/// The crosshair is the middle of the screen and the aim is the ray out of it,
+/// **cast against the level's collision triangles by the same
+/// [`LevelData::surface_hit`] a shot is traced with**. Left and right is where
+/// the view points; up and down is range, since a view tilted down meets the
+/// ground nearer and one tilted up throws the meeting further out. That is the
+/// whole of the aim, and it is why the reticle never has to leave the middle
+/// of the screen.
+///
+/// **A raycast rather than the ray march this used to be.** The march sampled
+/// the ray every metre and a half asking only "is this point under the floor",
+/// then handed back a spot on the bearing *from the player* to the crossing
+/// rather than the crossing itself. Two errors compounded: the sampling missed
+/// walls and ledges entirely -- there is no floor above a parapet, so a
+/// crosshair on one resolved to the lawn behind it -- and the reprojection
+/// slid the answer sideways whenever the camera sat off the player's shoulder,
+/// which is always. An order given at a wall landed somewhere else, and there
+/// was nothing drawn to show where. Now the hit is the answer, unmoved, and
+/// [`OrderMark`] rings it.
+///
+/// **`reach` is the only limit, and it is the caller's to set** -- there is no
+/// second clamp behind it. What the ray reaches, the aim may land on: a hit at
+/// eighty metres is the answer if eighty metres is what was asked for. See
+/// [`order_reach`], which is the whole level, and [`PLACE_REACH`], which is not.
+///
+/// Two cases are still not the ray's own answer, and both are about there being
+/// no answer to give. A ray that meets nothing -- out over the moat, off the
+/// edge of the world, or simply pointed at the sky -- is brought down to
+/// [`AIM_SKY_RANGE`] and walked back toward the player until there is floor
+/// under it. One that lands inside [`AIM_MIN_RANGE`] is pushed out to it, so
+/// the whistle circle is not drawn around his own boots.
+pub fn aim_point(
     level: &LevelData,
     origin: Vec3,
     direction: Vec3,
-    start: f32,
-    end: f32,
-) -> Option<f32> {
-    let mut previous = start;
-    let mut distance = start;
-    while distance <= end {
-        if underground(level, origin + direction * distance) {
-            let (mut low, mut high) = (previous, distance);
-            for _ in 0..AIM_REFINE {
-                let middle = (low + high) * 0.5;
-                if underground(level, origin + direction * middle) {
-                    high = middle;
-                } else {
-                    low = middle;
-                }
-            }
-            return Some(high);
-        }
-        previous = distance;
-        distance += AIM_STEP;
-    }
-    None
-}
-
-/// Where on the ground the crosshair is pointing.
-///
-/// The crosshair is the middle of the screen and the aim is the ray out of it,
-/// marched until it meets ground. Left and right is where the view points; up
-/// and down is range, since a view tilted down meets the ground nearer and one
-/// tilted up throws the meeting further out. That is the whole of the aim, and
-/// it is why the reticle never has to leave the middle of the screen.
-///
-/// The answer is a point in front of the *player* rather than the ray's own
-/// hit -- on the bearing from him to that hit -- so the camera sitting off his
-/// shoulder does not skew where the order lands. It is pulled back to
-/// `AIM_MAX_RANGE` when it is beyond range, pushed out to `AIM_MIN_RANGE` when
-/// the view is pointed at his own feet, and walked back toward him until there
-/// is floor under it when it is out over the moat or off the edge of the
-/// world. An order does not have to land exactly where it was pointed; it does
-/// have to land somewhere.
-pub fn aim_point(level: &LevelData, origin: Vec3, direction: Vec3, player: Vec3) -> Vec3 {
+    player: Vec3,
+    reach: f32,
+) -> Vec3 {
+    let direction = direction.normalize_or(Vec3::NEG_Z);
     let flat = Vec2::new(direction.x, direction.z).length();
     if flat < 1e-4 {
         // Straight down. Nothing to aim along; put it at his feet.
         return player;
     }
     let heading = Vec2::new(direction.x, direction.z) / flat;
-    // The march starts where the player is along the ray rather than at the
-    // camera: the ground between the camera and his back is behind him, and a
-    // target there points the order the wrong way.
+    // The cast starts abreast of the player rather than at the camera: the
+    // ground between the eye and his back is behind him, and a hit there
+    // points the order the wrong way.
     let start = (player - origin).dot(direction).max(1.0);
-    let hit = ray_ground(level, origin, direction, start, start + AIM_MAX_RANGE * 1.5);
-    let range = match hit {
-        Some(distance) => {
-            let point = origin + direction * distance;
-            Vec2::new(point.x - player.x, point.z - player.z).length()
-        }
-        None => AIM_MAX_RANGE,
+    let from = origin + direction * start;
+    let Some((hit, _)) = level.surface_hit(from, from + direction * reach) else {
+        return backed_off(level, player, heading, reach.min(AIM_SKY_RANGE));
     };
-    let mut range = range.clamp(AIM_MIN_RANGE, AIM_MAX_RANGE);
-    // Walk back until there is ground under the target.
+    if Vec2::new(hit.x - player.x, hit.z - player.z).length() < AIM_MIN_RANGE {
+        return backed_off(level, player, heading, AIM_MIN_RANGE);
+    }
+    // Exactly where the crosshair is, which is the point of casting at all.
+    hit
+}
+
+/// The furthest spot at or inside `range` on `heading` with floor under it,
+/// measured out from the player in the plane.
+///
+/// The fallback for every aim the cast could not answer outright: pointed at
+/// nothing, or landed so near it is inside the player. It steps in by
+/// [`AIM_BACKOFF`] until the floor query bites, and gives up onto
+/// `AIM_MIN_RANGE` -- his own feet, near enough -- rather than onto nothing.
+fn backed_off(level: &LevelData, player: Vec3, heading: Vec2, range: f32) -> Vec3 {
+    let mut range = range;
     while range > AIM_MIN_RANGE {
         let candidate = Vec3::new(
             player.x + heading.x * range,
@@ -380,21 +675,66 @@ impl Squad {
             if self.members.contains(ally) {
                 continue;
             }
-            self.sent.retain(|(sent, _, _)| sent != ally);
+            self.sent.retain(|order| order.who != *ally);
             self.members.push(*ally);
             joined += 1;
         }
         joined
     }
 
-    /// Sends the whole squad to a spot, spread around it.
-    pub fn send(&mut self, target: Vec2) -> usize {
-        let count = self.members.len();
-        for (index, ally) in self.members.drain(..).enumerate() {
-            self.sent
-                .push((ally, target + slot(index, SEND_SPACING), false));
+    /// Sends the whole squad to a spot, spread around it over ground it can
+    /// actually stand on.
+    ///
+    /// **The spread is filtered by the survey, and that is the whole of it.**
+    /// The cluster used to be pure arithmetic -- the target plus a golden-angle
+    /// offset -- laid down without ever asking whether there was anything under
+    /// it. Order a squad of eight onto the lip of the moat and the lip holds
+    /// four of them; the other four were sent out over the water, which no
+    /// Mario can reach, so each walked to the edge, leaned on it for
+    /// [`STUCK_SECONDS`], and was written off. What the player saw was half a
+    /// squad obeying and half of it milling about on a bank.
+    ///
+    /// Now [`cluster`] draws slots from the same spiral and keeps only the ones
+    /// the field will vouch for, so a cluster on a narrow bank reaches further
+    /// along it rather than spilling off it.
+    ///
+    /// Answers a [`Landed`]: where the order really came to rest and how wide
+    /// the cluster ended up, so the ring drawn for the player is drawn on the
+    /// spot the Marios were actually sent to rather than on the spot he
+    /// pointed at.
+    pub fn send(&mut self, field: &crate::flow::FlowField, aim: Vec3) -> Landed {
+        let at = landing(field, aim);
+        // **Everyone under command, not only those still following.** The
+        // whistle is how a Mario joins the squad and the whistle is how it
+        // leaves; an order is neither. Draining only `members` meant the first
+        // tap emptied the squad into `sent` and every tap after it ordered
+        // nobody, so redirecting a squad already on the march -- the most
+        // ordinary thing a player does with one -- meant whistling the whole
+        // group up again first. See [`Self::recruit`], which is still the only
+        // way in, and [`Self::disband`], which is still the way out.
+        let squad: Vec<Entity> = self
+            .members
+            .drain(..)
+            .chain(self.sent.drain(..).map(|order| order.who))
+            .collect();
+        let spots = cluster(field, at, squad.len());
+        let mut widest = 0.0_f32;
+        for (ally, spot) in squad.into_iter().zip(spots) {
+            widest = widest.max(Vec2::new(at.x, at.z).distance(spot));
+            self.sent.push(Sent {
+                who: ally,
+                at: spot,
+                arrived: false,
+                towards: spot,
+                closest: f32::INFINITY,
+                stuck_for: 0.0,
+                lost_for: 0.0,
+            });
         }
-        count
+        Landed {
+            at,
+            radius: widest + ORDER_RING_MARGIN,
+        }
     }
 
     pub fn disband(&mut self) -> usize {
@@ -418,7 +758,7 @@ impl Squad {
 
     /// Sent somewhere and not there yet.
     pub fn marching(&self) -> usize {
-        self.sent.iter().filter(|(_, _, arrived)| !arrived).count()
+        self.sent.iter().filter(|order| !order.arrived).count()
     }
 }
 
@@ -536,7 +876,7 @@ pub fn maintain_population(
         if standing.len() > wanted {
             for entity in standing.iter().skip(wanted) {
                 squad.members.retain(|member| member != entity);
-                squad.sent.retain(|(sent, _, _)| sent != entity);
+                squad.sent.retain(|order| order.who != *entity);
                 commands.entity(*entity).despawn();
                 placed -= 1;
             }
@@ -571,15 +911,17 @@ pub fn maintain_population(
 /// Refreshes every goal, once a tick, before the allies move.
 pub fn update_goals(
     mut squad: ResMut<Squad>,
+    // Which spots there is a way to. See [`Swept`].
+    field: Res<crate::flow::FlowField>,
     player: Query<&Transform, With<Player>>,
-    mut allies: Query<(&mut Ally, &Transform)>,
+    mut allies: Query<(&mut Ally, &Transform, &crate::path::Route)>,
 ) {
     let Ok(leader) = player.single() else {
         return;
     };
     // Drop anyone who is no longer in the field. Their goal goes with them.
     squad.members.retain(|ally| allies.contains(*ally));
-    squad.sent.retain(|(ally, _, _)| allies.contains(*ally));
+    squad.sent.retain(|order| allies.contains(order.who));
 
     // Behind the leader, so walking forward drags the group along rather than
     // through him -- but *behind* meaning the side they are already on, not the
@@ -616,25 +958,113 @@ pub fn update_goals(
     let anchor = here + trail.normalize_or_zero() * FOLLOW_DISTANCE;
     squad.anchor = Some(anchor);
     for (index, entity) in squad.members.iter().enumerate() {
-        if let Ok((mut ally, _)) = allies.get_mut(*entity) {
+        if let Ok((mut ally, _, _)) = allies.get_mut(*entity) {
             ally.goal = Some((anchor + slot(index, FOLLOW_SPACING), FOLLOW_ARRIVE));
         }
     }
-    let mut arrivals = Vec::new();
-    for (index, (entity, target, arrived)) in squad.sent.iter().enumerate() {
-        let Ok((mut ally, transform)) = allies.get_mut(*entity) else {
+    let dt = crate::player::FIXED_DT;
+    let swept = Swept::of(&field, leader.translation);
+    for order in squad.sent.iter_mut() {
+        let Ok((mut ally, transform, route)) = allies.get_mut(order.who) else {
             continue;
         };
-        ally.goal = Some((*target, SEND_ARRIVE));
+        ally.goal = Some((order.at, SEND_ARRIVE));
+        if order.arrived {
+            continue;
+        }
         let here = Vec2::new(transform.translation.x, transform.translation.z);
-        if !arrived && here.distance(*target) <= SEND_ARRIVE {
-            arrivals.push(index);
+        if here.distance(order.at) <= SEND_ARRIVE {
+            order.arrived = true;
+            continue;
+        }
+        // **Nowhere to walk is not the same as not getting anywhere, and it
+        // must not be paid for at the same rate.** The stall clock below is
+        // deliberately slow, because most of what it watches is a Mario making
+        // a detour and it must not retire an order half way round one. But a
+        // search that came back stranded has already settled every cell on this
+        // side of whatever is in the way and found no route among them -- there
+        // is nothing to wait six seconds for, and waiting is a Mario standing
+        // against a wall with its walk clip running. So an order the
+        // pathfinder has refused outright is retired in [`LOST_SECONDS`].
+        //
+        // See [`crate::path::Route::unreachable`] for why "stopped short" on
+        // its own is not enough to go on: most partial routes are a search that
+        // wanted more budget, and those get there in the end.
+        //
+        // The sweep is asked as well, and it is the better witness of the two.
+        // A per-body A* is metered -- it settles a few thousand cells and gives
+        // up -- so on a map with more ground than that it can never *prove* a
+        // spot unreachable, only fail to find it in time. The flow field floods
+        // the whole grid from the player with no budget at all, once a rebuild,
+        // so what it does not reach is not reachable. See [`Swept`].
+        //
+        // Only while this Mario is actually walking *the order*: it may be off
+        // fighting or fetching, and a route lost on the way to a slime says
+        // nothing about the spot the player sent it to.
+        let stranded = route.stranded() || !swept.reaches(order.at);
+        if matches!(ally.plan, crate::goap::Goal::Obey { .. }) && stranded {
+            order.lost_for += dt;
+            if order.lost_for >= LOST_SECONDS {
+                order.arrived = true;
+                continue;
+            }
+        } else {
+            // A route found again -- the world moved, or it was only ever the
+            // one tick a body spends in the air -- puts the clock back.
+            order.lost_for = 0.0;
+        }
+        // What it is actually walking at, which is a corner of its route when
+        // it has one. See [`Sent::towards`].
+        let aim = route.aim().map_or(order.at, |leg| Vec2::new(leg.x, leg.z));
+        // A new thing to be walking at is a fresh start: the record it was
+        // holding was about somewhere else.
+        if aim.distance(order.towards) > PROGRESS {
+            order.towards = aim;
+            order.closest = f32::INFINITY;
+            order.stuck_for = 0.0;
+            continue;
+        }
+        // Getting somewhere, or not. Measured against the best it has ever
+        // done rather than against last tick, because a Mario swinging round a
+        // pond spends most of a detour not gaining ground and is not stuck --
+        // what a stuck Mario cannot do is beat its own record, ever again.
+        let range = Vec2::new(transform.translation.x, transform.translation.z).distance(aim);
+        if range < order.closest - PROGRESS {
+            order.closest = range;
+            order.stuck_for = 0.0;
+            continue;
+        }
+        order.stuck_for += dt;
+        if order.stuck_for >= STUCK_SECONDS {
+            // The order is as carried out as it is ever going to be. It keeps
+            // the spot -- it will drift back towards it whenever it can, and a
+            // fence it cannot pass is one the fight has to come through too --
+            // but it stops being the only thing this Mario is allowed to want.
+            order.arrived = true;
         }
     }
-    for index in arrivals {
-        squad.sent[index].2 = true;
-    }
 }
+
+/// How much nearer its spot a Mario has to get for the walk to count as going
+/// somewhere, and how long it may fail to before the order is written off.
+///
+/// Six seconds is a long time to give a body that walks at seven metres a
+/// second -- long enough to swim a moat, round a pond, or wait out a press of
+/// bodies at a gate -- and that is deliberate. Writing an order off early is
+/// the squad ignoring the player; writing it off late is a few seconds of a
+/// Mario leaning on a fence. Only one of those is a bug worth risking.
+const PROGRESS: f32 = 0.25;
+const STUCK_SECONDS: f32 = 6.0;
+
+/// How long a Mario is given to find a way to its spot before an order to a
+/// place with no way to it is written off.
+///
+/// A whole second rather than the tick the answer arrives on, because `lost` is
+/// not only ever about the destination. A body in the air off a ledge, mid-jump
+/// or a stride into the moat is somewhere the survey calls unwalkable, so the
+/// search fails at the *start* end for a tick or two and says so the same way.
+/// A second outlives all of those and is still a twentieth of the stall clock.
+const LOST_SECONDS: f32 = 1.0;
 
 /// How quickly a swimming ally is pulled to the height it floats at, as a
 /// fraction of the remaining gap a second.
@@ -644,71 +1074,258 @@ pub fn update_goals(
 /// rather than one that changes height between two frames.
 const SWIM_RISE: f32 = 3.0;
 
-/// How far off a straight line a Mario will swing to keep out of the water, and
-/// how many deflections it tries before giving up and wading in.
+/// How far off a straight line a Mario will swing to keep clear of what is in
+/// the way, and how finely it looks between the two extremes.
 ///
-/// Tried outward in pairs, left and right of where it wanted to go, so it takes
-/// the smallest detour that works rather than always swinging the same way
-/// round a pond. Nine tries at ten degrees covers a right angle either side,
-/// which is enough to get round anything short of walking into a bay -- and
-/// walking into a bay is what the last resort is for.
-const SKIRT_STEP: f32 = std::f32::consts::PI / 18.0;
-const SKIRT_TRIES: usize = 9;
+/// Nine tries at ten degrees covers a right angle either side, tried in pairs
+/// so that neither side of an obstacle is preferred and a squad splits round a
+/// pond rather than filing along one bank of it. A right angle is the limit on
+/// purpose: past it the Mario is walking away from where it is going, and the
+/// thing that gets a body out of a dead end is [`crate::goap`] choosing
+/// something else to do, not a walk step reversing.
+const STEER_STEP: f32 = std::f32::consts::PI / 18.0;
+const STEER_TRIES: usize = 9;
 
-/// How far ahead a Mario looks for water, in strides.
+/// How far ahead a Mario looks, in strides.
 ///
-/// One step is a fortieth of a second of walking and far too short to steer on:
-/// by the time the next footfall is wet the one after it is in the middle of the
-/// moat. Looking a second or so ahead is what turns this from a body that stops
-/// at the water's edge into one that goes round.
-const SKIRT_LOOKAHEAD: f32 = 30.0;
+/// One step is a thirtieth of a second of walking and far too short to steer
+/// on: by the time the next footfall is wet, the one after it is in the middle
+/// of the moat. A metre and a half is about four ticks of warning at marching
+/// pace -- forty degrees of turn, which is enough to bend round a shoreline
+/// without the swerve reading as a flinch.
+const STEER_LOOKAHEAD: f32 = 45.0;
 
-/// Bends a step to keep out of deep water.
+/// What a Mario finds in front of it costs, before [`crate::goap::Goal::caution`]
+/// says how much this particular Mario minds.
+///
+/// Everything here is a *number* rather than a refusal, and that is the whole
+/// design. The old rule was "take the first dry heading, and if there is none,
+/// walk in anyway", which is a hard preference with a hard fallback: it cannot
+/// express "go the long way round unless the long way is very long", and it
+/// could not see a cliff at all. Scoring the candidates instead says all of it
+/// in one comparison, and the fallback comes out for free -- with every heading
+/// hazardous, the straight one wins on the detour term below and the Mario
+/// wades in.
+///
+/// The relative sizes are the design:
+///
+///   * **A wall or a fence** costs the most by a long way. It is the one thing
+///     here a Mario genuinely cannot cross, so walking at it is not a risk, it
+///     is a body standing still.
+///   * **A drop** costs more than water. A moat is a swim; a castle wall is a
+///     fall, and the squad following the player along a parapet should not
+///     shed a third of itself over the side.
+///   * **Nothing to stand on at all** costs the same as a drop. Over this level
+///     it is the edge of the map or the inside of a hill, and neither is
+///     somewhere to walk.
+///   * **Deep water** is the cheapest hazard, because it is the one the game
+///     actually expects them to cross -- see [`crate::goap::WET_PENALTY`], which
+///     is the same preference expressed against the *choice* rather than
+///     against the route.
+const WALL_COST: f32 = 4.0;
+const DROP_COST: f32 = 1.4;
+const VOID_COST: f32 = 1.4;
+const WET_COST: f32 = 1.0;
+
+/// What walking anywhere other than straight at the target costs.
+///
+/// `1 - cos(turn)`, so it is nothing for a shrug of a few degrees, a quarter at
+/// sixty, and a whole unit at a right angle -- the fraction of the stride the
+/// detour throws away. It is measured in the same units as the hazards above,
+/// and comparing the two is what decides every question this function is asked:
+/// at [`crate::goap::Goal::caution`] of 0.35, an order wades once the dry way
+/// round costs more than about fifty degrees of turn; at 1.6, an ambling Mario
+/// will turn the full right angle rather than get its feet wet.
+const DETOUR_COST: f32 = 1.0;
+
+/// The steepest ground there is, as rise over run.
+///
+/// **This is what sorts a hill from a cliff, in both directions, and it is
+/// derived rather than chosen.** The level itself files a triangle as ground
+/// only while it leans less than [`crate::level::GROUND_NORMAL_Y`] off
+/// horizontal, which is a shade under forty-six degrees, or a rise of about one
+/// in one. So over a lookahead of `reach`, the most the ground can legally
+/// climb or fall is `reach * WALKABLE_SLOPE`, and anything beyond that is
+/// something other than the ground continuing: a wall above, a drop below.
+///
+/// Written as a fraction of the stride rather than as a height, because a fixed
+/// height is wrong at both ends. As a *climb* it would refuse the castle's own
+/// ramps -- a Mario that treats a legal slope as a wall never leaves the lawn --
+/// and as a *drop* it would call every steep path down a cliff.
+///
+/// The level's own number, so that ground the collision grid is happy to call
+/// ground is never mistaken for either by anything walking over it.
+use crate::level::WALKABLE_SLOPE;
+
+/// How far above the probe a Mario looks for the ground ahead.
+///
+/// [`LevelData::ground_at`] answers with the highest ground *below* where it is
+/// asked, so asking at foot height would find no ground at all on any slope
+/// rising faster than about a metre in three -- and a Mario would treat every
+/// hill on the castle grounds as a hole. Asked from high enough that the
+/// steepest legal climb is inside the answer, [`WALKABLE_SLOPE`] then sorts what
+/// comes back.
+fn steer_reach_up(reach: f32) -> f32 {
+    reach * WALKABLE_SLOPE
+}
+
+/// How much a Mario minds what is in the way, and whether water is part of it.
+///
+/// Two things rather than one because they answer to different callers.
+/// `caution` comes off the goal -- an order is walked more boldly than an
+/// errand, see [`crate::goap::Goal::caution`] -- while `water` is a fact about
+/// the situation: a Mario already swimming, or one going to something that is
+/// itself in the water, has nothing to gain by keeping out of it, and a Mario
+/// that circles a pond it is standing in is the most broken-looking thing this
+/// module can produce.
+#[derive(Clone, Copy, Debug)]
+pub struct Care {
+    pub caution: f32,
+    pub water: bool,
+}
+
+/// Bends a step around what is in front of it.
 ///
 /// Returns the heading to actually walk, as a unit vector. The straight line is
-/// tried first and taken whenever it is dry, so this costs one water lookup for
-/// everything not near a shore.
+/// tried first and taken whenever it is clear, so this costs one look ahead for
+/// everything not near a shore, a wall or an edge.
 ///
-/// **It gives up rather than refuses**, and that is the whole of what makes it
-/// safe. A Mario already standing in the moat, or one whose ball has rolled into
-/// it, would otherwise be pinned: every direction is wet, no heading is
-/// acceptable, and it stands there for the rest of the session. So a Mario that
-/// cannot find a dry way walks the way it wanted to and swims -- see
-/// [`move_allies`], which is what actually carries it once it is in.
+/// **It weighs rather than refuses**, and that is what makes it both safe and
+/// obedient. A Mario already standing in the moat, or one whose ball has rolled
+/// into it, would otherwise be pinned: every direction is wet, no heading is
+/// acceptable, and it stands there for the rest of the session. Here the
+/// straight line is the cheapest thing on the list the moment every detour is
+/// as bad as it is, so a Mario with nowhere better to go goes where it meant to
+/// and swims -- see [`move_allies`], which is what carries it once it is in.
 ///
 /// Separate from the walk step and taking a `LevelData` rather than a query, so
 /// the rule can be exercised against a hand-built water box with no world
 /// around it.
-pub fn skirt(level: &LevelData, from: Vec3, heading: Vec2, reach: f32) -> Vec2 {
-    let dry = |direction: Vec2| {
+pub fn steer(level: &LevelData, from: Vec3, heading: Vec2, reach: f32, care: Care) -> Vec2 {
+    let knee = Vec3::Y * crate::enemy::STEP_UP;
+    // What one candidate heading runs into, in the units [`DETOUR_COST`] is
+    // measured in. Nothing here is a veto: the sum is compared, and the
+    // cheapest heading wins even when the cheapest is dreadful.
+    let hazard = |direction: Vec2| -> f32 {
         let ahead = from + Vec3::new(direction.x, 0.0, direction.y) * reach;
-        // The floor under the probe rather than the walker's own height: a
-        // shoreline is a slope, and a point measured at the height it is
-        // standing now reads as dry right up until it is swimming.
-        let ground = level.floor_height(ahead + Vec3::Y * PLAYER_HEIGHT);
-        let at = Vec3::new(ahead.x, ground.unwrap_or(ahead.y), ahead.z);
-        !level
-            .water_depth(at)
-            .is_some_and(|depth| depth > SWIMMING_DEPTH)
+        let mut cost = 0.0;
+        // What it would be standing on a stride from here, asked before
+        // anything else because the wall probe below needs it.
+        let footing = level.ground_at(ahead + Vec3::Y * steer_reach_up(reach));
+        // A fence. The knee is the same height [`crate::enemy::walk`] probes at
+        // and for the same reason: a kerb passes under it, a railing does not.
+        // Steepness is measured with the collision grid's own threshold, so a
+        // Mario's idea of a wall and the level's are one idea.
+        //
+        // **The cast runs between the two ends' own ground heights rather than
+        // at a fixed altitude, and that is not a nicety.** A horizontal ray from
+        // knee height on any rising ground goes *into* the hill: at the foot of
+        // a slope every direction but downhill reads as a wall, so the cheapest
+        // heading is whichever one the Mario was already pointed at, it walks
+        // into the slope, `resolve_walls` holds it out, and it stands there for
+        // the rest of the session with a perfectly good route in hand. That is
+        // the whole of "they still get stuck on the fence when they are ordered
+        // somewhere" -- it was not the fence, it was the bank behind it.
+        // [`crate::flow::FlowField::wall_between`] has followed the ground since
+        // it was written, and for exactly this reason; this is the same probe
+        // finally asking the same question.
+        let far = match footing {
+            Some((height, _)) => Vec3::new(ahead.x, height, ahead.z),
+            None => ahead,
+        };
+        //
+        // **Three rays a body's width apart, not one.** A single line down the
+        // middle answers whether a *point* could take the step, and a Mario is a
+        // cylinder that `LevelData::resolve_walls` holds a radius clear of
+        // everything: a heading that threads the centre line past the end of a
+        // wall walks the body's shoulder straight into it, and what that looks
+        // like is a Mario pinned against the inside of a fence, sliding, with a
+        // perfectly good route in hand. The survey has probed edges this way
+        // since it learned the same lesson -- see
+        // [`crate::flow::FlowField::wall_between`]. This is the walk step
+        // finally asking the same question.
+        let across = Vec3::new(-direction.y, 0.0, direction.x) * crate::player::PLAYER_RADIUS;
+        if [Vec3::ZERO, across, -across].iter().any(|offset| {
+            level
+                .surface_hit(from + knee + *offset, far + knee + *offset)
+                .is_some_and(|(_, normal)| normal.y.abs() <= crate::level::GROUND_NORMAL_Y)
+        }) {
+            cost += WALL_COST;
+        }
+        // And how far up or down that footing is.
+        match footing {
+            None => cost += VOID_COST,
+            Some((height, _)) => {
+                let step = height - from.y;
+                let walkable = reach * WALKABLE_SLOPE;
+                // **And the ground in between, not only the two ends.** A
+                // stride that rises eighty centimetres over a metre and a half
+                // is a gentle slope by the numbers and may still have a
+                // knee-high lip at the bottom of it that the body cannot get
+                // over -- see [`LevelData::climbable`], which is that question
+                // asked properly. Only worth asking when the far end is *above*
+                // the near one; nothing is climbed on the way down.
+                if step > 0.0 && !level.climbable(from, far) {
+                    cost += WALL_COST;
+                }
+                // Measured at the floor rather than at the walker's own height:
+                // a shoreline is a slope, and a point sampled at the height it
+                // is standing now reads as dry right up until it is swimming.
+                let deep = level
+                    .water_depth(far)
+                    .is_some_and(|depth| depth > SWIMMING_DEPTH);
+                if step > walkable {
+                    cost += WALL_COST;
+                } else if step < -walkable && !deep {
+                    // **A drop into water is a swim rather than a fall.** Two
+                    // reasons, and the second is the one that bites: a moat is
+                    // not a cliff, and a Mario already swimming in one is
+                    // floating several metres above its bed, so counting that
+                    // as a drop would put the same cost on every heading it
+                    // could take and leave the shore no more attractive than
+                    // the deep end. What is wrong with going that way, if
+                    // anything, is that it is wet -- which is the line below.
+                    cost += DROP_COST;
+                }
+                if deep && care.water {
+                    cost += WET_COST;
+                }
+            }
+        }
+        cost * care.caution
     };
-    if dry(heading) {
+    let straight = hazard(heading);
+    if straight <= 0.0 {
         return heading;
     }
-    for try_ in 1..=SKIRT_TRIES {
-        let turn = try_ as f32 * SKIRT_STEP;
+    let mut best = (straight, heading);
+    for try_ in 1..=STEER_TRIES {
+        let turn = try_ as f32 * STEER_STEP;
+        // What the turn itself costs, paid once for the pair: the two sides of
+        // a deflection are the same length.
+        let detour = (1.0 - turn.cos()) * DETOUR_COST;
+        // Nothing further round can beat what is already in hand, however clear
+        // it is -- the detour alone has passed it. Stopping here rather than
+        // running the arc out is most of what this costs on a busy shoreline.
+        if detour >= best.0 {
+            break;
+        }
         for side in [turn, -turn] {
             let (sin, cos) = side.sin_cos();
             let bent = Vec2::new(
                 heading.x * cos - heading.y * sin,
                 heading.x * sin + heading.y * cos,
             );
-            if dry(bent) {
-                return bent;
+            // Strictly better, so the smaller deflection and then the left-hand
+            // one hold a tie: a heading is never swapped for an equally good
+            // one, which is what would make a Mario on a shoreline waver.
+            let cost = detour + hazard(bent);
+            if cost < best.0 {
+                best = (cost, bent);
             }
         }
     }
-    // Ringed by water, or already in it. Go where it meant to.
-    heading
+    best.1
 }
 
 /// How deep the water has to be before a Mario swims in it rather than walking
@@ -724,19 +1341,29 @@ pub(crate) const SWIMMING_DEPTH: f32 = crate::player::SUBMERGED_DEPTH;
 pub fn move_allies(
     tuning: Res<GameTuning>,
     level: Res<LevelData>,
+    // Only to tell a corner that has been turned from one on the far side of a
+    // wall. See [`crate::path::Route::leg`].
+    field: Res<crate::flow::FlowField>,
     mut sounds: ResMut<SoundQueue>,
     // One still in the air out of the Mario pipe is flown by `pipe::fly`, and
     // walking it toward a goal at the same time would drag it out of its arc.
-    mut allies: Query<(Entity, &mut Ally, &mut Transform), Without<crate::pipe::Launched>>,
+    mut allies: Query<
+        (Entity, &mut Ally, &mut Transform, &mut crate::path::Route),
+        Without<crate::pipe::Launched>,
+    >,
 ) {
     let dt = crate::player::FIXED_DT;
-    for (_entity, mut ally, mut transform) in &mut allies {
+    for (_entity, mut ally, mut transform, mut route) in &mut allies {
         // The order it was given outlives being released by exactly one tick,
         // which is how being released is noticed: it stands where the order left
         // it and ambles from there, rather than walking back to wherever it was
         // recruited. The *plan* is rewritten from scratch every tick by
         // `goap::plan`, so nothing here has to expire it.
-        if !matches!(ally.plan, crate::goap::Goal::Obey { .. }) && ally.goal.take().is_some() {
+        if !matches!(
+            ally.plan,
+            crate::goap::Goal::Obey { .. } | crate::goap::Goal::Hold { .. }
+        ) && ally.goal.take().is_some()
+        {
             ally.home = transform.translation;
             ally.amble_somewhere_else();
         }
@@ -792,23 +1419,40 @@ pub fn move_allies(
             settle(&level, &mut transform, depth, swimming, dt);
             continue;
         }
-        // Round the pond rather than through it -- unless it is already in the
-        // water, or what it is going to get is, in which case the detour is a
-        // Mario walking in circles round the thing it came for. See [`skirt`].
-        let straight = to_target / distance;
+        // **Where the feet actually point**, which is not always the goal. A
+        // route is a list of corners each of which the Mario can see from the
+        // one before, so following one turns "get to the far side of the
+        // castle" -- a question no amount of looking ahead a stride answers --
+        // into a series of walks across open ground, which is the only question
+        // [`steer`] is any good at. With no route it walks at the goal, exactly
+        // as it did before there was any of this. See [`crate::path`].
+        let aim = route
+            .leg(&field, transform.translation, tuning.path_spread)
+            .map(|leg| Vec2::new(leg.x, leg.z))
+            .unwrap_or(target);
+        // Round the pond and along the top of the wall rather than through
+        // one and off the other -- but only as far as this job is worth going
+        // round. Water stops counting once the Mario is in it or what it came
+        // for is, because a detour round a pond it is standing in is a Mario
+        // walking in circles. See [`steer`].
+        //
+        // The straight line is towards the *corner*; how fast it walks and when
+        // it has arrived are still measured against the goal, because arriving
+        // at a corner is not arriving.
+        let straight = (aim - here).normalize_or(to_target / distance);
         let goal_is_wet = level
             .water_depth(Vec3::new(target.x, transform.translation.y, target.y))
             .is_some_and(|depth| depth > SWIMMING_DEPTH);
-        let heading = if swimming || goal_is_wet {
-            straight
-        } else {
-            skirt(
-                &level,
-                transform.translation,
-                straight,
-                SKIRT_LOOKAHEAD * dt,
-            )
-        };
+        let heading = steer(
+            &level,
+            transform.translation,
+            straight,
+            STEER_LOOKAHEAD * dt,
+            Care {
+                caution: ally.plan.caution(),
+                water: !swimming && !goal_is_wet,
+            },
+        );
         // Ease off over the last stride so arriving is not a hard stop. A plan
         // is a job and is walked at the squad's marching pace; ambling is not.
         // Swimming is its own speed, and the player's own -- a Mario in the
@@ -820,8 +1464,15 @@ pub fn move_allies(
         };
         let speed = pace * (distance / arrive.max(0.001)).min(1.0);
         let step = heading * speed * dt;
-        transform.translation.x += step.x;
-        transform.translation.z += step.y;
+        // Stopped by walls, as the same cylinder the player is stopped by --
+        // [`steer`] prefers not to walk into one, and this is what happens when
+        // preferring was not enough. Without it a Mario is the one body on the
+        // field that fences do not apply to: it walks through the railing, out
+        // over the moat, and is put down on whatever the floor query hands
+        // back.
+        let wanted = transform.translation + Vec3::new(step.x, 0.0, step.y);
+        transform.translation =
+            level.resolve_walls(wanted, Vec3::Y, crate::player::PLAYER_RADIUS, PLAYER_HEIGHT);
         // Re-read after the step: it has moved, so the depth it is riding is
         // the depth where it now is rather than where it set off from.
         let arrived_depth = level.water_depth(transform.translation);
@@ -852,6 +1503,16 @@ pub fn move_allies(
 /// The float is a pull rather than a snap, so breaking the surface is a body
 /// rising through it rather than a body teleporting to it, and it is the
 /// player's own `SWIM_FLOAT_DEPTH` so the two ride the water at the same height.
+///
+/// **Going down is paced and going up is not**, which is the same asymmetry
+/// [`crate::enemy`] settles a slime with. A rise is a slope the Mario is walking
+/// up and it is already limited by the walk: the floor query only ever offers
+/// ground it could have stepped onto, and a stride is a fifth of a metre. A
+/// *fall* has no such limit -- a Mario that walks off the castle wall is thirty
+/// metres above the moat, and taking that in one assignment is not a fall, it is
+/// the Mario ceasing to be up there and starting to be down here. [`steer`] is
+/// what tries to stop this happening at all; this is what it looks like when it
+/// happens anyway.
 fn settle(
     level: &LevelData,
     transform: &mut Transform,
@@ -867,9 +1528,16 @@ fn settle(
         return;
     }
     if let Some(height) = level.floor_height(transform.translation + Vec3::Y * PLAYER_HEIGHT) {
-        transform.translation.y = height;
+        let drop = FALL_SPEED * dt;
+        transform.translation.y += (height - transform.translation.y).max(-drop);
     }
 }
+
+/// How fast a Mario with nothing under it comes down, in metres a second.
+///
+/// The enemies' own falling speed, because a body dropping off the same wall
+/// should reach the water at the same time whichever side it is on.
+const FALL_SPEED: f32 = 14.0;
 
 // -- gliding ----------------------------------------------------------------
 
@@ -1017,6 +1685,10 @@ pub fn animate_allies(
 #[derive(Component)]
 pub struct WhistleCircle;
 
+/// The ring left on the ground where an order landed.
+#[derive(Component)]
+pub struct OrderCircle;
+
 /// The ring's own transform.
 ///
 /// Every exclusion here is load-bearing. Bevy proves two queries disjoint from
@@ -1073,18 +1745,41 @@ pub fn ring_mesh() -> Mesh {
     mesh
 }
 
-/// Spawns the (initially hidden) whistle ring. Called from startup.
+/// Spawns the (initially hidden) whistle and order rings. Called from startup.
+///
+/// Two entities off one mesh. They outlive a level for the reason the build
+/// preview does -- what you command with must not go away when you change
+/// level -- and they are told apart by colour: the whistle's ring is the warm
+/// one you are holding open, the order's is the cool one it left behind.
 pub fn spawn_circle(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
 ) {
+    let ring = meshes.add(ring_mesh());
+    commands.spawn((
+        OrderCircle,
+        bevy::light::NotShadowCaster,
+        Mesh3d(ring.clone()),
+        // Its own material handle rather than a share of the whistle's,
+        // because `order_ring` fades this one by writing its alpha every
+        // frame and a shared handle would drag the whistle's ring with it.
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgba(0.45, 0.90, 1.0, RING_ALPHA),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            double_sided: true,
+            cull_mode: None,
+            ..default()
+        })),
+        Visibility::Hidden,
+    ));
     commands.spawn((
         WhistleCircle,
         bevy::light::NotShadowCaster,
-        Mesh3d(meshes.add(ring_mesh())),
+        Mesh3d(ring),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgba(1.0, 0.94, 0.45, 0.85),
+            base_color: Color::srgba(1.0, 0.94, 0.45, RING_ALPHA),
             alpha_mode: AlphaMode::Blend,
             unlit: true,
             double_sided: true,
@@ -1105,7 +1800,11 @@ pub fn whistle(
     time: Res<Time>,
     mut input: ResMut<crate::input::InputState>,
     level: Res<LevelData>,
+    // Where the order may actually be *put*, which is a different question
+    // from where it was pointed. See [`Squad::send`].
+    field: Res<crate::flow::FlowField>,
     mut whistle: ResMut<Whistle>,
+    mut mark: ResMut<OrderMark>,
     mut squad: ResMut<Squad>,
     camera: Query<&Transform, (With<Camera3d>, Without<Player>)>,
     player: Query<&Transform, With<Player>>,
@@ -1124,6 +1823,9 @@ pub fn whistle(
             camera.translation,
             Vec3::from(camera.forward()),
             leader.translation,
+            // As far as the level goes. An order has no range. See
+            // [`order_reach`].
+            order_reach(&level),
         );
     }
     if input.squad {
@@ -1134,8 +1836,12 @@ pub fn whistle(
     if released {
         let held = whistle.held_for.take().unwrap_or(0.0);
         if held < TAP_SECONDS {
-            // A tap is an order to the squad it already has.
-            squad.send(Vec2::new(whistle.aim.x, whistle.aim.z));
+            // A tap is an order to the squad it already has, and the ring it
+            // leaves is the only report the player gets that it went anywhere
+            // -- the whistle's own circle was never drawn for a press this
+            // short. Marked from the count `send` returns, so an order to
+            // nobody still draws the smallest ring rather than nothing.
+            mark.left_at(squad.send(&field, whistle.aim));
         } else {
             let inside: Vec<_> = allies
                 .iter()
@@ -1160,6 +1866,51 @@ pub fn whistle(
             transform.translation = whistle.aim + Vec3::Y * 0.05;
             transform.scale = Vec3::new(whistle.radius, 1.0, whistle.radius);
         }
+    }
+}
+
+/// Draws the mark left where the last order landed, and ages it out.
+///
+/// Its own system rather than a tail on [`whistle`] because that one already
+/// writes the whistle circle's `Transform`, and a second `Transform` query in
+/// the same system has to name every exclusion the first one does -- see
+/// [`CircleQuery`] for what that costs. Chained after it in `presentation`, so
+/// a mark left this frame is drawn this frame rather than a frame stale.
+pub fn order_ring(
+    time: Res<Time>,
+    mut mark: ResMut<OrderMark>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut ring: Query<
+        (
+            &mut Transform,
+            &mut Visibility,
+            &MeshMaterial3d<StandardMaterial>,
+        ),
+        With<OrderCircle>,
+    >,
+) {
+    if let Some(age) = mark.age.as_mut() {
+        *age += time.delta_secs();
+    }
+    let fade = mark.fade();
+    let Ok((mut transform, mut visibility, material)) = ring.single_mut() else {
+        return;
+    };
+    if fade <= 0.0 {
+        *visibility = Visibility::Hidden;
+        // Spent, so stop ageing a number nothing reads again.
+        mark.age = None;
+        return;
+    }
+    *visibility = Visibility::Visible;
+    let radius = mark.drawn_radius();
+    // Just clear of the ground, so the ring is not half-buried in the slope it
+    // is drawn on -- the same 5cm the whistle's ring and the build preview's
+    // footprint are lifted by.
+    transform.translation = mark.at + Vec3::Y * 0.05;
+    transform.scale = Vec3::new(radius, 1.0, radius);
+    if let Some(mut material) = materials.get_mut(&material.0) {
+        material.base_color.set_alpha(RING_ALPHA * fade);
     }
 }
 
@@ -1284,10 +2035,11 @@ mod tests {
 
     #[test]
     fn recruiting_calls_back_an_ally_already_sent_somewhere() {
+        let field = crate::flow::FlowField::new(&lawn());
         let mut squad = Squad::default();
         let ally = Entity::from_raw_u32(7).unwrap();
         squad.members.push(ally);
-        assert_eq!(squad.send(Vec2::new(5.0, 5.0)), 1);
+        squad.send(&field, Vec3::new(5.0, 0.0, 5.0));
         assert_eq!(squad.sent.len(), 1);
         assert!(squad.members.is_empty());
         // Whistled again, he drops the order rather than walking on deaf.
@@ -1305,17 +2057,18 @@ mod tests {
         for raw in 0..5 {
             squad.members.push(Entity::from_raw_u32(raw).unwrap());
         }
+        let field = crate::flow::FlowField::new(&lawn());
         let target = Vec2::new(10.0, -4.0);
-        assert_eq!(squad.send(target), 5);
+        squad.send(&field, Vec3::new(target.x, 0.0, target.y));
         assert_eq!(squad.marching(), 5);
         let mut seen: Vec<Vec2> = Vec::new();
-        for (_, spot, _) in &squad.sent {
-            assert!(spot.distance(target) < SEND_SPACING * 3.0);
+        for order in &squad.sent {
+            assert!(order.at.distance(target) < SEND_SPACING * 3.0);
             assert!(
-                seen.iter().all(|other| other.distance(*spot) > 0.5),
+                seen.iter().all(|other| other.distance(order.at) > 0.5),
                 "two allies were sent to the same place"
             );
-            seen.push(*spot);
+            seen.push(order.at);
         }
     }
 
@@ -1340,6 +2093,10 @@ mod tests {
             .collect();
         squad.members.extend(allies.iter().copied());
         world.insert_resource(squad);
+        // Nothing here has been sent anywhere, so the sweep is never consulted
+        // -- but `update_goals` asks for it, and a system missing a resource is
+        // a system that does not run at all.
+        world.insert_resource(crate::flow::FlowField::new(&lawn()));
         let leader = world.spawn((Player, Transform::default())).id();
 
         let goals = |world: &mut World| -> Vec<Vec2> {
@@ -1385,9 +2142,15 @@ mod tests {
     fn disbanding_clears_both_lists() {
         let mut squad = Squad::default();
         squad.members.push(Entity::from_raw_u32(1).unwrap());
-        squad
-            .sent
-            .push((Entity::from_raw_u32(2).unwrap(), Vec2::ZERO, true));
+        squad.sent.push(Sent {
+            who: Entity::from_raw_u32(2).unwrap(),
+            at: Vec2::ZERO,
+            arrived: true,
+            towards: Vec2::ZERO,
+            closest: 0.0,
+            stuck_for: 0.0,
+            lost_for: 0.0,
+        });
         assert_eq!(squad.disband(), 2);
         assert!(squad.members.is_empty() && squad.sent.is_empty());
     }
@@ -1399,11 +2162,11 @@ mod tests {
         // A camera behind and above him, looking down at the ground ahead.
         let origin = player + Vec3::new(0.0, 6.0, 9.0);
         let direction = (Vec3::new(player.x, player.y, player.z - 8.0) - origin).normalize();
-        let aim = aim_point(&level, origin, direction, player);
+        let aim = aim_point(&level, origin, direction, player, order_reach(&level));
         let flat = Vec2::new(aim.x - player.x, aim.z - player.z).length();
         assert!(
-            (AIM_MIN_RANGE..=AIM_MAX_RANGE).contains(&flat),
-            "aimed {flat} away"
+            flat >= AIM_MIN_RANGE,
+            "aimed {flat} away, inside his own boots"
         );
         // It is ahead of him, on the bearing he is looking down.
         assert!(aim.z < player.z, "the aim landed behind the player");
@@ -1423,7 +2186,7 @@ mod tests {
         // off the edge of the map without ever meeting ground.
         let origin = player + Vec3::new(0.0, 2.0, 6.0);
         let direction = Vec3::new(0.0, 0.02, -1.0).normalize();
-        let aim = aim_point(&level, origin, direction, player);
+        let aim = aim_point(&level, origin, direction, player, order_reach(&level));
         let floor = level.floor_height(aim + Vec3::Y * PLAYER_HEIGHT);
         assert!(
             floor.is_some(),
@@ -1431,12 +2194,188 @@ mod tests {
         );
     }
 
+    /// An order reaches as far as the player can see, with no cap on it.
+    ///
+    /// **The cap did not refuse a long order, it quietly moved it.** Anything
+    /// beyond twenty-six metres was pulled back down the bearing to twenty-six,
+    /// so pointing across the courtyard sent the squad to a spot a third of the
+    /// way there -- an order that looks, from the player's chair, like it was
+    /// misunderstood. Sixty metres of lawn, and the aim has to land on the far
+    /// end of it.
+    #[test]
+    fn an_order_has_no_range() {
+        let level = lawn();
+        let player = Vec3::new(0.0, 0.0, 50.0);
+        let target = Vec3::new(0.0, 0.0, -50.0);
+        let origin = player + Vec3::new(0.0, 6.0, 6.0);
+        let aim = aim_point(
+            &level,
+            origin,
+            (target - origin).normalize(),
+            player,
+            order_reach(&level),
+        );
+        assert!(
+            aim.distance(target) < 1.0,
+            "a hundred-metre order landed at {aim:?} rather than at {target:?}"
+        );
+        // And the reach really is the level rather than a bigger number that
+        // happens to cover this lawn.
+        assert!(
+            order_reach(&level) >= 120.0,
+            "the reach is {} on a 120 m lawn",
+            order_reach(&level)
+        );
+    }
+
+    /// A lawn with a wall standing across it.
+    ///
+    /// The wall is the thing a ray march could not see: it is vertical, so
+    /// there is no "floor" anywhere along it to fall under, and a level ray
+    /// aimed at its face used to run straight through and land on the lawn
+    /// beyond. See [`aim_point`].
+    fn lawn_with_a_wall() -> LevelData {
+        let vertices = vec![
+            Vec3::new(-60., 0., -60.),
+            Vec3::new(60., 0., -60.),
+            Vec3::new(60., 0., 60.),
+            Vec3::new(-60., 0., 60.),
+            // The wall's face, standing on the lawn at z = -10.
+            Vec3::new(-8., 0., -10.),
+            Vec3::new(8., 0., -10.),
+            Vec3::new(8., 6., -10.),
+            Vec3::new(-8., 6., -10.),
+        ];
+        LevelData::new(
+            vertices,
+            vec![[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]],
+            vec![],
+        )
+    }
+
+    /// An order aimed at a wall lands on the wall, not on the lawn behind it.
+    ///
+    /// The whole of what the raycast bought. The march this replaced only ever
+    /// asked "is this sample under the floor", and along a level ray the answer
+    /// is no from one end to the other -- wall or no wall -- so the aim fell
+    /// through to its out-of-range fallback and put the order twenty-six metres
+    /// out, through the wall and well past it.
+    #[test]
+    fn an_aim_at_a_wall_stops_at_the_wall() {
+        let level = lawn_with_a_wall();
+        let player = Vec3::new(0.0, 0.0, 10.0);
+        // Off his shoulder, which is where the camera always is.
+        let origin = Vec3::new(3.0, 2.0, 16.0);
+        let direction = Vec3::new(0.0, 1.0, -26.0).normalize();
+        let aim = aim_point(&level, origin, direction, player, order_reach(&level));
+        assert!(
+            (aim.z + 10.0).abs() < 0.1,
+            "the aim went through the wall to {aim:?}"
+        );
+        assert!(
+            aim.y > 1.0,
+            "the aim slid down the wall to the lawn: {aim:?}"
+        );
+    }
+
+    /// And it lands where the crosshair is rather than on the player's bearing.
+    ///
+    /// The aim used to be handed back as a point in front of the *player*, on
+    /// the bearing from him to the hit, which quietly slid every order sideways
+    /// by however far the camera sits off his shoulder. With the ring now drawn
+    /// where the order landed, that skew is visible: the mark would sit next to
+    /// the thing the player was pointing at.
+    #[test]
+    fn an_order_lands_under_the_crosshair_rather_than_beside_it() {
+        let level = lawn_with_a_wall();
+        let player = Vec3::new(0.0, 0.0, 10.0);
+        let origin = Vec3::new(3.0, 2.0, 16.0);
+        let direction = Vec3::new(0.0, 1.0, -26.0).normalize();
+        let aim = aim_point(&level, origin, direction, player, order_reach(&level));
+        // The ray runs down x = 3, so that is where it meets the wall. On the
+        // player's own bearing -- straight up -x = 0 -- it would be at zero.
+        assert!(
+            (aim.x - 3.0).abs() < 0.1,
+            "the aim was pulled onto the player's bearing: {aim:?}"
+        );
+    }
+
+    /// A mark is left where the order landed, and it fades out rather than
+    /// staying up for ever.
+    #[test]
+    fn an_order_leaves_a_ring_that_fades() {
+        let field = crate::flow::FlowField::new(&lawn());
+        let mut squad = Squad::default();
+        for raw in 0..6 {
+            squad.members.push(Entity::from_raw_u32(raw).unwrap());
+        }
+        let mut mark = OrderMark::default();
+        assert_eq!(mark.fade(), 0.0, "a ring was drawn before any order");
+
+        let aim = Vec3::new(4.0, 0.0, -9.0);
+        let landed = squad.send(&field, aim);
+        mark.left_at(landed);
+        assert_eq!(mark.at, landed.at);
+        assert_eq!(mark.fade(), 1.0);
+        // It pops open rather than arriving at full width.
+        assert!(mark.drawn_radius() < mark.radius);
+        mark.age = Some(ORDER_RING_POP_SECONDS);
+        assert!((mark.drawn_radius() - mark.radius).abs() < 1e-5);
+
+        // Half spent, half solid.
+        mark.age = Some(ORDER_RING_SECONDS * 0.5);
+        assert!((mark.fade() - 0.5).abs() < 1e-5, "{}", mark.fade());
+        mark.age = Some(ORDER_RING_SECONDS);
+        assert_eq!(mark.fade(), 0.0, "the ring never went away");
+
+        // And it is drawn wide enough to hold every Mario it sent.
+        let middle = Vec2::new(landed.at.x, landed.at.z);
+        for order in &squad.sent {
+            assert!(
+                order.at.distance(middle) <= landed.radius,
+                "a Mario was sent {:.2} m out of a {:.2} m ring",
+                order.at.distance(middle),
+                landed.radius
+            );
+        }
+    }
+
+    /// An order to nobody still lands somewhere and still leaves a ring.
+    #[test]
+    fn an_order_with_nobody_to_carry_it_out_still_lands() {
+        let field = crate::flow::FlowField::new(&lawn());
+        let mut squad = Squad::default();
+        let landed = squad.send(&field, Vec3::new(4.0, 0.0, -9.0));
+        assert!(squad.sent.is_empty(), "an order to nobody sent somebody");
+        assert!(landed.radius > 0.0, "an order left no mark at all");
+    }
+
     #[test]
     fn aiming_straight_down_puts_the_target_at_his_feet() {
         let (level, _) = crate::level::load();
         let player = Vec3::new(-13.28, 3.0, 46.64);
-        let aim = aim_point(&level, player + Vec3::Y * 5.0, Vec3::NEG_Y, player);
+        let aim = aim_point(
+            &level,
+            player + Vec3::Y * 5.0,
+            Vec3::NEG_Y,
+            player,
+            order_reach(&level),
+        );
         assert_eq!(aim, player);
+    }
+
+    /// Sixty metres of flat ground in every direction, with nothing on it.
+    ///
+    /// The ground a cluster is *supposed* to land on, for the tests about what
+    /// a cluster is rather than about what the ground does to one.
+    fn lawn() -> LevelData {
+        let corners = [
+            Vec3::new(-60., 0., -60.),
+            Vec3::new(60., 0., -60.),
+            Vec3::new(60., 0., 60.),
+            Vec3::new(-60., 0., 60.),
+        ];
+        LevelData::new(corners.to_vec(), vec![[0, 1, 2], [0, 2, 3]], vec![])
     }
 
     /// A flat lawn with a pond cut into one half of it.
@@ -1465,6 +2404,14 @@ mod tests {
         )
     }
 
+    /// A Mario minding the water as much as an ordinary errand does.
+    fn wary() -> Care {
+        Care {
+            caution: 1.0,
+            water: true,
+        }
+    }
+
     #[test]
     fn a_dry_heading_is_taken_as_it_is() {
         let level = lawn_with_a_pond();
@@ -1472,7 +2419,7 @@ mod tests {
         // that is the case that has to stay free -- it is every step the squad
         // takes that is not near a shore.
         let away = Vec2::new(0.0, -1.0);
-        let kept = skirt(&level, Vec3::new(0.0, 0.0, -5.0), away, 6.0);
+        let kept = steer(&level, Vec3::new(0.0, 0.0, -5.0), away, 6.0, wary());
         assert!((kept - away).length() < 1e-6, "{kept:?}");
     }
 
@@ -1482,7 +2429,7 @@ mod tests {
         // Standing just short of the shore, pointed straight at the water.
         let from = Vec3::new(0.0, 0.0, -2.0);
         let into = Vec2::new(0.0, 1.0);
-        let bent = skirt(&level, from, into, 8.0);
+        let bent = steer(&level, from, into, 8.0, wary());
         assert!(
             (bent - into).length() > 1e-3,
             "walked straight in: {bent:?}"
@@ -1497,7 +2444,8 @@ mod tests {
             "the detour is wet too: {ahead:?}"
         );
         // Still roughly the way it wanted to go, rather than a right-about
-        // turn: `skirt` tries the smallest deflections first.
+        // turn: a detour is scored against what it throws away, so the smallest
+        // one that works wins.
         assert!(bent.dot(into) > 0.0, "it turned round: {bent:?}");
     }
 
@@ -1509,7 +2457,127 @@ mod tests {
         let level = lawn_with_a_pond();
         let middle = Vec3::new(0.0, 0.0, 20.0);
         let wanted = Vec2::new(0.0, 1.0);
-        assert_eq!(skirt(&level, middle, wanted, 4.0), wanted);
+        assert_eq!(steer(&level, middle, wanted, 4.0, wary()), wanted);
+    }
+
+    /// A lawn with a sheer eight-metre drop across the middle of it.
+    ///
+    /// Two flat slabs, the far one far below, with nothing but air where they
+    /// meet. Nothing here is a *wall* -- there is no vertical face to cast
+    /// against -- so what a walker notices is only what it would be standing on
+    /// a stride further along, which is the question a ledge asks.
+    fn lawn_with_a_ledge() -> LevelData {
+        let top = [
+            Vec3::new(-60., 0., -60.),
+            Vec3::new(60., 0., -60.),
+            Vec3::new(60., 0., 0.),
+            Vec3::new(-60., 0., 0.),
+        ];
+        let bottom = [
+            Vec3::new(-60., -8., 0.),
+            Vec3::new(60., -8., 0.),
+            Vec3::new(60., -8., 60.),
+            Vec3::new(-60., -8., 60.),
+        ];
+        LevelData::new(
+            top.iter().chain(bottom.iter()).copied().collect(),
+            vec![[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]],
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn a_mario_walks_along_a_ledge_rather_than_off_it() {
+        let level = lawn_with_a_ledge();
+        // Three metres back from the edge, walking straight at it.
+        let from = Vec3::new(0.0, 0.0, -3.0);
+        let over = Vec2::new(0.0, 1.0);
+        let bent = steer(&level, from, over, 6.0, wary());
+        assert!((bent - over).length() > 1e-3, "walked off: {bent:?}");
+        // What it picked is ground at its own level rather than the bottom of
+        // the drop -- a deflection that still ends in mid-air is not avoidance.
+        let ahead = from + Vec3::new(bent.x, 0.0, bent.y) * 6.0;
+        let footing = level.ground_at(ahead + Vec3::Y * steer_reach_up(6.0));
+        assert!(
+            footing.is_some_and(|(height, _)| height - from.y > -6.0 * WALKABLE_SLOPE),
+            "the detour goes over the edge too: {footing:?}"
+        );
+        // Still broadly where it was going. A right-about turn is not steering.
+        assert!(bent.dot(over) > 0.0, "it turned round: {bent:?}");
+    }
+
+    /// A hill is not a cliff, and a Mario that treats one as the other never
+    /// leaves the lawn.
+    ///
+    /// The ramp here climbs a metre in a metre, which is as steep as ground is
+    /// allowed to get before [`crate::level::GROUND_NORMAL_Y`] stops calling it
+    /// ground at all -- so this is the exact case [`WALKABLE_SLOPE`] is set
+    /// against, and it is a wall to any fixed idea of how far a stride may
+    /// climb. Both directions, because the same probe is what tells a path down
+    /// a hill from a drop off the castle.
+    #[test]
+    fn the_steepest_ground_the_level_allows_is_still_ground() {
+        let ramp = [
+            Vec3::new(-60., -60., -60.),
+            Vec3::new(60., -60., -60.),
+            Vec3::new(60., 60., 60.),
+            Vec3::new(-60., 60., 60.),
+        ];
+        let level = LevelData::new(ramp.to_vec(), vec![[0, 1, 2], [0, 2, 3]], Vec::new());
+        // Standing in the middle of it, which is where the slab crosses zero.
+        let from = Vec3::new(0.0, 0.0, 0.0);
+        let uphill = Vec2::new(0.0, 1.0);
+        assert_eq!(steer(&level, from, uphill, 4.0, wary()), uphill);
+        assert_eq!(steer(&level, from, -uphill, 4.0, wary()), -uphill);
+    }
+
+    /// The whole of "prefer not to, rather than never": the same shoreline,
+    /// two Marios, and the one with an order from the player crosses it.
+    #[test]
+    fn an_order_wades_where_an_errand_would_go_round() {
+        let level = lawn_with_a_pond();
+        // Pointed at the water, with dry lawn a long way round to either side.
+        let from = Vec3::new(0.0, 0.0, -2.0);
+        let into = Vec2::new(0.0, 1.0);
+        let errand = steer(
+            &level,
+            from,
+            into,
+            8.0,
+            Care {
+                caution: crate::goap::Goal::Fetch {
+                    ball: Entity::from_raw_u32(1).unwrap(),
+                    at: Vec2::ZERO,
+                    arrive: 1.0,
+                }
+                .caution(),
+                water: true,
+            },
+        );
+        assert!(
+            (errand - into).length() > 1e-3,
+            "an errand waded in: {errand:?}"
+        );
+        // The same step, walked under an order the player gave. The pond is
+        // twenty metres of detour and the order is worth more than that.
+        let ordered = steer(
+            &level,
+            from,
+            into,
+            8.0,
+            Care {
+                caution: crate::goap::Goal::Obey {
+                    at: Vec2::ZERO,
+                    arrive: 1.0,
+                }
+                .caution(),
+                water: true,
+            },
+        );
+        assert!(
+            ordered.dot(into) > errand.dot(into),
+            "an order was no bolder than an errand: {ordered:?} against {errand:?}"
+        );
     }
 
     /// An ally that walks into deep water swims in it rather than trudging
@@ -1568,6 +2636,16 @@ mod tests {
         assert!(at.z > under.z + 1.0, "it went nowhere: {at:?}");
     }
 
+    /// Sends the squad in a test world, which has to reach the field and the
+    /// squad at once. See [`Squad::send`], which needs the survey to know where
+    /// there is anything to stand on.
+    fn order(world: &mut World, to: Vec2) -> Landed {
+        let aim = Vec3::new(to.x, 0.0, to.y);
+        world.resource_scope(|world, mut squad: Mut<Squad>| {
+            squad.send(world.resource::<crate::flow::FlowField>(), aim)
+        })
+    }
+
     /// One fixed tick of the squad, in the order the game runs it.
     ///
     /// `goap::plan` sits between the two, because that is where it sits in the
@@ -1576,12 +2654,27 @@ mod tests {
     /// true about it. Deciding is its own system now; see [`crate::goap`].
     fn tick(world: &mut World) {
         use bevy::ecs::system::RunSystemOnce;
+        // First, as in the real schedule: everything downstream navigates by
+        // the sweep, and `update_goals` now asks it whether an order can be
+        // carried out at all. A tick that left it out would be deciding against
+        // a field that had never been swept. See [`Swept`].
+        world
+            .run_system_once(crate::flow::rebuild)
+            .expect("flow::rebuild could not run");
         world
             .run_system_once(update_goals)
             .expect("update_goals could not run");
         world
             .run_system_once(crate::goap::plan)
             .expect("goap::plan could not run");
+        // Between the decision and the walk, where it sits in the real
+        // schedule. Most ticks it does nothing at all -- a Mario that can see
+        // where it is going is not routed -- but it is in the list here for the
+        // same reason `goap::plan` is: a test that left it out would be
+        // exercising a walk step nothing had told which way to go.
+        world
+            .run_system_once(crate::path::plan)
+            .expect("path::plan could not run");
         world
             .run_system_once(move_allies)
             .expect("move_allies could not run");
@@ -1591,6 +2684,14 @@ mod tests {
     fn squad_resources(world: &mut World) {
         world.insert_resource(Squad::default());
         world.insert_resource(Time::<Fixed>::from_hz(30.0));
+        // The wall clock `flow::rebuild` counts its own interval against.
+        world.init_resource::<Time>();
+        // The navigation grid, surveyed off whatever level the caller has
+        // already put in. `path::plan` reads it, and a survey of a hand-built
+        // lawn is a few thousand floor queries against four triangles.
+        let field = crate::flow::FlowField::new(world.resource::<LevelData>());
+        world.insert_resource(field);
+        world.init_resource::<crate::path::Pathing>();
         // The plan asks what the network is lit with, and the walk step makes a
         // splash when somebody goes in the water.
         world.init_resource::<crate::pylon::Network>();
@@ -1694,6 +2795,558 @@ mod tests {
         );
     }
 
+    /// A lawn with a ten-metre moat cut across it, eight metres deep.
+    ///
+    /// **The bed matters more than the gap.** A hole with nothing in it is easy
+    /// to refuse -- there is no ground, so every check refuses it. A moat has a
+    /// floor, so a query dropped from the sky over the middle of it comes back
+    /// with an answer, and every "is there ground here" test in the game says
+    /// yes. That is the shape the castle actually has and the shape that got
+    /// through. See [`cluster`].
+    fn lawn_with_a_moat() -> LevelData {
+        let vertices = vec![
+            // The near bank.
+            Vec3::new(-60., 0., -60.),
+            Vec3::new(60., 0., -60.),
+            Vec3::new(60., 0., 0.),
+            Vec3::new(-60., 0., 0.),
+            // The bed of the moat, eight metres down.
+            Vec3::new(-60., -8., 0.),
+            Vec3::new(60., -8., 0.),
+            Vec3::new(60., -8., 10.),
+            Vec3::new(-60., -8., 10.),
+            // And the far bank.
+            Vec3::new(-60., 0., 10.),
+            Vec3::new(60., 0., 10.),
+            Vec3::new(60., 0., 60.),
+            Vec3::new(-60., 0., 60.),
+        ];
+        LevelData::new(
+            vertices,
+            vec![
+                [0, 1, 2],
+                [0, 2, 3],
+                [4, 5, 6],
+                [4, 6, 7],
+                [8, 9, 10],
+                [8, 10, 11],
+            ],
+            Vec::new(),
+        )
+    }
+
+    /// An order on the lip of a drop puts every Mario on ground it can stand on.
+    ///
+    /// **The bug this is about is the one that made the whole cluster a lie.**
+    /// Eight slots were laid out by arithmetic alone -- the target plus a
+    /// spiral offset -- so an order given on the edge of the moat sent four
+    /// Marios to spots over open water. Each of those walked to the lip, leaned
+    /// on it for six seconds and was written off, which on screen is half a
+    /// squad obeying and half of it milling about on a bank.
+    ///
+    /// The test asserts the fix and, first, that the *obvious* fix would not
+    /// have worked: the cells out over the moat are all "walkable" as the
+    /// survey means it, because there is a bed under them. Filtering on that
+    /// alone -- which is what the first attempt at this did -- leaves every one
+    /// of those spots exactly where it was.
+    #[test]
+    fn a_cluster_on_the_lip_of_a_drop_keeps_every_mario_on_the_ground() {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut world = World::new();
+        world.insert_resource(lawn_with_a_moat());
+        world.insert_resource(GameTuning::default());
+        squad_resources(&mut world);
+        // The leader on the near bank, which is what the sweep runs from and so
+        // what decides which side of the moat counts as reachable.
+        world.spawn((
+            Player,
+            Transform::from_translation(Vec3::new(0.0, 0.0, -6.0)),
+        ));
+        world
+            .run_system_once(crate::flow::rebuild)
+            .expect("flow::rebuild could not run");
+        for raw in 0..8 {
+            world
+                .resource_mut::<Squad>()
+                .members
+                .push(Entity::from_raw_u32(raw).unwrap());
+        }
+
+        // A metre back from the lip -- near enough that the bare spiral would
+        // throw most of the cluster over it.
+        let aimed = Vec2::new(0.0, -1.0);
+        let over: Vec<Vec2> = (0..8)
+            .map(|index| aimed + slot(index, SEND_SPACING))
+            .filter(|spot| spot.y > 0.0)
+            .collect();
+        assert!(
+            !over.is_empty(),
+            "this spot does not test anything: the plain spiral fits on the bank"
+        );
+        {
+            let field = world.resource::<crate::flow::FlowField>();
+            for spot in &over {
+                assert!(
+                    field
+                        .survey_of(field.cell_at(Vec3::new(spot.x, 0.0, spot.y)))
+                        .walkable,
+                    "this level does not reproduce the bug: {spot:?} over the moat \
+                     is not walkable, so the weak check would have caught it"
+                );
+            }
+        }
+
+        let landed = order(&mut world, aimed);
+        assert_eq!(
+            world.resource::<Squad>().sent.len(),
+            8,
+            "the order did not go out"
+        );
+        assert!(landed.at.z < 0.0, "the order landed at {:?}", landed.at);
+
+        let field = world.resource::<crate::flow::FlowField>();
+        for order in &world.resource::<Squad>().sent {
+            let at = Vec3::new(order.at.x, 0.0, order.at.y);
+            let cell = field.cell_at(at);
+            assert!(
+                field.survey_of(cell).walkable,
+                "a Mario was sent to stand on nothing at {:?}",
+                order.at
+            );
+            // The one that matters: the ground under the spot is the bank the
+            // order was given on, not the bed of the moat eight metres down.
+            assert!(
+                field.centre_of(cell).y > -1.0,
+                "a Mario was sent to stand {:.1} m down in the moat, at {:?}",
+                -field.centre_of(cell).y,
+                order.at
+            );
+            assert!(order.at.y < 0.5, "over the lip at {:?}", order.at);
+        }
+    }
+
+    /// A second order redirects the squad without whistling it up again.
+    ///
+    /// **A tap is the only thing an order needs to be.** `send` used to drain
+    /// the followers into the sent list and read nothing else, so the first tap
+    /// emptied the squad and every tap after it commanded nobody -- to redirect
+    /// a group already on the march the player had to hold the button, gather
+    /// them all back up, and only then point somewhere new. Marching is not
+    /// leaving the squad; only a whistle and a disband move anybody in or out.
+    #[test]
+    fn a_second_order_redirects_the_squad_it_already_sent() {
+        let field = crate::flow::FlowField::new(&lawn());
+        let mut squad = Squad::default();
+        let marios: Vec<Entity> = (0..5)
+            .map(|raw| Entity::from_raw_u32(raw).unwrap())
+            .collect();
+        squad.members.extend(marios.iter().copied());
+
+        squad.send(&field, Vec3::new(10.0, 0.0, 10.0));
+        assert_eq!(squad.sent.len(), 5);
+        // One of them has already arrived and is standing its post, which must
+        // not exempt it from being sent somewhere else.
+        squad.sent[0].arrived = true;
+
+        let again = Vec3::new(-14.0, 0.0, -6.0);
+        let landed = squad.send(&field, again);
+        assert_eq!(squad.sent.len(), 5, "the second order lost Marios");
+        assert!(squad.members.is_empty());
+        let mut who: Vec<Entity> = squad.sent.iter().map(|order| order.who).collect();
+        let mut expected = marios.clone();
+        who.sort();
+        expected.sort();
+        assert_eq!(who, expected, "the second order went to a different squad");
+        for order in &squad.sent {
+            assert!(!order.arrived, "an order arrived before it was given");
+            assert!(
+                order.at.distance(Vec2::new(again.x, again.z)) <= landed.radius,
+                "a Mario was left at the old spot: {:?}",
+                order.at
+            );
+        }
+    }
+
+    /// A Mario sent somewhere it cannot get to stops treating that as the only
+    /// thing in the world.
+    ///
+    /// **This is the other half of "they get there and just stand about", and
+    /// it is not a scoring bug -- the Mario really has not arrived.** A cluster
+    /// is spread over several metres of whatever ground is under it, so some of
+    /// its slots land behind railings, inside the castle wall, or on the far
+    /// bank. An order is discharged by arrival and by nothing else, so those
+    /// Marios lean on the fence at full [`crate::goap::Goal::Obey`] for the rest
+    /// of the session -- deaf to the slime beside them, because obeying at a
+    /// few metres' range outbids a fight at any range worth mentioning.
+    ///
+    /// Giving up is what makes it a squad again: the order retires to a post,
+    /// and a post is weak enough that anything real outbids it.
+    #[test]
+    fn an_order_that_cannot_be_carried_out_is_eventually_given_up_on() {
+        let mut world = World::new();
+        // A lawn with a wall straight across it, and no way round: the far side
+        // is reachable only by walking through five metres of stone.
+        let lawn = [
+            Vec3::new(-60., 0., -60.),
+            Vec3::new(60., 0., -60.),
+            Vec3::new(60., 0., 60.),
+            Vec3::new(-60., 0., 60.),
+            Vec3::new(-60., 0., 0.),
+            Vec3::new(60., 0., 0.),
+            Vec3::new(60., 5., 0.),
+            Vec3::new(-60., 5., 0.),
+        ];
+        world.insert_resource(LevelData::new(
+            lawn.to_vec(),
+            vec![[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]],
+            Vec::new(),
+        ));
+        world.insert_resource(GameTuning::default());
+        squad_resources(&mut world);
+        let leader = Vec3::new(0.0, 0.0, -10.0);
+        world.spawn((Player, Transform::from_translation(leader)));
+        let ally = world
+            .spawn((Ally::new(leader, 0.0), Transform::from_translation(leader)))
+            .id();
+        world.resource_mut::<Squad>().recruit(&[ally]);
+        // Sent to the far side of the wall.
+        order(&mut world, Vec2::new(0.0, 10.0));
+
+        // **Long enough to give up on it, and no longer.** The stall clock is
+        // six seconds and this budget is under two, so passing this means the
+        // order was retired by the pathfinder having refused it outright --
+        // [`LOST_SECONDS`] -- rather than by a Mario leaning on the wall until
+        // [`STUCK_SECONDS`] ran out. See [`update_goals`].
+        let ticks = ((LOST_SECONDS + 0.6) * 30.0) as usize;
+        assert!(
+            ticks < (STUCK_SECONDS * 30.0) as usize,
+            "the budget is long enough for the stall clock to be what retired it"
+        );
+        for _ in 0..ticks {
+            tick(&mut world);
+        }
+        let here = world.get::<Transform>(ally).unwrap().translation;
+        assert!(here.z < 0.0, "it walked through the wall: {here:?}");
+        let squad = world.resource::<Squad>();
+        assert_eq!(
+            squad.marching(),
+            0,
+            "still marching at a wall it cannot pass"
+        );
+        // And what it is doing now is standing a post, which is a thing a
+        // fight, a ball or a whistle can all take it away from.
+        assert!(
+            matches!(
+                world.get::<Ally>(ally).unwrap().plan,
+                crate::goap::Goal::Hold { .. }
+            ),
+            "the order never retired: {:?}",
+            world.get::<Ally>(ally).unwrap().plan
+        );
+    }
+
+    /// A lawn with a three-sided pocket cut into it, opening *away* from
+    /// everything.
+    ///
+    /// Six metres of wall on three sides and a mouth at the back. Standing
+    /// inside it, the way out is a hundred and eighty degrees from wherever you
+    /// are going -- which is the one thing no steering rule in this game can
+    /// ever produce, because [`steer`] deflects to a right angle and stops. It
+    /// is the shape of every "it walked into a corner and stayed there": a
+    /// courtyard, the inside of a castle wall, a bay of the moat.
+    fn lawn_with_a_pocket() -> LevelData {
+        let mut vertices = vec![
+            Vec3::new(-60., 0., -60.),
+            Vec3::new(60., 0., -60.),
+            Vec3::new(60., 0., 60.),
+            Vec3::new(-60., 0., 60.),
+        ];
+        let mut indices = vec![[0u32, 1, 2], [0, 2, 3]];
+        {
+            let mut wall = |a: Vec3, b: Vec3| {
+                let base = vertices.len() as u32;
+                vertices.extend([a, b, b + Vec3::Y * 6.0, a + Vec3::Y * 6.0]);
+                indices.push([base, base + 1, base + 2]);
+                indices.push([base, base + 2, base + 3]);
+            };
+            // The back of the pocket, standing between the Mario and the whole
+            // of the rest of the lawn.
+            wall(Vec3::new(-16., 0., -10.), Vec3::new(16., 0., -10.));
+            // And its two sides.
+            wall(Vec3::new(-16., 0., -32.), Vec3::new(-16., 0., -10.));
+            wall(Vec3::new(16., 0., -32.), Vec3::new(16., 0., -10.));
+        }
+        LevelData::new(vertices, indices, Vec::new())
+    }
+
+    /// A lawn in two levels with a knee-high lip between them, and one gentle
+    /// ramp off to one side.
+    ///
+    /// The lip is seventy centimetres over forty -- sixty degrees, steeper than
+    /// [`crate::level::GROUND_NORMAL_Y`] allows ground to be, so `resolve_walls`
+    /// holds a body out of it. **And it is invisible to every test that looks at
+    /// the two ends of a step.** The cells either side are good flat lawn, the
+    /// rise between their middles is well inside the grid's own climb limit, and
+    /// a knee-height ray following the ground sails clean over the top of it.
+    /// Which is the shape of the whole complaint: ordered across it, a Mario
+    /// walks up to the lip and stays there.
+    fn lawn_with_a_bank() -> LevelData {
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let mut slab = |a: Vec3, b: Vec3, c: Vec3, d: Vec3| {
+            let base = vertices.len() as u32;
+            vertices.extend([a, b, c, d]);
+            indices.push([base, base + 1, base + 2]);
+            indices.push([base, base + 2, base + 3]);
+        };
+        // The lower lawn, all of it.
+        slab(
+            Vec3::new(-60., 0., -60.),
+            Vec3::new(60., 0., -60.),
+            Vec3::new(60., 0., 0.),
+            Vec3::new(-60., 0., 0.),
+        );
+        // The lip, across everything but the eastern strip.
+        slab(
+            Vec3::new(-60., 0., 0.),
+            Vec3::new(20., 0., 0.),
+            Vec3::new(20., 0.7, 0.4),
+            Vec3::new(-60., 0.7, 0.4),
+        );
+        // And the ramp that takes its place there: the same climb over ten
+        // times the run.
+        slab(
+            Vec3::new(20., 0., 0.),
+            Vec3::new(60., 0., 0.),
+            Vec3::new(60., 0.7, 4.),
+            Vec3::new(20., 0.7, 4.),
+        );
+        // The upper lawn, in two pieces because the ramp reaches further into
+        // it than the lip does.
+        slab(
+            Vec3::new(-60., 0.7, 0.4),
+            Vec3::new(20., 0.7, 0.4),
+            Vec3::new(20., 0.7, 60.),
+            Vec3::new(-60., 0.7, 60.),
+        );
+        slab(
+            Vec3::new(20., 0.7, 4.),
+            Vec3::new(60., 0.7, 4.),
+            Vec3::new(60., 0.7, 60.),
+            Vec3::new(20., 0.7, 60.),
+        );
+        LevelData::new(vertices, indices, Vec::new())
+    }
+
+    /// **The complaint, staged.** Ordered somewhere on the far side of a bank a
+    /// Mario cannot climb, it walks round by the ramp instead of standing at the
+    /// foot of the bank.
+    ///
+    /// Both tiers had to learn the same thing for this to work, and either one
+    /// alone leaves the Mario stuck. The survey has to know the lip is there or
+    /// the route leads straight over it; the walk step has to know or it steers
+    /// into it anyway on the last stride. Neither could see it while they
+    /// measured the two ends of a step and called the average a slope -- see
+    /// [`LevelData::climbable`], which is that question asked of the ground in
+    /// between.
+    #[test]
+    fn a_mario_ordered_over_a_bank_it_cannot_climb_walks_round_by_the_ramp() {
+        let mut world = World::new();
+        world.insert_resource(lawn_with_a_bank());
+        world.insert_resource(GameTuning::default());
+        squad_resources(&mut world);
+        let here = Vec3::new(0.0, 0.0, -10.0);
+        world.spawn((Player, Transform::from_translation(here)));
+        let ally = world
+            .spawn((Ally::new(here, 0.0), Transform::from_translation(here)))
+            .id();
+        world.resource_mut::<Squad>().recruit(&[ally]);
+        // Straight over the lip, twenty metres away, with the only way up
+        // twenty metres off to the east.
+        let to = Vec2::new(0.0, 10.0);
+        order(&mut world, to);
+        for _ in 0..900 {
+            tick(&mut world);
+        }
+        let at = world.get::<Transform>(ally).unwrap().translation;
+        assert!(
+            Vec2::new(at.x, at.z).distance(to) <= SEND_ARRIVE + 1.0,
+            "it stopped {:.1} m short, at {at:?}",
+            Vec2::new(at.x, at.z).distance(to)
+        );
+        // And it is up on the top lawn rather than having found some way
+        // through the bank itself.
+        assert!(
+            (at.y - 0.7).abs() < 0.2,
+            "it is at {at:?}, not on the top lawn"
+        );
+    }
+
+    /// **The whole case for routing, staged as a pair of runs.** The same
+    /// Mario, the same order, the same lawn: with the search allowed it walks
+    /// out of the pocket and round to the spot, and with the search switched
+    /// off at the console it walks into the back wall and stays there.
+    ///
+    /// The two halves are one test rather than two because either alone proves
+    /// nothing. "It arrived" is satisfied by an order that was never obstructed;
+    /// "it did not arrive" is satisfied by a Mario that cannot walk at all. Run
+    /// against the same staging, what is left between them is the routing.
+    ///
+    /// Staged on a hand-built lawn rather than on the castle, and that is not
+    /// convenience. A route over the castle crosses ground the two tiers
+    /// disagree about -- the navigation grid refuses a steeper step than the
+    /// walk step does, and its cells are wider than a body -- so a castle
+    /// staging tests the survey's fidelity as much as the search, and fails for
+    /// reasons that have nothing to do with what it is asking. Here the walls
+    /// are walls to both tiers by construction.
+    #[test]
+    fn a_mario_sent_out_of_a_pocket_walks_the_wrong_way_first() {
+        let from = Vec3::new(0.0, 0.0, -20.0);
+        let to = Vec2::new(0.0, 40.0);
+
+        // Sent there twice: once with the routing on, once with it off.
+        let walked = |budget: f32| -> (f32, f32) {
+            let mut world = World::new();
+            world.insert_resource(lawn_with_a_pocket());
+            world.insert_resource(GameTuning::default());
+            squad_resources(&mut world);
+            world.resource_mut::<GameTuning>().path_budget = budget;
+            world.spawn((Player, Transform::from_translation(from)));
+            let ally = world
+                .spawn((Ally::new(from, 0.0), Transform::from_translation(from)))
+                .id();
+            world.resource_mut::<Squad>().recruit(&[ally]);
+            order(&mut world, to);
+            // Long enough to walk out of the pocket, round the wall and back up
+            // the lawn at the squad's marching pace, twice over.
+            let mut behind = 0.0_f32;
+            for t in 0..1200 {
+                tick(&mut world);
+                if t % 200 == 0 {
+                    let at = world.get::<Transform>(ally).unwrap().translation;
+                    let r = world.get::<crate::path::Route>(ally).unwrap();
+                    println!(
+                        "  b{budget} t{t} {at:?} legs {:?} lost {}",
+                        r.legs(),
+                        r.lost()
+                    );
+                }
+                let at = world.get::<Transform>(ally).unwrap().translation;
+                // How far *back* into the pocket it ever went, which is the
+                // thing being tested: leaving means going the wrong way first.
+                behind = behind.max(from.z - at.z);
+            }
+            let here = world.get::<Transform>(ally).unwrap().translation;
+            (Vec2::new(here.x, here.z).distance(to), behind)
+        };
+
+        let (routed, backwards) = walked(4.0);
+        let (beeline, _) = walked(0.0);
+        assert!(
+            routed <= SEND_ARRIVE + 1.0,
+            "routed, it still stopped {routed:.1} m short of the spot"
+        );
+        assert!(
+            backwards > 8.0,
+            "it never walked away from the spot, so it never left the pocket"
+        );
+        assert!(
+            beeline > 20.0,
+            "the straight line got within {beeline:.1} m of a spot it has no way \
+             of reaching, so the pocket is not a pocket"
+        );
+    }
+
+    /// **The screenshot this was written for.** A ball over the fence, and one
+    /// twice as far away on the same lawn: the squad goes for the one it can
+    /// walk to.
+    ///
+    /// Scored on how far off a thing is, the near one wins and the Marios walk
+    /// up to the railings and press against them -- which is the right answer to
+    /// that question, because the far side of a fence really is eight metres
+    /// away. It is not *closer*. See [`crate::goap::Option_::blocked`], and this
+    /// is that scoring wired to a real grid rather than to a hand-made struct.
+    #[test]
+    fn a_mario_fetches_the_ball_it_can_walk_to_rather_than_the_near_one_over_a_fence() {
+        let mut world = World::new();
+        // A lawn cut in two by a fence, with a pond on the far side of it.
+        let mut vertices = vec![
+            Vec3::new(-60., 0., -60.),
+            Vec3::new(60., 0., -60.),
+            Vec3::new(60., 0., 60.),
+            Vec3::new(-60., 0., 60.),
+        ];
+        let mut indices = vec![[0u32, 1, 2], [0, 2, 3]];
+        {
+            let base = vertices.len() as u32;
+            vertices.extend([
+                Vec3::new(-60., 0., 6.),
+                Vec3::new(60., 0., 6.),
+                Vec3::new(60., 6., 6.),
+                Vec3::new(-60., 6., 6.),
+            ]);
+            indices.push([base, base + 1, base + 2]);
+            indices.push([base, base + 2, base + 3]);
+        }
+        world.insert_resource(LevelData::new(
+            vertices,
+            indices,
+            // Well past the ball below, so that what separates the two is
+            // which side of the fence they are on and nothing else. A wet ball
+            // is already discounted by `WET_PENALTY` and would answer this test
+            // without `blocked` doing anything at all.
+            vec![crate::level::WaterBox {
+                min_x: -60.,
+                min_z: 20.,
+                max_x: 60.,
+                max_z: 60.,
+                surface_y: 3.0,
+            }],
+        ));
+        world.insert_resource(GameTuning::default());
+        squad_resources(&mut world);
+        let here = Vec3::new(0.0, 0.0, -2.0);
+        world.spawn((Player, Transform::from_translation(here)));
+        let ally = world
+            .spawn((Ally::new(here, 0.0), Transform::from_translation(here)))
+            .id();
+        // One ten metres off on dry ground over the fence, one twenty metres off
+        // on the Mario's own side. Both perfectly good balls; only one of them
+        // is a walk.
+        let fenced = world
+            .spawn((
+                crate::nuclonium::Nuclonium {
+                    held: crate::nuclonium::Held::Loose { claimed: None },
+                },
+                Transform::from_translation(Vec3::new(0.0, 0.0, 8.0)),
+            ))
+            .id();
+        let dry = world
+            .spawn((
+                crate::nuclonium::Nuclonium {
+                    held: crate::nuclonium::Held::Loose { claimed: None },
+                },
+                Transform::from_translation(Vec3::new(0.0, 0.0, -22.0)),
+            ))
+            .id();
+        tick(&mut world);
+        assert_eq!(
+            world.get::<Ally>(ally).unwrap().plan.claim(),
+            Some(dry),
+            "it went for the one over the fence: {:?}",
+            world.get::<Ally>(ally).unwrap().plan
+        );
+        // And it walks away from the fence rather than into it.
+        for _ in 0..150 {
+            tick(&mut world);
+        }
+        let at = world.get::<Transform>(ally).unwrap().translation;
+        assert!(
+            at.z < here.z - 5.0,
+            "it is still on the fence at {at:?}, {fenced:?} won"
+        );
+    }
+
     /// Sent somewhere, an ally holds the spot rather than drifting off it.
     #[test]
     fn a_sent_ally_arrives_and_holds_its_ground() {
@@ -1710,7 +3363,7 @@ mod tests {
         world.resource_mut::<Squad>().recruit(&[ally]);
         // Somewhere across the lawn, still on the castle grounds.
         let target = Vec2::new(leader.x + 8.0, leader.z - 6.0);
-        assert_eq!(world.resource_mut::<Squad>().send(target), 1);
+        order(&mut world, target);
 
         for _ in 0..150 {
             tick(&mut world);

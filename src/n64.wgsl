@@ -93,6 +93,10 @@ struct N64Lamp {
 }
 
 struct N64Lamplight {
+    // One sphere holding every lamp there is: xyz its middle, w how far it
+    // goes. See `n64.rs`'s `Lamplight::bounds` -- this is the one compare that
+    // stands in front of the loop below.
+    bounds: vec4<f32>,
     lamps: array<N64Lamp, #{N64_LAMPS}>,
 }
 
@@ -162,6 +166,14 @@ fn n64_shade(normal: vec3<f32>) -> vec3<f32> {
 // a reason nothing in the picture explains.
 fn n64_lamplight(world_position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
     var sum = vec3<f32>(0.0, 0.0, 0.0);
+    // Nothing in the world can reach this fragment, so do not spend two
+    // thousand tests proving it. Squared, so it costs a dot product and no
+    // square root, and it is also the empty case: with no lamps the radius is
+    // zero and every fragment leaves here.
+    let away = lamplight.bounds.xyz - world_position;
+    if dot(away, away) >= lamplight.bounds.w * lamplight.bounds.w {
+        return sum;
+    }
     let oriented = dot(normal, normal) > 0.0;
     for (var slot = 0u; slot < #{N64_LAMPS}u; slot += 1u) {
         let lamp = lamplight.lamps[slot];
@@ -175,10 +187,15 @@ fn n64_lamplight(world_position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
             break;
         }
         let toward = lamp.at.xyz - world_position;
-        let apart = length(toward);
-        if apart >= reach {
+        // Compared squared, so the reject path costs a dot product and no
+        // square root. This is the path nearly every lamp takes for nearly
+        // every fragment -- a lamp reaches a couple of metres and the world is
+        // hundreds across -- so it is the one worth being cheap.
+        let span = dot(toward, toward);
+        if span >= reach * reach {
             continue;
         }
+        let apart = sqrt(span);
         // Squared rather than linear, because that is the shape light falling
         // away from a point has -- but bounded, reaching exactly nothing at
         // `reach` rather than merely nearly nothing. A lamp dropped from the

@@ -23,3 +23,7 @@ blender should include
 - colliders
 - hand placment information
 - where the bullet comes out information
+
+
+Use bevy plugins if they help.  
+

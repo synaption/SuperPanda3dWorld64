@@ -50,7 +50,8 @@
 //! [`WET_PENALTY`]. That is the whole of "Marios should avoid water" at this
 //! layer -- they prefer dry work when there is dry work -- and the steering half
 //! of it, going *round* a pond on the way to something past it, is
-//! [`crate::squad::skirt`].
+//! [`crate::squad::steer`], which asks [`Goal::caution`] how much this
+//! particular job minds getting wet.
 //!
 //! Everything here is arithmetic over a small struct, so the decisions can be
 //! exercised without a level, a renderer or an ECS -- see the tests, which are
@@ -72,6 +73,14 @@ pub enum Goal {
     Idle,
     /// Walk to where the player sent it.
     Obey { at: Vec2, arrive: f32 },
+    /// Stand about the spot it was sent to, having got there.
+    ///
+    /// A different thing from [`Goal::Obey`] and not a shade of it: an order is
+    /// a journey and this is what is left when the journey is over. See
+    /// [`HOLD_APPEAL`] for why the two had to stop being scored as one, which
+    /// is the whole of "a squad sent to attack something arrives and then
+    /// stands there".
+    Hold { at: Vec2, arrive: f32 },
     /// Close on what it has noticed, and stop at that thing's edge.
     Fight { at: Vec2, arrive: f32 },
     /// Go and pick a ball up.
@@ -86,6 +95,7 @@ impl Goal {
         match self {
             Goal::Idle => None,
             Goal::Obey { at, arrive }
+            | Goal::Hold { at, arrive }
             | Goal::Fight { at, arrive }
             | Goal::Fetch { at, arrive, .. }
             | Goal::Deliver { at, arrive } => Some((at, arrive)),
@@ -93,9 +103,47 @@ impl Goal {
     }
 
     /// Whether this is worth walking at the squad's marching pace rather than
-    /// strolling. Everything that is a decision is; ambling is not.
+    /// strolling. Everything the Mario is on its way to do is; standing about
+    /// somewhere, whether that is the spot it was sent to or the patch of lawn
+    /// it was left on, is not.
     pub fn urgent(self) -> bool {
-        !matches!(self, Goal::Idle)
+        !matches!(self, Goal::Idle | Goal::Hold { .. })
+    }
+
+    /// How much this Mario minds what is between it and where it is going.
+    ///
+    /// The multiplier [`crate::squad::steer`] puts on every hazard it finds --
+    /// deep water, a drop, a wall -- against the cost of not walking straight
+    /// at the thing. It is what makes the rule *"prefer not to, rather than
+    /// never"*: nothing here is zero, so a Mario always takes the dry way round
+    /// when there is one, and nothing here is infinite, so a Mario with an
+    /// order and no dry way round wades in.
+    ///
+    /// The order is the design. **An order is the most daring thing a Mario
+    /// does** -- told to be somewhere, it swims the moat rather than pacing the
+    /// bank, because a squad that would not is a squad that cannot be sent
+    /// anywhere across water. A fight it has chosen for itself is next, then an
+    /// errand, and a Mario with nothing to do is the most careful of all: there
+    /// is no reason on earth for an ambling Mario to paddle anywhere, and an
+    /// idle crowd wandering into the sea is what the caution reads as from
+    /// outside.
+    /// The scale is set against the detour it is being weighed against, which
+    /// is `1 - cos(turn)` and so runs from nothing to one over a right angle.
+    /// Read the numbers as "how far out of its way this Mario will go": an
+    /// order swings about seventy degrees to keep out of the moat and nearly a
+    /// right angle to stay off a cliff, and past that it wades or climbs down,
+    /// because a squad that will not is a squad that cannot be sent across
+    /// water. An ambling Mario, at nearly three times an order's caution, never
+    /// gets its feet wet while there is any dry way at all.
+    pub fn caution(self) -> f32 {
+        match self {
+            Goal::Obey { .. } => 0.7,
+            Goal::Fight { .. } => 0.9,
+            Goal::Deliver { .. } => 1.0,
+            Goal::Fetch { .. } => 1.2,
+            Goal::Hold { .. } => 1.5,
+            Goal::Idle => 2.0,
+        }
     }
 
     /// Which ball this Mario is coming for, if any, so [`crate::nuclonium`] can hold
@@ -117,6 +165,22 @@ pub struct Option_ {
     pub range: f32,
     /// Whether getting there means being in deep water.
     pub wet: bool,
+    /// Whether there is something in the way of the straight line to it.
+    ///
+    /// **[`Self::range`] is how far off a thing is as the crow flies, and a
+    /// Mario is not a crow.** That gap is a whole class of behaviour: a ball
+    /// eight metres away through a fence and across the moat outscores one
+    /// twenty metres away on the same lawn, so the squad walks up to the
+    /// railings and presses against them -- which is exactly what it should do,
+    /// given a score that says the thing behind the fence is nearer. It is
+    /// nearer. It is not *closer*.
+    ///
+    /// Answered by [`crate::flow::FlowField::clear`], which is three array
+    /// reads a sample and is the same question [`crate::path`] asks before it
+    /// decides whether a route is worth working out. A real path length would be
+    /// better and is not affordable per option per body per tick; what this
+    /// costs is one grid walk for the candidates that could still win.
+    pub blocked: bool,
 }
 
 /// Everything one Mario knows about what it could be doing.
@@ -131,6 +195,9 @@ pub struct Options {
     /// [`FOLLOW_APPEAL`], and the paragraph above it, which is the difference
     /// between a squad that collects things and one that never has.
     pub following: Option<Option_>,
+    /// The spot it was sent to and has already reached. Not an order either,
+    /// for the same reason and with worse symptoms -- see [`HOLD_APPEAL`].
+    pub holding: Option<Option_>,
     /// What it has noticed, and the edge of it.
     pub quarry: Option<Option_>,
     /// The nearest ball it is allowed to go for, and which one.
@@ -203,6 +270,35 @@ const IDLE_APPEAL: f32 = 0.08;
 const FOLLOW_APPEAL: f32 = 0.35;
 const FOLLOW_SCALE: f32 = 60.0;
 
+/// What standing on the spot you were already sent to is worth.
+///
+/// **An order that has been carried out is not still an order, and scoring it
+/// as one is why a squad sent to attack something walked over and then stood
+/// there.** Work it through with [`OBEY_APPEAL`]: a Mario on its ordered spot
+/// is at zero range from it, so obeying scores the full 0.90 every tick, for
+/// ever. A slime three metres away scores `FIGHT_APPEAL * FIGHT_SCALE / (FIGHT_SCALE + 3)`,
+/// which is 0.70. The order wins. It goes on winning against anything further
+/// off than about eighty centimetres -- which is *inside* the reach the punch
+/// already has, so the only Marios that ever swung were the ones whose slot
+/// happened to land on top of something. The rest stood on their spots in the
+/// middle of a fight, looking broken, because they were doing exactly as they
+/// were told.
+///
+/// So arriving retires the order into a station: the same point, wanted the
+/// same way a formation slot is wanted. Weak enough that anything real outbids
+/// it -- a slime within about thirteen metres, which is [`crate::console::GameTuning::enemy_sight`]
+/// and therefore everything the Mario can see -- and long enough that a Mario
+/// shoved out of a fight walks back to its post rather than ambling off from
+/// wherever the fight left it. The player's order still decides *where* the
+/// squad is; it stops deciding what they may do once they are there.
+///
+/// The same numbers as [`FOLLOW_APPEAL`], because it is the same sentence about
+/// a different point. Kept as its own pair anyway: holding a line and trailing
+/// a leader are different orders from the player and will want to be tuned
+/// apart.
+const HOLD_APPEAL: f32 = 0.35;
+const HOLD_SCALE: f32 = 60.0;
+
 /// Whether a Mario is *in* a fight, as opposed to holding a grudge against
 /// something across the valley.
 ///
@@ -239,6 +335,23 @@ fn engaged(options: &Options) -> bool {
 /// inside the sweep, and the test below pins it.
 pub const WET_PENALTY: f32 = 0.25;
 
+/// What being round the far side of something does to the appeal of a job.
+///
+/// The same shape as [`WET_PENALTY`] and for the same reason: a discount rather
+/// than a refusal. A ball behind a fence is still worth having -- somebody walks
+/// round for it once there is nothing better on this side -- it is just worth a
+/// quarter of the same ball in plain sight, because the walk is the long way
+/// round and the score has no other way of knowing that.
+///
+/// A quarter is not a measurement of anything. What it is set against is the
+/// case in the screenshot this exists for: a ball across the moat at eight
+/// metres against a ball on the lawn at twenty. Fetching is hyperbolic in range,
+/// so the near one scores 0.63 and the far one 0.50 -- and a quarter of 0.63 is
+/// 0.16, which loses comfortably. Anything much gentler leaves the squad
+/// walking into fences; anything much harsher and a Mario will not step round a
+/// tree for something.
+pub const BLOCKED_PENALTY: f32 = 0.25;
+
 /// How far a Mario will consider going for a ball at all.
 ///
 /// Deliberately further than the range at which fetching actually wins anything,
@@ -260,13 +373,25 @@ pub fn appeal(base: f32, range: f32, scale: f32) -> f32 {
     base * scale / (scale + range.max(0.0))
 }
 
-/// What one option scores, water and all.
+/// What one option scores, water and walls and all.
+///
+/// **The harshest penalty that applies, rather than all of them multiplied
+/// together.** Both of them are saying the same thing from different angles --
+/// that the walk is not the simple one [`Option_::range`] describes -- and
+/// stacking them is double-counting a single fact. It also has a cliff in it: a
+/// ball that is both in the moat and round the far side of a fence scores a
+/// sixteenth, which lands under [`IDLE_APPEAL`], and a Mario that stands about
+/// rather than fetch the only thing on the lawn is a worse bug than one that
+/// takes a long walk for it.
 fn score(option: Option_, base: f32, scale: f32) -> f32 {
-    let worth = appeal(base, option.range, scale);
-    match option.wet {
-        true => worth * WET_PENALTY,
-        false => worth,
+    let mut discount = 1.0_f32;
+    if option.wet {
+        discount = discount.min(WET_PENALTY);
     }
+    if option.blocked {
+        discount = discount.min(BLOCKED_PENALTY);
+    }
+    appeal(base, option.range, scale) * discount
 }
 
 /// Picks what a Mario does this tick.
@@ -326,6 +451,15 @@ pub fn choose(options: &Options) -> Goal {
             },
         );
     }
+    if let Some(holding) = options.holding {
+        offer(
+            score(holding, HOLD_APPEAL, HOLD_SCALE),
+            Goal::Hold {
+                at: holding.at,
+                arrive: holding.arrive,
+            },
+        );
+    }
     if let Some(following) = options.following {
         offer(
             score(following, FOLLOW_APPEAL, FOLLOW_SCALE),
@@ -358,10 +492,19 @@ pub fn choose(options: &Options) -> Goal {
 #[allow(clippy::type_complexity)]
 pub fn plan(
     level: Res<LevelData>,
+    // Only to ask whether there is anything between a Mario and the thing it is
+    // thinking about. See [`Option_::blocked`].
+    field: Res<crate::flow::FlowField>,
     network: Res<Network>,
     tuning: Res<crate::console::GameTuning>,
     squad: Res<crate::squad::Squad>,
-    mut allies: Query<(Entity, &mut Ally, &Transform, Option<&crate::enemy::Aggro>)>,
+    mut allies: Query<(
+        Entity,
+        &mut Ally,
+        &Transform,
+        Option<&crate::enemy::Aggro>,
+        &mut crate::path::Route,
+    )>,
     mut balls: Query<(Entity, &mut nuclonium::Nuclonium, &Transform), Without<Ally>>,
 ) {
     // Where a ball could be taken. Taken once rather than per Mario: this is a
@@ -384,7 +527,7 @@ pub fn plan(
         held
     };
     let alive: Vec<Entity> = {
-        let mut all: Vec<Entity> = allies.iter().map(|(entity, _, _, _)| entity).collect();
+        let mut all: Vec<Entity> = allies.iter().map(|(entity, ..)| entity).collect();
         all.sort_unstable();
         all
     };
@@ -402,7 +545,7 @@ pub fn plan(
         }
     }
 
-    for (mario, mut ally, transform, aggro) in &mut allies {
+    for (mario, mut ally, transform, aggro, mut route) in &mut allies {
         let here = transform.translation;
         let flat = Vec2::new(here.x, here.z);
         let mut options = Options {
@@ -417,16 +560,23 @@ pub fn plan(
         // `Ally::goal`, so the record of what was asked for and the decision
         // about whether to do it right now stay separate things.
         //
-        // Neither is discounted for being wet: an order is where the player
-        // pointed, and second-guessing that is not this module's job.
+        // Neither is discounted for being wet, nor for being round a corner:
+        // an order is where the player pointed, and second-guessing that is not
+        // this module's job. The *walk* there is [`crate::path`]'s business and
+        // it goes round.
         let spot = |at: Vec2, arrive: f32| Option_ {
             at,
             arrive,
             range: flat.distance(at),
             wet: false,
+            blocked: false,
         };
         match ordered_spot(&squad, mario) {
-            Some((at, arrive)) => options.ordered = Some(spot(at, arrive)),
+            // Reached, so the order is spent and what is left is a post. The
+            // two are scored quite differently and that difference is the whole
+            // of [`HOLD_APPEAL`].
+            Some((at, arrive, true)) => options.holding = Some(spot(at, arrive)),
+            Some((at, arrive, false)) => options.ordered = Some(spot(at, arrive)),
             None => {
                 options.following = squad
                     .members
@@ -448,6 +598,11 @@ pub fn plan(
                 arrive: aggro.room + crate::player::PLAYER_RADIUS + crate::squad::STRIKE_RANGE,
                 range: flat.distance(at),
                 wet: wet(aggro.at),
+                // A slime it can see across the moat is a slime it would have to
+                // walk to the bridge for. Discounted rather than struck off:
+                // something that has come for a Mario is worth going round for
+                // once it is the only thing on the list.
+                blocked: !field.clear(here, aggro.at),
             });
         }
         if carrying.binary_search(&mario).is_ok() {
@@ -456,6 +611,7 @@ pub fn plan(
                 arrive: nuclonium::DELIVER_RANGE * 0.75,
                 range,
                 wet: wet(at),
+                blocked: !field.clear(here, at),
             });
         } else {
             // **Offered whether or not there is anywhere to take it.** Fetching
@@ -467,7 +623,16 @@ pub fn plan(
             // the takings of a fight they just won. A Mario that picks one up
             // and holds it is doing something useful: the moment a mast lights,
             // `mast` is offered and it delivers.
-            let mut best: Option<(Entity, Vec3, f32)> = None;
+            //
+            // **Picked by what it scores rather than by how far off it is**,
+            // which is the difference between a squad that collects the lawn
+            // and one that walks into a fence. Nearest is the right answer only
+            // when every candidate is worth the same, and they are not: one in
+            // the moat is worth a quarter, and one round the far side of
+            // something is worth a quarter again. Scoring here also means this
+            // loop and [`choose`] agree about which ball is the good one, which
+            // they did not when one sorted by distance and the other by worth.
+            let mut best: Option<(Entity, Option_, f32)> = None;
             for (ball, held, at) in &balls {
                 if !held.available(mario, is_alive) {
                     continue;
@@ -476,24 +641,51 @@ pub fn plan(
                 if range > FETCH_RANGE {
                     continue;
                 }
-                if best.is_none_or(|(_, _, best)| range < best) {
-                    best = Some((ball, at.translation, range));
+                // The most this could possibly be worth, before anything about
+                // it has been looked up: no water, nothing in the way. If even
+                // that loses to what is already in hand, the lookups are not
+                // worth paying for -- which is what keeps the grid walk below
+                // to the handful of balls that could still win.
+                if best
+                    .is_some_and(|(_, _, worth)| appeal(FETCH_APPEAL, range, FETCH_SCALE) <= worth)
+                {
+                    continue;
+                }
+                let option = Option_ {
+                    at: Vec2::new(at.translation.x, at.translation.z),
+                    arrive: nuclonium::PICKUP_RANGE * 0.75,
+                    range,
+                    wet: wet(at.translation),
+                    blocked: !field.clear(here, at.translation),
+                };
+                let worth = score(option, FETCH_APPEAL, FETCH_SCALE);
+                if best.is_none_or(|(_, _, had)| worth > had) {
+                    best = Some((ball, option, worth));
                 }
             }
-            options.ball = best.map(|(ball, at, range)| {
-                (
-                    ball,
-                    Option_ {
-                        at: Vec2::new(at.x, at.z),
-                        arrive: nuclonium::PICKUP_RANGE * 0.75,
-                        range,
-                        wet: wet(at),
-                    },
-                )
-            });
+            options.ball = best.map(|(ball, option, _)| (ball, option));
         }
 
         ally.plan = choose(&options);
+        // And the way there, which is a separate question from what to do and
+        // is answered by a separate module -- but *asked* here, because this is
+        // the tick and the line on which the destination is decided. Restating
+        // an unchanged want costs a compare; see [`crate::path::Route::want`].
+        //
+        // The water toll is this Mario's own caution against the console's
+        // number, which is the same preference [`Goal::caution`] hands the
+        // steering, one scale up: an order routes through the moat where an
+        // errand walks to the bridge.
+        match ally.plan.destination() {
+            Some((at, _)) => route.want(
+                at,
+                crate::flow::Tolls {
+                    wet: tuning.path_toll * ally.plan.caution(),
+                    hug: tuning.path_clearance,
+                },
+            ),
+            None => route.clear(),
+        }
         // Whatever it settled on going to get is now spoken for, so the next
         // Mario in this same loop picks a different ball.
         if let Some(ball) = ally.plan.claim() {
@@ -506,18 +698,23 @@ pub fn plan(
     }
 }
 
-/// Where the player *sent* this Mario, if anywhere.
+/// Where the player *sent* this Mario, if anywhere, and whether it is there
+/// yet.
 ///
 /// Only the whistle's sends. A formation slot used to come out of here too, and
 /// scoring the two the same is the whole of the bug [`FOLLOW_APPEAL`] describes:
 /// a squad that is following the player is always standing next to its slot, so
 /// an order-strength follow is an order-strength job that never goes away.
-fn ordered_spot(squad: &crate::squad::Squad, mario: Entity) -> Option<(Vec2, f32)> {
+///
+/// The flag is the same bug wearing the squad's own clothes. An order that has
+/// been carried out is a place to stand rather than a journey to make, and
+/// [`HOLD_APPEAL`] is what it is worth once it is.
+fn ordered_spot(squad: &crate::squad::Squad, mario: Entity) -> Option<(Vec2, f32, bool)> {
     squad
         .sent
         .iter()
-        .find(|(sent, _, _)| *sent == mario)
-        .map(|(_, at, _)| (*at, crate::squad::SEND_ARRIVE))
+        .find(|order| order.who == mario)
+        .map(|order| (order.at, crate::squad::SEND_ARRIVE, order.arrived))
 }
 
 /// The nearest of a handful of points, and how far off it is.
@@ -538,6 +735,7 @@ mod tests {
             arrive: 1.0,
             range,
             wet: false,
+            blocked: false,
         }
     }
 
@@ -606,6 +804,104 @@ mod tests {
         assert!(matches!(choose(&near), Goal::Fight { .. }), "{near:?}");
     }
 
+    /// **The bug this whole `Hold` business exists for.** A squad tapped at a
+    /// nest walks over, spreads out around it, and then stands there while
+    /// slimes wander past its elbow -- because every one of them is standing on
+    /// the spot it was told to stand on, and an order at zero range beats a
+    /// fight at any range past about eighty centimetres.
+    #[test]
+    fn a_mario_that_has_reached_the_spot_it_was_sent_to_fights_what_it_finds_there() {
+        let arrived = Options {
+            holding: Some(spot(0.0)),
+            quarry: Some(spot(4.0)),
+            engage: 14.0,
+            ..Options::default()
+        };
+        assert!(
+            matches!(choose(&arrived), Goal::Fight { .. }),
+            "it stood on its spot in the middle of a fight: {arrived:?}"
+        );
+        // And the same Mario still on its way does not stop for that fight,
+        // because an order it has not carried out yet is still an order.
+        let marching = Options {
+            ordered: Some(spot(20.0)),
+            quarry: Some(spot(4.0)),
+            engage: 14.0,
+            ..Options::default()
+        };
+        assert!(
+            matches!(choose(&marching), Goal::Obey { .. }),
+            "{marching:?}"
+        );
+    }
+
+    /// Holding a spot is worth more than nothing, which is what brings a Mario
+    /// back to it once the fight it left for is over.
+    #[test]
+    fn a_mario_with_the_field_to_itself_goes_back_to_its_post() {
+        let options = Options {
+            holding: Some(spot(9.0)),
+            ..Options::default()
+        };
+        assert!(matches!(choose(&options), Goal::Hold { .. }), "{options:?}");
+        // Standing on it, with nothing else on, it stays: the post outscores
+        // ambling at every range a Mario could be shoved to.
+        let standing = Options {
+            holding: Some(spot(0.0)),
+            ..Options::default()
+        };
+        assert!(matches!(choose(&standing), Goal::Hold { .. }));
+    }
+
+    /// A post is a preference and an order is an order: the same Mario walks
+    /// into water for one and round it for the other.
+    #[test]
+    fn a_post_is_walked_to_more_carefully_than_an_order() {
+        assert!(
+            Goal::Obey {
+                at: Vec2::ZERO,
+                arrive: 1.0
+            }
+            .caution()
+                < Goal::Hold {
+                    at: Vec2::ZERO,
+                    arrive: 1.0
+                }
+                .caution()
+        );
+        // And nothing is fearless or paralysed: every job weighs a hazard, and
+        // none of them weighs it infinitely. See [`crate::squad::steer`].
+        for goal in [
+            Goal::Idle,
+            Goal::Obey {
+                at: Vec2::ZERO,
+                arrive: 1.0,
+            },
+            Goal::Hold {
+                at: Vec2::ZERO,
+                arrive: 1.0,
+            },
+            Goal::Fight {
+                at: Vec2::ZERO,
+                arrive: 1.0,
+            },
+            Goal::Deliver {
+                at: Vec2::ZERO,
+                arrive: 1.0,
+            },
+            Goal::Fetch {
+                ball: ball(),
+                at: Vec2::ZERO,
+                arrive: 1.0,
+            },
+        ] {
+            assert!(
+                goal.caution() > 0.0 && goal.caution().is_finite(),
+                "{goal:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_mario_carrying_something_takes_it_home_past_a_passing_slime() {
         // Carrying beats a fight it is not actually in. It does not beat one it
@@ -622,6 +918,36 @@ mod tests {
             ..Options::default()
         };
         assert!(matches!(choose(&grappling), Goal::Fight { .. }));
+    }
+
+    /// **The screenshot this was written for.** A ball eight metres away
+    /// through a fence and across the moat, and one twenty metres away on the
+    /// same lawn. Scored on how far off they are, the squad walks up to the
+    /// railings and presses against them -- and that is the right answer to the
+    /// question, because the far side of a fence really is eight metres away.
+    #[test]
+    fn a_thing_round_the_far_side_of_something_loses_to_a_further_one_in_reach() {
+        let near_but_round_a_corner = Option_ {
+            blocked: true,
+            wet: true,
+            ..spot(8.0)
+        };
+        let far_but_on_this_side = spot(20.0);
+        assert!(
+            score(far_but_on_this_side, FETCH_APPEAL, FETCH_SCALE)
+                > score(near_but_round_a_corner, FETCH_APPEAL, FETCH_SCALE),
+            "it went for the one in the water"
+        );
+        // And it is a discount rather than a refusal: with nothing else on the
+        // lawn, somebody does go round for it.
+        let options = Options {
+            ball: Some((ball(), near_but_round_a_corner)),
+            ..Options::default()
+        };
+        assert!(
+            matches!(choose(&options), Goal::Fetch { .. }),
+            "{options:?}"
+        );
     }
 
     #[test]

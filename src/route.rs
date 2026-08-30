@@ -15,8 +15,25 @@
 //! asks for them through a closure rather than being handed a structure that
 //! would have to be assembled, kept in step, and paid for on every rebuild.
 //!
-//! [`tour`] is the other half: not "how do I get there" but "what order should
-//! I visit these in", which is the travelling salesman, and which the pylon
+//! [`astar`] is the third, and it exists because the other two answer the wrong
+//! question for one body going one place. [`flood`] is *every* node's distance
+//! from a source: unbeatable when a thousand enemies all want the same
+//! destination, and absurd when one Mario wants a route to one ball -- it sweeps
+//! nine thousand cells to use forty of them. A* sweeps outward from the start
+//! but always pops whichever open node looks most promising, so on the castle
+//! it settles a few hundred cells instead of all of them, and it is asked for
+//! *one* body at a time.
+//!
+//! **Nothing in this game may run a search per unit per frame, and [`astar`]
+//! is built so that it cannot.** Every call takes a `budget` of nodes it may
+//! settle, and a call that runs out returns the best partial route it found
+//! rather than nothing -- so the caller gets a body walking usefully in the
+//! right direction instead of a body standing still or a frame spent proving
+//! there is no way through. [`crate::path`] is the other half of the rule: it
+//! meters how many of these run in a tick at all.
+//!
+//! [`tour`] is the last: not "how do I get there" but "what order should I
+//! visit these in", which is the travelling salesman, and which the pylon
 //! network needs to send one supply packet round every mast it has. It is
 //! nearest-neighbour improved by 2-opt, because a network is a dozen or two
 //! stops and an exact answer to a problem this shape is not worth a frame.
@@ -92,6 +109,249 @@ impl Flood {
         let chain = self.path(node);
         chain.get(1).copied()
     }
+}
+
+/// What one A* search found: the chain of nodes from the start to the end it
+/// settled on, and what it cost to find out.
+///
+/// The counters are not diagnostics for their own sake. A search that ran out
+/// of budget is the one case a caller has to *do* something about -- walk the
+/// partial route and ask again shortly, rather than treat it as the answer --
+/// and [`crate::path`] puts both numbers on the debug overlay, because a route
+/// that is quietly being truncated every time looks from outside exactly like a
+/// unit that keeps changing its mind.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Found {
+    /// Start first, end last. Never empty for a search that returned at all.
+    pub nodes: Vec<usize>,
+    /// What walking it costs, in whatever units `neighbours` handed out.
+    pub cost: f32,
+    /// How many nodes the search settled before it stopped.
+    pub settled: usize,
+    /// Whether the search ran out of *ground* rather than out of budget.
+    ///
+    /// **The difference between "I could not find it in time" and "it is not
+    /// there", and only the caller can act on it.** A [`Self::partial`] route
+    /// means the chain stops short; on its own that says nothing about why, and
+    /// the honest thing to do about a budget that ran out is to walk as far as
+    /// it got and ask again from there. But a search that emptied its open set
+    /// has settled every cell it could ever reach, and the goal was not among
+    /// them -- asking again from anywhere on this side of the gap will settle
+    /// the same cells and fail the same way, for ever. See
+    /// [`crate::path::Route::unreachable`].
+    pub exhausted: bool,
+    /// Whether [`Self::nodes`] stops short of the goal.
+    ///
+    /// True when the budget ran out, in which case the chain runs to whichever
+    /// node came nearest the goal by the heuristic. A partial route is worth
+    /// having: it is by construction a walk that gets closer, and the caller
+    /// asks again from wherever it ends up.
+    pub partial: bool,
+}
+
+/// The working memory of an A* search, kept between calls.
+///
+/// **Three arrays the size of the graph, and a search that reused nothing would
+/// allocate and zero all three every time it ran.** On the navigation grid that
+/// is nine thousand cells, three times over, to settle a few hundred of them --
+/// more work spent preparing than searching. So the caller keeps one of these
+/// (a `Local` on the system that plans routes) and hands it back.
+///
+/// Clearing it is a counter rather than a fill. Every entry carries the number
+/// of the search that wrote it, and a stale stamp reads as "never visited",
+/// so starting a search costs one increment instead of nine thousand writes.
+#[derive(Default)]
+pub struct Search {
+    cost: Vec<f32>,
+    from: Vec<u32>,
+    stamp: Vec<u32>,
+    epoch: u32,
+    open: std::collections::BinaryHeap<Ranked>,
+}
+
+impl Search {
+    /// Readies the scratch for a graph of `count` nodes and forgets the last
+    /// search.
+    fn begin(&mut self, count: usize) {
+        if self.cost.len() != count {
+            self.cost = vec![0.0; count];
+            self.from = vec![UNREACHED; count];
+            self.stamp = vec![0; count];
+            self.epoch = 0;
+        }
+        self.open.clear();
+        // Wrapping would make every stale entry read as current, which is a
+        // search that silently refuses to visit anything. Once every four
+        // billion searches, pay for the fill.
+        match self.epoch.checked_add(1) {
+            Some(next) => self.epoch = next,
+            None => {
+                self.stamp.fill(0);
+                self.epoch = 1;
+            }
+        }
+    }
+
+    /// Whether this search has seen `node` yet.
+    fn seen(&self, node: usize) -> bool {
+        self.stamp[node] == self.epoch
+    }
+}
+
+/// One node waiting to be looked at, ordered by what it is estimated to cost.
+///
+/// `Ord` reversed and by `total_cmp`, so the standard max-heap pops the
+/// cheapest and a NaN estimate cannot panic the comparison inside the heap --
+/// a heuristic that returned one would simply sort last.
+#[derive(Clone, Copy, PartialEq)]
+struct Ranked {
+    estimate: f32,
+    node: u32,
+}
+
+impl Eq for Ranked {}
+
+impl Ord for Ranked {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .estimate
+            .total_cmp(&self.estimate)
+            .then_with(|| other.node.cmp(&self.node))
+    }
+}
+
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The cheapest way from `start` to `goal`, or the best start of one.
+///
+/// `neighbours` is asked, for each node the search settles, which nodes may be
+/// stepped to from it and what that step costs -- the same shape [`flood`] asks
+/// its edges in, with a price attached. `heuristic` estimates what is left to
+/// walk from a node to the goal.
+///
+/// **The heuristic must never overstate what is left**, or the first route
+/// found is not the cheapest one. On a grid that means straight-line or octile
+/// distance and nothing cleverer: any penalty the edges add -- water, a climb --
+/// only ever makes the real cost larger, so an estimate that ignores them stays
+/// a lower bound by construction. That is worth writing down because it is the
+/// one property that makes the answer an answer rather than a plausible walk.
+///
+/// `budget` is how many nodes it may settle before it gives up. It is a
+/// guarantee about the frame rather than a tuning knob: an unreachable goal on
+/// a nine-thousand-cell grid is a search that settles *every walkable cell*
+/// proving it, and a game cannot pay that on the tick somebody points at the
+/// far side of the moat. Out of budget, what comes back is the chain to
+/// whichever node the heuristic liked best -- a real walk in the right
+/// direction, marked [`Found::partial`] so the caller knows to ask again.
+///
+/// `None` only when `start` or `goal` is out of range, or when the reachable
+/// part of the graph was searched out and the goal was not in it.
+pub fn astar<I>(
+    search: &mut Search,
+    count: usize,
+    start: usize,
+    goal: usize,
+    budget: usize,
+    mut neighbours: impl FnMut(usize) -> I,
+    heuristic: impl Fn(usize) -> f32,
+) -> Option<Found>
+where
+    I: IntoIterator<Item = (usize, f32)>,
+{
+    if start >= count || goal >= count {
+        return None;
+    }
+    search.begin(count);
+    search.stamp[start] = search.epoch;
+    search.cost[start] = 0.0;
+    search.from[start] = UNREACHED;
+    search.open.push(Ranked {
+        estimate: heuristic(start),
+        node: start as u32,
+    });
+    // The nearest miss, in case the budget runs out. Seeded with the start, so
+    // there is always something to hand back -- a chain of one, which is a body
+    // that has been told to stay where it is rather than a body with no answer.
+    let mut nearest = (heuristic(start), start);
+    let mut settled = 0;
+    while let Some(Ranked { estimate, node }) = search.open.pop() {
+        let here = node as usize;
+        if here == goal {
+            return Some(Found {
+                nodes: chain(search, start, goal),
+                cost: search.cost[goal],
+                settled,
+                partial: false,
+                exhausted: false,
+            });
+        }
+        // A node can be pushed more than once, when a cheaper way to it turns
+        // up after it was first queued. The stale copies are still in the heap
+        // -- taking them out would cost a search of it -- so they are thrown
+        // away here instead, by noticing that the estimate they were filed
+        // under is no longer the one the node holds.
+        if estimate > search.cost[here] + heuristic(here) + 1e-4 {
+            continue;
+        }
+        settled += 1;
+        if settled > budget {
+            break;
+        }
+        for (there, step) in neighbours(here) {
+            if there >= count || !step.is_finite() || step < 0.0 {
+                continue;
+            }
+            let cost = search.cost[here] + step;
+            if search.seen(there) && cost >= search.cost[there] {
+                continue;
+            }
+            search.stamp[there] = search.epoch;
+            search.cost[there] = cost;
+            search.from[there] = here as u32;
+            let left = heuristic(there);
+            if left < nearest.0 {
+                nearest = (left, there);
+            }
+            search.open.push(Ranked {
+                estimate: cost + left,
+                node: there as u32,
+            });
+        }
+    }
+    // Searched out, or out of budget. Either way the useful answer is the same
+    // one: walk to whatever came nearest.
+    if nearest.1 == start && start != goal {
+        return None;
+    }
+    Some(Found {
+        nodes: chain(search, start, nearest.1),
+        cost: search.cost[nearest.1],
+        settled,
+        partial: true,
+        // The loop breaks on `settled > budget` and falls out of the bottom
+        // when the open set empties, so this is exactly "the heap ran dry".
+        exhausted: settled <= budget,
+    })
+}
+
+/// Walks the parents back from `node` to `start` and turns the chain round.
+fn chain(search: &Search, start: usize, node: usize) -> Vec<usize> {
+    let mut nodes = vec![node];
+    let mut here = node;
+    while here != start {
+        let parent = search.from[here];
+        if parent == UNREACHED || nodes.len() > search.from.len() {
+            break;
+        }
+        here = parent as usize;
+        nodes.push(here);
+    }
+    nodes.reverse();
+    nodes
 }
 
 /// Breadth-first from every source at once.
@@ -287,6 +547,125 @@ mod tests {
         // And the middle is reached from whichever corner is nearer.
         assert_eq!(found.steps(5), Some(2));
         assert_eq!(found.steps(10), Some(2));
+    }
+
+    /// The four-neighbour lattice again, priced at one per step.
+    fn priced(walled: bool) -> impl Fn(usize) -> Vec<(usize, f32)> {
+        let edges = lattice(walled);
+        move |here| edges(here).into_iter().map(|there| (there, 1.0)).collect()
+    }
+
+    /// Manhattan distance to the far corner, which on a four-neighbour lattice
+    /// with unit steps is exact and therefore admissible.
+    fn towards(goal: usize) -> impl Fn(usize) -> f32 {
+        move |node| {
+            let (x, y) = ((node % 4) as f32, (node / 4) as f32);
+            let (gx, gy) = ((goal % 4) as f32, (goal / 4) as f32);
+            (x - gx).abs() + (y - gy).abs()
+        }
+    }
+
+    #[test]
+    fn a_search_finds_the_shortest_way_across_the_lattice() {
+        let mut search = Search::default();
+        let found = astar(&mut search, 16, 0, 15, 1000, priced(false), towards(15)).unwrap();
+        assert!(!found.partial);
+        assert_eq!(found.nodes.first(), Some(&0));
+        assert_eq!(found.nodes.last(), Some(&15));
+        assert_eq!(found.cost, 6.0);
+        assert_eq!(found.nodes.len(), 7, "{found:?}");
+        for pair in found.nodes.windows(2) {
+            assert!(
+                lattice(false)(pair[0]).contains(&pair[1]),
+                "{pair:?} is not an edge"
+            );
+        }
+        // And it looked at less of the graph than a sweep would have. This is
+        // the whole reason it exists beside `flood`, so it is worth an
+        // assertion rather than a comment.
+        assert!(
+            found.settled < 16,
+            "it settled the whole lattice: {found:?}"
+        );
+    }
+
+    /// Cost is not distance, which is the whole reason the crowd's own sweep
+    /// could not be reused for this: a flood counts hops, and a route through
+    /// the moat is not the same length as a route round it.
+    #[test]
+    fn the_cheapest_way_is_taken_rather_than_the_shortest() {
+        // One cell in the middle of the lattice made ten times as expensive to
+        // step into. Every route from corner to corner is six steps, so the
+        // only thing that can steer the answer away from it is the price.
+        let toll = |here: usize| -> Vec<(usize, f32)> {
+            lattice(false)(here)
+                .into_iter()
+                .map(|there| (there, if there == 5 { 10.0 } else { 1.0 }))
+                .collect()
+        };
+        let mut search = Search::default();
+        let found = astar(&mut search, 16, 0, 15, 1000, toll, towards(15)).unwrap();
+        assert!(!found.partial);
+        assert_eq!(found.cost, 6.0, "it paid the toll: {found:?}");
+        assert!(
+            !found.nodes.contains(&5),
+            "it walked through the expensive cell: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_search_that_cannot_get_there_says_so_rather_than_guessing() {
+        let mut search = Search::default();
+        // The right half is walled off entirely. What comes back is the best
+        // approach to the wall -- a real walk, marked as not the whole answer.
+        let found = astar(&mut search, 16, 0, 3, 1000, priced(true), towards(3)).unwrap();
+        assert!(found.partial, "it claimed to have crossed the wall");
+        assert_eq!(found.nodes.first(), Some(&0));
+        assert!(
+            found.nodes.last().is_some_and(|node| node % 4 <= 1),
+            "it ended up past the wall: {found:?}"
+        );
+    }
+
+    /// **The guarantee the frame rate rests on**: a search may be stopped, and
+    /// what it gives back when it is stopped is still a walk in the right
+    /// direction rather than nothing.
+    #[test]
+    fn a_search_out_of_budget_hands_back_the_best_start_it_found() {
+        let mut search = Search::default();
+        let found = astar(&mut search, 16, 0, 15, 2, priced(false), towards(15)).unwrap();
+        assert!(found.partial, "two nodes was enough for the whole lattice?");
+        assert!(found.settled <= 3, "the budget was not a budget: {found:?}");
+        assert_eq!(found.nodes.first(), Some(&0));
+        let end = *found.nodes.last().unwrap();
+        assert!(
+            towards(15)(end) < towards(15)(0),
+            "the partial route goes the wrong way: {found:?}"
+        );
+    }
+
+    #[test]
+    fn the_scratch_is_reusable_and_a_stale_search_does_not_leak_into_the_next() {
+        let mut search = Search::default();
+        let first = astar(&mut search, 16, 0, 15, 1000, priced(false), towards(15)).unwrap();
+        // The same scratch, a different question, twice over -- the second of
+        // which is the one that would read the first's parents if the epoch
+        // stamp were not doing its job.
+        let blocked = astar(&mut search, 16, 0, 3, 1000, priced(true), towards(3)).unwrap();
+        assert!(blocked.partial);
+        let again = astar(&mut search, 16, 0, 15, 1000, priced(false), towards(15)).unwrap();
+        assert_eq!(first, again);
+    }
+
+    #[test]
+    fn a_search_to_where_it_already_is_is_a_chain_of_one() {
+        let mut search = Search::default();
+        let found = astar(&mut search, 16, 5, 5, 1000, priced(false), towards(5)).unwrap();
+        assert_eq!(found.nodes, vec![5]);
+        assert_eq!(found.cost, 0.0);
+        assert!(!found.partial);
+        // And a node that is not in the graph at all is not an answer.
+        assert!(astar(&mut search, 16, 0, 99, 1000, priced(false), towards(0)).is_none());
     }
 
     #[test]

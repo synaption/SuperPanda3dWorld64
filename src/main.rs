@@ -29,6 +29,7 @@ mod level;
 mod menu;
 mod n64;
 mod nuclonium;
+mod path;
 mod pipe;
 mod player;
 mod pylon;
@@ -385,6 +386,16 @@ pub fn add_game(app: &mut App) {
         .add_plugins(EntityCountDiagnosticsPlugin::default());
     register_world_asset_types(app);
     game_systems(app);
+    // **Here rather than in `game_systems`, which is the shared list, because
+    // this one needs a renderer.** `Gizmos` is backed by `GizmoPlugin`, which
+    // `DefaultPlugins` brings along behind the `bevy_gizmos` feature -- and
+    // which cannot be added to the headless harness, because its own systems
+    // want resources only the render app has. A `Gizmos` parameter with nothing
+    // behind it does not quietly draw nothing; it fails validation and takes
+    // the frame with it. So the debug overlay is a thing the windowed game has
+    // and the test harness does not, exactly as the render passes are.
+    app.add_systems(Startup, path::configure)
+        .add_systems(Update, path::draw);
 }
 
 /// Every resource the game's systems expect to find.
@@ -412,8 +423,12 @@ pub fn game_resources(app: &mut App) {
         .init_resource::<animation::PlayerAnimation>()
         .init_resource::<animation::EnemyGraphs>()
         .init_resource::<squad::Squad>()
+        .init_resource::<path::Pathing>()
         .init_resource::<action::Action>()
         .init_resource::<squad::Whistle>()
+        // The ring the whistle leaves where an order landed. Beside the
+        // whistle itself because the one writes the other.
+        .init_resource::<squad::OrderMark>()
         .init_resource::<stellarator::Build>()
         // The pylon network and the key that plants one. Beside the machine's
         // build state because they are the same control in a different hand.
@@ -590,8 +605,14 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
         // Where the train actually swims to is `nuclonium::swim`, per drawn
         // frame; the whistle that fills it is `nuclonium::call`, likewise. See
         // both for why those two are drawn rather than simulated.
+        //
+        // `path::plan` sits between the decision and the walk, and that is the
+        // only ordering it needs: a destination written this tick is routed
+        // this tick, and a Mario whose turn the budget did not reach walks last
+        // tick's route -- or straight at its goal -- and comes round again.
         (
             goap::plan,
+            path::plan,
             squad::move_allies,
             nuclonium::haul,
             nuclonium::escort,
@@ -691,7 +712,10 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
         animation::attach_graphs,
         animation::track_player,
         animation::update,
-        squad::whistle,
+        // Chained rather than two entries, and not only for the
+        // tuple-of-twenty reason: `whistle` leaves the mark that `order_ring`
+        // draws, so an order given this frame should be ringed this frame.
+        (squad::whistle, squad::order_ring).chain(),
         squad::animate_allies,
         // The build button and the plasma it draws, and then the pylons.
         // Beside the whistle because it is the same control in a different
@@ -1188,12 +1212,15 @@ fn toggle_fullscreen(
     };
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_hud(
     state: Res<GameState>,
     input: Res<InputState>,
     loadout: Res<weapon::Loadout>,
     squad: Res<squad::Squad>,
     bank: Res<nuclonium::Bank>,
+    tuning: Res<console::GameTuning>,
+    pathing: Res<path::Pathing>,
     player: Query<(&Controller, &health::Health), With<Player>>,
     mut text: Query<&mut Text, With<Hud>>,
 ) {
@@ -1212,7 +1239,24 @@ fn update_hud(
         let marching = squad.marching();
         let holding = squad.sent.len() - marching;
         let stored = bank.stored;
-        format!("Space Crusaders\n{:?}  ·  {:?}  ·  Health {}/{}  ·  {device}\nSquad {following} following · {marching} marching · {holding} holding · Nuclonium {stored}\nWASD move · mouse look · Space jump · V jetpack/skate\nShift attack · X squad (hold to whistle, tap to send)\nB build stellarator (hold to grow, tap for the smallest)\nG plant pylon (hold to place, beams link on sight)\nF/right mouse aim · Y weapon ({weapon}) · ` console · F2 switch · Esc menu · F11 window", state.active, ctrl.motion, health.current, health.max)
+        // Only while the overlay is on. The counters are how you tell a field
+        // that is re-planning constantly from one that is walking -- see
+        // [`path::Pathing`] -- and they are noise the rest of the time.
+        let paths = match tuning.path_debug > 0.0 {
+            true => format!(
+                "\nPaths {} walking · {} queued in {} groups · {} searched · {} direct · {} partial · {} lost · {} cells",
+                pathing.routed,
+                pathing.queued,
+                pathing.groups,
+                pathing.searched,
+                pathing.direct,
+                pathing.partial,
+                pathing.lost,
+                pathing.settled,
+            ),
+            false => String::new(),
+        };
+        format!("Space Crusaders\n{:?}  ·  {:?}  ·  Health {}/{}  ·  {device}\nSquad {following} following · {marching} marching · {holding} holding · Nuclonium {stored}\nWASD move · mouse look · Space jump · V jetpack/skate\nShift attack · X squad (hold to whistle, tap to send)\nB build stellarator (hold to grow, tap for the smallest)\nG plant pylon (hold to place, beams link on sight)\nF/right mouse aim · Y weapon ({weapon}) · ` console · F2 switch · Esc menu · F11 window{paths}", state.active, ctrl.motion, health.current, health.max)
     } else {
         String::new()
     };
@@ -2568,6 +2612,204 @@ mod tests {
         assert!(
             app.world().get_entity(nest).is_err(),
             "the nest survived a pool's worth of swings"
+        );
+    }
+
+    /// A squad tapped at something walks over and *fights* it.
+    ///
+    /// **The bug this is here to keep out is the one a player sees as "some of
+    /// them just stop and do nothing".** A Mario standing on the spot it was
+    /// sent to is at zero range from its order, which scores 0.90 for ever; a
+    /// slime four metres away scores 0.64. So the squad marched over, spread
+    /// out around the target, and stood in the middle of a fight -- every one
+    /// of them doing exactly as it was told, and the only ones that ever swung
+    /// were the ones whose slot in the cluster happened to land inside their own
+    /// punch's reach. See [`goap::Goal::Hold`], which is what an order becomes
+    /// once it has been carried out.
+    ///
+    /// Staged in the running game rather than against [`goap::choose`], because
+    /// the unit test cannot see the thing that actually went wrong: the score
+    /// was right, the *state fed to it* was a journey that had already finished.
+    #[test]
+    fn a_squad_sent_at_a_slime_closes_on_it_rather_than_standing_on_its_spot() {
+        let mut app = headless();
+        app.update();
+        let here = {
+            let mut player = app.world_mut().query_filtered::<&Transform, With<Player>>();
+            player.single(app.world()).unwrap().translation
+        };
+        // The castle's own squad is somewhere else and would confuse the count.
+        {
+            let mut allies = app
+                .world_mut()
+                .query_filtered::<Entity, With<squad::Ally>>();
+            let marios: Vec<Entity> = allies.iter(app.world()).collect();
+            for mario in marios {
+                app.world_mut().entity_mut(mario).despawn();
+            }
+            let mut tuning = app.world_mut().resource_mut::<console::GameTuning>();
+            tuning.ally_count = 4.0;
+            tuning.luna_count = 0.0;
+        }
+        // Four Marios in a huddle, and a slime standing five metres from where
+        // they are about to be sent. Five is the number that matters: outside
+        // `enemy::MARIO_REACH`, so nobody can hit it from the spot they are
+        // told to stand on, and well inside `enemy_sight`, so all four can see
+        // it the whole time.
+        let squad_at = here + Vec3::new(-12.0, 0.0, -6.0);
+        let target = Vec2::new(here.x - 12.0, here.z);
+        let slime_at = Vec3::new(target.x, here.y, target.y + 5.0);
+        let slime = app
+            .world_mut()
+            .run_system_once(move |mut commands: Commands, assets: Res<AssetServer>| {
+                for index in 0..4 {
+                    let offset = squad::slot(index, 1.5);
+                    squad::spawn_ally(
+                        &mut commands,
+                        &assets,
+                        ActiveCharacter::Mario,
+                        squad_at + Vec3::new(offset.x, 0.0, offset.y),
+                        index as f32,
+                    );
+                }
+                enemy::spawn(&mut commands, &assets, enemy::Kind::Slime, slime_at, 0.0)
+            })
+            .unwrap();
+        app.update();
+
+        // Whistled up and sent, which is the two halves of the button.
+        let marios: Vec<Entity> = {
+            let mut allies = app
+                .world_mut()
+                .query_filtered::<Entity, With<squad::Ally>>();
+            allies.iter(app.world()).collect()
+        };
+        assert_eq!(marios.len(), 4, "the squad is not the squad this test sent");
+        app.world_mut()
+            .resource_scope(|world, mut squad: Mut<squad::Squad>| {
+                squad.recruit(&marios);
+                squad.send(
+                    world.resource::<flow::FlowField>(),
+                    Vec3::new(target.x, slime_at.y, target.y),
+                );
+            });
+
+        // Long enough to walk twelve metres, arrive, notice, close and land a
+        // few punches.
+        let mut fought = false;
+        for _ in 0..600 {
+            app.update();
+            let mut plans = app.world_mut().query::<&squad::Ally>();
+            fought |= plans
+                .iter(app.world())
+                .any(|ally| matches!(ally.plan, goap::Goal::Fight { .. }));
+            if app.world().get_entity(slime).is_err() {
+                break;
+            }
+        }
+        assert!(
+            fought,
+            "the whole squad stood on its spots with a slime five metres away"
+        );
+        if app.world().get_entity(slime).is_ok() {
+            let at = app.world().get::<Transform>(slime).unwrap().translation;
+            let hp = app.world().get::<health::Health>(slime).map(|h| h.current);
+            let mut marios = app.world_mut().query::<(&squad::Ally, &Transform)>();
+            let who: Vec<_> = marios
+                .iter(app.world())
+                .map(|(a, t)| (t.translation.distance(at), a.plan))
+                .collect();
+            panic!("nobody ever reached the slime they were sent at: alive at {at:?} hp {hp:?}; marios {who:#?}");
+        }
+    }
+
+    /// A tap on the whistle sends the squad and leaves a ring where it landed.
+    ///
+    /// The end-to-end shape of the command, through the real button rather than
+    /// by poking `Squad::send`: the release resolves an aim, the squad is sent
+    /// to it, and `squad::order_ring` puts a visible mark on that exact spot.
+    /// Nothing else in the game reports where an order went, so a ring that is
+    /// drawn somewhere other than where the Marios were sent is a lie the
+    /// player has no way to catch.
+    #[test]
+    fn a_tap_sends_the_squad_and_rings_where_the_order_landed() {
+        let mut app = headless();
+        // A few frames for `squad::maintain_population` to put the field out.
+        for _ in 0..8 {
+            app.update();
+        }
+        // Recruit whatever the field starts with, so there is a squad to send.
+        let marios: Vec<Entity> = {
+            let mut allies = app
+                .world_mut()
+                .query_filtered::<Entity, With<squad::Ally>>();
+            allies.iter(app.world()).collect()
+        };
+        assert!(!marios.is_empty(), "no Marios to order about");
+        app.world_mut()
+            .resource_mut::<squad::Squad>()
+            .recruit(&marios);
+
+        // A tap: down for one frame, up on the next. Sixteen milliseconds is
+        // well inside `TAP_SECONDS`, so this is an order and not a whistle.
+        {
+            let mut input = app.world_mut().resource_mut::<input::InputState>();
+            input.squad = true;
+        }
+        app.update();
+        {
+            let mut input = app.world_mut().resource_mut::<input::InputState>();
+            input.squad = false;
+            input.squad_released = true;
+        }
+        app.update();
+
+        let mark = app.world().resource::<squad::OrderMark>();
+        let (at, radius) = (mark.at, mark.radius);
+        assert!(mark.fade() > 0.0, "the order left no ring");
+
+        // The Marios were sent to the same spot the ring is drawn on, each to
+        // its own slot inside it.
+        let squad = app.world().resource::<squad::Squad>();
+        assert_eq!(squad.marching(), marios.len(), "the tap sent nobody");
+
+        // And the ring entity is actually up, on that spot and that wide.
+        let mut rings = app
+            .world_mut()
+            .query_filtered::<(&Transform, &Visibility), With<squad::OrderCircle>>();
+        let (transform, visibility) = rings
+            .single(app.world())
+            .expect("no order ring in the world");
+        assert!(
+            matches!(visibility, Visibility::Visible),
+            "the order ring stayed hidden"
+        );
+        assert!(
+            transform.translation.distance(at) < 0.2,
+            "the ring was drawn at {:?} for an order that landed at {at:?}",
+            transform.translation
+        );
+        assert!(
+            transform.scale.x <= radius + 1e-3 && transform.scale.x > 0.0,
+            "the ring was drawn {} wide for a {radius} order",
+            transform.scale.x
+        );
+
+        // It does not stay up: run past its life and it is gone.
+        for _ in 0..160 {
+            app.update();
+        }
+        assert_eq!(
+            app.world().resource::<squad::OrderMark>().fade(),
+            0.0,
+            "the order ring never faded out"
+        );
+        let mut rings = app
+            .world_mut()
+            .query_filtered::<&Visibility, With<squad::OrderCircle>>();
+        assert!(
+            matches!(rings.single(app.world()), Ok(Visibility::Hidden)),
+            "the order ring is still on the ground"
         );
     }
 

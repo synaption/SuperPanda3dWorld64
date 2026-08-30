@@ -82,6 +82,32 @@ const WALL_GRID_MARGIN: f32 = 1.0;
 /// of a world and a ceiling on the other. Same constant, different up.
 pub const GROUND_NORMAL_Y: f32 = 0.7;
 
+/// The steepest ground there is, as rise over run.
+///
+/// [`GROUND_NORMAL_Y`] said the same thing as a normal; this is it as a slope,
+/// which is the form anything walking over the ground wants it in. A hair over
+/// the exact conversion, so that ground the collision grid is happy to call
+/// ground is never refused by something measuring it this way.
+pub const WALKABLE_SLOPE: f32 = 1.1;
+
+/// How far above where it is asked [`LevelData::ground_at`] will still hand
+/// back a surface.
+///
+/// A body's feet are never exactly on the floor -- it is a tick behind, or on
+/// the near side of a kerb -- so the query reaches up a little rather than
+/// finding nothing. Named because [`LevelData::climbable`] has to reach up by a
+/// controlled amount instead, and a caller cannot do that without knowing what
+/// the query already adds.
+pub const GROUND_REACH: f32 = 0.5;
+
+/// How far apart [`LevelData::climbable`] takes its samples, in metres.
+///
+/// Short enough to catch the thing it is looking for: a lip half a metre tall
+/// reads as a slope of one in one over half a metre and passes, and as two in
+/// one over a quarter of a metre and does not. Long enough that a stride's
+/// worth of walking is a handful of floor queries rather than a dozen.
+const CLIMB_SAMPLE: f32 = 0.3;
+
 /// Cells along one side of each of a planet's six cube-sphere faces.
 ///
 /// 96 puts a cell at about five metres on the 300 m planet `planet_gen`
@@ -582,7 +608,7 @@ impl LevelData {
                 continue;
             }
             if let Some(y) = surface_y(tri, point.x, point.z) {
-                if y <= point.y + 0.5 && best.is_none_or(|(height, _)| y > height) {
+                if y <= point.y + GROUND_REACH && best.is_none_or(|(height, _)| y > height) {
                     let up = if tri.normal.y < 0.0 {
                         -tri.normal
                     } else {
@@ -593,6 +619,51 @@ impl LevelData {
             }
         }
         best
+    }
+
+    /// Whether a walker could follow the ground from one point to the other
+    /// without meeting a step it cannot take.
+    ///
+    /// **The question every other test of this asks about the two ends, asked
+    /// about what is in between.** A body a stride from the foot of a bank sees
+    /// ground eighty centimetres up and a stride away -- half a metre of rise
+    /// per metre of run, gentler than anything walkable ought to be refused for
+    /// -- and walks straight into a knee-high lip at the bottom of it that
+    /// [`Self::resolve_walls`] will not let it past. It then slides along that
+    /// lip for the rest of the session, with a perfectly good route in hand and
+    /// nothing anywhere reporting a problem. Averages hide steps; this marches.
+    ///
+    /// Sampled every [`CLIMB_SAMPLE`] along the way, each sample asking for the
+    /// highest ground within a climbable step of where the walk has got to. A
+    /// short steep face shows up as no ground being found at all -- the face
+    /// itself is too steep to *be* ground, and what is on top of it is out of
+    /// reach -- which is the answer.
+    ///
+    /// Falling is not climbing: ground far below is fine and is somebody else's
+    /// question. See [`crate::squad::steer`], which prices a drop separately.
+    pub fn climbable(&self, from: Vec3, to: Vec3) -> bool {
+        let span = Vec2::new(to.x - from.x, to.z - from.z);
+        let length = span.length();
+        if length < 1e-4 {
+            return true;
+        }
+        let samples = (length / CLIMB_SAMPLE).ceil().max(1.0);
+        // The most the ground may rise between one sample and the next.
+        let rise = length / samples * WALKABLE_SLOPE;
+        let mut height = from.y;
+        for step in 1..=samples as usize {
+            let at = Vec2::new(from.x, from.z) + span * (step as f32 / samples);
+            // Asked from `rise` above where the walk has got to, less what the
+            // query reaches up by on its own -- so what comes back is the
+            // highest ground that could actually be stepped onto, and nothing
+            // higher.
+            let ceiling = height + rise - GROUND_REACH;
+            let Some((found, _)) = self.ground_at(Vec3::new(at.x, ceiling, at.y)) else {
+                return false;
+            };
+            height = found;
+        }
+        true
     }
 
     /// Returns the lowest horizontal surface above `point`, or `None` when
@@ -1330,7 +1401,10 @@ mod tests {
             &[[0, 1, 2]],
         );
         let corrected = data.resolve_walls(Vec3::new(0.2, 0., 0.), Vec3::Y, 0.5, 1.8);
-        assert!(corrected.x >= 0.5, "left standing in the parapet at {corrected}");
+        assert!(
+            corrected.x >= 0.5,
+            "left standing in the parapet at {corrected}"
+        );
     }
 
     #[test]

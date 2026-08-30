@@ -287,12 +287,87 @@ pub const SPECS: &[TunableSpec] = &[
         step: 0.05,
         doc: "how brightly the plasma flares",
     },
+    // How far off a glowing thing still lights the world around it. A slider
+    // for the reason the two above are: only sixteen lamps reach the shader at
+    // once, so this number trades how far away a lit ball can be seen against
+    // how many of the ones near you get to be lit at all -- and which of those
+    // matters is a thing you have to look at a field of them to decide.
+    // And how many of them the shader is allowed to walk. The one number in
+    // this file with a per-fragment price on it: every live lamp is tested
+    // against every pixel of the world, so this is the row to pull down if the
+    // frame chart moves when a field of nuclonium is on screen.
+    TunableSpec {
+        name: "lamp_count",
+        low: 0.0,
+        high: 2000.0,
+        step: 10.0,
+        doc: "how many glowing things light the world at once",
+    },
+    TunableSpec {
+        name: "lamp_range",
+        low: 10.0,
+        high: 400.0,
+        step: 5.0,
+        doc: "how far off a glowing thing still lights what is around it",
+    },
     TunableSpec {
         name: "enemy_speed",
         low: 0.0,
         high: 10.0,
         step: 0.1,
         doc: "enemy chase speed",
+    },
+    // Pathing. Three rows and between them they are the whole of what routing
+    // costs and how it looks -- see `src/path.rs`, whose entire design is that
+    // none of this may run per body per frame.
+    TunableSpec {
+        name: "path_budget",
+        low: 0.0,
+        high: 64.0,
+        step: 1.0,
+        doc: "route searches allowed per tick",
+    },
+    TunableSpec {
+        name: "path_refresh",
+        low: 0.1,
+        high: 20.0,
+        step: 0.1,
+        doc: "seconds a route is trusted for",
+    },
+    TunableSpec {
+        name: "path_toll",
+        low: 0.0,
+        high: 200.0,
+        step: 5.0,
+        doc: "metres of detour a wet cell is worth avoiding",
+    },
+    TunableSpec {
+        name: "path_clearance",
+        low: 0.0,
+        high: 20.0,
+        step: 0.25,
+        doc: "metres of detour a route pays to keep off walls",
+    },
+    TunableSpec {
+        name: "path_spread",
+        low: 0.0,
+        high: 4.0,
+        step: 0.1,
+        doc: "metres between neighbours walking abreast",
+    },
+    TunableSpec {
+        name: "path_group",
+        low: 1.0,
+        high: 40.0,
+        step: 1.0,
+        doc: "most bodies that share one worked-out route",
+    },
+    TunableSpec {
+        name: "path_debug",
+        low: 0.0,
+        high: 3.0,
+        step: 1.0,
+        doc: "draw routes (1), the nav grid (2), the flow field (3)",
     },
     TunableSpec {
         name: "enemy_sight",
@@ -511,6 +586,40 @@ pub struct GameTuning {
     /// and by nothing else.
     pub stellarator_spin: f32,
     pub stellarator_glow: f32,
+    /// How far from the camera a [`crate::n64::Lamp`] still lights the world,
+    /// in metres. See [`crate::n64::LAMP_RANGE`], which is where this starts.
+    pub lamp_range: f32,
+    /// How many lamps light the world at once, up to the array the shader was
+    /// compiled with. See [`crate::n64::LAMPS`].
+    pub lamp_count: f32,
+    /// How many route searches [`crate::path::plan`] may run in one fixed tick,
+    /// over the whole field. The cost of pathing is this number and not the
+    /// number of bodies, which is the whole point of it being a row.
+    pub path_budget: f32,
+    /// How long a route is trusted before it is worth working out again, in
+    /// seconds.
+    pub path_refresh: f32,
+    /// What a cell of deep water on the way is worth going round, in metres.
+    /// Scaled per body by [`crate::goap::Goal::caution`], so an order wades
+    /// where an errand walks the long way -- the same preference
+    /// [`crate::squad::steer`] applies a stride at a time, said to the search.
+    pub path_toll: f32,
+    /// What a route will pay in metres of detour to keep a cell of daylight
+    /// between itself and a wall. See [`crate::flow::Tolls::hug`], which is
+    /// where the size of it is argued.
+    pub path_clearance: f32,
+    /// How far apart, in metres, two bodies walking abreast on the same route
+    /// stand -- so a group sent the same way travels as a band rather than in
+    /// single file, and the band is as wide as the group needs.
+    /// See [`crate::path::Route::lane`].
+    pub path_spread: f32,
+    /// The most bodies that may share one worked-out route. A group larger than
+    /// this is split evenly -- fourteen into seven and seven. See
+    /// [`crate::path::plan`].
+    pub path_group: f32,
+    /// Draws the routes (1), the navigation grid over them (2), and the crowd's
+    /// flow field over that (3). See [`crate::path::draw`].
+    pub path_debug: f32,
     pub enemy_speed: f32,
     pub enemy_sight: f32,
     pub enemy_alert: f32,
@@ -612,6 +721,42 @@ impl Default for GameTuning {
             ally_speed: 7.0,
             stellarator_spin: 1.0,
             stellarator_glow: 1.0,
+            lamp_range: crate::n64::LAMP_RANGE,
+            lamp_count: 500.0,
+            // Four a tick is a hundred and twenty searches a second, which
+            // over a field of Marios is every one of them re-routed twice a
+            // second -- far more than `path_refresh` will ever ask for. It is
+            // set as a ceiling on the worst tick rather than as a rate: the
+            // moment that matters is the one where the whole squad is whistled
+            // at once and every one of them wants a route on the same tick.
+            path_budget: 4.0,
+            // A route over static ground stays true; what expires is the
+            // *reason* for it. Two seconds is short enough that a body cut off
+            // by something that has just been built notices, and long enough
+            // that a squad crossing the castle plans once on the way.
+            path_refresh: 2.0,
+            // Forty metres of dry detour is worth taking rather than swimming,
+            // before the body's own caution scales it. Against the castle's
+            // moat that is comfortably enough to walk to the bridge.
+            path_toll: 40.0,
+            // A metre. At the castle's cell size, stepping out of a wall's
+            // way and back costs about a metre and a half of extra diagonal,
+            // so this pays for itself after two cells of wall-hugging and
+            // never buys a detour anybody would notice.
+            path_clearance: 1.0,
+            // A little over a body's width, so a group walks abreast without
+            // standing on each other and `enemy::spread` has nothing left to
+            // sort out. Eight Marios come out as an eight-metre front; two come
+            // out walking side by side.
+            path_spread: 1.2,
+            // Ten. A group is a thing that moves together, and past about
+            // this many that stops being a useful description of what is on
+            // screen: they arrive over several seconds, the ones at the back
+            // are walking through the ones at the front, and one route is no
+            // longer a good answer for all of them. Two groups of seven behave
+            // like two squads; one of fourteen behaves like a crowd.
+            path_group: 10.0,
+            path_debug: 0.0,
             enemy_speed: 1.8,
             enemy_sight: 14.0,
             enemy_alert: 9.0,
@@ -713,6 +858,15 @@ impl GameTuning {
             "ally_speed" => self.ally_speed,
             "stellarator_spin" => self.stellarator_spin,
             "stellarator_glow" => self.stellarator_glow,
+            "lamp_range" => self.lamp_range,
+            "lamp_count" => self.lamp_count,
+            "path_budget" => self.path_budget,
+            "path_refresh" => self.path_refresh,
+            "path_toll" => self.path_toll,
+            "path_clearance" => self.path_clearance,
+            "path_spread" => self.path_spread,
+            "path_group" => self.path_group,
+            "path_debug" => self.path_debug,
             "enemy_speed" => self.enemy_speed,
             "enemy_sight" => self.enemy_sight,
             "enemy_alert" => self.enemy_alert,
@@ -778,6 +932,15 @@ impl GameTuning {
             "ally_speed" => self.ally_speed = value,
             "stellarator_spin" => self.stellarator_spin = value,
             "stellarator_glow" => self.stellarator_glow = value,
+            "lamp_range" => self.lamp_range = value,
+            "lamp_count" => self.lamp_count = value,
+            "path_budget" => self.path_budget = value,
+            "path_refresh" => self.path_refresh = value,
+            "path_toll" => self.path_toll = value,
+            "path_clearance" => self.path_clearance = value,
+            "path_spread" => self.path_spread = value,
+            "path_group" => self.path_group = value,
+            "path_debug" => self.path_debug = value,
             "enemy_speed" => self.enemy_speed = value,
             "enemy_sight" => self.enemy_sight = value,
             "enemy_alert" => self.enemy_alert = value,
@@ -1741,6 +1904,33 @@ pub fn draw(
 
 #[cfg(test)]
 mod tests {
+
+    /// Every row on the panel actually reads and writes something.
+    ///
+    /// The table, the getter and the setter are three lists of the same names
+    /// kept in step by hand, and a name missing from either of the last two is
+    /// a slider that moves and does nothing -- silently, because `set` finds
+    /// the spec, clamps the value and reports success before the match that
+    /// was supposed to store it falls through. So the sweep is over the table:
+    /// set each row to something inside its own range and read it back.
+    #[test]
+    fn every_row_on_the_panel_is_wired_to_a_setting() {
+        let mut tuning = GameTuning::default();
+        for spec in SPECS {
+            let wanted = spec.low + (spec.high - spec.low) * 0.5;
+            tuning
+                .set(spec.name, wanted)
+                .unwrap_or_else(|why| panic!("{}: {why}", spec.name));
+            let read = tuning
+                .get(spec.name)
+                .unwrap_or_else(|| panic!("{} can be set but not read", spec.name));
+            assert!(
+                (read - wanted).abs() < 1e-4,
+                "{} did not keep what it was given: {read} rather than {wanted}",
+                spec.name,
+            );
+        }
+    }
     use super::*;
 
     #[test]

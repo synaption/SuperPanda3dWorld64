@@ -278,15 +278,15 @@ pub struct BuildSite;
 #[derive(Component)]
 pub struct Footprint;
 
-/// One mote of nuclonium turning inside the coils, and the two clocks that
-/// make it its own.
+/// One mote of nuclonium turning inside the coils, and the clocks that make it
+/// its own.
 ///
 /// `u` runs round the ring the long way and `v` round the tube; `rate` and
-/// `wind` are how fast this one does each. All four are seeded off the golden
-/// angle by the mote's own index in [`mote`], which is what lets the field be
-/// grown one mote at a time and still be evenly spread at every count: the
-/// hundredth arrival lands in the gap the first ninety-nine left, without
-/// anything having to be re-laid.
+/// `wind` are how fast this one does each, while `speed` gives both a slight
+/// individual nudge. All five are seeded off the golden angle by the mote's own
+/// index in [`mote`], which is what lets the field be grown one mote at a time
+/// and still be evenly spread at every count: the hundredth arrival lands in
+/// the gap the first ninety-nine left, without anything having to be re-laid.
 #[derive(Component)]
 pub struct Orbit {
     /// Which arrival this was, counting from the machine's first. Kept so that
@@ -297,6 +297,10 @@ pub struct Orbit {
     rate: f32,
     v: f32,
     wind: f32,
+    /// A deterministic per-mote multiplier in `0.99..=1.01`. It applies to
+    /// both angular clocks so it changes how quickly the mote follows its
+    /// particular orbit without changing that orbit's shape.
+    speed: f32,
     /// Which nested flux surface it rides, from the axis out. See
     /// [`MOTE_REACH`]: the field fills the tube rather than tiling its skin,
     /// which is both what plasma looks like and what stops five hundred motes
@@ -318,6 +322,17 @@ pub struct Orbit {
     /// the same [`crate::nuclonium::Trail`] a ball on the lawn does, the swim
     /// out draws its own wake into the coils.
     settling: f32,
+}
+
+/// The largest individual departure from a mote's natural orbital speed.
+const MOTE_SPEED_VARIATION: f32 = 0.01;
+
+/// Gives every mote its own reproducible speed without needing an RNG in the
+/// machine. The signed sine matters: using the absolute-value spread employed
+/// by the spatial layout would make every adjustment a speed-up.
+fn mote_speed(index: u32) -> f32 {
+    let phase = index as f32 * GOLDEN_ANGLE;
+    1.0 + MOTE_SPEED_VARIATION * (phase * 0.43).sin()
 }
 
 /// What one machine is holding, and how much of it is on screen.
@@ -681,6 +696,7 @@ fn mote(art: &crate::nuclonium::Art, index: u32) -> impl Bundle + use<> {
             rate: 0.65 + 0.70 * spread(0.37),
             v: phase * 2.0,
             wind: 0.80 + 1.10 * spread(0.21),
+            speed: mote_speed(index),
             // Square-rooted, so the motes are spread evenly over the tube's
             // *area* rather than over its radius -- without it half of them
             // crowd into the middle, where a circle has almost no room.
@@ -816,6 +832,9 @@ pub fn place(
             camera.translation,
             Vec3::from(camera.forward()),
             leader.translation,
+            // A machine is put down within sight of the person putting it
+            // down. See [`crate::squad::PLACE_REACH`].
+            squad::PLACE_REACH,
         );
         let held = if input.build {
             let held = build.held_for.unwrap_or(0.0) + time.delta_secs();
@@ -1054,8 +1073,8 @@ pub fn orbit(
     // re-exported at another `--scale`.
     let size = machine().scale;
     for (mut mote, mut transform, mut visible) in &mut motes {
-        let u = mote.u + now * tuning.stellarator_spin * mote.rate;
-        let v = mote.v + now * tuning.stellarator_spin * mote.wind;
+        let u = mote.u + now * tuning.stellarator_spin * mote.rate * mote.speed;
+        let v = mote.v + now * tuning.stellarator_spin * mote.wind * mote.speed;
         // Lifted with the machine, so a mote is inside the coils rather than
         // buried in the lawn they are standing on.
         let axis = Vec3::Y * machine().lift;
@@ -1367,6 +1386,27 @@ mod tests {
         assert_eq!(store.held, 50_000);
     }
 
+    /// Every mote gets a small speed offset of its own, with neither a field
+    /// that only accelerates nor one whose variation grows beyond one percent.
+    #[test]
+    fn each_mote_has_an_individual_one_percent_speed_modifier() {
+        let speeds: Vec<_> = (0..ORBIT_CAP).map(mote_speed).collect();
+
+        assert!(speeds.iter().all(|speed| (0.99..=1.01).contains(speed)));
+        assert!(
+            speeds.iter().any(|speed| *speed < 0.991),
+            "no mote received a slowdown near the requested limit"
+        );
+        assert!(
+            speeds.iter().any(|speed| *speed > 1.009),
+            "no mote received a speed-up near the requested limit"
+        );
+        assert!(
+            speeds.windows(2).all(|pair| pair[0] != pair[1]),
+            "two successive motes received the same modifier"
+        );
+    }
+
     /// Nuclonium arriving at a machine ends up turning inside it, and stops
     /// arriving on screen at the cap.
     ///
@@ -1466,6 +1506,7 @@ mod tests {
                     rate: 1.0,
                     v: 0.0,
                     wind: 1.0,
+                    speed: 1.0,
                     rho: MOTE_REACH,
                     settling: 1.0,
                 },
