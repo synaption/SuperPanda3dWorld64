@@ -367,7 +367,7 @@ pub const SPECS: &[TunableSpec] = &[
         low: 0.0,
         high: 3.0,
         step: 1.0,
-        doc: "draw routes (1), the nav grid (2), the flow field (3)",
+        doc: "draw routes and crawlers (1), the nav grid (2), the flow field (3)",
     },
     TunableSpec {
         name: "enemy_sight",
@@ -417,6 +417,13 @@ pub const SPECS: &[TunableSpec] = &[
         high: 6.0,
         step: 0.1,
         doc: "how far a rival must out-threaten the current target to steal it",
+    },
+    TunableSpec {
+        name: "threat_focus",
+        low: 1.0,
+        high: 6.0,
+        step: 0.1,
+        doc: "how much more attention something coming for you earns than something walking past",
     },
     TunableSpec {
         name: "sim_budget",
@@ -649,6 +656,26 @@ pub struct GameTuning {
     /// Below 1.0 would mean switching to something *less* threatening, which is
     /// why the slider stops there.
     pub threat_switch: f32,
+    /// What having its fists up is worth to something being appraised, as a
+    /// multiple of what merely standing there is worth.
+    ///
+    /// **The one thing in this row that is about intent rather than geometry.**
+    /// Everything above scores a creature by where it is and what it has just
+    /// done, and by those alone a Mario walking past on an errand and a Mario
+    /// closing to punch you are the same object. So an enemy would set off
+    /// after whichever was nearest, walk through the one actually fighting it,
+    /// and be chased across the field by a Mario it never turned to face --
+    /// which is the same complaint from the other end: Marios cannot land a
+    /// punch on something that will not stop walking away.
+    ///
+    /// Read by [`crate::enemy::alert`], which decides who counts as coming: an
+    /// enemy is coming for whatever it is chasing, and a Mario only for what
+    /// [`crate::goap::Goal::Fight`] says it has chosen. Aggro is never given
+    /// up, so a Mario's *target* says nothing about what it is doing.
+    ///
+    /// Below 1.0 would mean preferring whatever is ignoring you, so the slider
+    /// stops there and [`crate::enemy::alert`] clamps to it.
+    pub threat_focus: f32,
     /// How many of the nearest enemies are simulated in full. The rest are
     /// moved by the flow field -- see [`crate::enemy::Detail`].
     pub sim_budget: f32,
@@ -783,6 +810,14 @@ impl Default for GameTuning {
             // twenty deliberate players rather than a lawn full of Marios --
             // the noisier the field, the wider the gap has to be.
             threat_switch: 1.6,
+            // Worth three of a passer-by, and the number is set against
+            // `threat_switch` rather than picked for its own sake: at anything
+            // under that a creature can never turn onto the Mario hitting it
+            // on the strength of being hit, because the two scores accumulate
+            // and decay together and settle at exactly this ratio. Three clears
+            // 1.6 comfortably enough that the Mario need not also be the
+            // nearest thing on the field.
+            threat_focus: 3.0,
             // The budget the crowd work is built around: a couple of hundred
             // enemies get collision, jostling and the aggro chain, and
             // everything past that is carried by the flow field. Chosen as a
@@ -875,6 +910,7 @@ impl GameTuning {
             "threat_kill" => self.threat_kill,
             "threat_decay" => self.threat_decay,
             "threat_switch" => self.threat_switch,
+            "threat_focus" => self.threat_focus,
             "sim_budget" => self.sim_budget,
             "enemy_lod_near" => self.enemy_lod_near,
             "enemy_lod_far" => self.enemy_lod_far,
@@ -949,6 +985,7 @@ impl GameTuning {
             "threat_kill" => self.threat_kill = value,
             "threat_decay" => self.threat_decay = value,
             "threat_switch" => self.threat_switch = value,
+            "threat_focus" => self.threat_focus = value,
             "sim_budget" => self.sim_budget = value,
             "enemy_lod_near" => self.enemy_lod_near = value,
             "enemy_lod_far" => self.enemy_lod_far = value,
@@ -1046,7 +1083,11 @@ pub enum CrowdKind {
 /// command table be tested without a renderer. Putting a crowd on the map needs
 /// `Commands`, the asset server and the level's collision, so the command
 /// records what it wants here and [`crate::enemy::crowd`] does it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `Eq` rather than only `PartialEq` was possible while every field was an
+/// integer. [`Request::PlacePortals`] carries coordinates, and a float has no
+/// total equality, so the derive lost the half of it nothing was using.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Request {
     /// Put this many enemies on the map, of this mix.
     Crowd(usize, CrowdKind),
@@ -1085,6 +1126,30 @@ pub enum Request {
     /// Take every loose ball of nuclonium off the map. The red ones are swept
     /// with `medkit 0`, which is the same thing said the other way.
     ClearNuclonium,
+    /// Take both ends of the portal pair off the map.
+    ///
+    /// `pylon`'s reason: a state that takes two accurate shots to reach is a
+    /// state a screenshot cannot reproduce, and one that takes none to leave is
+    /// worth having. There is deliberately no request to *place* a pair -- where
+    /// a portal goes is the whole of the decision, and a pair put down at two
+    /// numbers typed into a console is a pair on the wrong two walls.
+    ClearPortals,
+    /// Put a pair down at two spots in the world.
+    ///
+    /// The one thing about a portal a screenshot cannot otherwise reach. Where
+    /// a pair goes is the whole of the decision a player makes with the gun, so
+    /// there is no version of this that is a shortcut for playing -- and that is
+    /// exactly why a picture of one needs it: two accurate shots at two named
+    /// walls is not a thing a headless run can take, and every other state in
+    /// this game that is hard to reach by hand has a command that reaches it.
+    ///
+    /// Each triple is a *spot* rather than a gate: the ground under it is what
+    /// the gate is stood on, and it is turned to face the player, exactly as
+    /// one planted through the crosshair is. See `portal::drop_onto`.
+    ///
+    /// The `bool` is whether to build them as bubbles rather than arches -- see
+    /// `portal::Shape`, and `portals` below for how it is asked for.
+    PlacePortals([f32; 3], [f32; 3], bool),
     /// Put this much straight into every stellarator's store.
     ///
     /// The only way to look at a full machine. A field is grown out of what has
@@ -1227,6 +1292,7 @@ impl ConsoleState {
         match words[0].to_ascii_lowercase().as_str() {
             "help" | "?" => self.echo("commands: <name> [value], vars, reset <name|all>, close <name|all>, clear\ncrowd <n> [slime|ant|mix] puts a whole field down at once; crowd clear takes it away.
 pylon <n> plants a line of masts and a machine to feed them; pylon clear takes them away.
+portal x,y,z x,y,z [orb] stands a pair of gates at two spots; portal clear closes both.
 nuclonium <n> scatters balls for the squad to carry to the network; medkit <n> scatters the red ones; nuclonium store <n> loads the machines; nuclonium clear sweeps up.
 weapon <sword|pistol> puts one in Luna's hand; Y cycles it in play.\nLeft/Right/Home/End move the caret; Up/Down recall; Tab completes.\nSelect a variable then use [ and ] (Shift = 10x) to tune it. Wheel/PageUp/PageDown scroll the log."),
             "vars" | "list" => {
@@ -1237,6 +1303,7 @@ weapon <sword|pistol> puts one in Luna's hand; Y cycles it in play.\nLeft/Right/
             "clear" => self.log.clear(),
             "crowd" => self.crowd(&words[1..]),
             "pylon" | "pylons" | "grid" => self.pylons(&words[1..]),
+            "portal" | "portals" => self.portals(&words[1..]),
             "nuclonium" | "nuc" | "loot" | "resource" | "resources" => self.nuclonium(&words[1..]),
             "medkit" | "medkits" | "health" => self.medkits(&words[1..]),
             "weapon" | "equip" => self.weapon(&words[1..]),
@@ -1321,6 +1388,49 @@ weapon <sword|pistol> puts one in Luna's hand; Y cycles it in play.\nLeft/Right/
         };
         self.pending.push(Request::Pylons(count));
         self.echo(format!("pylon: planting {count}"));
+    }
+
+    /// `portal clear`: takes both ends of the pair away.
+    ///
+    /// Clearing is the only thing it does. See [`Request::ClearPortals`] for
+    /// why there is no way to place one from here.
+    fn portals(&mut self, args: &[&str]) {
+        match args.first() {
+            Some(&"clear") | Some(&"none") | None => {
+                self.pending.push(Request::ClearPortals);
+                self.echo("portal: closing both ends");
+                return;
+            }
+            Some(_) => {}
+        }
+        let spot = |word: &str| -> Option<[f32; 3]> {
+            let parts: Vec<f32> = word
+                .split(',')
+                .filter_map(|part| part.trim().parse().ok())
+                .collect();
+            match parts[..] {
+                [x, y, z] => Some([x, y, z]),
+                _ => None,
+            }
+        };
+        // `orb` anywhere in the line rather than positionally: the two spots are
+        // already three numbers each, and a third position to count would be a
+        // command nobody could type from memory.
+        let orb = args.iter().any(|word| *word == "orb" || *word == "sphere");
+        let spots: Vec<[f32; 3]> = args.iter().filter_map(|word| spot(word)).collect();
+        match spots[..] {
+            [blue, orange] => {
+                self.pending.push(Request::PlacePortals(blue, orange, orb));
+                let kind = if orb { "bubbles" } else { "arches" };
+                self.echo(format!(
+                    "portal: standing {kind} at {blue:?} and {orange:?}"
+                ));
+            }
+            _ => self.echo(
+                "portal: `portal clear`, or `portal x,y,z x,y,z [orb]` to stand a gate \
+                 on the ground under each of two spots",
+            ),
+        }
     }
 
     /// `nuclonium <n>`, or `nuclonium clear`. Spelled `nuc`, `loot` or

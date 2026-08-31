@@ -804,6 +804,7 @@ type SiteQuery<'w, 's> = Query<
 /// and the preview is drawn every frame -- and it takes the released edge the
 /// same latched way, so a press is neither lost nor counted twice across the
 /// fixed-step boundary.
+#[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 pub fn place(
     time: Res<Time>,
@@ -813,7 +814,14 @@ pub fn place(
     level: Res<LevelData>,
     art: Res<FieldArt>,
     mut build: ResMut<Build>,
-    camera: Query<&Transform, (With<Camera3d>, Without<Player>)>,
+    camera: Query<
+        &Transform,
+        (
+            With<Camera3d>,
+            Without<Player>,
+            Without<crate::portal::PortalView>,
+        ),
+    >,
     player: Query<&Transform, With<Player>>,
     placed: Query<(&Transform, &Stellarator)>,
     mut site: SiteQuery,

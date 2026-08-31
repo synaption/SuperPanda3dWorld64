@@ -211,8 +211,16 @@ impl Weapon {
     }
 
     /// Whether pulling the trigger fires rather than swings.
+    ///
+    /// Stated on the weapon rather than on its [`Spec::shot`], which is the
+    /// same answer today and not the same question. Three callers want *this*
+    /// one -- `player::movement` leaves the trigger alone for a weapon that is
+    /// not swung, and `aim::drive` raises the torso and points it down the
+    /// crosshair for one that is aimed -- and a weapon that is aimed and fired
+    /// without resolving as a bullet would be a weapon all three got wrong.
+    /// What has a shot is `spec().shot`, and [`fire`] asks for it by name.
     pub fn is_ranged(self) -> bool {
-        self.spec().shot.is_some()
+        !matches!(self, Weapon::Sword)
     }
 }
 

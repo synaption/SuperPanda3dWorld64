@@ -796,18 +796,32 @@ pub fn draw(
     mut stats: ResMut<ImpostorStats>,
     mut meshes: ResMut<Assets<Mesh>>,
     tuning: Res<crate::console::GameTuning>,
-    camera: Query<&GlobalTransform, With<Camera3d>>,
+    // **The eye the player is actually looking from, which is not always where
+    // the camera entity is.** A gate the boom goes through flies the camera to
+    // the far end of the pair for the frame it is drawn on -- see
+    // [`crate::portal::carry_camera`] -- and a sprite that picked its angle from *that*
+    // is a sprite showing the wrong side of itself. `FollowCamera::eye` is where the view
+    // logically is, beside the player, which is the right answer for the
+    // overwhelming majority of what is on the screen at that moment.
+    //
+    // It is `Option` because the impostor baker runs this same chain with a
+    // camera of its own and no follow rig on it; there the entity's own
+    // transform is the only eye there is.
+    camera: Query<
+        (&GlobalTransform, Option<&crate::camera::FollowCamera>),
+        (With<Camera3d>, Without<crate::portal::PortalView>),
+    >,
     crowd: Query<(&Enemy, &Transform, &Visibility, &Quirk, Option<&Children>)>,
     mut buffers: Local<Vec<(Kind, Vec<Member>)>>,
     mut shadows: Local<Vec<(Vec3, f32, f32)>>,
 ) {
-    let (Some(impostors), Ok(view)) = (impostors, camera.single()) else {
+    let (Some(impostors), Ok((view, follow))) = (impostors, camera.single()) else {
         return;
     };
     stats.skinned = 0;
     stats.sprites = 0;
     stats.missing = 0;
-    let eye = view.translation();
+    let eye = follow.map_or_else(|| view.translation(), |follow| follow.eye.translation);
     let elapsed = time.elapsed_secs();
     // The buffers are kept between frames: this refills them every frame for
     // every distant enemy in the world, and allocating a fresh pair of vectors

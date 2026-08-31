@@ -168,6 +168,19 @@ impl Route {
         self.forget();
     }
 
+    /// Throws away the route in hand, keeping where this body was going.
+    ///
+    /// For anything that has moved a body somewhere its route no longer makes
+    /// sense from -- which today is [`crate::portal::transit`] and nothing else.
+    /// A route is a list of corners on the ground the body was standing on, and
+    /// a body carried across the map still holding one walks back at the first
+    /// of them. Dropped, it is replanned from where it now is on whichever of
+    /// the next few ticks the budget reaches it, which is the same wait a body
+    /// has for a route anywhere.
+    pub fn replan(&mut self) {
+        self.forget();
+    }
+
     fn forget(&mut self) {
         // The lane is not forgotten. It is which of the group this body is,
         // rather than anything about the walk, and a body that drew a new one
@@ -309,6 +322,20 @@ impl Route {
     /// line.
     pub fn routed(&self) -> bool {
         !self.legs.is_empty()
+    }
+
+    /// Whether this route has nothing to do and is holding nothing from a
+    /// journey it used to be making.
+    ///
+    /// **For deciders that run over a crowd.** [`Self::clear`] on a body that
+    /// is already clear changes nothing and still costs the write -- Bevy marks
+    /// a component changed on the mutable borrow rather than on the value
+    /// moving -- so a thousand ambling enemies saying "still nothing" every
+    /// tick is a thousand change ticks and every system downstream of them
+    /// woken for it. Read this first; write only when the answer is no. See
+    /// [`crate::enemy::navigate`], which is the crowd this exists for.
+    pub fn resting(&self) -> bool {
+        self.want.is_none() && self.planned_for.is_none()
     }
 
     /// Whether it is time to think about this one again.
@@ -684,7 +711,7 @@ pub fn draw(
     field: Res<FlowField>,
     mut gizmos: Gizmos,
     followers: Query<(&Transform, &Route)>,
-    camera: Query<&Transform, With<Camera3d>>,
+    camera: Query<&Transform, (With<Camera3d>, Without<crate::portal::PortalView>)>,
 ) {
     let level = tuning.path_debug.round() as u32;
     if level == 0 {

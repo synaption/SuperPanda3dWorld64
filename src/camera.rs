@@ -63,6 +63,20 @@ pub struct FollowCamera {
     /// `None` until the first frame places it, so the camera arrives already
     /// framed rather than flying in from the origin.
     pub focus: Option<Vec3>,
+    /// Where the eye logically is, before any portal has flown it anywhere.
+    ///
+    /// **Two cameras in one, and which one a system wants is decided by what it
+    /// is asking.** A gate the boom passes through takes the camera to the far
+    /// side of the pair for the frame it is drawn on -- see
+    /// [`crate::portal::carry_camera`] -- so the entity's own `Transform` is
+    /// where the picture is *taken from*, and anything drawing has to have that
+    /// one. Anything **aiming** wants this one instead: the crosshair belongs
+    /// beside the player, and a shot laid from a camera that has been flown
+    /// across the castle is a shot at the back of a gate.
+    ///
+    /// Written here at the end of [`update`], which is the last thing to place
+    /// the camera before the portals get hold of it.
+    pub eye: Transform,
 }
 
 impl Default for FollowCamera {
@@ -78,6 +92,7 @@ impl Default for FollowCamera {
             frame: Quat::IDENTITY,
             view: Quat::IDENTITY,
             focus: None,
+            eye: Transform::IDENTITY,
         }
     }
 }
@@ -178,6 +193,7 @@ pub fn update(
     gravity: Res<Gravity>,
     mut state: ResMut<GameState>,
     tuning: Res<GameTuning>,
+    portals: Res<crate::portal::Portals>,
 ) {
     let Ok((mut camera, mut follow)) = cameras.single_mut() else {
         return;
@@ -250,10 +266,18 @@ pub fn update(
 
     // How much of the boom is free this frame, measured along the boom rather
     // than as a position, so it can be compared with the last frame's answer.
-    let reach = match level.segment_hit(focus, focus + boom) {
+    let wall = match level.segment_hit(focus, focus + boom) {
         Some(hit) => ((hit - focus).length() - WALL_GAP).max(0.0) / boom.length().max(f32::EPSILON),
         None => 1.0,
     };
+    // And the portals, which shorten it for the same reason a wall does and the
+    // opposite cause: a gate's plane is something the camera must not end up
+    // behind, *except* through the doorway, where going through is the whole
+    // point. See [`crate::portal::Portals::clearance`], and
+    // [`crate::portal::carry_camera`] for what happens to the boom that does go
+    // through. Both answers are fractions of the same boom, so the tighter one
+    // simply wins and the easing below sees one number as it always did.
+    let reach = wall.min(portals.clearance(focus, boom));
     // The two directions are deliberately not symmetric. Coming in has to be
     // immediate: the wall is between the player and the camera *now*, and any
     // easing there is a frame spent looking at the inside of it. Going back out
@@ -289,6 +313,11 @@ pub fn update(
     // where it costs the player a little drift off centre and costs the aim
     // nothing at all.
     camera.look_to(-boom, view_up);
+    // The last word on where the eye logically is. Anything that flies the
+    // camera somewhere else for the sake of the picture does it after this and
+    // leaves this alone, so that the crosshair and the movement basis go on
+    // being measured beside the player. See [`FollowCamera::eye`].
+    follow.eye = *camera;
 }
 
 #[cfg(test)]
@@ -315,6 +344,9 @@ mod tests {
         world.insert_resource(GameState::default());
         world.insert_resource(GameTuning::default());
         world.insert_resource(ButtonInput::<KeyCode>::default());
+        // No gates open, so `Portals::clearance` answers one for every boom and
+        // this fixture is the one it always was.
+        world.init_resource::<crate::portal::Portals>();
         world.init_resource::<Time>();
         let aligned = Quat::from_rotation_arc(Vec3::Y, at.normalize());
         world.spawn((

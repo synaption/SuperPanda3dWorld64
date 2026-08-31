@@ -1928,13 +1928,21 @@ type CircleQuery<'w, 's> = Query<
 /// whistle does and for the same reason: the circle grows on wall-clock time
 /// and is drawn every frame, while what comes out of it is a one-shot write the
 /// fixed step then acts on.
+#[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 pub fn call(
     time: Res<Time>,
     mut input: ResMut<crate::input::InputState>,
     level: Res<LevelData>,
     mut grab: ResMut<Grab>,
-    camera: Query<&Transform, (With<Camera3d>, Without<crate::player::Player>)>,
+    camera: Query<
+        &Transform,
+        (
+            With<Camera3d>,
+            Without<crate::player::Player>,
+            Without<crate::portal::PortalView>,
+        ),
+    >,
     leaders: Query<(Entity, &Transform), With<crate::player::Player>>,
     mut balls: Query<(&mut Nuclonium, &Transform), Without<crate::player::Player>>,
     mut ring: CircleQuery,
@@ -2186,7 +2194,7 @@ pub fn glow(
     time: Res<Time>,
     art: Res<Art>,
     mut meshes: ResMut<Assets<Mesh>>,
-    camera: Query<&GlobalTransform, With<Camera3d>>,
+    camera: Query<&GlobalTransform, (With<Camera3d>, Without<crate::portal::PortalView>)>,
     sources: Query<(&Glow, &GlobalTransform, Option<&InheritedVisibility>)>,
     mut glows: Local<Glows>,
 ) {
@@ -2234,11 +2242,19 @@ pub fn glow(
 /// The width of a trail comes off the same transform, so it is the width of the
 /// glow that is making it. That one line is what lets a ball on the lawn and a
 /// mote a fiftieth its size share every other number in this file.
+#[allow(clippy::type_complexity)]
 pub fn trail(
     time: Res<Time>,
     art: Res<Art>,
     mut meshes: ResMut<Assets<Mesh>>,
-    camera: Query<&GlobalTransform, (With<Camera3d>, Without<Trail>)>,
+    camera: Query<
+        &GlobalTransform,
+        (
+            With<Camera3d>,
+            Without<Trail>,
+            Without<crate::portal::PortalView>,
+        ),
+    >,
     mut trails: Query<(&mut Trail, &GlobalTransform)>,
 ) {
     let Ok(view) = camera.single() else {

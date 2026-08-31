@@ -1013,6 +1013,26 @@ pub fn update_goals(
             // one tick a body spends in the air -- puts the clock back.
             order.lost_for = 0.0;
         }
+        // **A Mario that has turned aside is not a Mario that is stuck.** The
+        // clock below watches one thing -- whether this body is getting any
+        // nearer what it is walking at -- and reads everything else as a wall.
+        // A Mario standing over a slime in the gateway, swinging, is getting
+        // nearer nothing at all, so six seconds of a fight it was *supposed*
+        // to have retired the order that sent it into one. What the player saw
+        // was a squad that stopped half way whenever the crossing was
+        // contested, which is the one crossing where being sent somewhere
+        // matters.
+        //
+        // So the clock only runs while the Mario is actually walking the
+        // order. The record goes with it: whatever it beat on the way to a
+        // slime says nothing about the walk it goes back to afterwards, and
+        // starting that walk from an unbeatable record is a stall clock that
+        // begins expired.
+        if !matches!(ally.plan, crate::goap::Goal::Obey { .. }) {
+            order.stuck_for = 0.0;
+            order.closest = f32::INFINITY;
+            continue;
+        }
         // What it is actually walking at, which is a corner of its route when
         // it has one. See [`Sent::towards`].
         let aim = route.aim().map_or(order.at, |leg| Vec2::new(leg.x, leg.z));
@@ -1546,11 +1566,19 @@ const FALL_SPEED: f32 = 14.0;
 ///
 /// A Mario walks four metres a second, so a third of a metre is a busy tick and
 /// six metres is not a walk at all -- it is a warp pipe, a level swapping under
-/// it, or a body being put somewhere. Interpolating one of those draws the ally
-/// sliding across the map over the next thirty-third of a second, through
-/// everything in between. `player::sync_visual` has no equivalent because the
-/// player is never moved that way with the visual still attached.
-const GLIDE_JUMP: f32 = 6.0;
+/// it, a portal, or a body being put somewhere. Interpolating one of those
+/// draws the ally sliding across the map over the next thirty-third of a
+/// second, through everything in between.
+///
+/// **[`crate::player::sync_visual`] uses this too, and did not always.** It
+/// used to say here that the player needed no such guard because he was never
+/// moved that way with the visual still attached -- which was true of every
+/// system in the game until [`crate::portal::transit`], and is the shape of
+/// bug that comment exists to stop somebody else re-deriving. A player stepping
+/// through a gate is a player moved a hundred metres between two ticks, and
+/// interpolated he is a player, a camera and a crosshair all flying across the
+/// castle for the third of a second it takes to arrive.
+pub const GLIDE_JUMP: f32 = 6.0;
 
 /// Where an ally stood at the end of each of the last two ticks.
 ///
@@ -1795,6 +1823,7 @@ pub fn spawn_circle(
 /// Runs at the render rate rather than on the fixed step, because the circle
 /// grows with wall-clock time and is drawn every frame; the orders it produces
 /// are one-shot writes onto the squad, which the fixed step then acts on.
+#[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 pub fn whistle(
     time: Res<Time>,
@@ -1806,7 +1835,14 @@ pub fn whistle(
     mut whistle: ResMut<Whistle>,
     mut mark: ResMut<OrderMark>,
     mut squad: ResMut<Squad>,
-    camera: Query<&Transform, (With<Camera3d>, Without<Player>)>,
+    camera: Query<
+        &Transform,
+        (
+            With<Camera3d>,
+            Without<Player>,
+            Without<crate::portal::PortalView>,
+        ),
+    >,
     player: Query<&Transform, With<Player>>,
     allies: Query<(Entity, &Transform), With<Ally>>,
     mut circle: CircleQuery,
@@ -2965,6 +3001,73 @@ mod tests {
                 order.at
             );
         }
+    }
+
+    /// A fight on the way must not cost a Mario the order that sent it into
+    /// one.
+    ///
+    /// **The trap the stall clock walks into as soon as the squad fights
+    /// things en route.** That clock watches exactly one number -- whether
+    /// this body is getting nearer what it is walking at -- and a Mario stood
+    /// over a slime, swinging, is getting nearer nothing at all. It reads
+    /// identically to a Mario leaning on a fence, so a fight lasting longer
+    /// than [`STUCK_SECONDS`] retired the order in the middle of being carried
+    /// out, and the squad stopped wherever the crossing was contested. Which
+    /// is the one crossing where being sent somewhere is worth anything.
+    ///
+    /// Driven through [`update_goals`] with the plan set by hand rather than
+    /// through a staged fight, because what is being pinned is the clock and
+    /// not the scoring: any plan that is not [`crate::goap::Goal::Obey`] is a
+    /// Mario doing something other than walking the order.
+    #[test]
+    fn a_mario_that_stops_to_fight_on_the_way_keeps_the_order_it_was_given() {
+        use bevy::ecs::system::RunSystemOnce;
+        let mut world = World::new();
+        world.insert_resource(lawn());
+        world.insert_resource(GameTuning::default());
+        squad_resources(&mut world);
+        let leader = Vec3::new(0.0, 0.0, -20.0);
+        world.spawn((Player, Transform::from_translation(leader)));
+        let ally = world
+            .spawn((Ally::new(leader, 0.0), Transform::from_translation(leader)))
+            .id();
+        world.resource_mut::<Squad>().recruit(&[ally]);
+        order(&mut world, Vec2::new(0.0, 20.0));
+
+        // Forty metres off and not moving an inch, for twice as long as a
+        // stuck Mario is given -- but fighting, so none of that is stalling.
+        world.get_mut::<Ally>(ally).unwrap().plan = crate::goap::Goal::Fight {
+            at: Vec2::new(0.0, -18.0),
+            arrive: 1.0,
+        };
+        let ticks = (STUCK_SECONDS * 2.0 / crate::player::FIXED_DT) as usize;
+        for _ in 0..ticks {
+            world
+                .run_system_once(update_goals)
+                .expect("update_goals could not run");
+        }
+        assert_eq!(
+            world.resource::<Squad>().marching(),
+            1,
+            "a long fight on the way wrote off the order that caused it"
+        );
+
+        // And the clock is paused rather than broken: the same Mario, standing
+        // just as still with nothing to fight, is written off on time.
+        world.get_mut::<Ally>(ally).unwrap().plan = crate::goap::Goal::Obey {
+            at: Vec2::new(0.0, 20.0),
+            arrive: SEND_ARRIVE,
+        };
+        for _ in 0..ticks {
+            world
+                .run_system_once(update_goals)
+                .expect("update_goals could not run");
+        }
+        assert_eq!(
+            world.resource::<Squad>().marching(),
+            0,
+            "a Mario leaning on nothing at all marched for ever"
+        );
     }
 
     /// A Mario sent somewhere it cannot get to stops treating that as the only

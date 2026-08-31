@@ -47,7 +47,11 @@ pub const WIDTH: usize = 96;
 /// field refuse to route a crowd off the castle wall or up a cliff. Without it
 /// the sweep happily walks up sheer faces and the flow points a thousand
 /// slimes at a wall.
-const CLIMB: f32 = 1.2;
+///
+/// Public because it is also the line that decides who this grid is any use
+/// to: a body that can climb more than this is a body every answer here is
+/// wrong for. See [`crate::enemy::navigate`].
+pub const CLIMB: f32 = 1.2;
 
 /// How high off the ground the survey looks for something in the way.
 ///
@@ -84,6 +88,29 @@ const ALARM_SPREAD: f32 = 18.0;
 /// Where the alarm stops growing: comfortably past the far corner of any grid,
 /// so it saturates rather than counting up forever.
 const MAX_ALARM: f32 = (WIDTH * 2) as f32;
+
+/// One end of a way across the map that is not a step.
+///
+/// A portal, in every case that exists today, and stated here in terms of the
+/// grid rather than in terms of portals: the field's business is that two cells
+/// which are nowhere near each other are one move apart, and it has no opinion
+/// about what put them that way. See [`crate::portal`], and
+/// [`FlowField::set_warp`] for what the grid does with a pair of these.
+#[derive(Clone, Copy, Debug)]
+pub struct Warp {
+    /// Where a body stands to use it: a spot on real ground, a stride out from
+    /// the opening, which is what the survey has to be able to vouch for.
+    pub stand: Vec3,
+    /// The point a body actually walks at, which is a little way *through* the
+    /// opening rather than in front of it.
+    ///
+    /// The two are different on purpose and the difference is the whole of
+    /// whether a route works. `stand` is a place on the grid, so it is what the
+    /// search reasons about; walking to it and stopping is a body standing in
+    /// front of a portal admiring it. The last leg has to be somewhere on the
+    /// far side of the plane, or nothing ever crosses.
+    pub mouth: Vec3,
+}
 
 /// The navigation grid, and the last sweep run over it.
 #[derive(Resource)]
@@ -162,6 +189,25 @@ pub struct FlowField {
     /// Where the player was when the last sweep ran, so a stationary player
     /// does not pay for a sweep that would produce the same field.
     swept_from: Option<usize>,
+    /// The ways across that are not steps, each end once. Empty almost always;
+    /// two entries while a pair of portals is open. See [`Self::set_warp`].
+    warps: Vec<Link>,
+}
+
+/// One end of a warp, as the grid holds it: which cell it is used from, which
+/// cell it lands in, and the two points a route puts on either side of the
+/// crossing.
+#[derive(Clone, Copy, Debug)]
+struct Link {
+    cell: usize,
+    exit: usize,
+    /// The point through the opening, which is the leg a body walks at.
+    mouth: Vec3,
+    /// Where a body walks *to* on this side, for tautening the run up to it.
+    stand: Vec3,
+    /// Where it comes out, which is where the next stretch of the route is
+    /// pulled taut from.
+    landing: Vec3,
 }
 
 /// What a cell knows, handed to an enemy standing in it.
@@ -291,6 +337,7 @@ impl FlowField {
             alarm: 0.0,
             due: 0.0,
             swept_from: None,
+            warps: Vec::new(),
         };
         field.survey_walls(level);
         // After the walls, and not before: what counts as being up against
@@ -639,6 +686,83 @@ impl FlowField {
     /// walls, so a run across the lawn is two points and a route round the
     /// castle is one per corner. See [`FlowField::clear`], which is the same
     /// test the sweep built the route with.
+    /// Hangs a way across the map on the grid, or takes the last one off.
+    ///
+    /// **One edge, and every answer the grid gives changes.** The sweep that
+    /// tells the crowd which way the player is walks over it, so a horde on the
+    /// far side of the castle comes through the portal rather than round the
+    /// long way; the A* a Mario runs over it, so an errand across the map is
+    /// suddenly worth taking; and the tautening knows to break the route there
+    /// rather than draw a straight line between two points a hundred metres
+    /// apart. That is the whole reason a portal is a fact about the *field*
+    /// rather than a thing the follower checks for as it walks: a body that
+    /// discovers a shortcut when it is standing on it has already walked the
+    /// long way.
+    ///
+    /// The two ends are given as [`Warp`]s and are snapped to whatever the
+    /// survey says is standable near them, which is what stops an opening on a
+    /// wall two metres above a ledge from wiring the crowd into thin air. An
+    /// end with nothing standable near it wires nothing at all: a one-way edge
+    /// is a route the crowd walks into and cannot come back out of.
+    ///
+    /// The last sweep is thrown away rather than kept, because it was made over
+    /// a different graph -- a field that still remembers the old edge is a field
+    /// pointing a crowd at a portal that is not there any more.
+    pub fn set_warp(&mut self, pair: Option<(Warp, Warp)>) {
+        self.warps.clear();
+        if let Some((first, second)) = pair {
+            if let (Some(here), Some(there)) = (
+                self.nearest_walkable(first.stand),
+                self.nearest_walkable(second.stand),
+            ) {
+                // Refused when the two ends land in the same cell, which is a
+                // pair of portals close enough together to be the same place.
+                // The edge would be a self-loop, and a self-loop with a cost of
+                // nearly nothing is a search that settles the same cell over
+                // and over.
+                if here != there {
+                    self.warps.push(Link {
+                        cell: here,
+                        exit: there,
+                        mouth: first.mouth,
+                        stand: first.stand,
+                        landing: second.stand,
+                    });
+                    self.warps.push(Link {
+                        cell: there,
+                        exit: here,
+                        mouth: second.mouth,
+                        stand: second.stand,
+                        landing: first.stand,
+                    });
+                }
+            }
+        }
+        // Whatever it was, the graph has changed.
+        self.swept_from = None;
+        self.due = 0.0;
+    }
+
+    /// The warp used from this cell, if there is one.
+    ///
+    /// A scan over a list that holds two entries at most, which is why it is a
+    /// list rather than an array the width of the grid: this is asked once per
+    /// node expansion, beside eight neighbour lookups, and two compares against
+    /// nine thousand words of cache is the cheaper of the two shapes.
+    fn warp_at(&self, here: usize) -> Option<&Link> {
+        self.warps.iter().find(|link| link.cell == here)
+    }
+
+    /// Where a step into this cell's warp comes out.
+    fn warp_exit(&self, here: usize) -> Option<usize> {
+        self.warp_at(here).map(|link| link.exit)
+    }
+
+    /// Whether the grid currently has any way across that is not a step.
+    pub fn warped(&self) -> bool {
+        !self.warps.is_empty()
+    }
+
     pub fn route(
         &self,
         search: &mut crate::route::Search,
@@ -649,16 +773,32 @@ impl FlowField {
     ) -> Option<Routed> {
         let start = self.nearest_walkable(from)?;
         let goal = self.nearest_walkable(to)?;
-        let (gx, gz) = ((goal % WIDTH) as f32, (goal / WIDTH) as f32);
         let cell = self.cell;
-        // Octile distance in metres: the exact cost of walking there over empty
-        // ground, and never more than the cost of walking there over real
-        // ground, which is what makes the first route found the cheapest one.
-        // Both tolls only ever add, so neither can break that.
-        let heuristic = |node: usize| {
-            let (x, z) = ((node % WIDTH) as f32, (node / WIDTH) as f32);
-            let (dx, dz) = ((x - gx).abs(), (z - gz).abs());
+        // Octile distance in metres: the exact cost of walking from one cell to
+        // another over empty ground, and never more than the cost of walking it
+        // over real ground.
+        let octile = |from: usize, to: usize| {
+            let (fx, fz) = ((from % WIDTH) as f32, (from / WIDTH) as f32);
+            let (tx, tz) = ((to % WIDTH) as f32, (to / WIDTH) as f32);
+            let (dx, dz) = ((fx - tx).abs(), (fz - tz).abs());
             (dx.max(dz) + (std::f32::consts::SQRT_2 - 1.0) * dx.min(dz)) * cell
+        };
+        // What makes the first route found the cheapest one is that the estimate
+        // never exceeds the real remaining cost. Both tolls only ever add, so
+        // neither can break that -- **but a warp can**, and this is the one
+        // place in the search that has to know portals exist. Walking distance
+        // is no longer a lower bound on the way there once there is an edge
+        // that crosses the map for nothing: a cell fifty metres from the goal
+        // and two from a portal whose far end is next to it is two metres away,
+        // and an estimate of fifty would let the search settle on a longer route
+        // and stop. So the estimate is the best of going there and going *via*
+        // each end of each warp, which is a lower bound again -- and is two
+        // extra octile distances on a list that is empty in almost every game.
+        let heuristic = |node: usize| {
+            let direct = octile(node, goal);
+            self.warps.iter().fold(direct, |best: f32, link| {
+                best.min(octile(node, link.cell) + octile(link.exit, goal))
+            })
         };
         let found = crate::route::astar(
             search,
@@ -678,15 +818,77 @@ impl FlowField {
                         };
                         (there, stride + self.toll(there, tolls))
                     })
+                    // Stepping through is free of ground covered and is *not*
+                    // free: a cost of nothing makes every route through a
+                    // portal tie with every other, and a search full of ties
+                    // settles cells in whatever order the queue happens to pop.
+                    // A stride is what it actually costs -- one step, like any
+                    // other -- and it keeps the ordering meaningful.
+                    .chain(
+                        self.warp_at(here)
+                            .map(|link| (link.exit, cell + self.toll(link.exit, tolls))),
+                    )
             },
             heuristic,
         )?;
         Some(Routed {
-            legs: self.pull(from, &found.nodes, to, found.partial),
+            legs: self.thread(from, &found.nodes, to, found.partial),
             settled: found.settled,
             partial: found.partial,
             exhausted: found.exhausted,
         })
+    }
+
+    /// Pulls a chain of cells taut, breaking it wherever it goes through a
+    /// warp.
+    ///
+    /// [`Self::pull`] straightens a run of cells by asking whether the body
+    /// could simply walk from one to a later one, and across a warp that
+    /// question has the wrong answer twice over: the two cells are a hundred
+    /// metres apart, so the honest answer is no and the pull stops -- and where
+    /// two portals happen to be strung out along one open line of sight it is
+    /// *yes*, and the pull quietly replaces the shortcut with the walk it was
+    /// supposed to save. Neither is a route.
+    ///
+    /// So the chain is cut at every warp edge and each piece pulled on its own.
+    /// The piece before a crossing gets a leg **through** the opening rather
+    /// than in front of it -- see [`Warp::mouth`] -- and the piece after it is
+    /// pulled from where the body will actually be standing when it arrives.
+    fn thread(&self, from: Vec3, cells: &[usize], to: Vec3, partial: bool) -> Vec<Vec3> {
+        if self.warps.is_empty() {
+            return self.pull(from, cells, to, partial);
+        }
+        let mut legs = Vec::new();
+        let mut anchor = from;
+        let mut start = 0;
+        for index in 0..cells.len().saturating_sub(1) {
+            let (here, next) = (cells[index], cells[index + 1]);
+            // A warp edge is one the grid could not have taken: the exit of the
+            // warp standing in this cell, and not a cell next door. Both halves
+            // are needed -- a portal whose two ends landed in neighbouring cells
+            // is refused by `set_warp`, but a route may still step from one of
+            // them to the other the ordinary way, and cutting the chain there
+            // would put a leg through a wall that is not between them.
+            let crossed = self
+                .warp_at(here)
+                .filter(|link| link.exit == next && !adjacent(here, next));
+            let Some(link) = crossed else {
+                continue;
+            };
+            let mut piece = self.pull(anchor, &cells[start..=index], link.stand, false);
+            // And then the opening itself, past the surface. Nothing drops this
+            // leg by reaching it -- it is on the far side of a wall, which is
+            // exactly what [`crate::path::Route::turned`] refuses to count as
+            // turned -- because nothing has to: a body that walks at it is
+            // carried through by [`crate::portal::transit`] on the tick it
+            // crosses, and arrives with its route replanned from the other side.
+            piece.push(link.mouth);
+            legs.append(&mut piece);
+            anchor = link.landing;
+            start = index + 1;
+        }
+        legs.extend(self.pull(anchor, &cells[start..], to, partial));
+        legs
     }
 
     /// What stepping into a cell costs on top of the stride, in metres.
@@ -1001,6 +1203,12 @@ pub fn rebuild(
             neighbours(here)
                 .filter(move |&(step, there)| grid.passable(here, step, there))
                 .map(|(_, there)| there)
+                // And the way across that is not a step. One line, and it is
+                // the whole of a crowd of two thousand knowing that a portal
+                // exists: the sweep walks it like any other edge, so the cells
+                // on the far side of it count their distance to the player
+                // through the opening and the flow they hand out points at it.
+                .chain(grid.warp_exit(here))
         })
     };
     field.steps = swept.steps;
@@ -1034,6 +1242,21 @@ pub fn rebuild(
             let (hx, hz) = ((here % WIDTH) as f32, (here / WIDTH) as f32);
             let (nx, nz) = ((neighbour % WIDTH) as f32, (neighbour / WIDTH) as f32);
             towards = Vec2::new(nx - hx, nz - hz);
+        }
+        // And the warp, after the eight, because it is the one edge out of this
+        // cell that is not one of them. A cell holding a portal mouth whose far
+        // side is nearer the player points **at the opening** rather than at a
+        // neighbouring cell -- the direction is in metres of world rather than
+        // in cells, which normalising makes the same thing -- and the crowd
+        // walks into it and is carried through. Without this the cell is still
+        // *counted* through the portal by the sweep above, so the crowd knows
+        // it is close, and then walks at whichever neighbour is next nearest:
+        // a horde standing in front of an open portal shuffling sideways.
+        if let Some(link) = field.warp_at(here) {
+            if field.steps[link.exit] < best {
+                let centre = field.centre_of(here);
+                towards = Vec2::new(link.mouth.x - centre.x, link.mouth.z - centre.z);
+            }
         }
         field.flow[here] = towards.normalize_or_zero();
     }
@@ -1089,6 +1312,17 @@ fn neighbour(here: usize, step: usize) -> Option<usize> {
     // the map as next door.
     (nx >= 0 && nx < WIDTH as isize && nz >= 0 && nz < WIDTH as isize)
         .then(|| nz as usize * WIDTH + nx as usize)
+}
+
+/// Whether two cells touch, which is the same thing as one being reachable from
+/// the other in a single step of the grid.
+///
+/// Stated on the coordinates rather than by searching [`STEPS`], so it stays
+/// one subtraction and two compares in the middle of a loop over a route.
+fn adjacent(here: usize, there: usize) -> bool {
+    let (hx, hz) = ((here % WIDTH) as isize, (here / WIDTH) as isize);
+    let (tx, tz) = ((there % WIDTH) as isize, (there / WIDTH) as isize);
+    (hx - tx).abs() <= 1 && (hz - tz).abs() <= 1 && here != there
 }
 
 /// The up-to-eight cells touching this one, each with the step that reaches it.
@@ -1181,6 +1415,209 @@ mod tests {
         assert!(
             routed.legs.len() > 1,
             "one leg through a castle: {routed:?}"
+        );
+    }
+
+    /// The two cells furthest apart the survey can offer, and a portal pair
+    /// joining them.
+    ///
+    /// Chosen by the survey rather than named by hand: the castle moves and a
+    /// test that writes coordinates into itself is a test that quietly stops
+    /// testing anything.
+    fn across_the_map(field: &FlowField) -> (Vec3, Vec3) {
+        let walkable: Vec<usize> = (0..WIDTH * WIDTH)
+            .filter(|&at| field.walkable[at])
+            .collect();
+        let span = |x: usize, y: usize| {
+            ((x % WIDTH) as f32 - (y % WIDTH) as f32).hypot((x / WIDTH) as f32 - (y / WIDTH) as f32)
+        };
+        let (near, far) = walkable
+            .iter()
+            .flat_map(|&a| walkable.iter().map(move |&b| (a, b)))
+            .max_by(|(al, ar), (bl, br)| span(*al, *ar).total_cmp(&span(*bl, *br)))
+            .expect("the castle has no walkable ground");
+        (field.centre_of(near), field.centre_of(far))
+    }
+
+    /// A mouth standing at a spot, whose opening is half a metre east of it.
+    fn opening(at: Vec3) -> Warp {
+        Warp {
+            stand: at,
+            mouth: at + Vec3::X * 0.5,
+        }
+    }
+
+    /// Ground actually covered on foot: the sum of the legs, less the crossing.
+    ///
+    /// **The crossing has to come out or the measurement is meaningless.** A
+    /// route through a portal has one leg joining two points a hundred and
+    /// fifty metres apart, and that leg is not walked at all -- it is the
+    /// transit. Counting it makes a route that crosses the map for nothing look
+    /// like the longest route there is.
+    fn on_foot(from: Vec3, legs: &[Vec3], jump: f32) -> f32 {
+        legs.iter()
+            .fold((from, 0.0), |(last, total), leg| {
+                let step = last.distance(*leg);
+                (*leg, total + if step > jump { 0.0 } else { step })
+            })
+            .1
+    }
+
+    /// A pair of portals is a way across the map, and the search takes it.
+    #[test]
+    fn a_route_takes_a_portal_rather_than_walking_round() {
+        let (level, _) = crate::level::load();
+        let mut field = FlowField::new(&level);
+        let mut search = crate::route::Search::default();
+        let (from, to) = across_the_map(&field);
+        let jump = field.cell_size() * 8.0;
+
+        // Without a portal, whatever the walk costs.
+        let plain = field
+            .route(&mut search, from, to, 20000, Tolls::default())
+            .expect("no route across the castle at all");
+        let walked = on_foot(from, &plain.legs, jump);
+        assert!(
+            walked > 40.0,
+            "the two ends are not far enough apart to test"
+        );
+
+        // And now with one at each end.
+        field.set_warp(Some((opening(from), opening(to))));
+        assert!(field.warped());
+        let through = field
+            .route(&mut search, from, to, 20000, Tolls::default())
+            .expect("no route with a portal open");
+        assert!(!through.partial, "{through:?}");
+        assert!(
+            on_foot(from, &through.legs, jump) < walked * 0.25,
+            "the route still walked {} of the {walked} the ground costs: {through:?}",
+            on_foot(from, &through.legs, jump)
+        );
+
+        // And taking it away puts the field back where it was, rather than
+        // leaving a shortcut nobody can see.
+        field.set_warp(None);
+        assert!(!field.warped());
+        let again = field
+            .route(&mut search, from, to, 20000, Tolls::default())
+            .expect("no route after the portal closed");
+        assert!(
+            (on_foot(from, &again.legs, jump) - walked).abs() < 1.0,
+            "{again:?}"
+        );
+    }
+
+    /// The taut route is broken at the crossing rather than drawn through it.
+    ///
+    /// Two things, and each of them was a way of getting this wrong.
+    /// [`FlowField::pull`] straightens a run of cells by asking whether the
+    /// body could walk from one to a later one, and across a warp that question
+    /// has the wrong answer twice: usually no, so the route is left as the raw
+    /// staircase, and where the two mouths happen to lie on one open line of
+    /// sight, *yes* -- which quietly replaces the shortcut with the walk it was
+    /// supposed to save. So: the crossing is there, it is the mouth rather than
+    /// the spot in front of it, and every stretch that is not the crossing is a
+    /// walk the field itself would allow.
+    #[test]
+    fn a_route_through_a_portal_is_cut_at_the_crossing() {
+        let (level, _) = crate::level::load();
+        let mut field = FlowField::new(&level);
+        let mut search = crate::route::Search::default();
+        let (from, to) = across_the_map(&field);
+        let (here, there) = (opening(from), opening(to));
+        field.set_warp(Some((here, there)));
+        let routed = field
+            .route(&mut search, from, to, 20000, Tolls::default())
+            .expect("no route with a portal open");
+
+        // The leg that carries the body through is the opening itself and not
+        // the spot in front of it -- a route that stops at the spot is a body
+        // that walks up to a portal and stands there admiring it.
+        let crossing = routed
+            .legs
+            .iter()
+            .position(|leg| leg.distance(here.mouth) < 1e-3)
+            .unwrap_or_else(|| panic!("the route never goes through the opening: {routed:?}"));
+        assert!(crossing + 1 < routed.legs.len(), "{routed:?}");
+        assert!(
+            routed.legs[crossing + 1].distance(to) < field.cell_size() * 2.0,
+            "the route comes out somewhere that is not the far mouth: {routed:?}"
+        );
+
+        // And every stretch either side of it is a walk, rather than a line
+        // drawn through whatever was in the way.
+        let mut anchor = from;
+        for (index, leg) in routed.legs.iter().enumerate() {
+            if index != crossing && index != crossing + 1 {
+                assert!(
+                    field.clear(anchor, *leg),
+                    "leg {index} runs through something: {anchor:?} -> {leg:?}"
+                );
+            }
+            anchor = *leg;
+        }
+    }
+
+    /// The crowd's own field points at the opening rather than past it.
+    ///
+    /// The sweep and the flow are two passes over the same graph and they have
+    /// to agree: a cell whose shortest way to the player is through a portal is
+    /// counted that way by the first, and if the second then points at a
+    /// neighbouring cell instead, what is drawn is a horde standing in front of
+    /// an open portal shuffling sideways.
+    #[test]
+    fn the_crowd_is_pointed_into_the_opening() {
+        let (level, _) = crate::level::load();
+        let base = FlowField::new(&level);
+        let (player, far) = across_the_map(&base);
+
+        let sweep = |warp: Option<(Warp, Warp)>| {
+            let mut world = World::new();
+            let mut field = FlowField::new(&level);
+            field.set_warp(warp);
+            world.insert_resource(field);
+            world.insert_resource(Time::<()>::default());
+            world.spawn((crate::player::Player, Transform::from_translation(player)));
+            world.run_system_once(rebuild).expect("the sweep ran");
+            world.remove_resource::<FlowField>().expect("the field")
+        };
+
+        // How far the crowd at the far end thinks it is on foot -- which on
+        // this castle may be *no distance at all*, because the two ends of the
+        // map are on opposite sides of the moat and the sweep never gets
+        // there. Both answers are the same fact for this test, and the second
+        // is the stronger one: a portal is the only way across.
+        let walked = sweep(None).at(far).steps;
+        // A portal from there to the player's own feet, and the same question.
+        let opened = sweep(Some((
+            opening(far),
+            Warp {
+                stand: player,
+                mouth: player + Vec3::X * 0.5,
+            },
+        )));
+        let hops = opened
+            .at(far)
+            .steps
+            .expect("the far end has no route to the player even with a portal open");
+        match walked {
+            None => {} // cut off entirely, and now it is not
+            Some(walked) => assert!(
+                hops < walked / 4,
+                "the portal was worth {hops} steps against {walked} on foot"
+            ),
+        }
+        assert!(hops <= 4, "a portal to his feet is {hops} steps of walking");
+
+        // And the direction handed to a body standing there points at the
+        // opening rather than at whichever neighbour is next-nearest.
+        let centre = opened.centre_of(opened.cell_at(far));
+        let wanted = Vec2::new(far.x + 0.5 - centre.x, far.z - centre.z);
+        let towards = opened.at(far).towards;
+        assert!(
+            wanted.length() > 1e-3 && towards.dot(wanted.normalize()) > 0.7,
+            "the flow points {towards:?} rather than at the opening {wanted:?}"
         );
     }
 

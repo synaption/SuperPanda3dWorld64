@@ -32,6 +32,7 @@ mod nuclonium;
 mod path;
 mod pipe;
 mod player;
+mod portal;
 mod pylon;
 mod route;
 mod shadow;
@@ -377,7 +378,7 @@ pub fn add_game(app: &mut App) {
     game_resources(app);
     // The whole world is drawn by this one material, so it goes on directly
     // after the plugins it is built out of.
-    app.add_plugins((n64::N64Plugin, nuclonium::VfxPlugin))
+    app.add_plugins((n64::N64Plugin, nuclonium::VfxPlugin, portal::PortalPlugin))
         // Enough raw history for the chart's four-second window at 240 Hz.
         .add_plugins(FrameTimeDiagnosticsPlugin::new(960))
         // The other half of the benchmark readout: an enemy is a whole scene of
@@ -394,8 +395,13 @@ pub fn add_game(app: &mut App) {
     // behind it does not quietly draw nothing; it fails validation and takes
     // the frame with it. So the debug overlay is a thing the windowed game has
     // and the test harness does not, exactly as the render passes are.
+    //
+    // `enemy::draw_crawlers` rides on the same switch and for the same reason
+    // it cannot ride in `path::draw`: an ant is never routed, so the route
+    // overlay has nothing to say about one, and a blank where a body should be
+    // reads as a broken body. See that system for what it draws instead.
     app.add_systems(Startup, path::configure)
-        .add_systems(Update, path::draw);
+        .add_systems(Update, (path::draw, enemy::draw_crawlers));
 }
 
 /// Every resource the game's systems expect to find.
@@ -434,6 +440,8 @@ pub fn game_resources(app: &mut App) {
         // build state because they are the same control in a different hand.
         .init_resource::<pylon::Plant>()
         .init_resource::<pylon::Network>()
+        .init_resource::<portal::Portals>()
+        .init_resource::<portal::Planting>()
         // The one die in the game -- see `nuclonium::Drops::maybe` -- and what the
         // squad has managed to ship back down the beams.
         .init_resource::<nuclonium::Drops>()
@@ -478,7 +486,7 @@ pub fn game_systems(app: &mut App) {
         // After the chart has stopped its clock, so a frame held back to the
         // player's cap is not drawn as a frame that took that long to think.
         .add_systems(Last, display::cap_frames.after(frame_chart::finish))
-        .add_systems(Startup, (setup, weapon::load_shot_assets))
+        .add_systems(Startup, (setup, weapon::load_shot_assets, portal::setup))
         .add_systems(FixedUpdate, simulation())
         .add_systems(Update, presentation())
         .add_systems(Update, overlay())
@@ -488,6 +496,26 @@ pub fn game_systems(app: &mut App) {
         // torso carrying it.
         .add_systems(PostUpdate, (aim::systems(), weapon::systems()).chain())
         .add_systems(PostUpdate, drawing())
+        // Between the camera that has already moved this frame and the
+        // propagation that will publish where everything ended up: the portal
+        // cameras are derived from the player's eye, so they have to be written
+        // after it moves, and their transforms have to be propagated in the
+        // same frame they are written or the picture inside every opening lags
+        // the wall it is cut into by one. See `portal::aim_cameras`.
+        .add_systems(
+            PostUpdate,
+            // Chained: `carry_camera` flies the eye through a gate the boom
+            // goes through, and `aim_cameras` derives both portal cameras from
+            // where the eye actually ended up. Unordered, the openings would be
+            // drawn for an eye that is about to move.
+            (portal::carry_camera, portal::aim_cameras)
+                .chain()
+                .before(bevy::transform::TransformSystems::Propagate),
+        )
+        // And the undoing, at the very top of the next frame -- before the
+        // fixed step reads the camera for the movement basis, and before
+        // `camera::update` recomputes it. See `portal::release_camera`.
+        .add_systems(First, portal::release_camera)
         // In `PostUpdate` rather than with the rest of the overlay, and pinned
         // between two of Bevy's own sets: a bar is a world position projected
         // through the camera and written into a UI node, so it has to run after
@@ -580,7 +608,13 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
         // Before anything that reads it. The field is what the crowd tier
         // navigates by, and one built from last tick's player position would
         // send two thousand enemies a step behind him.
-        flow::rebuild,
+        //
+        // `portal::wire_field` immediately in front of it, and that order is
+        // its correctness rather than tidiness: it hangs the pair's edge on the
+        // grid, and a sweep run before the edge is on is a sweep the whole crowd
+        // spends the next tenth of a second walking round a portal that is open.
+        // It does nothing at all on the ticks nobody fired the gun.
+        (portal::wire_field, flow::rebuild).chain(),
         // And before every system that asks how much simulation an enemy is
         // getting this tick.
         enemy::assign_detail,
@@ -610,7 +644,17 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
         // only ordering it needs: a destination written this tick is routed
         // this tick, and a Mario whose turn the budget did not reach walks last
         // tick's route -- or straight at its goal -- and comes round again.
+        //
+        // `enemy::navigate` rides in front of it for exactly that reason and
+        // is why this nest holds a system with nothing to do with Marios:
+        // **two deciders, one router.** The enemies want the same searches out
+        // of the same budget and want them grouped against the Marios' rather
+        // than beside them, so both say where they are going before the one
+        // system that works out the way. What it reads is last tick's aggro --
+        // `enemy::alert` runs further down -- which is a tick of staleness
+        // against `path::DRIFT`, three metres, and so is no staleness at all.
         (
+            enemy::navigate,
             goap::plan,
             path::plan,
             squad::move_allies,
@@ -687,7 +731,15 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
         // the Marios" is only true once nothing else is going to move one --
         // the walk, the fight, the warp pipe's arc are all above it. See
         // [`squad::Glide`].
-        (aim::turn_body, squad::bank).chain(),
+        //
+        // `portal::transit` at the head of that last nest, which puts it after
+        // every system in the tick that moves a body and before the two that
+        // write down where the tick left them. It tests the *step* each body
+        // took rather than where it ended up -- see [`portal::Transit`] -- so
+        // it has to see the finished step, and a body carried across the map
+        // after `squad::bank` had recorded it would be drawn interpolating the
+        // whole way there.
+        (portal::transit, aim::turn_body, squad::bank).chain(),
     )
         .chain()
         .run_if(console::is_closed)
@@ -706,7 +758,13 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
         // `nuclonium::swim`, which swims a carried ball after the pose its
         // carrier is actually drawn at.
         (player::sync_visual, squad::glide).chain(),
-        camera::update,
+        // The portals, and then the camera that frames them. Chained rather
+        // than two entries because `portal::turn_camera` carries the player's
+        // view through a transit that happened on the tick just gone, and a
+        // camera built before it is a camera pointed at the wall the player
+        // came out of for one frame -- which at sixty frames a second is
+        // exactly long enough to see.
+        (portal::systems(), camera::update).chain(),
         animation::resolve_clips,
         animation::claim_players,
         animation::attach_graphs,
@@ -805,11 +863,19 @@ fn overlay() -> ScheduleConfigs<ScheduleSystem> {
         // Beside it and for the same reason: a mast's scene finishes loading
         // whenever it does, and a console left open must not be the difference
         // between an emitter that breathes and one that does not.
-        pylon::claim,
+        //
+        // `portal::claim` is nested with it rather than given an entry of its
+        // own -- Bevy's system tuples stop at twenty and this list is at it --
+        // and it belongs beside it anyway: it is the same kind of thing, giving
+        // a body that arrived whenever it arrived the one component it needs to
+        // be able to walk into a portal.
+        (pylon::claim, portal::claim).chain(),
         // Straight after `enemy::crowd` and `weapon::equip` in spirit: the
         // three share the console's request queue and each hands back what the
         // others wanted. See `ConsoleState::defer`.
-        pylon::command,
+        // `portal::command` nested with it for the tuple-of-twenty reason, and
+        // beside it anyway: it is the fourth system sharing that queue.
+        (pylon::command, portal::command).chain(),
         // Straight after it, and for the third time in this chain the reason is
         // `ConsoleState::defer`: these systems share one request queue and each
         // hands back what the others asked for.
@@ -965,6 +1031,25 @@ fn setup(
             },
             Transform::from_scale(Vec3::splat(scale)),
         ));
+        // And a second of each, for the half of him that is already through a
+        // portal. Spawned here beside the real one rather than when a gate goes
+        // up, because a skinned scene takes frames to load and a body that
+        // appeared halfway through a stride would be a body arriving late for
+        // the one moment it exists to cover. Hidden until `portal::ghost` has
+        // somewhere to put it -- which is the second a player spends in a
+        // doorway and no other. See [`portal::Ghost`].
+        //
+        // No `ShadowCaster`: there is one player and he casts one shadow, and
+        // the disc under a ghost would be a second shadow sliding across the
+        // lawn at the far gate.
+        commands.spawn((
+            PlayerVisual,
+            portal::Ghost,
+            character,
+            WorldAssetRoot(assets.load(model)),
+            Visibility::Hidden,
+            Transform::from_scale(Vec3::splat(scale)),
+        ));
     }
 
     // No light entity and no ambient resource: every surface in the world is
@@ -988,6 +1073,13 @@ fn setup(
             ..default()
         }),
         FollowCamera::default(),
+        // Every layer, which is what makes this the one camera that can see a
+        // portal. The two openings are each on a layer of their own so that
+        // neither portal camera draws the surface it is feeding -- see
+        // `portal::LAYERS`, where the reason that is a hard requirement rather
+        // than a nicety -- and where the infinity mirror comes from -- is
+        // written down.
+        portal::world_layers(),
         // Only values above the display range contribute: the world keeps its
         // authored N64 colours, while the HDR nuclonium material supplies the
         // energy this old-school bloom scatters around each orb and mote.
@@ -1087,11 +1179,19 @@ fn setup(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 fn controls(
     mut input: ResMut<InputState>,
     mut state: ResMut<GameState>,
     mut squad: ResMut<squad::Squad>,
-    mut visuals: Query<(&ActiveCharacter, &mut Visibility), With<PlayerVisual>>,
+    // `Without<Ghost>`: a ghost's visibility is `portal::ghost`'s to say, and it
+    // is hidden on all but the handful of frames a player spends in a doorway.
+    // Swept up by the character swap it would be shown for good, standing at
+    // the origin.
+    mut visuals: Query<
+        (&ActiveCharacter, &mut Visibility),
+        (With<PlayerVisual>, Without<portal::Ghost>),
+    >,
     console: Res<console::ConsoleState>,
 ) {
     if console.open || console.closed_this_frame {
@@ -1322,6 +1422,13 @@ mod tests {
             // this app does not have.
             .init_asset::<n64::N64Material>()
             .init_asset::<nuclonium::GlowMaterial>()
+            // And the portal surface's, which is what decides whether
+            // `portal::setup` builds anything at all. **It has to be here.**
+            // Without it the harness runs a world with one `Camera3d` in it and
+            // the real game runs one with three, and every system that reaches
+            // for "the camera" is a system the tests cannot see break. See
+            // `portal::LAYERS` for why there are three.
+            .init_asset::<portal::PortalMaterial>()
             // The one buffer the lamps live in. Its store is part of the
             // renderer in a real build, and `n64::lamplight` writes it every
             // frame here as it does there.
@@ -2453,6 +2560,253 @@ mod tests {
         );
     }
 
+    /// A body that walks into one opening comes out of the other, in the real
+    /// tick.
+    ///
+    /// **The unit tests prove the arithmetic; this proves the wiring.** A
+    /// transit needs four things that live in four different files to line up:
+    /// something has to have given the body its [`portal::Transit`] without
+    /// anybody spawning it having heard of portals, the crossing has to be
+    /// tested against the step the tick actually took, the carry has to happen
+    /// after everything else that moves a body, and the camera has to come
+    /// round with it. Any one of them missing is a body that walks up to a
+    /// portal and stops, or a player who arrives looking at a wall -- and none
+    /// of them is visible from inside [`portal`].
+    #[test]
+    fn a_body_that_walks_into_a_portal_comes_out_of_the_other() {
+        let mut app = headless();
+        for _ in 0..8 {
+            app.update();
+        }
+        let player = app
+            .world_mut()
+            .query_filtered::<Entity, With<Player>>()
+            .iter(app.world())
+            .next()
+            .expect("no player in the world");
+        let stood = app.world().get::<Transform>(player).unwrap().translation;
+        assert!(
+            app.world().get::<portal::Transit>(player).is_some(),
+            "nothing gave the player the component that lets him go through"
+        );
+        // Two gates facing the *same* way, twenty metres apart down the lawn,
+        // with the near one right in front of him. Built rather than planted,
+        // because what is under test is the tick and not the placement -- and
+        // facing the same way because that is the pair that turns a body right
+        // round: he walks north into the first and comes out of the second
+        // walking south.
+        let near = stood + Vec3::new(0.0, 0.6, -1.0);
+        let far = stood + Vec3::new(0.0, 0.6, -20.0);
+        {
+            let mut portals = app.world_mut().resource_mut::<portal::Portals>();
+            portals.set(
+                portal::Side::Blue,
+                portal::Mouth::built(near, Vec3::Z, portal::Shape::Arch),
+            );
+            portals.set(
+                portal::Side::Orange,
+                portal::Mouth::built(far, Vec3::Z, portal::Shape::Arch),
+            );
+        }
+        let before = app
+            .world_mut()
+            .query::<&FollowCamera>()
+            .single(app.world())
+            .expect("no camera")
+            .yaw;
+        // A tick with the pair open and nothing crossing, so the memory of
+        // where he was standing is this side of it.
+        app.update();
+        // And then a step that crosses the plane. Written straight onto the
+        // transform, which is what a walk does.
+        app.world_mut()
+            .entity_mut(player)
+            .get_mut::<Transform>()
+            .unwrap()
+            .translation = stood - Vec3::Z * 2.0;
+        app.update();
+
+        let arrived = app.world().get::<Transform>(player).unwrap().translation;
+        assert!(
+            arrived.distance(far) < 4.0,
+            "he walked into the opening and stayed where he was: {arrived:?}, \
+             wanted somewhere near {far:?}"
+        );
+        // And the view came round with him. These two gates face the same way,
+        // so the turn is a half one -- a player who kept his old yaw would
+        // arrive looking back at the gate he had just come out of.
+        let after = app
+            .world_mut()
+            .query::<&FollowCamera>()
+            .single(app.world())
+            .expect("no camera")
+            .yaw;
+        let turned = aim::wrap(after - before).abs();
+        assert!(
+            (turned - std::f32::consts::PI).abs() < 0.2,
+            "the camera turned {turned} rather than half way round"
+        );
+    }
+
+    /// The action button, end to end, stands a gate on the lawn.
+    ///
+    /// **The unit tests prove the geometry; this proves the wiring.** The
+    /// button is not bound to a key at all -- it reaches this system only if
+    /// [`action::route`] points the picker's held flag at it -- and past that
+    /// there is the aim between the camera and the player, the footprint test
+    /// against everything already standing, and the alternation that makes one
+    /// button plant two ends. None of it is reachable from a test that calls
+    /// `portal::fits` directly, and all of it is a game that quietly does
+    /// nothing when you hold the button.
+    #[test]
+    fn holding_the_action_button_stands_a_gate_on_the_lawn() {
+        let mut app = headless();
+        app.update();
+        // The gate's own flag rather than the picker's button, exactly as the
+        // machine's test drives `build`: the headless harness has no window and
+        // so does not run the input pipeline, which is where `action::route`
+        // lives. That the picker points at these flags at all is asserted where
+        // it can be -- see `action::tests`.
+        let hold_and_release = |app: &mut App| {
+            // Long enough that a hold is being read rather than only a release.
+            for _ in 0..40 {
+                app.world_mut().resource_mut::<input::InputState>().portal = true;
+                app.update();
+            }
+            {
+                let mut input = app.world_mut().resource_mut::<input::InputState>();
+                input.portal = false;
+                input.portal_released = true;
+            }
+            app.update();
+        };
+
+        hold_and_release(&mut app);
+        let aim = app.world().resource::<portal::Planting>().aim;
+        let blue = *app
+            .world()
+            .resource::<portal::Portals>()
+            .mouth(portal::Side::Blue)
+            .expect("holding the button planted nothing");
+        // Standing on the spot the crosshair was on, upright, with its base on
+        // the ground -- which is the whole of what makes it a thing you walk
+        // through rather than a thing you look at.
+        assert!(
+            blue.foot().distance(aim) < 0.01,
+            "{:?} vs {aim:?}",
+            blue.foot()
+        );
+        assert!(
+            blue.up().distance(Vec3::Y) < 1e-4,
+            "the gate is leaning: {:?}",
+            blue.up()
+        );
+        assert!(
+            blue.normal().y.abs() < 1e-4,
+            "the gate's face is not level: {:?}",
+            blue.normal()
+        );
+        // Turned to face whoever planted it, so the side they are standing on
+        // is the side that is a door. See the note in [`portal`].
+        let player = app
+            .world_mut()
+            .query_filtered::<&Transform, With<Player>>()
+            .single(app.world())
+            .expect("no player")
+            .translation;
+        let toward = player - blue.at;
+        assert!(
+            Vec2::new(toward.x, toward.z)
+                .normalize_or_zero()
+                .dot(Vec2::new(blue.normal().x, blue.normal().z))
+                > 0.9,
+            "the gate has its back to the player who planted it"
+        );
+        // Nothing to see through yet: one gate is a hoop.
+        assert!(!app.world().resource::<portal::Portals>().open());
+
+        // The same site a second time is refused -- there is a gate standing on
+        // it -- so the pair is still half open and the first end has not moved.
+        hold_and_release(&mut app);
+        let portals = app.world().resource::<portal::Portals>();
+        assert!(
+            portals.mouth(portal::Side::Orange).is_none(),
+            "a gate was planted through the one already standing there"
+        );
+        assert!(
+            portals
+                .mouth(portal::Side::Blue)
+                .unwrap()
+                .at
+                .distance(blue.at)
+                < 0.01
+        );
+    }
+
+    /// One button plants two ends, and then keeps replacing the older one.
+    #[test]
+    fn planting_a_third_gate_replaces_the_older_end() {
+        let mut portals = portal::Portals::default();
+        let gate = |x: f32| {
+            portal::Mouth::built(Vec3::new(x, 1.35, 0.0), Vec3::Z, portal::Shape::Arch)
+                .expect("a direction")
+        };
+        assert_eq!(portals.plant(gate(0.0)), portal::Side::Blue);
+        assert_eq!(portals.plant(gate(10.0)), portal::Side::Orange);
+        assert!(portals.open(), "two plants is a pair");
+        // And from here each new gate takes the place of the older of the two,
+        // so the pair is never half-broken by planting.
+        assert_eq!(portals.plant(gate(20.0)), portal::Side::Blue);
+        assert!(portals.open());
+        assert_eq!(portals.mouth(portal::Side::Blue).unwrap().at.x, 20.0);
+        assert_eq!(portals.mouth(portal::Side::Orange).unwrap().at.x, 10.0);
+        assert_eq!(portals.plant(gate(30.0)), portal::Side::Orange);
+        assert_eq!(portals.mouth(portal::Side::Orange).unwrap().at.x, 30.0);
+    }
+
+    /// Opening a pair rebuilds the beam network, with nothing planted or built.
+    ///
+    /// A gate is not a mast and not a machine, so the counts [`pylon::relink`]
+    /// watches do not move when one goes up -- and yet the graph does, because
+    /// a beam can now go through it. Missing that is a network that is correct
+    /// until you plant a gate and then correct again the next time somebody
+    /// plants a mast.
+    #[test]
+    fn opening_a_portal_rebuilds_the_beam_network() {
+        let mut app = headless();
+        for _ in 0..8 {
+            app.update();
+        }
+        let settled = app.world().resource::<pylon::Network>().revision;
+        // Two more frames with nothing happening: the network is expensive and
+        // must not rebuild itself for nothing.
+        app.update();
+        app.update();
+        assert_eq!(
+            app.world().resource::<pylon::Network>().revision,
+            settled,
+            "the network rebuilt itself with nothing changed"
+        );
+        {
+            let mut portals = app.world_mut().resource_mut::<portal::Portals>();
+            portals.set(
+                portal::Side::Blue,
+                portal::Mouth::built(Vec3::new(-13.0, 3.2, 40.0), Vec3::Z, portal::Shape::Arch),
+            );
+        }
+        app.update();
+        assert_ne!(
+            app.world().resource::<pylon::Network>().revision,
+            settled,
+            "planting a gate left the beam network looking at the old world"
+        );
+        assert_eq!(
+            app.world().resource::<pylon::Network>().optics,
+            None,
+            "one end of a pair is not a way through"
+        );
+    }
+
     /// A mast is something that can be lost.
     ///
     /// The point of the whole [`structure`] module: an ant that has noticed a
@@ -2721,6 +3075,129 @@ mod tests {
                 .collect();
             panic!("nobody ever reached the slime they were sent at: alive at {at:?} hp {hp:?}; marios {who:#?}");
         }
+    }
+
+    /// A squad sent somewhere deals with what is standing in the way of getting
+    /// there, rather than filing round it.
+    ///
+    /// **The complaint this is here for is "they walk straight past things".**
+    /// It was true and the scoring said so: an order is worth 0.76 at eleven
+    /// metres out and a fight is worth 0.54 at six, so a Mario with somewhere
+    /// to be squeezed past the slime in the gateway and only turned on it once
+    /// it had arrived and the order had retired into a post. Which is a squad
+    /// that fights *at* its destination and never *on the way* to one.
+    ///
+    /// The fix is [`goap::detour`] -- a fight is scored by how far out of the
+    /// Mario's way it is, and something on the line is no way out of it at all
+    /// -- and the assertion that separates the two behaviours is the timing.
+    /// The old squad fought this slime too. It fought it afterwards.
+    ///
+    /// Staged in the running game because what is being tested is the state the
+    /// scoring is fed: that a Mario walking an order really does see the thing
+    /// in front of it as sitting on its line.
+    #[test]
+    fn a_squad_marching_past_a_slime_stops_and_fights_it_on_the_way() {
+        let mut app = headless();
+        app.update();
+        let here = {
+            let mut player = app.world_mut().query_filtered::<&Transform, With<Player>>();
+            player.single(app.world()).unwrap().translation
+        };
+        // The castle's own squad is somewhere else and would confuse the count.
+        {
+            let mut allies = app
+                .world_mut()
+                .query_filtered::<Entity, With<squad::Ally>>();
+            let marios: Vec<Entity> = allies.iter(app.world()).collect();
+            for mario in marios {
+                app.world_mut().entity_mut(mario).despawn();
+            }
+            let mut tuning = app.world_mut().resource_mut::<console::GameTuning>();
+            tuning.ally_count = 4.0;
+            tuning.luna_count = 0.0;
+        }
+        // The same stretch of courtyard the test above walks, with the pieces
+        // in the other order: the squad at one end, the spot they are sent to
+        // at the other, and the slime half way between the two. Five metres
+        // short of the spot, so nobody can reach it from where they are told
+        // to stand -- if it dies before they arrive, somebody left the line
+        // for it.
+        let squad_at = here + Vec3::new(-12.0, 0.0, -6.0);
+        let slime_at = Vec3::new(here.x - 12.0, here.y, here.z);
+        let target = Vec2::new(here.x - 12.0, here.z + 5.0);
+        let slime = app
+            .world_mut()
+            .run_system_once(move |mut commands: Commands, assets: Res<AssetServer>| {
+                for index in 0..4 {
+                    let offset = squad::slot(index, 1.5);
+                    squad::spawn_ally(
+                        &mut commands,
+                        &assets,
+                        ActiveCharacter::Mario,
+                        squad_at + Vec3::new(offset.x, 0.0, offset.y),
+                        index as f32,
+                    );
+                }
+                enemy::spawn(&mut commands, &assets, enemy::Kind::Slime, slime_at, 0.0)
+            })
+            .unwrap();
+        app.update();
+
+        let marios: Vec<Entity> = {
+            let mut allies = app
+                .world_mut()
+                .query_filtered::<Entity, With<squad::Ally>>();
+            allies.iter(app.world()).collect()
+        };
+        assert_eq!(marios.len(), 4, "the squad is not the squad this test sent");
+        app.world_mut()
+            .resource_scope(|world, mut squad: Mut<squad::Squad>| {
+                squad.recruit(&marios);
+                squad.send(
+                    world.resource::<flow::FlowField>(),
+                    Vec3::new(target.x, slime_at.y, target.y),
+                );
+            });
+
+        // Long enough to walk eleven metres and have the fight.
+        let mut fought_on_the_way = false;
+        let mut killed_on_the_way = false;
+        for _ in 0..600 {
+            app.update();
+            // A Mario whose order is still outstanding, turning on the slime.
+            // Both halves matter: the plan on its own is what the old squad
+            // did once it had arrived and its order had become a post.
+            let marching: Vec<Entity> = app
+                .world()
+                .resource::<squad::Squad>()
+                .sent
+                .iter()
+                .filter(|order| !order.arrived)
+                .map(|order| order.who)
+                .collect();
+            let turned = marching.iter().any(|mario| {
+                app.world()
+                    .get::<squad::Ally>(*mario)
+                    .is_some_and(|ally| matches!(ally.plan, goap::Goal::Fight { .. }))
+            });
+            fought_on_the_way |= turned;
+            if app.world().get_entity(slime).is_err() {
+                killed_on_the_way = !marching.is_empty();
+                break;
+            }
+        }
+        assert!(
+            fought_on_the_way,
+            "the squad filed past a slime standing in the gateway"
+        );
+        assert!(
+            app.world().get_entity(slime).is_err(),
+            "the slime was noticed and never dealt with"
+        );
+        assert!(
+            killed_on_the_way,
+            "the slime only died once every Mario had already finished its order"
+        );
     }
 
     /// A tap on the whistle sends the squad and leaves a ring where it landed.
@@ -3360,14 +3837,18 @@ mod tests {
         initialise(overlay());
     }
 
-    /// The world goes into the render target and the UI goes onto the window.
+    /// The world goes into the render target and the UI goes onto the window,
+    /// and the portals are drawn before either.
     ///
-    /// Two things break silently if this ever stops holding, and neither one
+    /// Three things break silently if this ever stops holding, and none of them
     /// is a compile error. Point the world camera back at the window and the
     /// render-resolution setting quietly does nothing. Give the world camera
     /// the higher order, or the window as a target, and Bevy hands the UI to
     /// *it* instead -- so the HUD and the menu are drawn into the
-    /// low-resolution image and come out blurred.
+    /// low-resolution image and come out blurred. And give a portal camera an
+    /// order above the world's and every opening shows what was behind it a
+    /// frame ago, which reads as the view inside the frame lagging the wall
+    /// around it whenever the player turns.
     #[test]
     fn the_world_is_drawn_into_the_target_and_the_ui_onto_the_window() {
         use bevy::camera::RenderTarget;
@@ -3376,17 +3857,51 @@ mod tests {
         app.update();
 
         let target = app.world().resource::<SceneTarget>().0.clone();
-        let mut world = app
-            .world_mut()
-            .query::<(&Camera, &RenderTarget, &Camera3d)>();
+        // The portal cameras are `Camera3d`s too, so "the camera drawing the
+        // world" is the one that is not one of them -- which is the same
+        // distinction every system reaching for the player's eye now has to
+        // draw. See `portal::PortalView`.
+        let mut world = app.world_mut().query_filtered::<
+            (&Camera, &RenderTarget),
+            (With<Camera3d>, Without<portal::PortalView>),
+        >();
         let (world_order, world_target) = world
             .single(app.world())
-            .map(|(camera, target, _)| (camera.order, target.clone()))
+            .map(|(camera, target)| (camera.order, target.clone()))
             .expect("there should be exactly one camera drawing the world");
         assert_eq!(
             world_target.as_image(),
             Some(&target),
             "the world camera draws into the render target"
+        );
+
+        let mut portals = app
+            .world_mut()
+            .query_filtered::<(&Camera, &RenderTarget), With<portal::PortalView>>();
+        let seen: Vec<_> = portals
+            .iter(app.world())
+            .map(|(camera, target)| (camera.order, target.as_image().cloned()))
+            .collect();
+        assert_eq!(
+            seen.len(),
+            2,
+            "a portal is a pair and each end has a camera"
+        );
+        for (order, into) in &seen {
+            assert!(
+                *order < world_order,
+                "a portal is drawn after the frame that samples it"
+            );
+            let into = into.as_ref().expect("a portal camera draws into an image");
+            assert_ne!(
+                into, &target,
+                "a portal camera is drawing over the world's own picture"
+            );
+        }
+        assert_ne!(
+            seen[0].0, seen[1].0,
+            "the two portal passes share an order, so which is drawn first is \
+             down to whichever thread is free"
         );
 
         let mut presentation = app

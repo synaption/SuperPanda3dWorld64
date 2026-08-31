@@ -31,6 +31,12 @@
 //!   * A slime forty metres away outranks nothing. The same fight, scored at
 //!     range, loses to a ball at the Mario's feet -- and to the order it was
 //!     given, which is what makes an order an order.
+//!   * A slime *between* a Mario and where it was sent is fought, whatever the
+//!     numbers above say about forty metres, because the distance a fight is
+//!     scored at is how far out of the way it is rather than how far off. A
+//!     squad marching across the map deals with what it walks into and ignores
+//!     what it walks past. See [`detour`], which is one subtraction and is the
+//!     whole of that behaviour.
 //!   * A Mario with nothing else to do will cross a lawn for a ball, because
 //!     ambling scores a flat and very small amount and any real option beats
 //!     it at any distance.
@@ -223,6 +229,8 @@ pub struct Options {
 ///     creature across the lawn is somebody else's problem. The short scale is
 ///     what stops a permanent aggro target -- which is what every Mario has,
 ///     see this module's preamble -- from monopolising the whole squad forever.
+///     For a Mario under orders, read "away" as [`detour`] does: away from the
+///     line it is walking, not away from the Mario.
 ///   * **An order** is worth almost as much and reaches furthest of anything.
 ///     That is what makes it an order: told to stand somewhere fifty metres
 ///     off, a Mario goes, and only something with its hands on it stops them.
@@ -373,6 +381,60 @@ pub fn appeal(base: f32, range: f32, scale: f32) -> f32 {
     base * scale / (scale + range.max(0.0))
 }
 
+/// How far a fight is out of a Mario's way, rather than how far off it is.
+///
+/// **A squad marching across the map should deal with what it walks into.**
+/// That was not what it did, and the reason is worth writing down because the
+/// numbers say it plainly. An order is worth [`OBEY_APPEAL`] over
+/// [`OBEY_SCALE`], which is 0.60 at thirty metres out; a fight is worth
+/// [`FIGHT_APPEAL`] over [`FIGHT_SCALE`], which is 0.60 at *four and a half*.
+/// So a Mario with somewhere to be threw a punch only at something already
+/// close enough to hit it, and walked past everything else -- including the
+/// slime standing squarely between it and the spot it was sent to, which it
+/// then squeezed round.
+///
+/// The mistake is measuring the fight the same way from every direction. What
+/// a fight actually costs a Mario that is going somewhere is not the walk to
+/// the creature, it is the walk to the creature *and on to where it was going*
+/// less the walk it was making anyway -- the extra metres, which is what
+/// "out of its way" means and is one subtraction:
+///
+/// ```text
+/// detour = |here -> foe| + |foe -> spot| - |here -> spot|
+/// ```
+///
+/// Every case falls out of that one line, with no corridor width, no cone and
+/// no special case for "on the route":
+///
+///   * Something **on the line** costs nothing. The detour is zero, the fight
+///     scores the full [`FIGHT_APPEAL`], and the Mario stops and deals with it
+///     -- at any distance, because walking at it *is* walking to the spot.
+///   * Something **beside the line** costs the width of the sidestep, and the
+///     longer the march the less that is: five metres off a thirty-metre order
+///     is a metre and a half of detour and gets fought, fifteen metres off the
+///     same order is twelve and does not.
+///   * Something **behind** costs double -- there and back -- so a grudge a
+///     Mario is walking away from stays walked away from. This is the case
+///     that made the whole thing safe to do: [`crate::enemy::alert`] never
+///     lets go of a target, so most Marios are carrying one, and raw distance
+///     cannot tell "in front of me" from "behind me" at all.
+///   * Something **past the spot** costs the overshoot twice, so a squad sent
+///     to a spot stops at the spot rather than running on at the first thing
+///     it can see beyond it. It arrives, the order retires into a post, and
+///     [`HOLD_APPEAL`] lets it have the fight from there.
+///
+/// Only against an order. A Mario ambling, holding a post or trailing the
+/// player is not on its way anywhere it minds about, so a fight is scored at
+/// what it is: how far off it is.
+fn detour(quarry: Option_, ordered: Option<Option_>) -> f32 {
+    let Some(ordered) = ordered else {
+        return quarry.range;
+    };
+    // Non-negative by the triangle inequality; clamped because it is three
+    // subtractions of floats and a hair below zero would be an arrival bonus.
+    (quarry.range + quarry.at.distance(ordered.at) - ordered.range).max(0.0)
+}
+
 /// What one option scores, water and walls and all.
 ///
 /// **The harshest penalty that applies, rather than all of them multiplied
@@ -411,7 +473,9 @@ fn score(option: Option_, base: f32, scale: f32) -> f32 {
 /// An order is deliberately **not** gated. A whistle is the player speaking,
 /// and a squad that ignores it because a slime wandered into view is worse than
 /// one that leaves a fight when told to; that contest stays scored, where an
-/// order out-reaches a distant fight and yields to a near one.
+/// order out-reaches a fight it would have to leave the line for and yields to
+/// one standing on that line. See [`detour`] for what "distant" means to a
+/// Mario that has somewhere to be.
 pub fn choose(options: &Options) -> Goal {
     let mut best = (IDLE_APPEAL, Goal::Idle);
     let hauling = !engaged(options);
@@ -444,7 +508,40 @@ pub fn choose(options: &Options) -> Goal {
     }
     if let Some(quarry) = options.quarry {
         offer(
-            score(quarry, FIGHT_APPEAL, FIGHT_SCALE),
+            score(
+                Option_ {
+                    // Scored by how far out of the Mario's way it is rather
+                    // than by how far off it is, which is the whole of
+                    // fighting things on the way. See [`detour`].
+                    range: detour(quarry, options.ordered),
+                    // **And not discounted for having something in the way**,
+                    // which is the one place [`BLOCKED_PENALTY`] does not
+                    // belong. Work it through: a fight is the shortest-scaled
+                    // option there is, so a quarter of it is under
+                    // [`IDLE_APPEAL`] by fifteen metres and under a formation
+                    // slot by three -- and [`crate::flow::FlowField::clear`] is
+                    // a coarse question, false for a kerb, a hummock or the
+                    // corner of a wall anywhere along a line drawn over cells
+                    // nearly two metres across. Across a lawn at ten metres it
+                    // is false more often than not. So the squad stood about
+                    // while things walked up to it, and the further off the
+                    // thing was the likelier that was: this is "Marios have a
+                    // hard time punching things that are farther away".
+                    //
+                    // The penalty is right for a *ball*, which is the case it
+                    // was written for: one behind a fence is worth less than
+                    // one on the lawn because they are alternatives and the
+                    // Mario picks. A quarry is not an alternative to anything
+                    // -- there is one, it noticed the Mario, and it is walking
+                    // over -- and the walk round is [`crate::path`]'s job,
+                    // which a Mario has and a ball's score cannot see.
+                    // `wet` still applies, so nobody swims a moat for a fight.
+                    blocked: false,
+                    ..quarry
+                },
+                FIGHT_APPEAL,
+                FIGHT_SCALE,
+            ),
             Goal::Fight {
                 at: quarry.at,
                 arrive: quarry.arrive,
@@ -729,14 +826,25 @@ fn nearest(points: &[Vec3], from: Vec3) -> Option<(Vec3, f32)> {
 mod tests {
     use super::*;
 
-    fn spot(range: f32) -> Option_ {
+    /// Something at a point on the ground, with the Mario at the origin.
+    ///
+    /// The range is worked out from the position rather than passed in beside
+    /// it, because [`detour`] reads both and a test that let the two disagree
+    /// would be describing a world that cannot exist.
+    fn beside(x: f32, z: f32) -> Option_ {
         Option_ {
-            at: Vec2::new(range, 0.0),
+            at: Vec2::new(x, z),
             arrive: 1.0,
-            range,
+            range: Vec2::new(x, z).length(),
             wet: false,
             blocked: false,
         }
+    }
+
+    /// Something straight ahead of the Mario. Everything laid out with this is
+    /// on one line, which is the arrangement [`detour`] charges nothing for.
+    fn spot(range: f32) -> Option_ {
+        beside(range, 0.0)
     }
 
     fn ball() -> Entity {
@@ -821,11 +929,14 @@ mod tests {
             matches!(choose(&arrived), Goal::Fight { .. }),
             "it stood on its spot in the middle of a fight: {arrived:?}"
         );
-        // And the same Mario still on its way does not stop for that fight,
-        // because an order it has not carried out yet is still an order.
+        // And the same Mario still on its way keeps walking past a fight it
+        // would have to leave the line for, because an order it has not
+        // carried out yet is still an order. Four metres *ahead* it would
+        // stop for; twelve metres out to one side of a twenty-metre march it
+        // does not. See [`detour`].
         let marching = Options {
             ordered: Some(spot(20.0)),
-            quarry: Some(spot(4.0)),
+            quarry: Some(beside(2.0, 12.0)),
             engage: 14.0,
             ..Options::default()
         };
@@ -833,6 +944,84 @@ mod tests {
             matches!(choose(&marching), Goal::Obey { .. }),
             "{marching:?}"
         );
+    }
+
+    /// **What a squad sent across a field full of slimes is expected to do.**
+    /// It was not doing it: an order is worth 0.60 at thirty metres and a
+    /// fight is worth 0.60 at four and a half, so a marching Mario swung only
+    /// at what was already close enough to hit it and squeezed round
+    /// everything else -- the slime standing squarely in the gateway included.
+    ///
+    /// Scoring the fight by [`detour`] rather than by distance is the whole of
+    /// the fix, and the three cases here are the three the subtraction has to
+    /// tell apart.
+    #[test]
+    fn a_marching_mario_fights_what_stands_in_its_way_and_walks_past_what_does_not() {
+        // Dead on the line, half way along. Walking at it is walking to the
+        // spot, so it costs nothing and is dealt with -- at eighteen metres,
+        // which is well past anything raw distance would have stopped for.
+        let ahead = Options {
+            ordered: Some(spot(40.0)),
+            quarry: Some(spot(18.0)),
+            engage: 14.0,
+            ..Options::default()
+        };
+        assert!(matches!(choose(&ahead), Goal::Fight { .. }), "{ahead:?}");
+        // The same creature, the same distance off, square to the march. Now
+        // it is twenty-two metres of walking that the order does not want, and
+        // the order wins.
+        let aside = Options {
+            ordered: Some(spot(40.0)),
+            quarry: Some(beside(0.0, 18.0)),
+            engage: 14.0,
+            ..Options::default()
+        };
+        assert!(matches!(choose(&aside), Goal::Obey { .. }), "{aside:?}");
+        // And a grudge it is walking away from costs the walk twice, which is
+        // what keeps the permanent aggro every Mario carries from turning the
+        // squad round. Six metres behind, and it does not go back for it.
+        let behind = Options {
+            ordered: Some(spot(40.0)),
+            quarry: Some(beside(-6.0, 0.0)),
+            engage: 14.0,
+            ..Options::default()
+        };
+        assert!(matches!(choose(&behind), Goal::Obey { .. }), "{behind:?}");
+    }
+
+    /// A corridor, without a corridor width anywhere in the code: how far to
+    /// one side counts as "on the way" falls out of how long the march is.
+    #[test]
+    fn how_far_off_the_line_a_mario_will_step_grows_with_the_march() {
+        let past = |x: f32, z: f32| Options {
+            ordered: Some(spot(30.0)),
+            quarry: Some(beside(x, z)),
+            engage: 14.0,
+            ..Options::default()
+        };
+        // Five metres off a thirty-metre order is a metre and a half of extra
+        // walking. Worth it.
+        let near = past(15.0, 5.0);
+        assert!(matches!(choose(&near), Goal::Fight { .. }), "{near:?}");
+        // Fifteen metres off the same order is twelve. Not worth it.
+        let wide = past(15.0, 15.0);
+        assert!(matches!(choose(&wide), Goal::Obey { .. }), "{wide:?}");
+    }
+
+    /// The detour is only charged against an order, because only an order is
+    /// somewhere the Mario minds about being. A Mario holding a post scores a
+    /// fight at what it is: how far off it is.
+    #[test]
+    fn a_mario_with_no_order_scores_a_fight_at_its_own_range() {
+        // Off to one side of nothing at all, so there is no line to be off.
+        // Four metres from a Mario standing on its post is a fight.
+        let posted = Options {
+            holding: Some(spot(0.0)),
+            quarry: Some(beside(0.0, 4.0)),
+            engage: 14.0,
+            ..Options::default()
+        };
+        assert!(matches!(choose(&posted), Goal::Fight { .. }), "{posted:?}");
     }
 
     /// Holding a spot is worth more than nothing, which is what brings a Mario
@@ -950,6 +1139,44 @@ mod tests {
         );
     }
 
+    /// **And the case that is not that one: a fight.** A kerb, a hummock or the
+    /// corner of a wall anywhere along the line makes
+    /// [`crate::flow::FlowField::clear`] say no, which over ten metres of lawn
+    /// it does more often than not -- and a quarter of a fight is under a
+    /// formation slot from three metres and under [`IDLE_APPEAL`] from fifteen.
+    /// So the squad stood about while things walked up to it, and the further
+    /// off the thing was the likelier that was.
+    #[test]
+    fn a_fight_is_not_talked_out_of_by_a_bump_in_the_lawn() {
+        let over_a_kerb = Option_ {
+            blocked: true,
+            ..spot(9.0)
+        };
+        let holding_formation = Options {
+            following: Some(spot(0.0)),
+            quarry: Some(over_a_kerb),
+            ..Options::default()
+        };
+        assert!(
+            matches!(choose(&holding_formation), Goal::Fight { .. }),
+            "it held formation while something walked up to it: {holding_formation:?}"
+        );
+        // Water still is a wall's worth of discouragement, because swimming a
+        // moat for a fight is a different sentence from walking round a rock.
+        let across_the_moat = Options {
+            following: Some(spot(0.0)),
+            quarry: Some(Option_ {
+                wet: true,
+                ..spot(9.0)
+            }),
+            ..Options::default()
+        };
+        assert!(
+            matches!(choose(&across_the_moat), Goal::Obey { .. }),
+            "it swam the moat for a slime: {across_the_moat:?}"
+        );
+    }
+
     #[test]
     fn water_is_a_cost_rather_than_a_wall() {
         // Given a dry ball and a wet one, the squad takes the dry one, even
@@ -1055,13 +1282,23 @@ mod tests {
         // Orders are deliberately outside the rule: the whistle is the player
         // speaking, and a squad that cannot be called off a slime is worse than
         // one that leaves a fight when told to.
+        //
+        // The slime is put square to the march rather than along it, and that
+        // is not incidental. Being *in* a fight is about how near the thing is
+        // and nothing else, so this is still a Mario with a slime inside sight
+        // -- but where the fight is decides whether the order outbids it, and
+        // one standing in the gateway is a fight the Mario should stop for.
+        // See [`detour`], and the marching cases above.
         let options = Options {
-            quarry: Some(spot(SIGHT - 1.0)),
+            quarry: Some(beside(0.0, SIGHT - 2.0)),
             ordered: Some(spot(20.0)),
             engage: SIGHT,
             ..Options::default()
         };
         assert!(matches!(choose(&options), Goal::Obey { .. }), "{options:?}");
+        // What the rule is actually about: fetching and delivering are struck
+        // off while it is engaged, and the order is not.
+        assert!(engaged(&options), "{options:?}");
     }
 
     #[test]

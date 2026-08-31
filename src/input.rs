@@ -73,6 +73,24 @@ pub struct InputState {
     /// a mast on it. See [`crate::pylon::place`].
     pub pylon: bool,
     pub pylon_released: bool,
+    /// The gate button, held, and its release. The same two-field shape again,
+    /// because it is the same gesture: a hold opens a site on the ground and
+    /// the release stands a portal on it. See [`crate::portal::place`].
+    ///
+    /// **Reached only through the Tab picker**, unlike the three above it,
+    /// which each kept the direct key they were bound to before the picker
+    /// existed. Those are shortcuts somebody has already learnt; a new one
+    /// would be a fourth letter to remember on a keyboard and nothing at all on
+    /// a pad, which is the whole thing [`crate::action`] was written to stop.
+    pub portal: bool,
+    pub portal_released: bool,
+    /// The same again for the other shape a gate can be built as, and a field
+    /// of its own rather than a flag beside it because the picker only knows
+    /// how to point the action button at *a pair of flags*: a mode is one entry
+    /// in [`crate::action::aim`]'s table and nothing more. See
+    /// [`crate::portal::Shape`].
+    pub orb: bool,
+    pub orb_released: bool,
     /// The resource button, held, and its release. The same two-field shape
     /// `squad` has, because it is the same gesture: a hold opens a circle on
     /// the ground and the release calls everything loose inside it into Luna's
@@ -249,6 +267,12 @@ pub fn gather(
     state.grab = false;
     state.build = build;
     state.pylon = pylon;
+    // Cleared rather than written, for `squad` and `grab`'s reason: neither
+    // shape of gate has a direct key at all, so the only thing that ever sets
+    // these is `action::route`, which runs between this and anything that reads
+    // them.
+    state.portal = false;
+    state.orb = false;
     // Edges accumulate rather than overwrite: a press seen on a frame whose
     // consumer has not run yet must survive into the frame that consumes it.
     state.jump |= jump;

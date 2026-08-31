@@ -205,6 +205,20 @@ const ROLL_RATE: f32 = 1000.0 * std::f32::consts::PI / 180.0;
 /// a probe that may or may not find it depending on the last bit of the float.
 const CRAWL_SKIN: f32 = 0.02;
 
+/// How far from level a surface has to be before a crawler treats what is
+/// behind it as something to climb over rather than walk along.
+///
+/// Half, which is a surface tilted more than sixty degrees. The number is not
+/// measured off anything; what it has to do is separate two cases that are
+/// nowhere near each other. A floor, a ramp and a hillside are all things a bug
+/// walks *along*, and the steepest of those the level will call ground at all
+/// is [`crate::level::GROUND_NORMAL_Y`] -- 0.7, or about forty-five degrees --
+/// because anything sheerer is a wall that [`walk`] pushes bodies out of. A
+/// wall and a ceiling are things a bug goes *over*, and their normals lie at
+/// nought and minus one. So anywhere in that gap does, and the middle of it is
+/// the least interesting place to put it. See [`crawl_towards`].
+const CLIMB_STEEP: f32 = 0.5;
+
 /// The enemies the port places. Each is resolved against the player as an
 /// upright cylinder, the way the original does: a radius in the horizontal
 /// plane and a height above its feet.
@@ -550,8 +564,16 @@ impl Kind {
 /// without a tier -- including the ones tests build by hand. A missing
 /// `Detail` would not be a compile error, it would be an enemy silently left
 /// out of every query that decides how much simulation it gets.
+///
+/// [`crate::path::Route`] rides along for the same reason and on the same
+/// terms [`crate::squad::Ally`] requires one: a body that can be told to chase
+/// something across a castle is a body that needs telling the way. An empty
+/// route costs a vector that never allocates and means "walk straight at it",
+/// which is what every enemy did before there was any of this -- and is what a
+/// [`Crawler`] does for ever, because a body that can walk up the wall in front
+/// of it does not want telling the way round. See [`navigate`].
 #[derive(Component)]
-#[require(Detail)]
+#[require(Detail, crate::path::Route)]
 pub struct Enemy {
     /// What it is, which is also its collision cylinder and its model: kept as
     /// the one fact rather than as a copy of each thing derived from it.
@@ -1261,6 +1283,10 @@ type Hunters<'w, 's> = Query<
         &'static Transform,
         &'static Side,
         &'static mut Aggro,
+        // What a Mario has decided to do with itself, which is the difference
+        // between one coming to fight and one walking past on an errand. Absent
+        // on everything that is not a Mario. See [`GameTuning::threat_focus`].
+        Option<&'static crate::squad::Ally>,
         Option<&'static Detail>,
     ),
 >;
@@ -1385,6 +1411,9 @@ pub struct Noticing {
     nearby: Vec<usize>,
     shouting: Vec<usize>,
     decided: Vec<Hunt>,
+    /// Who is already coming for whom, sorted by the one doing the coming. See
+    /// [`GameTuning::threat_focus`], which is what it is read for.
+    engaged: Vec<(Entity, Entity)>,
     /// Which slice of the field appraises on this tick. See [`ATTENTION_SPAN`].
     tick: u32,
 }
@@ -1435,6 +1464,7 @@ pub fn alert(
         nearby,
         shouting,
         decided,
+        engaged,
         tick,
     } = &mut *scratch;
     *tick = tick.wrapping_add(1);
@@ -1458,8 +1488,8 @@ pub fn alert(
     hunting.extend(
         hunters
             .iter()
-            .filter(|(_, _, _, _, detail)| detailed(*detail))
-            .map(|(entity, transform, side, aggro, _)| {
+            .filter(|(_, _, _, _, _, detail)| detailed(*detail))
+            .map(|(entity, transform, side, aggro, _, _)| {
                 // Something no longer in the world is no longer anything. This
                 // is how a Mario that has just flattened a slime goes looking
                 // for the next one rather than standing over the spot.
@@ -1488,6 +1518,43 @@ pub fn alert(
             }),
     );
 
+    // Who is already coming for whom. Built from the same snapshot the scores
+    // are argued over, so it is what every hunter had decided at the top of the
+    // tick rather than a half-updated picture of what they are deciding now.
+    //
+    // **A target is not an intention.** Aggro is never given up -- see this
+    // function's own preamble -- so nearly every Mario on the field has
+    // something filed against it, including the ones fetching balls at the
+    // other end of the lawn. What separates "coming for you" from "has you
+    // written down" is the plan, and only a Mario has one: an enemy walking
+    // towards its target is doing the only thing it does.
+    engaged.clear();
+    engaged.extend(
+        hunters
+            .iter()
+            .filter(|(_, _, _, _, _, detail)| detailed(*detail))
+            .filter_map(|(entity, _, _, aggro, ally, _)| {
+                let target = aggro.target?;
+                let coming =
+                    ally.is_none_or(|ally| matches!(ally.plan, crate::goap::Goal::Fight { .. }));
+                coming.then_some((entity, target))
+            }),
+    );
+    engaged.sort_unstable_by_key(|(who, _)| *who);
+    // Whether `who` is on its way to fight `me`, which is the one question
+    // [`GameTuning::threat_focus`] is asked about. Sorted and searched for
+    // [`Hunt`]'s reason: built once a tick and read once per candidate, where a
+    // `HashMap` would be a SipHash of every key on both sides.
+    let coming_for = |who: Entity, me: Entity| {
+        engaged
+            .binary_search_by_key(&who, |(who, _)| *who)
+            .is_ok_and(|found| engaged[found].1 == me)
+    };
+    // Never below one: a creature that preferred what was *ignoring* it would
+    // be the same bug this fixes, pointing the other way. The slider stops
+    // there too, and this is the guard for a saved file that does not.
+    let focus = tuning.threat_focus.max(1.0);
+
     let sight = tuning.enemy_sight;
     let earshot = tuning.enemy_alert;
     seen.fill(crowd.iter().map(|(_, at, _)| *at), sight);
@@ -1499,6 +1566,7 @@ pub fn alert(
     // what it sees, and only on its own tick -- see [`ATTENTION_SPAN`].
     for (index, hunt) in hunting.iter_mut().enumerate() {
         let Hunt {
+            entity,
             at,
             side,
             target,
@@ -1508,33 +1576,57 @@ pub fn alert(
         if !appraising {
             continue;
         }
+        // What something at `range` is worth per look, and the whole of
+        // [`GameTuning::threat_focus`]: something with its fists up is worth
+        // several of something the same distance off that is walking past.
+        // Applied to the fight it is already in as well as to what it can see,
+        // and both halves are load-bearing -- the boost that pulls a creature
+        // onto the Mario punching it is the same boost that has to keep it
+        // there once it has turned, or it turns straight back on the next look.
+        let pressing = |who: Entity, range: f32| {
+            tuning.threat_near
+                * (1.0 - range / sight)
+                * if coming_for(who, entity) { focus } else { 1.0 }
+        };
         // The fight it is already in keeps earning while it is still in front
         // of it. Without this the score is only ever "who is nearest" and the
         // margin buys a delay rather than a decision: something that already
         // has a creature's attention *and* is standing on it has to be harder
         // to pull it away from than something that has only the second.
-        if let Some((_, held, _, _, _, _)) = target.and_then(|held| everyone.get(held).ok()) {
-            let range = at.distance(held.translation);
+        if let Some((held, held_at)) = target.and_then(|held| {
+            everyone
+                .get(held)
+                .ok()
+                .map(|(_, held_at, _, _, _, _)| (held, held_at))
+        }) {
+            let range = at.distance(held_at.translation);
             if range < sight {
-                hunt.commitment += tuning.threat_near * (1.0 - range / sight);
+                hunt.commitment += pressing(held, range);
             }
         }
         seen.near(at, nearby);
+        // **Weighed rather than measured.** Taking the nearest outright is what
+        // sends a creature past the Mario squarely in front of it after
+        // something a metre closer that has not noticed it -- and, once it is
+        // chasing that, past every Mario it walks through on the way. The
+        // nearest is still what wins between two things that are equally
+        // interested in it, because at equal weight the score is the range.
         let quarry = nearby
             .iter()
             .map(|&other| crowd[other])
             .filter(|(_, _, theirs)| *theirs != side)
-            .map(|(entity, theirs, _)| (entity, at.distance_squared(theirs)))
-            .filter(|(_, range)| *range < sight * sight)
-            .min_by(|(_, a), (_, b)| a.total_cmp(b));
-        let Some((quarry, range)) = quarry else {
+            .filter_map(|(other, theirs, _)| {
+                let range = at.distance(theirs);
+                (range < sight).then(|| (other, pressing(other, range)))
+            })
+            .max_by(|(_, a), (_, b)| a.total_cmp(b));
+        let Some((quarry, pressing)) = quarry else {
             continue;
         };
         // Already credited just above, as the fight it is in.
         if Some(quarry) == target {
             continue;
         }
-        let pressing = tuning.threat_near * (1.0 - range.sqrt() / sight);
         match target {
             None => {
                 hunt.seize(quarry, pressing);
@@ -1653,7 +1745,7 @@ pub fn alert(
             .ok()
             .map(|found| decided[found])
     };
-    for (entity, transform, _, mut aggro, detail) in &mut hunters {
+    for (entity, transform, _, mut aggro, _, detail) in &mut hunters {
         // A crowd-tier enemy keeps whatever it was chasing when it was last in
         // the near tier, and is not given a new target here. Losing one by
         // walking away would break the rule that aggro is never given up.
@@ -2150,9 +2242,145 @@ type WalkingEnemies<'w, 's> = Query<
         &'static mut Wander,
         Option<&'static mut Crawler>,
         &'static Detail,
+        // The way to whatever it is chasing, when the straight line will not
+        // do. Written by [`navigate`], filled in by [`crate::path::plan`], and
+        // empty on open ground -- which is most enemies most of the time. See
+        // [`navigate`].
+        &'static mut crate::path::Route,
     ),
     (With<Enemy>, Without<Player>, Without<crate::pipe::Launched>),
 >;
+
+/// How much a chasing enemy minds deep water on the way, against the console's
+/// `path_toll`.
+///
+/// The same scale [`crate::goap::Goal::caution`] puts on a Mario's jobs, and
+/// set between an order and an errand: a chase goes round the pond when there
+/// is a way round and through it when there is not. Nothing here is zero, so a
+/// brood takes the bridge when the bridge is there; nothing here is infinite,
+/// so a moat is not a wall an enemy can be parked behind for ever.
+const CHASE_CAUTION: f32 = 0.9;
+
+/// The spot a chasing enemy is actually making for.
+///
+/// Its own place around the target rather than the target itself, so a brood
+/// arrives *around* what it is after instead of inside it -- see
+/// [`Quirk::stand_off`], and `aggro.room`, which is how wide the thing being
+/// chased is.
+///
+/// One function rather than the line written out at each site, because three
+/// places want this answer -- the walk step, [`navigate`], and the overlay that
+/// draws what the walk step is doing -- and a debug view that draws a different
+/// spot from the one the body is walking to is worse than no debug view.
+fn chase_goal(enemy: &Enemy, aggro: &Aggro, quirk: &Quirk) -> Vec3 {
+    aggro.at + quirk.stand_off(aggro.room + enemy.kind.body().0)
+}
+
+/// Everything [`navigate`] needs to say where one enemy is trying to get to.
+///
+/// `Crawler` is optional because it is what an ant has and a slime has not, and
+/// the whole of the rule below is that the two want different answers.
+type Chasers<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static Enemy,
+        &'static Aggro,
+        &'static Detail,
+        &'static Quirk,
+        Option<&'static Crawler>,
+        &'static mut crate::path::Route,
+    ),
+>;
+
+/// Tells the pathfinder where every chasing enemy is trying to get to.
+///
+/// **The enemies' half of [`crate::path`], and it is a decider rather than a
+/// search.** It writes a `want` and nothing else; [`crate::path::plan`] does
+/// the work, for the enemies and the Marios together, out of one budget.
+///
+/// The reason it is worth having at all is that the two tiers were not equally
+/// well served. A [`Detail::Crowd`] enemy already navigates globally -- it
+/// walks down [`crate::flow::FlowField`]'s own gradient, which is a flood from
+/// the player over the whole grid, so it comes round the moat and through the
+/// gate without ever being told to. A [`Detail::Full`] one walked *straight at*
+/// what it had noticed, with a stride and a half of local steering to get it
+/// out of trouble. So the near tier -- the enemies actually on screen, the only
+/// ones the player can watch -- was the half that got stuck on walls, filed
+/// along fences, and stood pressing into the outside of the courtyard it had
+/// last seen a Mario in. Better simulation, worse navigation.
+///
+/// The flood cannot fix that, and it is worth saying why rather than reaching
+/// for it: it is flooded from *the player*, so it answers exactly one question
+/// -- which way is he -- and an enemy fighting the squad is chasing a Mario
+/// somewhere else entirely. A route is per journey and this crowd makes a lot
+/// of journeys, which is what the grouping in [`crate::path::plan`] is for: a
+/// brood coming out of one pipe at one Mario is one search between all of them,
+/// bucketed on where they are and where they are going.
+///
+/// Only the near tier is offered one. The far crowd has the flood, which is
+/// better than a route for the question it can answer and costs one array read;
+/// putting a thousand of them into the search queue would spend the whole
+/// budget on bodies the size of a thumbnail.
+///
+/// **What it costs, measured rather than argued.** Two hundred near-tier
+/// enemies scattered over the castle and all chasing the player -- the worst
+/// arrangement for the sharing, since scattered bodies are scattered journeys
+/// -- run this and [`crate::path::plan`] together in 0.29 ms a tick on average
+/// and 0.56 ms at worst, against a fixed step of 33 ms. Eight of the two
+/// hundred come due on a given tick, because a route is trusted for
+/// `path_refresh` seconds, and four of those are served, because `path_budget`
+/// says four; the rest walk last tick's route and come round next tick. That
+/// is the same shape as everything else in the crowd tier: the bill is a
+/// console row, not a body count.
+///
+/// # Who is told the way is decided by what the body can walk on
+///
+/// **A [`Crawler`] is never routed, and that is navigation rather than an
+/// omission.** [`crate::flow::FlowField`] is a floor: one ground height a cell,
+/// and an edge it refuses when the step between two cells is taller than
+/// [`crate::flow::CLIMB`]. Every question it can answer is a question about
+/// getting *round* things. An ant does not want the answer to that question. It
+/// is stuck to whatever it is touching -- see [`crawl_towards`], where walking
+/// into a wall *is* climbing it -- so the wall in front of it is not an
+/// obstacle between it and the Mario, it is the next bit of floor. Routed on
+/// the grid, an ant that used to go over the courtyard wall walks the long way
+/// round to the gate instead, and an ant part way up a wall is handed a corner
+/// on the ground and comes back down for it. Both are worse than the straight
+/// line, and the straight line is already right: **what is in the way is the
+/// way.**
+///
+/// So the rule is not "ants are a special case", it is that a route answers a
+/// question only some bodies are asking. A flier will land here as the third
+/// case and for the same reason -- it goes over the top of what a walker goes
+/// round -- and what it wants is height rather than a floor plan, which is
+/// again not a thing this grid holds. Both belong in this one `if`.
+pub fn navigate(tuning: Res<GameTuning>, mut enemies: Chasers) {
+    for (enemy, aggro, detail, quirk, crawler, mut route) in &mut enemies {
+        // Nothing to route to, too far off to be worth routing, or a body that
+        // walks on the walls and is better off without one. See the note above.
+        if *detail != Detail::Full || aggro.target.is_none() || crawler.is_some() {
+            // Asked before it is told, so a field of a thousand ambling
+            // enemies is not marked changed every tick for having nothing to
+            // do. See [`crate::path::Route::resting`].
+            if !route.resting() {
+                route.clear();
+            }
+            continue;
+        }
+        // The same point the walk step will make for. Routing to anywhere else
+        // would hand it a last corner it is not allowed to stand on and leave
+        // [`spread`] arguing with the route about where it goes.
+        let goal = chase_goal(enemy, aggro, quirk);
+        route.want(
+            Vec2::new(goal.x, goal.z),
+            crate::flow::Tolls {
+                wet: tuning.path_toll * CHASE_CAUTION,
+                hug: tuning.path_clearance,
+            },
+        );
+    }
+}
 
 pub fn update(
     fixed_time: Res<Time<Fixed>>,
@@ -2181,6 +2409,7 @@ pub fn update(
             mut wander,
             crawler,
             detail,
+            mut route,
         )| {
             let distance_squared = player.distance_squared(transform.translation);
             // Hysteresis, and it is load-bearing rather than tidy. Crossing
@@ -2243,9 +2472,16 @@ pub fn update(
             }
             let (goal, speed) = match aggro.target {
                 Some(_) => (
-                    // Outside both bodies, not a metre from the target's
-                    // middle. An ant is 2.5 m of radius on its own.
-                    Some(aggro.at + quirk.stand_off(aggro.room + enemy.kind.body().0)),
+                    // The next corner of the way there, when the straight line
+                    // would not have done and the pathfinder has been round to
+                    // this one. Empty on open ground, which is most enemies
+                    // most of the time -- and then this is the standoff point
+                    // it always walked at: outside both bodies, not a metre
+                    // from the target's middle. An ant is 2.5 m of radius on
+                    // its own. See [`navigate`].
+                    route
+                        .leg(&field, transform.translation, tuning.path_spread)
+                        .or_else(|| Some(chase_goal(enemy, &aggro, quirk))),
                     tuning.enemy_speed,
                 ),
                 None => (wander.goal(transform.translation, dt), WANDER_SPEED),
@@ -2651,9 +2887,44 @@ fn crawl_towards(
     lift: f32,
 ) -> Vec3 {
     let contact = position - crawler.up * lift;
-    // The part of the way to the goal it could actually walk. Behind a wall,
-    // that is the wall -- and a bug that walks into a wall climbs it.
-    let wanted = tangent(goal - contact, crawler.up);
+    let toward = goal - contact;
+    // **What to head for, which once it is on a wall is not where the goal
+    // is.** The part of the way to the goal that lies in the surface is the
+    // right answer on any floor and the wrong one on a wall, and getting that
+    // wrong is the whole of "ants will not go over anything".
+    //
+    // Work the case through. A bug on the lawn walks into the courtyard wall
+    // and climbs it, because [`crawl`] hands it the face it ran into and
+    // [`lean`] carries its heading round the corner -- so far, so right. It is
+    // now on a vertical face with the Mario it is after standing on the ground
+    // on the other side. Project that direction into the face and what comes
+    // out points *down*: the only part of "over there and below me" the wall
+    // can hold is the below. So it turns round inside a second -- [`TURN_RATE`]
+    // is three radians of it -- walks back down the metre it climbed, reaches
+    // the bottom, walks into the wall, and climbs again. Watched, that is an
+    // ant bobbing at the foot of a wall for the rest of the session, and every
+    // part of it is the projection doing exactly what it says.
+    //
+    // The missing sentence is that **a wall between a bug and what it wants is
+    // not something to walk along, it is something to go over, and the way
+    // over is up.** Two conditions, and both are needed:
+    //
+    //   * the surface is *steep* -- [`CLIMB_STEEP`] -- so this cannot fire on a
+    //     lawn, where the goal is a hair above or below the plane and the sign
+    //     of that is noise;
+    //   * and the goal is *behind* it, on the far side of the face it is stuck
+    //     to. On a slope with the goal at the foot of it that is false, because
+    //     a slope's normal leans out over its own foot, so a bug walks down a
+    //     hill rather than climbing it.
+    //
+    // What it hands back then is straight up the face, and everything after is
+    // machinery that already worked: over the lip, across the top, and down the
+    // far side -- where the goal is in front of the surface again and this
+    // stops firing on its own.
+    let wanted = match climbing(crawler.up, toward) {
+        true => tangent(Vec3::Y, crawler.up),
+        false => tangent(toward, crawler.up),
+    };
     crawler.heading = steer(crawler.heading, wanted, crawler.up, TURN_RATE * dt);
     match crawl(level, contact, crawler.up, crawler.heading * speed * dt) {
         Some((moved, found)) => {
@@ -2695,6 +2966,16 @@ fn crawl_towards(
             settle(level, drifted, dt) + crawler.up * lift
         }
     }
+}
+
+/// Whether a crawler is going *over* what is between it and where it wants to
+/// be, rather than walking along it.
+///
+/// The two conditions [`crawl_towards`] sets out, as one question, so that the
+/// walk step and the overlay that draws it cannot come to different answers.
+/// See [`CLIMB_STEEP`] for the first and [`draw_crawlers`] for who else asks.
+fn climbing(up: Vec3, toward: Vec3) -> bool {
+    up.y.abs() < CLIMB_STEEP && toward.dot(up) < 0.0
 }
 
 /// Rolls `up` towards `wanted` by at most `most` radians, and is the whole of
@@ -2825,6 +3106,78 @@ fn crawl(level: &LevelData, position: Vec3, up: Vec3, step: Vec3) -> Option<(Vec
     }
     None
 }
+
+/// Draws what a crawler is doing, on the same `path_debug` switch the routes
+/// are on.
+///
+/// **It is here because the route overlay draws nothing for an ant, and cannot
+/// be made to.** [`crate::path::draw`] shows a body's corners and a cross on
+/// the spot it was told to be, and a crawler has neither: it is deliberately
+/// never routed -- see [`navigate`] -- so at `path_debug 1` an ant is a blank
+/// where a slime is a green line, and a blank looks exactly like a bug.
+///
+/// What an ant's navigation actually consists of is three things, so they are
+/// the three things drawn:
+///
+///   * **which way is up for it**, a stalk out of its back along
+///     [`Crawler::up`]. This is the whole of "it is on the wall": upright on the
+///     lawn, flat out sideways half way up the courtyard, pointing at the floor
+///     once it is on the ceiling. Watch it swing over two or three frames at
+///     every corner, which is [`ROLL_RATE`] doing its job.
+///   * **which way it is walking**, a spur along [`Crawler::heading`], which
+///     lies in that same surface. On a wall this is the one to watch: it is
+///     what gets carried round the corner rather than recomputed, and an ant
+///     that will not climb is an ant whose heading keeps being turned back
+///     downwards.
+///   * **what it is after**, a line to [`chase_goal`] with a cross on it. The
+///     line goes through the wall, and that is the point -- it is the straight
+///     line the ant is not able to walk, and the gap between it and the heading
+///     is the detour the climb is making.
+///
+/// **The colour is the rule.** Cyan while it is walking along the surface it is
+/// on, magenta while [`climbing`] says the thing it wants is behind that
+/// surface and the way there is up. Turning magenta at the foot of a wall and
+/// back to cyan on the far side of it is the whole behaviour in two colour
+/// changes; an ant that stays cyan against a wall is one this rule is not
+/// firing for.
+///
+/// Immediate mode and per frame, exactly as [`crate::path::draw`] is, so it
+/// costs nothing while `path_debug` is nought.
+pub fn draw_crawlers(
+    tuning: Res<GameTuning>,
+    mut gizmos: Gizmos,
+    crawlers: Query<(&Enemy, &Transform, &Crawler, &Aggro, &Quirk)>,
+) {
+    if tuning.path_debug.round() as u32 == 0 {
+        return;
+    }
+    for (enemy, at, crawler, aggro, quirk) in &crawlers {
+        let contact = at.translation - crawler.up * enemy.kind.lift();
+        // Nothing to chase is a bug ambling, and the wander goal is not a fact
+        // about surfaces. The stalk and the spur are still worth drawing: which
+        // way is up for an idle ant is the thing this view is for.
+        let goal = aggro.target.map(|_| chase_goal(enemy, aggro, quirk));
+        let colour = match goal.is_some_and(|goal| climbing(crawler.up, goal - contact)) {
+            true => Color::srgb(1.0, 0.3, 0.9),
+            false => Color::srgb(0.25, 0.9, 1.0),
+        };
+        // Off the surface along its own up rather than along the world's, or
+        // the marks on a bug under a ledge are drawn inside the ledge.
+        gizmos.line(contact, contact + crawler.up * CRAWL_DRAW, colour);
+        gizmos.line(contact, contact + crawler.heading * CRAWL_DRAW, colour);
+        if let Some(goal) = goal {
+            gizmos.line(contact + crawler.up * CRAWL_SKIN, goal, colour);
+            gizmos.cross(goal, 0.7, colour);
+        }
+    }
+}
+
+/// How long the up stalk and the heading spur are drawn, in metres.
+///
+/// A metre and a half: long enough to read the angle across a courtyard,
+/// short enough that a wall covered in ants is still a wall rather than a
+/// hedgehog.
+const CRAWL_DRAW: f32 = 1.5;
 
 /// Resolves the player against every enemy once a tick: a swing defeats what
 /// is in front of him, coming down on one stomps it, and touching one any
@@ -4873,6 +5226,85 @@ mod tests {
         assert_eq!(world.get::<Ally>(mario).unwrap().swing_left, 0.0);
     }
 
+    /// **An enemy goes for whoever is coming for it, not for whoever is
+    /// nearest.**
+    ///
+    /// The report this is here for is one complaint from both ends: Marios
+    /// cannot land a punch on anything that is not already standing on them,
+    /// and enemies walk straight through the Mario fighting them after
+    /// somebody who has not so much as looked up. Both are the same missing
+    /// fact -- that a creature with its fists up is a different thing from one
+    /// walking past on an errand, and nothing in a score made of distances can
+    /// tell them apart. See [`GameTuning::threat_focus`].
+    #[test]
+    fn an_enemy_turns_on_the_mario_fighting_it_rather_than_the_one_walking_past() {
+        let mut world = World::new();
+        world.init_resource::<Threats>();
+        world.insert_resource(GameTuning::default());
+        // One that has chosen the fight, further off, and one on an errand,
+        // nearer. Without the preference the nearer one wins outright, which is
+        // what "chasing after units that have a different goal" looks like.
+        let mut mario = |at: f32, plan: crate::goap::Goal| {
+            let mut ally = Ally::new(Vec3::new(at, 0., 0.), 0.0);
+            ally.plan = plan;
+            world
+                .spawn((
+                    ally,
+                    Side::Friendly,
+                    Aggro::default(),
+                    Transform::from_xyz(at, 0., 0.),
+                ))
+                .id()
+        };
+        let fetching = mario(
+            5.0,
+            crate::goap::Goal::Fetch {
+                ball: Entity::from_raw_u32(9).unwrap(),
+                at: Vec2::ZERO,
+                arrive: 1.0,
+            },
+        );
+        let fighting = mario(
+            1.0,
+            crate::goap::Goal::Fight {
+                at: Vec2::new(6., 0.),
+                arrive: 1.0,
+            },
+        );
+        let slime = world
+            .spawn((
+                Enemy {
+                    kind: Kind::Slime,
+                    animation: Handle::default(),
+                },
+                Side::Hostile,
+                Aggro::default(),
+                Transform::from_xyz(6., 0., 0.),
+            ))
+            .id();
+        // The one that has chosen the fight is coming for this slime, which is
+        // what the plan above says and what `alert` would have written down on
+        // the tick it decided.
+        world.get_mut::<Aggro>(fighting).unwrap().target = Some(slime);
+        world.run_system_once(alert).expect("alert could not run");
+        assert_eq!(
+            world.get::<Aggro>(slime).unwrap().target,
+            Some(fighting),
+            "it set off after the Mario that had not noticed it"
+        );
+        // And it stays turned. The boost is on the fight it is in as well as on
+        // what it can see, or the nearer Mario takes it straight back off it.
+        for _ in 0..ATTENTION_SPAN * 20 {
+            world.run_system_once(alert).expect("alert could not run");
+        }
+        assert_eq!(
+            world.get::<Aggro>(slime).unwrap().target,
+            Some(fighting),
+            "the Mario walking past pulled it off the one hitting it"
+        );
+        assert_ne!(fetching, fighting);
+    }
+
     /// Both sides notice each other, off the one rule. The Mario has a slime
     /// to hit and the slime has a Mario to chase, out of a single pass.
     #[test]
@@ -5622,6 +6054,562 @@ mod tests {
                 .is_none_or(|kids| kids.is_empty()),
             "the far enemy kept the skeleton the model spawned, so the next one \
              it is given will be its second"
+        );
+    }
+
+    /// A lawn with a wall across the middle of it and one gate in the wall.
+    ///
+    /// The wall is a plain vertical quad, which a drop from the sky goes
+    /// straight past -- so both sides survey as walkable ground at nought and
+    /// what stops anything crossing is the fence check, a horizontal cast
+    /// between neighbouring cell centres. That is the same thing the castle's
+    /// railings are to the grid, which is the case this stands in for.
+    fn a_walled_lawn() -> LevelData {
+        let points = vec![
+            Vec3::new(-30., 0., -30.),
+            Vec3::new(30., 0., -30.),
+            Vec3::new(30., 0., 30.),
+            Vec3::new(-30., 0., 30.),
+            // The left half of the wall, from the western edge to the gate.
+            Vec3::new(-30., 0., 0.),
+            Vec3::new(-3., 0., 0.),
+            Vec3::new(-3., 5., 0.),
+            Vec3::new(-30., 5., 0.),
+            // And the right half, from the gate to the eastern edge.
+            Vec3::new(3., 0., 0.),
+            Vec3::new(30., 0., 0.),
+            Vec3::new(30., 5., 0.),
+            Vec3::new(3., 5., 0.),
+        ];
+        LevelData::new(
+            points,
+            vec![
+                [0, 1, 2],
+                [0, 2, 3],
+                [4, 5, 6],
+                [4, 6, 7],
+                [8, 9, 10],
+                [8, 10, 11],
+            ],
+            Vec::new(),
+        )
+    }
+
+    /// One near-tier slime, chasing something on the far side of that wall.
+    ///
+    /// `routed` is the whole experiment: with it, [`navigate`] and
+    /// [`crate::path::plan`] run in the tick and the slime is told the way;
+    /// without it, nothing else about the world differs and it does what every
+    /// enemy in this game did before -- walks straight at what it noticed.
+    /// Answers the furthest it ever got across the wall.
+    fn chase_across_the_wall(routed: bool) -> f32 {
+        bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let mut world = World::new();
+        let level = a_walled_lawn();
+        world.insert_resource(GameTuning {
+            // So the walk is a few hundred ticks rather than a few thousand.
+            // Nothing being tested here is about how fast it gets there.
+            enemy_speed: 6.0,
+            ..GameTuning::default()
+        });
+        world.insert_resource(crate::flow::FlowField::new(&level));
+        world.insert_resource(level);
+        world.insert_resource(Time::<Fixed>::default());
+        world.init_resource::<crate::path::Pathing>();
+        let start = Vec3::new(-14.0, 0.0, -8.0);
+        let quarry = Vec3::new(-14.0, 0.0, 8.0);
+        // The player stands next to the slime rather than being what it is
+        // after, because the walk step measures how much simulation to give a
+        // body against how far off *he* is. What it is chasing is `Aggro::at`,
+        // which is across the wall -- and a chase is never given up on, so
+        // nothing has to keep refreshing it.
+        let luna = world
+            .spawn((Player, Transform::from_translation(start + Vec3::X * 2.0)))
+            .id();
+        let slime = world
+            .spawn((
+                Enemy {
+                    kind: Kind::Slime,
+                    animation: Handle::default(),
+                },
+                Transform::from_translation(start),
+                Visibility::Visible,
+                Side::Hostile,
+                Aggro {
+                    target: Some(luna),
+                    at: quarry,
+                    ..Aggro::default()
+                },
+                Quirk::new(0.0),
+                Wander::new(start, 0.0),
+                Detail::Full,
+            ))
+            .id();
+        let tell = world.register_system(navigate);
+        let route = world.register_system(crate::path::plan);
+        let walk = world.register_system(update);
+        let mut furthest = f32::NEG_INFINITY;
+        for _ in 0..600 {
+            if routed {
+                world.run_system(tell).expect("navigate could not run");
+                world.run_system(route).expect("path::plan could not run");
+            }
+            world.run_system(walk).expect("update could not run");
+            furthest = furthest.max(world.get::<Transform>(slime).unwrap().translation.z);
+        }
+        furthest
+    }
+
+    /// **What "enemies need the A* too" is asking for.** The far crowd has had
+    /// global navigation all along -- it walks down the flow field's own
+    /// gradient, which is a flood over the whole grid -- and the near tier, the
+    /// enemies actually on screen, had a stride and a half of local steering
+    /// and nothing else. So the ones the player can watch were the ones that
+    /// pressed into the wall in front of them for the rest of the session, and
+    /// the flood cannot help them: it is flooded from the player, and this
+    /// slime is after something else.
+    #[test]
+    fn a_chasing_enemy_takes_the_gate_rather_than_the_wall_in_front_of_it() {
+        let told = chase_across_the_wall(true);
+        assert!(
+            told > 1.0,
+            "it never got through the gate: furthest z {told}"
+        );
+        // And the same slime, in the same world, with nothing to go on but
+        // where the thing it is chasing is. It is a hundred ticks of walking
+        // from the gate and never finds it.
+        let alone = chase_across_the_wall(false);
+        assert!(
+            alone < 0.0,
+            "it crossed a wall nobody told it the way round: furthest z {alone}"
+        );
+    }
+
+    /// **Ten enemies going the same way are one search between them, and that
+    /// is what makes routing the near tier affordable at all.** A brood comes
+    /// out of one pipe at one Mario: same place, same destination, and by any
+    /// reasonable reading the same walk. [`crate::path::plan`] buckets on a
+    /// block of cells at each end and hands the bucket one route, so the cost
+    /// of a crowd chasing something is the cost of one body chasing it.
+    #[test]
+    fn a_brood_going_the_same_way_is_one_search_between_them() {
+        let mut world = World::new();
+        let level = a_walled_lawn();
+        world.insert_resource(GameTuning::default());
+        world.insert_resource(crate::flow::FlowField::new(&level));
+        world.insert_resource(level);
+        world.init_resource::<crate::path::Pathing>();
+        let start = Vec3::new(-14.0, 0.0, -8.0);
+        let quarry = Vec3::new(-14.0, 0.0, 8.0);
+        let luna = world
+            .spawn((Player, Transform::from_translation(start)))
+            .id();
+        for index in 0..10 {
+            let offset = crate::squad::slot(index, 0.25);
+            world.spawn((
+                Enemy {
+                    kind: Kind::Slime,
+                    animation: Handle::default(),
+                },
+                Transform::from_translation(start + Vec3::new(offset.x, 0.0, offset.y)),
+                Side::Hostile,
+                Aggro {
+                    target: Some(luna),
+                    at: quarry,
+                    ..Aggro::default()
+                },
+                // The same phase for all ten, so they want the same spot as
+                // well as coming from the same one. A brood with ten different
+                // standoff angles is ten destinations two metres apart, which
+                // is a fair test of the bucketing and a poor one of the claim.
+                Quirk::new(0.0),
+                Wander::new(start, 0.0),
+                Detail::Full,
+            ));
+        }
+        world
+            .run_system_once(navigate)
+            .expect("navigate could not run");
+        world
+            .run_system_once(crate::path::plan)
+            .expect("path::plan could not run");
+        let stats = world.resource::<crate::path::Pathing>();
+        assert_eq!(stats.queued, 10, "not every slime asked the way: {stats:?}");
+        assert_eq!(stats.direct, 0, "the wall was not in the way: {stats:?}");
+        // **Two rather than one, and the slack is honest rather than
+        // defensive.** The bucket is a block of cells and a huddle can sit
+        // across the line between two of them, so a brood is one journey or it
+        // is two depending on where the grid happens to fall -- which is a
+        // property of a fixed grid and not something worth aligning a test to.
+        // What is being claimed is that the cost of a crowd going one way is a
+        // small constant, and the number that would fail it is ten.
+        assert!(
+            stats.groups <= 2,
+            "one journey came out as several: {stats:?}"
+        );
+        assert!(
+            stats.searched <= 2,
+            "ten bodies cost a search each: {stats:?}"
+        );
+    }
+
+    /// The far crowd is not offered a route, and that is the other half of the
+    /// affordability argument.
+    ///
+    /// It is not going without: it has the flood, which answers "which way is
+    /// the player" for every cell of the grid at one array read and comes round
+    /// the moat and through the gate on its own. What it must not do is join
+    /// the search queue -- a thousand bodies the size of a thumbnail would
+    /// spend the whole of `path_budget` and leave none of it for the enemies
+    /// the player can actually see.
+    #[test]
+    fn the_far_crowd_asks_for_no_routes_at_all() {
+        let mut world = World::new();
+        let level = a_walled_lawn();
+        world.insert_resource(GameTuning::default());
+        world.insert_resource(crate::flow::FlowField::new(&level));
+        world.insert_resource(level);
+        world.init_resource::<crate::path::Pathing>();
+        let start = Vec3::new(-14.0, 0.0, -8.0);
+        let luna = world
+            .spawn((Player, Transform::from_translation(start)))
+            .id();
+        let chasing = |detail: Detail| {
+            (
+                Enemy {
+                    kind: Kind::Slime,
+                    animation: Handle::default(),
+                },
+                Transform::from_translation(start),
+                Side::Hostile,
+                Aggro {
+                    target: Some(luna),
+                    at: Vec3::new(-14.0, 0.0, 8.0),
+                    ..Aggro::default()
+                },
+                Quirk::new(0.0),
+                Wander::new(start, 0.0),
+                detail,
+            )
+        };
+        let far = world.spawn(chasing(Detail::Crowd)).id();
+        world
+            .run_system_once(navigate)
+            .expect("navigate could not run");
+        world
+            .run_system_once(crate::path::plan)
+            .expect("path::plan could not run");
+        assert_eq!(
+            world.resource::<crate::path::Pathing>().queued,
+            0,
+            "the far crowd is in the search queue"
+        );
+        // And the tier really is what decided that: the same slime, promoted,
+        // asks the way like anything else. Without this the test passes just as
+        // well against an enemy that never routes at all.
+        *world.get_mut::<Detail>(far).unwrap() = Detail::Full;
+        world
+            .run_system_once(navigate)
+            .expect("navigate could not run");
+        world
+            .run_system_once(crate::path::plan)
+            .expect("path::plan could not run");
+        assert_eq!(
+            world.resource::<crate::path::Pathing>().queued,
+            1,
+            "a near-tier enemy went unrouted"
+        );
+    }
+
+    /// The rule the climb turns on, and the three things it must not fire for.
+    ///
+    /// Written against [`climbing`] rather than against a walk, because this is
+    /// arithmetic over two vectors and the cases that matter are the ones a
+    /// staged walk would never happen to produce. It is also what
+    /// [`draw_crawlers`] colours by, so these are the four pictures the overlay
+    /// can show.
+    #[test]
+    fn a_bug_climbs_only_what_is_between_it_and_where_it_is_going() {
+        // On the lawn, with the Mario a stride away and a hair below it. The
+        // sign of that hair is noise and must decide nothing.
+        assert!(!climbing(Vec3::Y, Vec3::new(9.0, -0.2, 0.0)));
+        assert!(!climbing(Vec3::Y, Vec3::new(9.0, 0.2, 0.0)));
+        // On the near face of a wall, with the Mario on the far side of it and
+        // on the ground. This is the case the whole thing exists for: what the
+        // wall can hold of "over there and below me" is the below.
+        assert!(climbing(Vec3::NEG_Z, Vec3::new(0.0, -2.5, 9.0)));
+        // The far face of that same wall, on the way down. The goal is in
+        // front of the surface now, so the rule lets go on its own rather than
+        // needing to be told the climb is over.
+        assert!(!climbing(Vec3::Z, Vec3::new(0.0, -4.0, 7.0)));
+        // A steep hillside with the Mario at the foot of it. Its normal leans
+        // out over its own foot, which is what keeps a bug walking down a hill
+        // rather than climbing it -- and is why the steepness test alone would
+        // not do.
+        let slope = Vec3::new(0.0, 0.34, 0.94);
+        assert!(!climbing(slope, Vec3::new(0.0, -3.0, 3.0)));
+        // And a ceiling, which is not steep at all by this measure: a bug under
+        // one walks along it towards what it is after, exactly as it did.
+        assert!(!climbing(Vec3::NEG_Y, Vec3::new(9.0, -4.0, 0.0)));
+    }
+
+    /// The same lawn, with a solid slab across the whole width of it and no way
+    /// round at either end. Five metres tall, two thick, with a top to walk on.
+    ///
+    /// A wall rather than the fence [`a_walled_lawn`] uses, because what is
+    /// being watched here is a body going *over* one, and a zero-thickness quad
+    /// has no over: no top face to reach, and both of its sides are the same
+    /// triangle.
+    fn a_lawn_cut_in_two_by_a_wall(gate: Option<(f32, f32)>) -> LevelData {
+        let mut points = vec![
+            Vec3::new(-30., 0., -30.),
+            Vec3::new(30., 0., -30.),
+            Vec3::new(30., 0., 30.),
+            Vec3::new(-30., 0., 30.),
+        ];
+        let mut faces: Vec<[u32; 3]> = vec![[0, 1, 2], [0, 2, 3]];
+        // One span of wall, or two with a hole between them.
+        let spans = match gate {
+            None => vec![(-30.0_f32, 30.0_f32)],
+            Some((from, to)) => vec![(-30.0, from), (to, 30.0)],
+        };
+        for (from, to) in spans {
+            let base = points.len() as u32;
+            points.extend([
+                // The near face, at z = -1, anticlockwise from its bottom left.
+                Vec3::new(from, 0., -1.),
+                Vec3::new(to, 0., -1.),
+                Vec3::new(to, 5., -1.),
+                Vec3::new(from, 5., -1.),
+                // And the far face, at z = 1, the same way round.
+                Vec3::new(from, 0., 1.),
+                Vec3::new(to, 0., 1.),
+                Vec3::new(to, 5., 1.),
+                Vec3::new(from, 5., 1.),
+            ]);
+            // Winding is not worth getting right: `surface_hit` turns every
+            // normal it answers with to face whatever asked, so a triangle here
+            // is a solid surface from both sides however it is wound.
+            let mut quad = |a: u32, b: u32, c: u32, d: u32| {
+                faces.push([base + a, base + b, base + c]);
+                faces.push([base + a, base + c, base + d]);
+            };
+            quad(0, 1, 2, 3);
+            quad(4, 5, 6, 7);
+            // And the top between them, which is what makes this a wall with an
+            // over rather than a fence.
+            quad(3, 2, 6, 7);
+        }
+        LevelData::new(points, faces, Vec::new())
+    }
+
+    /// One enemy, chasing something on the far side of that wall for twenty
+    /// seconds. Answers how far across it ever got and how high it ever climbed.
+    ///
+    /// `crawling` is the only difference between the two runs, and it is the
+    /// difference between the two kinds: a [`Crawler`] is what [`spawn`] gives
+    /// an ant and withholds from a slime.
+    fn chase_over_the_wall(crawling: bool, gate: Option<(f32, f32)>) -> (f32, f32) {
+        bevy::tasks::ComputeTaskPool::get_or_init(bevy::tasks::TaskPool::default);
+        let mut world = World::new();
+        let level = a_lawn_cut_in_two_by_a_wall(gate);
+        world.insert_resource(GameTuning {
+            // So the climb is a couple of hundred ticks rather than a couple of
+            // thousand. Nothing here is about how fast it gets over.
+            enemy_speed: 6.0,
+            ..GameTuning::default()
+        });
+        world.insert_resource(crate::flow::FlowField::new(&level));
+        world.insert_resource(level);
+        world.insert_resource(Time::<Fixed>::default());
+        world.init_resource::<crate::path::Pathing>();
+        // Well away from wherever the gate is, when there is one.
+        let start = Vec3::new(-20.0, 0.0, -8.0);
+        let quarry = Vec3::new(-20.0, 0.0, 8.0);
+        let luna = world
+            .spawn((Player, Transform::from_translation(start + Vec3::X * 2.0)))
+            .id();
+        let kind = match crawling {
+            true => Kind::Ant,
+            false => Kind::Slime,
+        };
+        let body = world
+            .spawn((
+                Enemy {
+                    kind,
+                    animation: Handle::default(),
+                },
+                Transform::from_translation(start),
+                Visibility::Visible,
+                Side::Hostile,
+                Aggro {
+                    target: Some(luna),
+                    at: quarry,
+                    ..Aggro::default()
+                },
+                Quirk::new(0.0),
+                Wander::new(start, 0.0),
+                Detail::Full,
+            ))
+            .id();
+        if crawling {
+            world.entity_mut(body).insert(Crawler::default());
+        }
+        let tell = world.register_system(navigate);
+        let route = world.register_system(crate::path::plan);
+        let walk = world.register_system(update);
+        let (mut across, mut high) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for _ in 0..600 {
+            world.run_system(tell).expect("navigate could not run");
+            world.run_system(route).expect("path::plan could not run");
+            world.run_system(walk).expect("update could not run");
+            let at = world.get::<Transform>(body).unwrap().translation;
+            across = across.max(at.z);
+            high = high.max(at.y);
+        }
+        (across, high)
+    }
+
+    /// **"Ants should be able to path along walls and ceilings."** A wall right
+    /// across the lawn, and the Mario on the other side of it.
+    ///
+    /// Two things had to be true and neither was. The ant must not be handed a
+    /// route, because [`crate::flow::FlowField`] is a floor and every answer it
+    /// has is about going round -- see the note on [`navigate`]. And once it is
+    /// on the wall it must keep climbing, which is the rule [`CLIMB_STEEP`]
+    /// draws: before that, the way to the goal projected into a vertical face
+    /// pointed *downwards*, so an ant climbed a metre, turned round inside a
+    /// second, walked back down, and bobbed at the foot of the wall for ever.
+    ///
+    /// The slime is the control and the point of the geometry. There is no gate
+    /// and no way round at either end, so nothing that keeps its feet on the
+    /// floor can be on the far side however good its pathfinding is -- which
+    /// makes "the ant got there" a claim about climbing rather than about the
+    /// wall having a hole in it somewhere.
+    #[test]
+    fn an_ant_goes_over_a_wall_that_stops_a_slime_dead() {
+        let (across, high) = chase_over_the_wall(true, None);
+        assert!(
+            high > 4.0,
+            "the ant never got up the wall: highest y {high}"
+        );
+        assert!(
+            across > 2.0,
+            "the ant never got over the wall: furthest z {across}"
+        );
+        let (walked, climbed) = chase_over_the_wall(false, None);
+        assert!(
+            climbed < 1.0,
+            "the slime went up a wall: highest y {climbed}"
+        );
+        assert!(
+            walked < 0.0,
+            "the slime got past a wall with no way round it: furthest z {walked}"
+        );
+    }
+
+    /// The other half, and the one the pathfinding put back. Now the wall has a
+    /// gate in it, twenty metres off to one side.
+    ///
+    /// A route exists, and it is a perfectly good one -- along the wall, through
+    /// the gate, back along the far side. It is also not what an ant does, and
+    /// handing it one is how a bug that used to walk over the courtyard wall
+    /// started taking the long way round like everything else. So a [`Crawler`]
+    /// is not routed at all: see the note on [`navigate`], which is where the
+    /// rule lives and why.
+    ///
+    /// The claim is about the climb rather than the arrival, because both
+    /// behaviours arrive. What tells them apart is whether the ant ever left the
+    /// ground, and an ant that walked to the gate never does.
+    #[test]
+    fn an_ant_climbs_the_wall_in_front_of_it_rather_than_walking_to_the_gate() {
+        let (across, high) = chase_over_the_wall(true, Some((14.0, 18.0)));
+        assert!(
+            high > 4.0,
+            "the ant took the long way round to the gate: highest y {high}"
+        );
+        assert!(
+            across > 2.0,
+            "the ant never got to the far side at all: furthest z {across}"
+        );
+        // And the slime does use the gate, which is what makes the gate a real
+        // way round rather than a hole this test happens not to find.
+        let (walked, climbed) = chase_over_the_wall(false, Some((14.0, 18.0)));
+        assert!(
+            walked > 2.0,
+            "the slime never found the gate: furthest z {walked}"
+        );
+        assert!(
+            climbed < 1.0,
+            "the slime went up a wall: highest y {climbed}"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_navigate_and_plan() {
+        use std::time::Instant;
+        let mut world = World::new();
+        let level = a_walled_lawn();
+        world.insert_resource(GameTuning::default());
+        world.insert_resource(crate::flow::FlowField::new(&level));
+        world.insert_resource(level);
+        world.init_resource::<crate::path::Pathing>();
+        let luna = world
+            .spawn((Player, Transform::from_translation(Vec3::ZERO)))
+            .id();
+        let total: usize = std::env::var("BENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1000);
+        let full: usize = std::env::var("BENCH_FULL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+        for index in 0..total {
+            let angle = index as f32 * 0.137;
+            let at = Vec3::new(angle.cos() * 30.0, 0.0, angle.sin() * 30.0);
+            let near = index < full;
+            world.spawn((
+                Enemy {
+                    kind: Kind::Slime,
+                    animation: Handle::default(),
+                },
+                Transform::from_translation(at),
+                Side::Hostile,
+                Aggro {
+                    target: near.then_some(luna),
+                    at: Vec3::ZERO,
+                    ..Aggro::default()
+                },
+                Quirk::new(index as f32),
+                Wander::new(at, 0.0),
+                if near { Detail::Full } else { Detail::Crowd },
+            ));
+        }
+        let navigate_id = world.register_system(navigate);
+        let plan_id = world.register_system(crate::path::plan);
+        // Warm up: first tick plans, later ones ride the refresh.
+        for _ in 0..5 {
+            world.run_system(navigate_id).unwrap();
+            world.run_system(plan_id).unwrap();
+        }
+        let ticks = 200;
+        let mut nav = 0u128;
+        let mut plan = 0u128;
+        for _ in 0..ticks {
+            let t = Instant::now();
+            world.run_system(navigate_id).unwrap();
+            nav += t.elapsed().as_nanos();
+            let t = Instant::now();
+            world.run_system(plan_id).unwrap();
+            plan += t.elapsed().as_nanos();
+        }
+        let stats = format!("{:?}", world.resource::<crate::path::Pathing>());
+        println!(
+            "{total} enemies ({full} full): navigate {:.1} us/tick, plan {:.1} us/tick -- {stats}",
+            nav as f64 / ticks as f64 / 1000.0,
+            plan as f64 / ticks as f64 / 1000.0,
         );
     }
 }

@@ -4,7 +4,7 @@ jumping doesn't always work
 fall through floor sometimes
 amortize/SoA
 
-enemies should use pathing, flow fields, and group based calculation.  
+
 guns for mario
 bigger hit box/valid attack area
 
@@ -41,9 +41,8 @@ SoA amortization
 
 ctrl+c/ctrl+v in ingame console
 
-pop in
+pop in shadows random delay
 
-marios stuck in corner, need to be smart enough not to get stuck, pathing?  
 
 
 Planet gen topology needs to be walkable and flat enough to farm.  
@@ -74,17 +73,15 @@ Animation-clip and aim-rig inspection.
 
 dash
 
-X rename hero to Luna, rename game to Space Crusaders, organize all assets.  
 
 X make luna AI playable too
 
-furniture::tests::the_castle_is_where_it_always_was fails: the ant warp pipe moved from x = 46.8 to x = 53.45 in assets/bevy/castle_furniture.json..  this move is intentional, but it should not require farther changes anywhere else in the codebase.  blender is the source of truth for scenes.  things should be able to move in the castle grounds blend file.  Also the actual modles themselves should be used, like the warp pipe should ba the actual warp pipe, and not a box.  same with the stellarator, player start point, and initial units.  most things should be placed in the scene like this.  
 
 X reorganize, clear clutter, get rid of unneccisary tests
 
 X I do not want to preserve  SM64 collision quirks, including triangle orderingand unusual wall-resolution behavior
 
-sometimes I have CPU load spikes per frame until I change the frame rate limit,but If I change it back to the same limit the spikes go away. 
+sometimes I have CPU load spikes per frame until I change the frame rate limit,but If I change it back to the same limit the spikes go away. this does not happen with vsync off.
 
 health bar should be blue
 
@@ -92,7 +89,7 @@ enemies are getting inside walls a lot, I still fall through things often
 
 need a way to spawn mario
 
-portals
+X portals - an arch or a bubble you plant like a pylon: walk through half in and half out, momentum kept, the camera comes through with you; the crowd paths through it and beams cross it
 
 VRR support?
 
@@ -106,6 +103,6 @@ environmental clouds (prerendered asthetic), lightning, fog, better ground textu
 
 tree shadows clip, but unit shadows never do.  
 
-nuclonium orbs in the stellarator should have an individual slight modifier to their speed of +- 1%
+make the coper material on the stellarator better
 
-enemies need the A* too.  this is why I asked for groupings, so it could handle a lot of units at once.  
+asteroid generation
