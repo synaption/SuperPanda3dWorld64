@@ -42,10 +42,16 @@ export PATH="$HOME/.cargo/bin:$PATH"
 cargo run
 ```
 
-`./run_bevy.sh` from the repository root runs from any working directory. By
-default it refreshes the packaged Windows build and then launches it;
-`--source` builds and runs the native Rust source, while `--packaged` launches
-the existing Windows package without rebuilding it.
+`./run_bevy.sh` cross-builds/packages and launches the Windows executable from
+any working directory. Every project path is derived from the checkout rather
+than a user- or machine-specific absolute path. `--source` builds and runs the
+native Rust source instead, while `--packaged` launches the existing Windows
+package without rebuilding it. `--windows` explicitly selects the default
+build-and-launch behaviour.
+
+Runtime assets are committed under `assets/`, so neither path needs Blender.
+`python3 tools/build_assets.py` is an authoring command for deliberately
+regenerating those files and requires Blender 5.2.
 
 Sound and gamepad support build against ALSA and udev on Linux, which the WSL
 environment here has no headers for, so on Linux they are opt-in and a plain
@@ -62,14 +68,19 @@ build always has both — those backends are part of the OS there.
 
 ### The Windows executable, from Linux/WSL
 
-Install a MinGW-w64 cross-compiler, then:
+On Ubuntu/WSL, install the 64-bit MinGW cross-compiler, then build:
 
 ```bash
+sudo apt update
+sudo apt install gcc-mingw-w64-x86-64
 ./build_windows.sh
 ```
 
+The script also recognizes the `-posix` and `-win32` compiler names used by
+some MinGW packages. Set `MINGW_CC=/path/to/compiler` for any other layout.
+
 The script adds the `x86_64-pc-windows-gnu` standard library through rustup if
-it is missing, regenerates the level blob, and produces:
+it is missing, packages the committed runtime assets, and produces:
 
 ```text
 dist/windows/SpaceCrusaders.exe

@@ -26,22 +26,50 @@ require_command() {
 require_command cargo
 require_command rustup
 require_command python3
-# The GNU target links with MinGW's linker rather than one Rust ships.
-require_command x86_64-w64-mingw32-gcc
+
+find_mingw_cc() {
+    # Debian-family packages may expose only a threading-model-specific name,
+    # while the full meta-package provides the unsuffixed alternative. Accept
+    # all of them, and allow a non-system toolchain to be named explicitly.
+    local candidate
+    for candidate in \
+        "${MINGW_CC:-}" \
+        x86_64-w64-mingw32-gcc \
+        x86_64-w64-mingw32-gcc-posix \
+        x86_64-w64-mingw32-gcc-win32
+    do
+        [[ -n "$candidate" ]] || continue
+        if command -v "$candidate" >/dev/null 2>&1; then
+            command -v "$candidate"
+            return
+        fi
+    done
+
+    cat >&2 <<'EOF'
+error: a 64-bit MinGW cross-compiler is required to build the Windows game
+
+On Ubuntu/WSL, install it with:
+  sudo apt update
+  sudo apt install gcc-mingw-w64-x86-64
+
+For a compiler installed elsewhere:
+  MINGW_CC=/path/to/x86_64-w64-mingw32-gcc ./run_bevy.sh
+EOF
+    exit 1
+}
+
+MINGW_CC="$(find_mingw_cc)"
 
 if ! rustup target list --installed | grep -qx "$WINDOWS_TARGET"; then
     echo "Installing the $WINDOWS_TARGET standard library" >&2
     rustup target add "$WINDOWS_TARGET"
 fi
 
-echo "Regenerating Bevy castle assets"
-python3 "$REPO_ROOT/tools/convert_level.py"
-
 echo "Building $WINDOWS_TARGET release executable"
 cargo build \
     --manifest-path "$REPO_ROOT/Cargo.toml" \
     --release --locked --target "$WINDOWS_TARGET" \
-    --config "target.$WINDOWS_TARGET.linker=\"x86_64-w64-mingw32-gcc\""
+    --config "target.$WINDOWS_TARGET.linker=\"$MINGW_CC\""
 
 echo "Packaging Windows build"
 mkdir -p \

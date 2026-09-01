@@ -618,8 +618,10 @@ conversion is applied to collision.
 - `assets/bevy/water.png` — copied out of the reference pack, since water is
   not part of the level mesh and so is not in the GLB.
 
-`build_windows.sh` runs it before packaging, so a Windows build cannot ship a
-level blob older than the NPZs it came from.
+The generated files are committed runtime assets. Normal native and Windows
+builds package them as-is and do not invoke Blender or this authoring tool. Run
+the `castle` stage of `build_assets.py` after changing the source NPZs or the
+castle Blender scene, and commit the regenerated outputs together.
 
 ### The planet
 

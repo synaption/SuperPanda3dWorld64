@@ -24,10 +24,10 @@
 # without one and rebuild everything the first time.
 /.build_assets.json
 
-# Rust / Cargo. The crate lives at the repository root, so this is the game's
-# own build tree. Cargo.lock IS tracked -- this is a binary, not a library, and
-# a reproducible build is worth more here than floating dependency versions.
-/target/
+# Rust / Cargo build trees, including nested experimental crates. Cargo.lock IS
+# tracked -- this is a binary, not a library, and a reproducible build is worth
+# more here than floating dependency versions.
+**/target/
 
 # Packaged builds produced by build_windows.sh.
 /dist/

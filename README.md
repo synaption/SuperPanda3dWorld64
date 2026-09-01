@@ -122,16 +122,19 @@ export PATH="$HOME/.cargo/bin:$PATH"
 cargo run
 ```
 
-`./run_bevy.sh` runs from any working directory, refreshes the packaged Windows
-build, and then launches its executable. Pass `--source` to build and run the
-native Rust source instead, or `--packaged` to launch the existing Windows
-package without rebuilding it. On Linux, sound and gamepad build against ALSA
-and udev and are opt-in: `cargo run --features sound,gamepad`. The Windows
-build always has both.
+`./run_bevy.sh` runs from any working directory, cross-builds/packages the
+Windows executable, and launches it. Its paths are derived from the checkout,
+so they do not depend on a particular user or machine. Pass `--source` to build
+and run the native Rust source instead, or `--packaged` to launch an existing
+Windows package without rebuilding it. On Linux, sound and gamepad build
+against ALSA and udev and are opt-in: `cargo run --features sound,gamepad`. The
+Windows build always has both.
 
 Game assets required at runtime and their Blender authoring sources are
 included under `assets/`. The old SM64 reference sources are no longer used by
-the active asset pipeline. Asset tools do not ship with the game.
+the active asset pipeline. A normal build uses the committed runtime assets and
+does not require Blender; run `tools/build_assets.py` only when regenerating
+them from their authoring sources. Asset tools do not ship with the game.
 
 ## Documentation wiki
 

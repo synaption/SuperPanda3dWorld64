@@ -165,7 +165,13 @@ def resolve_blender(explicit):
         seen.add(real)
         best.append((blender_version(path) or (0, 0, 0), path))
     if not best:
-        sys.exit("no blender found (install one, or pass --blender / set $BLENDER)")
+        sys.exit(
+            "no Blender found\n"
+            "asset regeneration requires Blender 5.2; install it, pass "
+            "--blender /path/to/blender, or set $BLENDER\n"
+            "building and running the game does not regenerate assets; use "
+            "./run_bevy.sh instead"
+        )
     best.sort()
     version, path = best[-1]
     return path, (version if version != (0, 0, 0) else None)

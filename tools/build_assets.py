@@ -143,7 +143,14 @@ STAGES = ("mario", "luna", "weapons", "castle", "levels", "planet",
 
 def run(command):
     print("+", " ".join(map(str, command)), flush=True)
-    subprocess.run(command, cwd=ROOT, check=True)
+    try:
+        subprocess.run(command, cwd=ROOT, check=True)
+    except subprocess.CalledProcessError as error:
+        # The child has already printed the useful error. Do not bury it below
+        # an implementation traceback from this orchestration script.
+        raise SystemExit(
+            f"asset command failed with exit status {error.returncode}"
+        ) from None
 
 
 def blend_to_glb(blend, output, blender):
