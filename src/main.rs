@@ -894,8 +894,8 @@ fn setup(
     commands.insert_resource(shadow_art);
     // The sky rides the camera and outlives every level, so it is put up here
     // beside the other two `prepare`s rather than by whichever level is up
-    // first. `sky::advance` is what turns it off on a level that is not the
-    // castle grounds.
+    // first. `sky::advance` is what turns it off on a level with no sky of
+    // its own.
     sky::prepare(&mut commands, &mut meshes, &mut images, &mut sprites);
     squad::spawn_circle(&mut commands, &mut meshes, &mut materials);
     // The build preview, which outlives a level exactly as the whistle ring

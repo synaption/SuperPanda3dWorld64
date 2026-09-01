@@ -39,16 +39,22 @@
 //! whole far half of the level goes pink because the fog it is dissolving into
 //! is pink.
 //!
-//! **The castle only.** The sky is put up once and follows the camera for the
-//! rest of the run, but [`advance`] does nothing on the planet and hides all
-//! four shells there. A dome whose horizon is the XZ plane is a claim that up
-//! is `+Y`, and on the planet up is whichever way the core is not -- the sun
-//! would set into the ground on one side of it and sit under the floor on the
-//! other. Levels whose gravity points somewhere are a sky of their own to
-//! write and not a special case of this one.
+//! **Two skies, and one level with none.** The shells are put up once and
+//! follow the camera for the rest of the run. Over the castle the sky is a
+//! clock: up is `+Y` everywhere and the sun runs round [`ORBIT_AXIS`] once a
+//! day. Over the orbiting planet the same four shells are hung in a different
+//! frame ([`Overhead`]): up is whichever way the core is not, so the dome is
+//! turned to put its horizon on the player's own horizon, and the sun is where
+//! [`Sky::orbit_sun`] says -- the planet's spin carrying it round the poles
+//! once a day, and the planet's orbit drifting it through the star field
+//! across the year, with the axial tilt swinging noon up and down the sky as
+//! the seasons turn. The plain planet level keeps the fixed noon it always
+//! had: [`advance`] puts the constant light back and hides all four shells
+//! there.
 
 use crate::{
     console::GameTuning,
+    gravity::Gravity,
     n64::{N64Lighting, N64Material, N64Uniform, Shading},
     water::{self, CameraMedium},
     world::LevelId,
@@ -145,6 +151,22 @@ const SUNRISE: Vec3 = Vec3::X;
 /// console slider are the numbers on a clock.
 const DAWN_HOUR: f32 = 6.0;
 const HOURS: f32 = 24.0;
+
+/// How long the orbiting planet's year is, in its own days, and how far its
+/// spin axis leans out of its orbit.
+///
+/// Eight days to the year rather than hundreds, because an orbit is only
+/// visible in what it changes -- the sun drifting through the constellations,
+/// the seasons swinging noon up and down the sky -- and at 365 days to a
+/// five-minute day a single season would take a working week of play to turn.
+/// Eight puts a whole year, solstice to solstice and back, inside three
+/// quarters of an hour.
+///
+/// The tilt is Earth's, and it is what makes the orbit *show*. With the axis
+/// square to the orbital plane the sun would ride the same circle every day of
+/// the year, and the only witness to the year would be the stars behind it.
+const YEAR_DAYS: f32 = 8.0;
+const AXIAL_TILT: f32 = 23.4_f32.to_radians();
 
 /// How far the sun has to move before the world is relit and the dome
 /// recoloured.
@@ -420,11 +442,20 @@ const RAMP: [(f32, Look); 8] = [
 pub struct Sky {
     /// The hour of the day, 0 to 24.
     pub hours: f32,
+    /// How far through the year the orbiting planet is, in days, 0 to
+    /// [`YEAR_DAYS`]. Advanced by the same clock as `hours` while that level
+    /// is up, and left where it was everywhere else: the year is that
+    /// planet's year, and it does not pass while nobody is on it.
+    pub year: f32,
     /// The hour last written into `GameTuning::sky_hour`, so a value that
     /// differs from it can only have come from the player.
     published: f32,
-    /// Where the sun was when the world was last relit and the dome last
-    /// recoloured. See [`RELIGHT_STEP`].
+    /// Where the sun last stood in the local sky -- [`Overhead::apparent`] --
+    /// when the world was last relit and the dome last recoloured. See
+    /// [`RELIGHT_STEP`]. The apparent sun rather than the world one, because
+    /// on the planet the sun can stand still in the world while the player
+    /// walks the horizon out from under it, and elevation over *that* horizon
+    /// is what every colour in the [`RAMP`] is keyed on.
     lit_from: Option<Vec3>,
 }
 
@@ -435,6 +466,9 @@ impl Default for Sky {
             // every screenshot of this game has been taken in and what the
             // impostor sheets were baked under.
             hours: GameTuning::default().sky_hour,
+            // The year opens at a solstice, so the first season a player sees
+            // is a season and not the year's most average day.
+            year: 0.0,
             // Agreeing with `hours` from the start, so the first frame reads
             // the slider as untouched and advances the clock rather than
             // taking a scrub nobody made.
@@ -447,16 +481,10 @@ impl Default for Sky {
 }
 
 impl Sky {
-    /// Where the sun is, as a unit vector pointing at it from the ground.
+    /// Where the sun is over the castle, as a unit vector pointing at it from
+    /// the ground.
     pub fn sun(&self) -> Vec3 {
         self.spin() * SUNRISE
-    }
-
-    /// Where the moon is. Opposite the sun, which makes it a full moon that
-    /// rises as the sun sets -- the one phase worth having when there is only
-    /// going to be one.
-    pub fn moon(&self) -> Vec3 {
-        -self.sun()
     }
 
     /// The turn the whole celestial sphere has made since dawn. The sun is a
@@ -465,6 +493,122 @@ impl Sky {
     fn spin(&self) -> Quat {
         let turned = (self.hours - DAWN_HOUR) / HOURS * std::f32::consts::TAU;
         Quat::from_axis_angle(ORBIT_AXIS.normalize(), turned)
+    }
+
+    /// Where the sun is from the orbiting planet, as a unit vector in the
+    /// planet's own frame -- the frame its mesh, its collision and everyone
+    /// standing on it all live in.
+    ///
+    /// Built from the outside in. In the orbit's frame the sun is a point on
+    /// a circle the year moves round; the axial tilt then leans that whole
+    /// frame off the planet's equator, which is where the seasons come from;
+    /// and the day's spin carries it round the poles. The spin is about `Y`
+    /// and not [`ORBIT_AXIS`]: the planet's poles are its mesh's poles, and
+    /// the tilt has already been applied by the middle term.
+    pub fn orbit_sun(&self) -> Vec3 {
+        let along = self.year / YEAR_DAYS * std::f32::consts::TAU;
+        let toward = Vec3::new(along.cos(), 0.0, along.sin());
+        self.orbit_spin() * (Quat::from_rotation_z(-AXIAL_TILT) * toward)
+    }
+
+    /// The turn the day's spin has put on the orbiting planet's sky: about
+    /// the poles, backwards -- the planet turns one way, so everything over
+    /// it appears to go the other -- once every [`HOURS`].
+    fn orbit_spin(&self) -> Quat {
+        let turned = (self.hours - DAWN_HOUR) / HOURS * std::f32::consts::TAU;
+        Quat::from_rotation_y(-turned)
+    }
+
+    /// The turn the star field has made over the orbiting planet. The tilt is
+    /// in it and the year is not: the stars sit in the same frame as the sun,
+    /// but they are infinitely far away, so the orbit that moves the sun
+    /// round its circle moves them not at all. That difference is the orbit's
+    /// one signature in the sky -- the sun drifts through the constellations
+    /// and comes back round in exactly a year.
+    fn orbit_stars(&self) -> Quat {
+        self.orbit_spin() * Quat::from_rotation_z(-AXIAL_TILT)
+    }
+}
+
+/// Which sky a level stands under.
+///
+/// The castle has the clock sky this module began as; the orbiting planet has
+/// the same four shells hung in its own frame; and the plain planet has none,
+/// keeping the fixed noon the rest of the game was tuned against. One place to
+/// answer the question rather than `==` tests scattered through two systems,
+/// so a fourth level has one line to add.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SkyKind {
+    /// The castle's: up is `+Y` everywhere and the sun keeps the hours its
+    /// slider is labelled with.
+    Clock,
+    /// The orbiting planet's: up is local, the spin is the day, and the orbit
+    /// is the year.
+    Orbit,
+    /// No sky at all -- the constant noon light, and all four shells hidden.
+    None,
+}
+
+fn sky_of(level: LevelId) -> SkyKind {
+    match level {
+        LevelId::Castle => SkyKind::Clock,
+        LevelId::PlanetOrbit => SkyKind::Orbit,
+        LevelId::Planet => SkyKind::None,
+    }
+}
+
+/// Where the sky stands over one particular pair of feet: everything
+/// [`advance`] and [`follow`] both need, computed from the same inputs in each
+/// so the world's light and the picture of the sky can never disagree.
+struct Overhead {
+    /// The direction to the sun in the world's frame, which is what the
+    /// meshes are lit from and where the disc is hung.
+    sun: Vec3,
+    /// The turn carrying the sky's own `+Y` onto the up under the camera.
+    /// Identity over the castle; over the planet the dome wears it, which is
+    /// what lays the dome's horizon along the player's own.
+    frame: Quat,
+    /// The sun seen through `frame`, whose `y` is its elevation over the
+    /// player's horizon: the number the whole [`RAMP`] is keyed on. Over the
+    /// castle it *is* `sun`.
+    apparent: Vec3,
+    /// The turn the star field has made.
+    stars: Quat,
+}
+
+impl Overhead {
+    /// The moon: opposite the sun, which makes it a full moon that rises as
+    /// the sun sets -- the one phase worth having when there is only going to
+    /// be one.
+    fn moon(&self) -> Vec3 {
+        -self.sun
+    }
+}
+
+/// The sky over an `up`. [`SkyKind::None`] never gets here -- both callers
+/// have returned before asking -- so the castle's answer stands in for it
+/// harmlessly.
+fn overhead(kind: SkyKind, sky: &Sky, up: Vec3) -> Overhead {
+    match kind {
+        SkyKind::Orbit => {
+            let sun = sky.orbit_sun();
+            let frame = Quat::from_rotation_arc(Vec3::Y, up);
+            Overhead {
+                sun,
+                frame,
+                apparent: frame.inverse() * sun,
+                stars: sky.orbit_stars(),
+            }
+        }
+        SkyKind::Clock | SkyKind::None => {
+            let sun = sky.sun();
+            Overhead {
+                sun,
+                frame: Quat::IDENTITY,
+                apparent: sun,
+                stars: sky.spin(),
+            }
+        }
     }
 }
 
@@ -851,20 +995,27 @@ fn above_horizon(elevation: f32) -> f32 {
 /// the player scrubbing to an hour and the clock jumps to it. Otherwise the
 /// clock advances and the slider is written to follow. `day_length` at zero
 /// holds it, which is how you park the game at a sunset and look at it.
+///
+/// The same clock runs both skies. On the castle it drives the sun round its
+/// axis; on the orbiting planet it *is* the spin, so scrubbing the slider
+/// there is turning the globe by hand. The year only advances while the clock
+/// runs -- a scrub moves the day and not the season.
 #[allow(clippy::too_many_arguments)]
 pub fn advance(
     time: Res<Time>,
     level: Res<LevelId>,
     medium: Res<CameraMedium>,
+    gravity: Option<Res<Gravity>>,
     mut tuning: ResMut<GameTuning>,
     mut sky: ResMut<Sky>,
     mut lighting: ResMut<N64Lighting>,
     mut clear: ResMut<ClearColor>,
-    mut fog: Query<&mut DistanceFog, With<Camera3d>>,
+    mut fog: Query<(&mut DistanceFog, &GlobalTransform), With<Camera3d>>,
 ) {
-    if *level != LevelId::Castle {
-        // Not this level's sky. Everything the castle's clock was driving goes
-        // back to the fixed value the rest of the game was written against --
+    let kind = sky_of(*level);
+    if kind == SkyKind::None {
+        // Not this level's sky. Everything the clock was driving goes back to
+        // the fixed value the rest of the game was written against --
         // including the fog and the clear colour, or a player who steps onto
         // the planet at midnight arrives under a black sky that nothing there
         // will ever repaint.
@@ -880,7 +1031,7 @@ pub fn advance(
             lighting.to_light = N64Lighting::default().to_light;
             if !medium.submerged() {
                 clear.0 = water::SKY_COLOUR;
-                if let Ok(mut fog) = fog.single_mut() {
+                if let Ok((mut fog, _)) = fog.single_mut() {
                     fog.color = water::SKY_COLOUR;
                 }
             }
@@ -892,14 +1043,29 @@ pub fn advance(
     if (tuning.sky_hour - sky.published).abs() > 1e-4 {
         sky.hours = tuning.sky_hour;
     } else if tuning.day_length > 0.0 {
-        sky.hours += HOURS * time.delta_secs() / tuning.day_length;
+        let step = HOURS * time.delta_secs() / tuning.day_length;
+        sky.hours += step;
+        if kind == SkyKind::Orbit {
+            sky.year = (sky.year + step / HOURS).rem_euclid(YEAR_DAYS);
+        }
     }
     sky.hours = sky.hours.rem_euclid(HOURS);
     sky.published = sky.hours;
     tuning.sky_hour = sky.hours;
 
-    let sun = sky.sun();
-    let look = Look::at(sun.y);
+    // Which way is up under the camera: `+Y` on the castle, and off the
+    // planet's core under anywhere the player has walked to. Missing pieces
+    // fall back to `+Y` rather than skipping the frame -- a headless world
+    // with no camera still wants its light run.
+    let up = match &gravity {
+        Some(gravity) => fog
+            .single()
+            .map(|(_, eye)| gravity.up(eye.translation()))
+            .unwrap_or(Vec3::Y),
+        None => Vec3::Y,
+    };
+    let view = overhead(kind, &sky, up);
+    let look = Look::at(view.apparent.y);
 
     // The fog and the clear colour are the horizon, so the world fades into
     // the sky rather than into a colour that used to match it. Left alone
@@ -909,28 +1075,30 @@ pub fn advance(
         let horizon = look.horizon;
         let colour = Color::srgb(horizon.x, horizon.y, horizon.z);
         clear.0 = colour;
-        if let Ok(mut fog) = fog.single_mut() {
+        if let Ok((mut fog, _)) = fog.single_mut() {
             fog.color = colour;
         }
     }
 
     // The light, at a quarter of a degree of sun rather than every frame. See
-    // `RELIGHT_STEP` for why that is not a shortcut.
+    // `RELIGHT_STEP` for why that is not a shortcut. Measured on the
+    // *apparent* sun: on the planet the world's sun can hold still while the
+    // player walks the horizon round underneath it, and either motion is a
+    // change of light.
     let moved = sky
         .lit_from
-        .is_none_or(|last| last.dot(sun).clamp(-1.0, 1.0).acos() >= RELIGHT_STEP);
+        .is_none_or(|last| last.dot(view.apparent).clamp(-1.0, 1.0).acos() >= RELIGHT_STEP);
     if !moved {
         return;
     }
-    sky.lit_from = Some(sun);
+    sky.lit_from = Some(view.apparent);
     // Where the key light comes from, once the sun is down: from the moon,
     // which is the only thing left up there. Crossfaded rather than switched,
     // because a key that jumps from one side of the sky to the other flips
     // which face of every wall in the level is the lit one, in one frame.
-    let moon = -sun;
-    let day = above_horizon(sun.y);
-    let night = above_horizon(moon.y) * (1.0 - day);
-    let direction = (sun * day + moon * night).normalize_or(Vec3::Y);
+    let day = above_horizon(view.apparent.y);
+    let night = above_horizon(-view.apparent.y) * (1.0 - day);
+    let direction = (view.sun * day + view.moon() * night).normalize_or(up);
     lighting.to_light = direction;
     lighting.key = look.key;
     lighting.ambient = look.ambient;
@@ -948,10 +1116,11 @@ pub fn advance(
 /// the meshes and the materials and does not care what time it is beyond
 /// asking, and that one holds the clock and the world's light and never looks
 /// at a vertex.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn follow(
     level: Res<LevelId>,
     medium: Res<CameraMedium>,
+    gravity: Option<Res<Gravity>>,
     sky: Res<Sky>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<N64Material>>,
@@ -967,14 +1136,21 @@ pub fn follow(
     // Underwater the sky is behind a wall of fog that closes at forty metres,
     // and an unfogged dome six hundred metres out would be drawn straight
     // through it -- open sky seen from the bottom of the moat.
-    let shown = *level == LevelId::Castle && !medium.submerged();
+    let kind = sky_of(*level);
+    let shown = kind != SkyKind::None && !medium.submerged();
     let Ok(camera) = camera.single() else {
         return;
     };
     let eye = camera.translation();
-    let sun = sky.sun();
-    let moon = sky.moon();
-    let look = Look::at(sun.y);
+    // The same up, the same `overhead`, the same inputs as `advance` this
+    // frame, so the picture and the light agree to the bit -- which the dome's
+    // repaint gate below compares them on.
+    let up = match &gravity {
+        Some(gravity) => gravity.up(eye),
+        None => Vec3::Y,
+    };
+    let view = overhead(kind, &sky, up);
+    let look = Look::at(view.apparent.y);
 
     for (part, mut transform, mut visibility, mesh, material) in &mut parts {
         if !shown {
@@ -985,12 +1161,18 @@ pub fn follow(
             SkyPart::Dome => {
                 visibility.set_if_neq(Visibility::Visible);
                 transform.translation = eye;
+                // The dome's pole is the player's up: identity on the castle,
+                // and on the planet the turn that keeps its painted horizon
+                // lying along the real one as he walks round the world.
+                transform.rotation = view.frame;
                 // Only when the light has moved: the same gate `advance` uses,
                 // read off the same field, so the dome and the world's light
                 // step together and never disagree about what time it is.
-                if sky.lit_from == Some(sun) {
+                if sky.lit_from == Some(view.apparent) {
                     if let Some(mut mesh) = meshes.get_mut(&mesh.0) {
-                        repaint(&mut mesh, sun, &look);
+                        // The apparent sun, because the vertices being painted
+                        // are in the dome's own frame.
+                        repaint(&mut mesh, view.apparent, &look);
                     }
                 }
             }
@@ -1003,23 +1185,24 @@ pub fn follow(
                 // The stars are the one thing that actually turns. The dome's
                 // gradient is fixed to the horizon and the two discs are moved
                 // rather than spun, so this is where "the sky rotates" lives.
-                transform.rotation = sky.spin();
+                transform.rotation = view.stars;
                 tint(&mut materials, material, Vec3::ONE, look.stars);
             }
             SkyPart::Sun => {
-                let fade = above_horizon(sun.y);
+                let fade = above_horizon(view.apparent.y);
                 visibility.set_if_neq(visible(fade));
                 // Wider on the horizon than overhead. `SUN_SWELL`.
-                let swell = 1.0 + SUN_SWELL * (1.0 - smooth_step(0.0, 0.30, sun.y));
-                *transform = body(eye, sun, SUN_SIZE * swell);
+                let swell = 1.0 + SUN_SWELL * (1.0 - smooth_step(0.0, 0.30, view.apparent.y));
+                *transform = body(eye, view.sun, SUN_SIZE * swell);
                 tint(&mut materials, material, linear(look.disc), fade);
             }
             SkyPart::Moon => {
                 // Up, and dimmed by daylight rather than hidden by it.
-                let daylight = above_horizon(sun.y);
-                let fade = above_horizon(moon.y) * (1.0 - daylight * (1.0 - DAYTIME_MOON));
+                let daylight = above_horizon(view.apparent.y);
+                let fade =
+                    above_horizon(-view.apparent.y) * (1.0 - daylight * (1.0 - DAYTIME_MOON));
                 visibility.set_if_neq(visible(fade));
-                *transform = body(eye, moon, MOON_SIZE);
+                *transform = body(eye, view.moon(), MOON_SIZE);
                 tint(&mut materials, material, Vec3::ONE, fade);
             }
         }
@@ -1124,6 +1307,115 @@ mod tests {
         }
     }
 
+    /// The orbiting planet's sun is on the unit sphere whatever the hour and
+    /// the season, for the same reason the castle's is: every colour in the
+    /// [`RAMP`] is keyed on its elevation, and a sun that shortens is a sun
+    /// read from the wrong row.
+    #[test]
+    fn the_orbiting_sun_is_a_unit_vector_all_year() {
+        for day in 0..8 {
+            for hour in 0..24 {
+                let mut sky = at(hour as f32);
+                sky.year = day as f32;
+                let sun = sky.orbit_sun();
+                assert!(
+                    (sun.length() - 1.0).abs() < 1e-5,
+                    "the sun on day {day} at {hour}:00 is {} long",
+                    sun.length()
+                );
+            }
+        }
+    }
+
+    /// The tilt is what turns the orbit into seasons: across the year the
+    /// subsolar point swings from one tropic to the other and back. Without
+    /// this the sun would ride the same circle every day and the year would
+    /// be invisible from the ground.
+    #[test]
+    fn the_year_swings_the_sun_between_the_tropics() {
+        let mut sky = at(12.0);
+        let solstice = AXIAL_TILT.sin();
+        sky.year = 0.0;
+        assert!(
+            (sky.orbit_sun().y + solstice).abs() < 1e-5,
+            "the year does not open at a solstice: {}",
+            sky.orbit_sun().y
+        );
+        sky.year = YEAR_DAYS / 2.0;
+        assert!(
+            (sky.orbit_sun().y - solstice).abs() < 1e-5,
+            "half a year later the other pole does not have the sun"
+        );
+        sky.year = YEAR_DAYS / 4.0;
+        assert!(
+            sky.orbit_sun().y.abs() < 1e-5,
+            "the equinox sun is off the equator by {}",
+            sky.orbit_sun().y
+        );
+    }
+
+    /// The orbit's one signature in the sky: measured against the stars the
+    /// sun holds still across a day and drifts across the year. Break the
+    /// shared spin between [`Sky::orbit_sun`] and [`Sky::orbit_stars`] and
+    /// the constellations slide behind the sun in a single evening.
+    #[test]
+    fn the_sun_drifts_through_the_stars_across_the_year() {
+        let against_the_stars = |sky: &Sky| sky.orbit_stars().inverse() * sky.orbit_sun();
+        let mut sky = at(6.0);
+        sky.year = 1.0;
+        let morning = against_the_stars(&sky);
+        sky.hours = 20.0;
+        assert!(
+            (against_the_stars(&sky) - morning).length() < 1e-5,
+            "the sun moved against the stars over one day"
+        );
+        sky.year = 3.0;
+        assert!(
+            (against_the_stars(&sky) - morning).length() > 0.5,
+            "a quarter of a year did not move the sun through the constellations"
+        );
+    }
+
+    /// The whole point of the orbiting level, held at the resource level: the
+    /// season changes what the ground gets. At the north pole -- which is
+    /// where the fallback up of `+Y` stands -- the year opens in polar night,
+    /// and half a year later the same midnight hour is under the midnight
+    /// sun.
+    #[test]
+    fn the_seasons_reach_the_ground_on_the_orbiting_planet() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<GameTuning>()
+            .init_resource::<Sky>()
+            .init_resource::<N64Lighting>()
+            .init_resource::<CameraMedium>()
+            .init_resource::<ClearColor>()
+            .insert_resource(LevelId::PlanetOrbit)
+            .insert_resource(Gravity::towards(Vec3::ZERO))
+            .add_systems(Update, advance);
+        app.update();
+        let winter = app.world().resource::<N64Lighting>().daylight;
+        assert!(
+            winter.max_element() < 0.2,
+            "the pole's winter night still gets {winter:?} of the daylight"
+        );
+        // And the sky was painted for it rather than left at the fixed noon
+        // the plain planet keeps.
+        assert_ne!(
+            app.world().resource::<ClearColor>().0,
+            water::SKY_COLOUR,
+            "the orbiting planet is under the castle's stand-in sky"
+        );
+
+        app.world_mut().resource_mut::<Sky>().year = YEAR_DAYS / 2.0;
+        app.update();
+        let summer = app.world().resource::<N64Lighting>().daylight;
+        assert!(
+            summer.min_element() > winter.max_element() * 2.0,
+            "the midnight sun ({summer:?}) is no brighter than the polar night ({winter:?})"
+        );
+    }
+
     /// The clock has to agree with the words. Six is sunrise, noon is the top
     /// of the arc, six in the evening is sunset and midnight is the bottom --
     /// and a slider labelled in hours that does none of those is a slider
@@ -1163,10 +1455,10 @@ mod tests {
     /// not, so the night has something in it.
     #[test]
     fn the_moon_is_up_at_night_and_the_sun_is_not() {
-        let midnight = at(0.0);
-        assert!(midnight.sun().y < 0.0 && midnight.moon().y > 0.0);
-        let noon = at(12.0);
-        assert!(noon.sun().y > 0.0 && noon.moon().y < 0.0);
+        let midnight = overhead(SkyKind::Clock, &at(0.0), Vec3::Y);
+        assert!(midnight.sun.y < 0.0 && midnight.moon().y > 0.0);
+        let noon = overhead(SkyKind::Clock, &at(12.0), Vec3::Y);
+        assert!(noon.sun.y > 0.0 && noon.moon().y < 0.0);
     }
 
     /// The sky is only worth having if it changes, and it has to change in the

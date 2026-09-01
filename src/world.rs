@@ -39,7 +39,7 @@ use bevy::{
 
 /// The levels the pause menu offers.
 ///
-/// An enum rather than a table read off disk: there are two of them, each
+/// An enum rather than a table read off disk: there are three of them, each
 /// needs its own spawning code anyway, and a level that is only data is a level
 /// this port cannot yet describe.
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -50,16 +50,24 @@ pub enum LevelId {
     /// The generated planet, from `experimental/planet_gen`. Round, and
     /// gravity points at the middle of it.
     Planet,
+    /// The same planet, set in motion: spinning through a day and a night and
+    /// running round a sun through a year of seasons. The motion is all in the
+    /// sky -- see [`crate::sky`] -- because a planet watched from its own
+    /// surface moves by everything *else* wheeling over it: the ground, the
+    /// collision and the player all live in the planet's own frame, which is
+    /// the one frame in which none of them move.
+    PlanetOrbit,
 }
 
 impl LevelId {
     /// In the order the menu lists them.
-    pub const ALL: [LevelId; 2] = [LevelId::Castle, LevelId::Planet];
+    pub const ALL: [LevelId; 3] = [LevelId::Castle, LevelId::Planet, LevelId::PlanetOrbit];
 
     pub fn name(self) -> &'static str {
         match self {
             LevelId::Castle => "Castle grounds",
             LevelId::Planet => "Planet",
+            LevelId::PlanetOrbit => "Planet in orbit",
         }
     }
 
@@ -67,7 +75,10 @@ impl LevelId {
     pub fn scene(self) -> &'static str {
         match self {
             LevelId::Castle => "bevy/castle.glb",
-            LevelId::Planet => "bevy/planet.glb",
+            // One file for both planets: the orbiting one differs only in what
+            // the sky does over it, and a second 14 MB copy of the same ground
+            // would be the packaging step's most expensive way to say so.
+            LevelId::Planet | LevelId::PlanetOrbit => "bevy/planet.glb",
         }
     }
 }
@@ -238,7 +249,7 @@ pub fn spawn(
             spawn_inhabitants(&furniture, commands, assets);
             load.pending = None;
         }
-        LevelId::Planet => {
+        LevelId::Planet | LevelId::PlanetOrbit => {
             // Empty collision and radial gravity from the first frame: the
             // world is already round while it loads, so nothing has to be
             // switched over a second time when the ground arrives.
@@ -246,7 +257,7 @@ pub fn spawn(
             commands.insert_resource(FlowField::new(&empty));
             commands.insert_resource(empty);
             commands.insert_resource(Gravity::towards(PLANET_CENTRE));
-            load.pending = Some(LevelId::Planet);
+            load.pending = Some(id);
             load.handle = assets.load(id.scene());
         }
     }
@@ -493,16 +504,16 @@ pub fn finish_planet(
     gravity: Res<Gravity>,
     mut placement: ParamSet<(PlacePlayer<'_, '_>, PlaceCamera<'_, '_>)>,
 ) {
-    if load.pending != Some(LevelId::Planet) {
+    let Some(id @ (LevelId::Planet | LevelId::PlanetOrbit)) = load.pending else {
         return;
-    }
+    };
     // Waited on rather than timed out. A load that is merely slow -- 14 MB of
     // glTF off a cold disk -- is still going to arrive, and a wall clock is a
     // bad judge of that: it would give up on a slow machine and never fire on a
     // fast one. What is worth reacting to is the asset server saying it cannot
     // be done, which it says plainly.
     if let bevy::asset::LoadState::Failed(why) = assets.load_state(&load.handle) {
-        let trouble = format!("{} did not load: {why}", LevelId::Planet.scene());
+        let trouble = format!("{} did not load: {why}", id.scene());
         console.report(trouble.clone());
         load.failed = Some(trouble);
         load.pending = None;
@@ -991,6 +1002,40 @@ mod tests {
             sea_transform.rotation.angle_between(Quat::IDENTITY) > 1e-5,
             "the sea never drifted: {:?}",
             sea_transform.rotation
+        );
+    }
+
+    /// The orbiting planet is the same ground down the same load path -- what
+    /// it adds is all in the sky, which `sky::tests` holds. What this holds is
+    /// that adding it broke nothing on the way to standing on it: the widened
+    /// gate in [`finish_planet`] has to recognise the new id, or the level
+    /// hangs on the pause menu's "loading" for ever.
+    #[test]
+    fn the_orbiting_planet_loads_down_the_same_path() {
+        let mut app = with_a_loader();
+        app.update();
+        app.world_mut().write_message(LoadLevel(LevelId::PlanetOrbit));
+        let started = std::time::Instant::now();
+        let mut frames = 0;
+        while app.world().resource::<LevelLoad>().busy() || frames == 0 {
+            app.update();
+            frames += 1;
+            assert!(
+                started.elapsed().as_secs() < 60,
+                "the orbiting planet never finished loading"
+            );
+        }
+        assert_eq!(*app.world().resource::<LevelId>(), LevelId::PlanetOrbit);
+        assert_eq!(
+            *app.world().resource::<Gravity>(),
+            Gravity::towards(PLANET_CENTRE)
+        );
+        let Shape::Planet { radius, .. } = app.world().resource::<LevelData>().shape() else {
+            panic!("the orbiting planet's collision is still flat");
+        };
+        assert!(
+            (250.0..350.0).contains(&radius),
+            "planet.glb measured {radius} m across the middle"
         );
     }
 
