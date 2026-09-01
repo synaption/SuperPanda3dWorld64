@@ -867,9 +867,13 @@ const CUTOUT: f32 = 0.05;
 /// hardware could not have sorted anything anyway.
 ///
 /// So the texture is asked rather than the flag believed. A material whose
-/// picture is genuinely translucent -- the castle's one such surface, which
-/// tops out at an alpha of 163 and has no solid texel anywhere in it -- is left
-/// blended, because for that one the blend is the point.
+/// picture is genuinely translucent -- the castle's one such surface, the baked
+/// tree shadows, whose picture tops out at an alpha of 163 and has no solid
+/// texel anywhere in it -- is left blended, because for that one the blend is
+/// the point. [`crate::shadow::shed_baked`] drops those quads before anybody
+/// sees them, and the rule still has to be able to tell them apart: it is the
+/// one picture in the game on that side of the line, so it is what the test
+/// below pins the rule against.
 fn drawn_as(source: &StandardMaterial, images: &Assets<Image>) -> Option<AlphaMode> {
     if !matches!(source.alpha_mode, AlphaMode::Blend) {
         return Some(source.alpha_mode);
@@ -1491,9 +1495,13 @@ mod tests {
     /// which is the rim left by the resize and nothing anybody authored.
     ///
     /// The castle's one genuinely see-through surface is the other side of the
-    /// line and has to stay where it is. Its picture has no solid texel in it
-    /// at all -- the whole thing tops out at an alpha of 163 -- and drawing it
-    /// as a mask would turn a translucent surface opaque.
+    /// line and has to stay where it is: the tree shadows the level carries
+    /// baked into its own mesh, whose picture has no solid texel in it at all
+    /// -- the whole thing tops out at an alpha of 163 -- and drawing it as a
+    /// mask would turn a translucent surface opaque. The game drops those quads
+    /// rather than drawing them (see [`crate::shadow::shed_baked`]), and this
+    /// is still the only picture in the game that holds the rule down on this
+    /// side.
     #[test]
     fn a_blend_whose_picture_is_a_cutout_is_drawn_as_a_mask() {
         for (file, name) in [
@@ -1508,9 +1516,9 @@ mod tests {
                  a surface the depth buffer cannot order"
             );
         }
-        let glass = baked_picture("bevy/castle.glb", "outside_0900BC00");
+        let baked_shadows = baked_picture("bevy/castle.glb", "outside_0900BC00");
         assert!(
-            !cutout(&glass),
+            !cutout(&baked_shadows),
             "the castle's translucent surface was taken for a cutout, which draws \
              it solid"
         );

@@ -150,6 +150,33 @@ const PLANET_CENTRE: Vec3 = Vec3::ZERO;
 /// How far above the ground the player is put down when a level comes up.
 const DROP_IN: f32 = 0.5;
 
+/// What the tree card is drawn at. Its mesh is in the units the decomp's
+/// exporter wrote, 714 across and 809 tall, and this is the port's 1/100.
+const TREE_SCALE: f32 = 0.01;
+
+/// How tall a tree stands once it is drawn. Nothing about the disc is taken
+/// from it except through [`crate::shadow::clearance`], which is the one thing
+/// that reads a caster's height: it bounds how far the disc may be drawn in
+/// front of where it lies, so that a shadow lifted clear of a hillside is
+/// never lifted through the trunk standing on it.
+const TREE_HEIGHT: f32 = 800.0 * TREE_SCALE;
+
+/// How wide a tree's shadow is on the ground.
+///
+/// Measured off the decals it replaces -- see
+/// [`crate::shadow::shed_baked`]. Each was a quad 8.2 metres across whose
+/// picture is solid to four fifths of that and gone by the rim, so the dark
+/// circle it drew was 3.9 metres from the trunk at its widest. This port draws
+/// that diameter 30% smaller; its disc also fades over a wider band than the
+/// original picture, keeping the reduced footprint soft at the edge.
+const TREE_SHADOW_RADIUS: f32 = 3.9 * 0.70;
+
+/// And how dark, which is 163 of 255: the alpha the decal's picture tops out
+/// at, and well short of the 200 [`crate::shadow::SOLID`] gives a unit. A tree
+/// with a Mario's shadow under it is a much darker thing than the original
+/// ever put on that lawn.
+const TREE_SHADOW_SOLIDITY: f32 = 163.0 / 255.0;
+
 /// Puts a level up: its collision, its gravity, its scenery and its
 /// inhabitants.
 ///
@@ -175,7 +202,7 @@ pub fn spawn(
     match id {
         LevelId::Castle => {
             let furniture = furniture::castle();
-            let (collision, render) = level::load();
+            let (collision, _) = level::load();
             commands.insert_resource(FlowField::new(&collision));
             water::spawn(commands, assets, meshes, materials, &collision);
             // The drawn surfaces -- the waterfall -- are meshes in a .glb, so
@@ -183,7 +210,7 @@ pub fn spawn(
             // known now, which is the whole reason the placements travel as
             // JSON and only the geometry travels as glTF.
             water::expect_surfaces(commands, assets, &furniture);
-            for position in render.trees {
+            for position in furniture.trees() {
                 commands.spawn((
                     LevelEntity,
                     // bhvTree is CYLBOARD in the original: it turns to face the
@@ -193,8 +220,16 @@ pub fn spawn(
                     // there at all.
                     crate::billboard::BillboardAxis,
                     crate::billboard::BillboardActor,
+                    // The same disc every unit gets, in place of the shadow
+                    // the level used to carry baked into its own mesh. See
+                    // [`crate::shadow::shed_baked`], which drops that one.
+                    crate::shadow::ShadowCaster {
+                        radius: TREE_SHADOW_RADIUS,
+                        height: TREE_HEIGHT,
+                        solidity: TREE_SHADOW_SOLIDITY,
+                    },
                     WorldAssetRoot(assets.load("actors/tree.glb#Scene0")),
-                    Transform::from_translation(position).with_scale(Vec3::splat(0.01)),
+                    Transform::from_translation(position).with_scale(Vec3::splat(TREE_SCALE)),
                 ));
             }
             commands.insert_resource(collision);

@@ -105,3 +105,6 @@ tree shadows clip, but unit shadows never do.
 make the coper material on the stellarator better
 
 asteroid generation
+
+
+I want the closes 100 units to be fully simulated instead of impostors, even if they are far away.  For disance based impostors, I don;t want them to change right away. if they enter or leave the range I want there to be a certain probability that they change based on how close they are every cycle to prevent suden pop in along the line as I move around.  

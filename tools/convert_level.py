@@ -2,9 +2,29 @@
 """Convert the committed SM64 NPZ level into Bevy's tiny native blob.
 
 Run from anywhere. The generated file is committed so playing the Bevy port
-does not require Python or NumPy. Geometry and collision come from the NPZs;
-their authored world dimensions come from the castle mesh in
-``assets/bevy/castle_grounds.blend``. One Blender metre is one game metre.
+does not require Python or NumPy.
+
+**Collision comes out of Blender.** It is the castle mesh in
+``assets/bevy/castle_grounds.blend``, in its own world space -- one Blender
+metre is one game metre, so nothing scales it on the way through. It used to be
+``assets/castle_grounds/collision.npz``, the decomp's separate 879-triangle
+collision hull, and the level therefore shipped two meshes that nobody could
+compare: the one you saw and the one you walked on. They disagreed, and every
+"I fell through the floor" and "it is standing inside the wall" had that as a
+candidate cause with no way to rule it out. Now there is one mesh, so the
+question cannot be asked.
+
+What is lost with the hull is what a hull is for: the decomp's invisible walls,
+its death planes and its floor types (``tri_type``/``tri_force`` in the NPZ,
+which nothing here has ever read). A castle collided with as it is drawn has
+none of those, and things you could once walk through -- railings, the castle
+facade -- now stop you. That is the intended trade.
+
+The render mesh still comes from the NPZ, because exporting the blend loses
+``KHR_materials_unlit`` and gains ``alphaMode: BLEND`` on all 45 materials --
+see ``build_assets.build_castle``. The two are the same geometry today, and
+`report_cover` below says so out loud on every run, because the day they stop
+being the same is the day the disagreement comes back.
 """
 import argparse
 from pathlib import Path
@@ -31,6 +51,7 @@ WATER_OUT = ROOT / "assets" / "bevy" / "water.png"
 CASTLE_BLEND = ROOT / "assets" / "bevy" / "castle_grounds.blend"
 CASTLE_ROOT = "CastleGrounds"
 BOUNDS_MARKER = "CASTLE_GROUNDS_EXTENTS="
+GEOMETRY_MARKER = "CASTLE_GROUNDS_GEOMETRY="
 sys.path.insert(0, str(ROOT))
 from tools.glb import GLB, FLOAT, UNSIGNED_INT, ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER
 from tools.blend_to_glb import resolve_blender
@@ -71,11 +92,31 @@ def world_scale(source_extents, blender_extents):
     return uniform_scale([want / raw for raw, want in zip(source, authored)])
 
 
-def blender_extents(explicit_blender=None):
-    """Measure the authored castle in Blender metres without exporting it."""
+def blender_castle(explicit_blender=None, dump=None):
+    """Read the authored castle out of Blender: its size and its triangles.
+
+    One launch for both, because they are one question -- what is in the blend
+    -- and because Blender takes seconds to start. `extents` is still measured
+    off the object bounding boxes, exactly as when this only measured, so the
+    render mesh's scale is unchanged to the last bit by collision arriving
+    beside it.
+
+    The vertices come back in *game* axes and in metres. Blender is Z-up and
+    the game is Y-up, so the swap happens here rather than being left for a
+    caller to remember: `(x, y, z)` in Blender is `(x, z, -y)` in the game,
+    which is the same convention glTF's `+Y up` export uses.
+
+    Evaluated meshes rather than the authored ones, so a wall built with a
+    mirror or an array modifier is collided with as it is drawn rather than as
+    it is stored.
+    """
     if not CASTLE_BLEND.is_file():
-        raise SystemExit(f"missing Blender scale source: {CASTLE_BLEND}")
+        raise SystemExit(f"missing Blender level source: {CASTLE_BLEND}")
     blender, version = resolve_blender(explicit_blender)
+    # The geometry goes to a file rather than through the marker line: it is a
+    # megabyte of JSON, and Blender's stdout is shared with whatever an add-on
+    # decides to print.
+    dump = Path(dump) if dump else CASTLE_BLEND.with_suffix(".geometry.json")
     expression = "\n".join((
         "import bpy, json, os, sys",
         "from mathutils import Vector",
@@ -95,9 +136,27 @@ def blender_extents(explicit_blender=None):
         "low = [min(point[axis] for point in corners) for axis in range(3)]",
         "high = [max(point[axis] for point in corners) for axis in range(3)]",
         "extents = [high[axis] - low[axis] for axis in range(3)]",
+        "depsgraph = bpy.context.evaluated_depsgraph_get()",
+        "vertices, triangles = [], []",
+        "for obj in meshes:",
+        "    evaluated = obj.evaluated_get(depsgraph)",
+        "    mesh = evaluated.to_mesh()",
+        "    mesh.calc_loop_triangles()",
+        "    base = len(vertices)",
+        "    matrix = obj.matrix_world",
+        "    for vertex in mesh.vertices:",
+        "        point = matrix @ vertex.co",
+        "        vertices.append([point.x, point.z, -point.y])",
+        "    for tri in mesh.loop_triangles:",
+        "        triangles.append([base + i for i in tri.vertices])",
+        "    evaluated.to_mesh_clear()",
+        (f"open({str(dump)!r}, 'w').write(json.dumps("
+         "{'vertices': vertices, 'triangles': triangles}))"),
         f"print({BOUNDS_MARKER!r} + json.dumps(extents), flush=True)",
+        f"print({GEOMETRY_MARKER!r} + json.dumps("
+        "[len(vertices), len(triangles)]), flush=True)",
         # A saved BlenderMCP handler can leave a server thread alive even in
-        # background/factory mode. This process has only read metadata, so a
+        # background/factory mode. This process has only read the file, so a
         # direct exit avoids waiting forever for unrelated add-on threads.
         "os._exit(0)",
     ))
@@ -121,7 +180,7 @@ def blender_extents(explicit_blender=None):
     if result.returncode != 0:
         sys.stderr.write(chatter)
         raise SystemExit(
-            f"could not measure castle dimensions with Blender "
+            f"could not read the castle with Blender "
             f"{'.'.join(map(str, version or ['unknown']))}")
     marked = [line[len(BOUNDS_MARKER):] for line in chatter.splitlines()
               if line.startswith(BOUNDS_MARKER)]
@@ -134,7 +193,66 @@ def blender_extents(explicit_blender=None):
         raise SystemExit(f"invalid Blender castle extents: {marked[0]!r}") from error
     if len(extents) != 3:
         raise SystemExit(f"invalid Blender castle extents: {extents!r}")
-    return extents
+    if not dump.is_file():
+        raise SystemExit(f"Blender wrote no castle geometry to {dump}")
+    try:
+        geometry = json.loads(dump.read_text())
+        vertices = np.asarray(geometry["vertices"], dtype=np.float32)
+        triangles = np.asarray(geometry["triangles"], dtype=np.uint32)
+    except (KeyError, ValueError, json.JSONDecodeError) as error:
+        raise SystemExit(f"invalid castle geometry in {dump}") from error
+    finally:
+        dump.unlink(missing_ok=True)
+    if not len(triangles):
+        raise SystemExit(f"no triangles beneath {CASTLE_ROOT} in {CASTLE_BLEND}")
+    return extents, vertices, triangles
+
+
+def drop_degenerate(vertices, triangles):
+    """Throw away the triangles with no area to speak of.
+
+    A hull authored by hand had none; a mesh authored to be *looked at* has
+    them by the dozen, and one of them is an invisible floor in the middle of
+    the world -- `level::degenerate` on the Rust side has the whole story for
+    the planet, and this is the same hazard reaching the castle for the first
+    time. Cheaper to drop them here, once, than to have every query in the game
+    step over them for ever.
+    """
+    corners = vertices[triangles.astype(np.int64)]
+    normals = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+    keep = np.linalg.norm(normals, axis=1) > 1e-6
+    if not keep.all():
+        print(f"dropped {int((~keep).sum())} degenerate collision triangles")
+    return triangles[keep]
+
+
+def report_cover(collision_vertices, collision_triangles, positions, triangles):
+    """Say how far the collision and the render mesh have drifted apart.
+
+    They are the same mesh today: the blend was built from `castle.glb`, which
+    is built from the same NPZ these positions come from. Nothing enforces
+    that, though -- the blend is the one a person edits, and the render mesh is
+    regenerated from the decomp -- so the moment somebody moves a wall in
+    Blender the two part company, and the game goes back to drawing one castle
+    and colliding with another.
+
+    A warning rather than a failure, because parting company is sometimes the
+    point: the collision is the authored one and a blend edit is meant to take
+    effect. But it is said out loud, with numbers, so it is never a surprise.
+    Turn on `collide_debug 2` in the game to see which faces.
+    """
+    def faces(vertices, indices):
+        return {tuple(sorted(tuple(point) for point in np.round(vertices[tri], 3)))
+                for tri in indices.astype(np.int64)}
+    collided, drawn = faces(collision_vertices, collision_triangles), \
+        faces(positions, triangles)
+    only_drawn, only_collided = len(drawn - collided), len(collided - drawn)
+    if not (only_drawn or only_collided):
+        print(f"collision matches the render mesh exactly ({len(drawn)} triangles)")
+        return
+    print(f"WARNING: the blend's collision and the render mesh disagree -- "
+          f"{only_drawn} face(s) are drawn with nothing to stand on, "
+          f"{only_collided} are collided with and never drawn")
 
 
 def write_vec(out, values, code):
@@ -151,7 +269,7 @@ def main(argv=None):
 
     mesh = np.load(ROOT / "assets/castle_grounds/mesh.npz")
     source_extents = np.ptp(mesh["positions"].astype(np.float64), axis=0)
-    authored_extents = blender_extents(args.blender)
+    authored_extents, coll_vertices, coll_triangles = blender_castle(args.blender)
     try:
         scale = world_scale(source_extents, authored_extents)
     except ValueError as error:
@@ -159,7 +277,9 @@ def main(argv=None):
     print("castle dimensions in Blender: "
           + " x ".join(f"{value:g} m" for value in authored_extents))
     print(f"derived source-unit conversion: {scale:g} m")
-    collision = np.load(ROOT / "assets/castle_grounds/collision.npz")
+    coll_triangles = drop_degenerate(coll_vertices, coll_triangles)
+    print(f"collision from {CASTLE_BLEND.name}: "
+          f"{len(coll_vertices):,} vertices, {len(coll_triangles):,} triangles")
     positions = mesh["positions"].astype(np.float32) * scale
     triangles = mesh["triangles"].astype(np.uint32)
 
@@ -178,28 +298,22 @@ def main(argv=None):
     # The source UV convention is vertically opposite glTF/Bevy.
     uvs = mesh["uvs"].astype(np.float32)
     uvs[:, 1] = 1.0 - uvs[:, 1]
-    coll_vertices = collision["vertices"].astype(np.float32) * scale
-    coll_triangles = collision["tri_verts"].astype(np.uint32)
-    # The decomp's water boxes are deliberately not read. They are furniture
-    # now -- two planes in `assets/levels/castle.blend`, exported by
+    # The water is not in here either. It is furniture -- two planes in
+    # `assets/levels/castle.blend`, exported by
     # `tools/export_level_furniture.py` -- so that moving the moat is
-    # something you do by dragging it. This file is the level's geometry, and
-    # geometry is the part nobody authors.
-
-    objects = json.loads((ROOT / "assets/castle_grounds/collision_objects.json").read_text())
-    trees = [o["pos"] for o in objects if o["preset"] == "special_bubble_tree"]
-    trees = np.asarray(trees, dtype=np.float32) * scale
+    # something you do by dragging it, which is now what moving anything is.
+    report_cover(coll_vertices, coll_triangles, positions, triangles)
 
     out = bytearray(b"SBW1")
     for values, code in (
         (positions, "<f4"), (normals, "<f4"), (uvs, "<f4"),
         (colors, "<f4"), (triangles, "<u4"),
-        (coll_vertices, "<f4"), (coll_triangles, "<u4"), (trees, "<f4"),
+        (coll_vertices, "<f4"), (coll_triangles, "<u4"),
     ):
         write_vec(out, values, code)
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_bytes(out)
-    print(f"wrote {OUT} ({len(out):,} bytes, {len(trees)} trees)")
+    print(f"wrote {OUT} ({len(out):,} bytes)")
     write_render_glb(mesh, scale)
     write_water_texture()
 

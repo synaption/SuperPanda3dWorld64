@@ -13,6 +13,7 @@ mod animation;
 mod audio;
 mod billboard;
 mod camera;
+mod collide;
 mod console;
 mod display;
 mod enemy;
@@ -400,7 +401,7 @@ pub fn add_game(app: &mut App) {
     // overlay has nothing to say about one, and a blank where a body should be
     // reads as a broken body. See that system for what it draws instead.
     app.add_systems(Startup, path::configure)
-        .add_systems(Update, (path::draw, enemy::draw_crawlers));
+        .add_systems(Update, (path::draw, enemy::draw_crawlers, collide::draw));
 }
 
 /// Every resource the game's systems expect to find.
@@ -812,15 +813,13 @@ fn overlay() -> ScheduleConfigs<ScheduleSystem> {
         // Straight after it, because the two share the console's request queue
         // and each hands back what the other one wanted. See `ConsoleState::defer`.
         weapon::equip,
-        // Out here rather than in `presentation` because a scene finishes
-        // loading whenever it does, and a console left open must not be the
-        // difference between a machine with a blue balloon inside it and one
-        // without.
-        stellarator::claim,
-        // Beside it and for the same reason: a mast's scene finishes loading
-        // whenever it does, and a console left open must not be the difference
-        // between an emitter that breathes and one that does not.
-        pylon::claim,
+        // All three out here rather than in `presentation` because a scene
+        // finishes loading whenever it does, and a console left open must not
+        // be the difference between a machine with a blue balloon inside it
+        // and one without, a mast that breathes and one that does not, or a
+        // lawn with the level's baked tree shadows still on it and one
+        // without. Nested for the tuple-of-twenty reason.
+        (stellarator::claim, pylon::claim, shadow::shed_baked),
         // Straight after `enemy::crowd` and `weapon::equip` in spirit: the
         // three share the console's request queue and each hands back what the
         // others wanted. See `ConsoleState::defer`.

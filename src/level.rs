@@ -69,6 +69,24 @@ enum Index {
 const GRID_WIDTH: usize = 64;
 const WALL_GRID_MARGIN: f32 = 1.0;
 
+/// The most face cells either way [`LevelData::faces_near`] will sweep on a
+/// planet.
+///
+/// A cap on the overlay rather than a property of the world: thirteen cells
+/// across is some sixty metres of terrain, which is already more wireframe
+/// than can be read, and the arc a given `reach` works out to grows without
+/// limit as a planet shrinks.
+const DEBUG_FACE_STEPS: isize = 6;
+
+/// The least a triangle may lean off vertical and still be filed as floor.
+///
+/// Barely a filter at all, and deliberately: the list it guards answers "what
+/// stops a falling body here", and the only triangles that stop nothing are
+/// the ones exactly on edge. Named because [`LevelData::face`] has to sort a
+/// triangle into the same three boxes the filing does, and a second copy of
+/// the number is a second answer waiting to happen.
+const FLOOR_FILE_LEAN: f32 = 0.01;
+
 /// How far off horizontal a triangle may lean and still be ground rather than
 /// wall. Anything at or below this is something you are pushed out of instead
 /// of something you stand on, which is the split [`LevelData::new`] has always
@@ -186,9 +204,7 @@ pub struct WaterBox {
     pub surface_y: f32,
 }
 
-pub struct RenderLevel {
-    pub trees: Vec<Vec3>,
-}
+pub struct RenderLevel;
 
 struct Reader<'a> {
     bytes: &'a [u8],
@@ -254,23 +270,25 @@ pub fn load() -> (LevelData, RenderLevel) {
         .into_iter()
         .map(|v| [v[0], v[1], v[2]])
         .collect();
-    let trees = r
-        .floats(3)
-        .into_iter()
-        .map(|v| Vec3::new(v[0], v[1], v[2]))
-        .collect();
-    // The water is not in here. It was, when it came out of the decomp's
-    // collision data along with everything else, and it is now two planes in
+    // These triangles are the ones the castle is *drawn* with, exported from
+    // `assets/bevy/castle_grounds.blend` by `tools/convert_level.py`. They
+    // used to be the decomp's separate 879-triangle collision hull, so the
+    // level shipped one mesh you could see and another you walked on, with
+    // nothing anywhere comparing them -- and `collide_debug 2` exists partly
+    // because that difference was invisible. Moving a wall in Blender now
+    // moves what stops you, and the hull's invisible walls and death planes
+    // are gone with it.
+    //
+    // The water is not in here either. It is two planes in
     // `assets/levels/castle.blend` that somebody can drag -- see
-    // [`crate::furniture`]. The rest of this file is the level's geometry,
-    // which is not authored anywhere and is the same as it ever was.
+    // [`crate::furniture`].
     (
         LevelData::new(
             collision_vertices,
             collision_triangles,
             crate::furniture::castle().water_boxes(),
         ),
-        RenderLevel { trees },
+        RenderLevel,
     )
 }
 
@@ -332,7 +350,7 @@ impl LevelData {
                     // consistently wound, so a floor's normal is as likely to
                     // be its underside as its top, and the query above picks
                     // by height rather than by facing for the same reason.
-                    if tri.normal.y.abs() > 0.01 {
+                    if tri.normal.y.abs() > FLOOR_FILE_LEAN {
                         cells[z * GRID_WIDTH + x].floors.push(index);
                     }
                 }
@@ -767,53 +785,9 @@ impl LevelData {
             let foot = result + up * radius;
             let head = result + up * (height - radius).max(radius);
             for &index in &candidates {
-                let tri = self.triangles[index as usize];
-                let (on_capsule, on_wall) =
-                    closest_points_segment_triangle(foot, head, tri.a, tri.b, tri.c);
-                let offset = on_capsule - on_wall;
-                // "Horizontal" is whatever lies flat against the ground here,
-                // which on a planet is a different plane at every point. The
-                // push stays in that plane because a wall should stop a body,
-                // not lift it over itself.
-                let climb = offset.dot(up);
-                let flat = offset - up * climb;
-                let distance = flat.length();
-                // How far apart the two have to be *horizontally* to be clear,
-                // given how far apart they already are vertically. This is the
-                // whole of the difference between a capsule and a column, and
-                // leaving it out is what put invisible walls on the bridges: a
-                // moat face five metres below the deck is directly under the
-                // edge you are walking along, so its horizontal distance is
-                // nearly nothing, and a body clear of it by five metres was
-                // being shoved a metre and a half sideways by it.
-                //
-                // Where the contact is level with the body this is the radius
-                // and nothing has changed. Where it is a radius or more above
-                // the head or below the feet there is no overlap at all and
-                // the wall is not a wall to this body.
-                let square = radius * radius - climb * climb;
-                if square <= 0.0 {
-                    continue;
+                if let Some(contact) = self.contact(index, foot, head, up, radius) {
+                    contacts.push(contact);
                 }
-                let clearance = square.sqrt();
-                if distance >= clearance {
-                    continue;
-                }
-                let direction = if distance > 1e-5 {
-                    flat / distance
-                } else {
-                    // Dead in the wall's plane: the offset says nothing about
-                    // which side to leave by, so the triangle's own facing
-                    // decides, flattened against the local ground.
-                    (tri.normal - up * tri.normal.dot(up)).normalize_or_zero()
-                };
-                if direction == Vec3::ZERO {
-                    continue;
-                }
-                contacts.push(Contact {
-                    direction,
-                    depth: clearance - distance + WALL_SKIN,
-                });
             }
             if contacts.is_empty() {
                 break;
@@ -843,6 +817,68 @@ impl LevelData {
             result += push;
         }
         result
+    }
+
+    /// What one wall does to the capsule running from `foot` to `head`, or
+    /// `None` where the two are clear of each other.
+    ///
+    /// Its own function rather than the body of the loop above because
+    /// [`Self::wall_contacts`] has to give the same answer -- an overlay that
+    /// measures the push its own way is an overlay that disagrees with the bug
+    /// it was turned on to explain.
+    fn contact(
+        &self,
+        index: u32,
+        foot: Vec3,
+        head: Vec3,
+        up: Vec3,
+        radius: f32,
+    ) -> Option<Contact> {
+        let tri = self.triangles[index as usize];
+        let (on_capsule, on_wall) =
+            closest_points_segment_triangle(foot, head, tri.a, tri.b, tri.c);
+        let offset = on_capsule - on_wall;
+        // "Horizontal" is whatever lies flat against the ground here, which on
+        // a planet is a different plane at every point. The push stays in that
+        // plane because a wall should stop a body, not lift it over itself.
+        let climb = offset.dot(up);
+        let flat = offset - up * climb;
+        let distance = flat.length();
+        // How far apart the two have to be *horizontally* to be clear, given
+        // how far apart they already are vertically. This is the whole of the
+        // difference between a capsule and a column, and leaving it out is
+        // what put invisible walls on the bridges: a moat face five metres
+        // below the deck is directly under the edge you are walking along, so
+        // its horizontal distance is nearly nothing, and a body clear of it by
+        // five metres was being shoved a metre and a half sideways by it.
+        //
+        // Where the contact is level with the body this is the radius and
+        // nothing has changed. Where it is a radius or more above the head or
+        // below the feet there is no overlap at all and the wall is not a wall
+        // to this body.
+        let square = radius * radius - climb * climb;
+        if square <= 0.0 {
+            return None;
+        }
+        let clearance = square.sqrt();
+        if distance >= clearance {
+            return None;
+        }
+        let direction = if distance > 1e-5 {
+            flat / distance
+        } else {
+            // Dead in the wall's plane: the offset says nothing about which
+            // side to leave by, so the triangle's own facing decides,
+            // flattened against the local ground.
+            (tri.normal - up * tri.normal.dot(up)).normalize_or_zero()
+        };
+        if direction == Vec3::ZERO {
+            return None;
+        }
+        Some(Contact {
+            direction,
+            depth: clearance - distance + WALL_SKIN,
+        })
     }
 
     /// The triangles near `at` that count as wall rather than floor.
@@ -1346,6 +1382,208 @@ fn closest_point_on_triangle(point: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
     }
     let denominator = (va + vb + vc).recip();
     a + ab * (vb * denominator) + ac * (vc * denominator)
+}
+
+/// What the collision grid has decided a triangle is.
+///
+/// Not a property of the triangle so much as of the *filing*: which of the
+/// grid's two lists it went into, which is what settles whether a body stands
+/// on it, is held off it, or goes straight through. The two lists overlap, and
+/// nearly every "I fell through the floor" and "it is standing inside the
+/// wall" is about a face on the wrong side of one of the two lines below.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FaceKind {
+    /// Leaning less than [`GROUND_NORMAL_Y`] off flat: something to stand on,
+    /// and something [`LevelData::resolve_walls`] will never push a body out
+    /// of. Ground is only ever under you.
+    Ground,
+    /// Steeper than ground, not quite on edge: filed as a wall *and* as a
+    /// floor. It shoves a body sideways, and it is also what a falling body
+    /// can land on -- so a body pressed into one may be resting on a face that
+    /// is at the same time trying to eject it.
+    Ledge,
+    /// On edge to within [`FLOOR_FILE_LEAN`], and so a wall and nothing else.
+    /// Nothing stands on one of these: get past it and there is no floor
+    /// underneath, which is the shape of most of the falling through.
+    Wall,
+}
+
+/// One triangle of collision, as the overlay reads it.
+pub struct DebugFace {
+    pub corners: [Vec3; 3],
+    /// The triangle's own normal. The converted castle mesh is not wound
+    /// consistently, so this points out of the floor about as often as it
+    /// points into it -- which is why every query here measures its lean on
+    /// the absolute value and so does [`LevelData::face`].
+    pub normal: Vec3,
+    pub kind: FaceKind,
+}
+
+/// One wall a body is being resolved against, and what that wall is doing to
+/// it at this instant.
+pub struct DebugWall {
+    pub face: DebugFace,
+    /// Where on the triangle the body's spine comes nearest it.
+    pub nearest: Vec3,
+    /// The push this wall is making right now, as direction times depth, or
+    /// zero where the two are clear of each other. A body standing still with
+    /// a push on it is a body the resolution has given up on.
+    pub push: Vec3,
+}
+
+/// One cell of the flat collision grid.
+pub struct DebugCell {
+    /// The low corner, in world `(x, z)`.
+    pub min: Vec2,
+    pub size: Vec2,
+    /// How many triangles a floor query in this cell walks. Zero is a hole:
+    /// nothing here can hold anything up.
+    pub floors: usize,
+    /// How many a wall resolution walks.
+    pub walls: usize,
+}
+
+/// What the collision looks like from outside, for the overlay in
+/// [`crate::collide`].
+///
+/// Deliberately not a second set of queries. Everything here either hands back
+/// the very list a real query walks, or runs the real test -- because the only
+/// use for any of it is answering "why did the collision do that", and a view
+/// that works the answer out its own way cannot.
+impl LevelData {
+    /// Every triangle filed within `reach` of `at`.
+    pub fn faces_near(&self, at: Vec3, reach: f32, out: &mut Vec<DebugFace>) {
+        out.clear();
+        let mut found: Vec<u32> = Vec::new();
+        match &self.index {
+            Index::Flat { cells, .. } => {
+                let low = self.cell_coords(Vec2::new(at.x - reach, at.z - reach));
+                let high = self.cell_coords(Vec2::new(at.x + reach, at.z + reach));
+                for z in low.1..=high.1 {
+                    for x in low.0..=high.0 {
+                        found.extend(cells[z * GRID_WIDTH + x].all.iter().map(|&i| i as u32));
+                    }
+                }
+            }
+            Index::Planet {
+                centre,
+                radius,
+                cells,
+                ..
+            } => {
+                // A patch of face cells around the one the point is over. The
+                // sweep is in angle rather than in metres because that is what
+                // a face cell is measured in; `reach` becomes an arc on the
+                // way in and a handful of cells on the way out.
+                let radial = (at - *centre).normalize_or(Vec3::Y);
+                let (along, across) = radial.any_orthonormal_pair();
+                let arc = reach / radius.max(1.0) / FACE_CELL_ANGLE;
+                let steps = (arc.ceil() as isize).clamp(1, DEBUG_FACE_STEPS);
+                for down in -steps..=steps {
+                    for right in -steps..=steps {
+                        let towards = radial
+                            + along * (right as f32 * FACE_CELL_ANGLE)
+                            + across * (down as f32 * FACE_CELL_ANGLE);
+                        found.extend(&cells[face_cell(towards)]);
+                    }
+                }
+            }
+        }
+        // One triangle spans several cells and is filed in every one of them.
+        found.sort_unstable();
+        found.dedup();
+        for index in found {
+            let tri = self.triangles[index as usize];
+            let near = match self.index {
+                // The filing is by `(x, z)` and so is the range: a triangle is
+                // in reach if its own footprint is. Without this the one big
+                // floor slab under a hall drags its whole outline in from
+                // wherever it happens to start.
+                Index::Flat { .. } => {
+                    tri.max.x >= at.x - reach
+                        && tri.min.x <= at.x + reach
+                        && tri.max.y >= at.z - reach
+                        && tri.min.y <= at.z + reach
+                }
+                // A face cell is already a patch of surface, so anything filed
+                // in the ones sampled above is near by construction.
+                Index::Planet { .. } => true,
+            };
+            if near {
+                out.push(self.face(tri));
+            }
+        }
+    }
+
+    /// The walls a body standing at `at` is resolved against, each with the
+    /// push it is making.
+    ///
+    /// The candidate list [`Self::resolve_walls`] walks, run through the same
+    /// test it uses -- so a triangle listed here with no push is one the
+    /// resolution looked at and let be, and that distinction is the whole
+    /// question when a body is standing in something.
+    pub fn wall_contacts(
+        &self,
+        at: Vec3,
+        up: Vec3,
+        radius: f32,
+        height: f32,
+        out: &mut Vec<DebugWall>,
+    ) {
+        out.clear();
+        let mut cells = Vec::new();
+        let mut candidates = Vec::new();
+        self.walls_near(at, up, &mut cells, &mut candidates);
+        let foot = at + up * radius;
+        let head = at + up * (height - radius).max(radius);
+        for index in candidates {
+            let tri = self.triangles[index as usize];
+            let (_, nearest) = closest_points_segment_triangle(foot, head, tri.a, tri.b, tri.c);
+            let push = self
+                .contact(index, foot, head, up, radius)
+                .map_or(Vec3::ZERO, |contact| contact.direction * contact.depth);
+            out.push(DebugWall {
+                face: self.face(tri),
+                nearest,
+                push,
+            });
+        }
+    }
+
+    /// The grid cell a query at `point` is answered from, or `None` on a
+    /// planet, which files by face cell and has no such square.
+    pub fn cell_footprint(&self, point: Vec3) -> Option<DebugCell> {
+        let (cells, min, size) = self.flat()?;
+        let (x, z) = self.cell_coords(Vec2::new(point.x, point.z));
+        let cell = &cells[z * GRID_WIDTH + x];
+        Some(DebugCell {
+            min: min + size * Vec2::new(x as f32, z as f32),
+            size,
+            floors: cell.floors.len(),
+            walls: cell.walls.len(),
+        })
+    }
+
+    /// One triangle, sorted into the same three boxes the filing sorts it
+    /// into -- measured against the up that holds where the triangle is, which
+    /// on a planet is a different direction for every one of them.
+    fn face(&self, tri: CollisionTriangle) -> DebugFace {
+        let middle = (tri.a + tri.b + tri.c) / 3.0;
+        let up = match self.index {
+            Index::Flat { .. } => Vec3::Y,
+            Index::Planet { centre, .. } => (middle - centre).normalize_or(Vec3::Y),
+        };
+        let lean = tri.normal.dot(up).abs();
+        DebugFace {
+            corners: [tri.a, tri.b, tri.c],
+            normal: tri.normal,
+            kind: match lean {
+                _ if lean > GROUND_NORMAL_Y => FaceKind::Ground,
+                _ if lean > FLOOR_FILE_LEAN => FaceKind::Ledge,
+                _ => FaceKind::Wall,
+            },
+        }
+    }
 }
 
 #[cfg(test)]

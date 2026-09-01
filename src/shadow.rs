@@ -402,6 +402,41 @@ pub fn dim_with_drop(solidity: f32, drop: f32) -> f32 {
     }
 }
 
+/// The node the castle's glTF keeps its tree shadows in.
+///
+/// SM64 gave the grounds' trees their shadows as level geometry rather than as
+/// the disc everything that moves gets: twenty-six quads in
+/// `LAYER_TRANSPARENT_DECAL`, one under each tree, each carrying a soft dark
+/// circle whose alpha tops out at 163. `tools/convert_level.py` carries them
+/// across with the rest of the mesh under the segment address their display
+/// list had, and they are the one genuinely translucent surface in the level --
+/// see [`crate::n64::drawn_as`], which sorts blends from cutouts and has this
+/// picture pinned as its translucent case.
+///
+/// They are dropped because they are laid at the height the ground was when
+/// somebody placed them and the lawn is not flat: the uphill half of a quad
+/// ends up inside the hill and the downhill half floats over it, and neither
+/// of the two corrections that keep a unit's disc on the ground -- the [`LIFT`]
+/// along the floor's own normal, the [`FLOAT`] toward the eye -- can be applied
+/// to geometry that shipped baked into the level. The tree carries a
+/// [`ShadowCaster`] instead, and gets the same disc, dropped the same way,
+/// as the thing standing next to it.
+const BAKED_TREE_SHADOWS: &str = "outside_0900BC00";
+
+/// Drops the level's baked shadow decals as its scene arrives.
+///
+/// By node name, because that is what survives the export -- the same way
+/// [`crate::billboard::claim`] finds the joints it drives. Only the node is
+/// matched: the primitive under it is named after both the mesh and the
+/// material, and it goes when its parent does.
+pub fn shed_baked(mut commands: Commands, arrivals: Query<(Entity, &Name), Added<Name>>) {
+    for (entity, name) in &arrivals {
+        if name.as_str() == BAKED_TREE_SHADOWS {
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
 /// Gives every caster a disc, and reclaims the discs of casters that are gone.
 ///
 /// A new disc starts on the solid rung of the ladder; [`project`] moves it to
@@ -523,6 +558,75 @@ pub fn systems() -> ScheduleConfigs<ScheduleSystem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What [`shed_baked`] drops is still in the level, still called what this
+    /// module calls it, and still exactly one quad per tree.
+    ///
+    /// The name is a segment address out of the decomp, so nothing about it
+    /// says what it holds; if the conversion ever renames the group or stops
+    /// writing it, the system above silently drops nothing and the baked
+    /// shadows come back under trees that now cast their own. The count is the
+    /// other half of the same guard, in the other direction: it is what says
+    /// this node is the tree shadows rather than some other decal that happens
+    /// to be blended, and that dropping the whole of it costs the level
+    /// nothing else.
+    #[test]
+    fn the_level_carries_one_baked_shadow_quad_per_tree() {
+        let file = gltf("bevy/castle.glb");
+        let mesh = file["meshes"]
+            .as_array()
+            .expect("no meshes")
+            .iter()
+            .find(|mesh| mesh["name"] == BAKED_TREE_SHADOWS)
+            .unwrap_or_else(|| panic!("the castle has no {BAKED_TREE_SHADOWS} to drop"));
+        let accessor = mesh["primitives"][0]["attributes"]["POSITION"]
+            .as_u64()
+            .expect("no positions") as usize;
+        let corners = file["accessors"][accessor]["count"]
+            .as_u64()
+            .expect("no count");
+        let trees = crate::furniture::castle().trees().len() as u64;
+        assert_eq!(
+            corners,
+            trees * 4,
+            "the castle's baked decal layer is {corners} corners against {trees} \
+             trees, so it is no longer four to a tree and dropping it whole is \
+             dropping something else too"
+        );
+    }
+
+    /// The node goes as it arrives, and its neighbours in the same scene stay.
+    #[test]
+    fn the_baked_shadows_are_dropped_as_the_level_arrives() {
+        let mut app = App::new();
+        app.add_systems(Update, shed_baked);
+        let baked = app.world_mut().spawn(Name::new(BAKED_TREE_SHADOWS)).id();
+        // With a child, because the loader hangs the geometry off one: it is
+        // named after the mesh and the material rather than after the node,
+        // and it has to go with its parent rather than be matched on its own.
+        let quads = app
+            .world_mut()
+            .spawn((
+                Name::new(format!("{BAKED_TREE_SHADOWS}.{BAKED_TREE_SHADOWS}")),
+                ChildOf(baked),
+            ))
+            .id();
+        let lawn = app.world_mut().spawn(Name::new("outside_09000000")).id();
+        app.update();
+
+        assert!(
+            app.world().get_entity(baked).is_err(),
+            "the baked shadows are still in the level"
+        );
+        assert!(
+            app.world().get_entity(quads).is_err(),
+            "the quads under the dropped node outlived it"
+        );
+        assert!(
+            app.world().get_entity(lawn).is_ok(),
+            "dropping the baked shadows took a piece of the lawn with it"
+        );
+    }
 
     /// The two curves, at the three points the original pins them at.
     #[test]
@@ -808,5 +912,17 @@ mod tests {
             (drawn - faint).abs() <= ShadowArt::rung() / 2.0 + 1e-6,
             "a caster asking for {faint} was drawn at {drawn}"
         );
+    }
+
+    /// The JSON out of a shipped GLB, read straight off disk: a twelve-byte
+    /// header, then the JSON chunk with its own length in front of it. The
+    /// same reading [`crate::billboard`] does, and for the same reason -- no
+    /// renderer, no asset server, and no loading a scene to ask a question
+    /// about the file it came out of.
+    fn gltf(path: &str) -> serde_json::Value {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let bytes = std::fs::read(root.join(path)).expect("missing glb");
+        let length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        serde_json::from_slice(&bytes[20..20 + length]).expect("bad glb json")
     }
 }

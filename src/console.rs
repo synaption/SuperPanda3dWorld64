@@ -370,6 +370,13 @@ pub const SPECS: &[TunableSpec] = &[
         doc: "draw routes and crawlers (1), the nav grid (2), the flow field (3)",
     },
     TunableSpec {
+        name: "collide_debug",
+        low: 0.0,
+        high: 3.0,
+        step: 1.0,
+        doc: "draw collision bodies (1), the mesh (2), the grid and candidates (3)",
+    },
+    TunableSpec {
         name: "enemy_sight",
         low: 0.0,
         high: 200.0,
@@ -627,6 +634,10 @@ pub struct GameTuning {
     /// Draws the routes (1), the navigation grid over them (2), and the crowd's
     /// flow field over that (3). See [`crate::path::draw`].
     pub path_debug: f32,
+    /// Draws the collision bodies (1), the mesh they are resolved against (2),
+    /// and the grid and candidate lists behind that (3). See
+    /// [`crate::collide::draw`].
+    pub collide_debug: f32,
     pub enemy_speed: f32,
     pub enemy_sight: f32,
     pub enemy_alert: f32,
@@ -784,6 +795,7 @@ impl Default for GameTuning {
             // like two squads; one of fourteen behaves like a crowd.
             path_group: 10.0,
             path_debug: 0.0,
+            collide_debug: 0.0,
             enemy_speed: 1.8,
             enemy_sight: 14.0,
             enemy_alert: 9.0,
@@ -902,6 +914,7 @@ impl GameTuning {
             "path_spread" => self.path_spread,
             "path_group" => self.path_group,
             "path_debug" => self.path_debug,
+            "collide_debug" => self.collide_debug,
             "enemy_speed" => self.enemy_speed,
             "enemy_sight" => self.enemy_sight,
             "enemy_alert" => self.enemy_alert,
@@ -977,6 +990,7 @@ impl GameTuning {
             "path_spread" => self.path_spread = value,
             "path_group" => self.path_group = value,
             "path_debug" => self.path_debug = value,
+            "collide_debug" => self.collide_debug = value,
             "enemy_speed" => self.enemy_speed = value,
             "enemy_sight" => self.enemy_sight = value,
             "enemy_alert" => self.enemy_alert = value,

@@ -12,6 +12,7 @@ reads. This refuses to overwrite an existing file unless asked twice.
 What it seeds is exactly what the game did before:
 
 - the two water boxes from `assets/castle_grounds/collision.npz`
+- the trees from `assets/castle_grounds/collision_objects.json`
 - the 15-vertex movtex waterfall strip from `src/water.rs`
 - the three warp pipes and what each produces, and the five hand-placed
   enemies, from `world::spawn_castle_inhabitants`
@@ -26,6 +27,7 @@ holds one copy of each however many are placed. Neither is exported: the model
 collections are not in the scene at all, and the exporter walks `Furniture`.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -41,6 +43,7 @@ from export_level_furniture import DISPLAY_SCALE, SHOWS, stem  # noqa: E402
 
 REFERENCE = ROOT / "assets" / "bevy" / "castle_grounds.blend"
 COLLISION = ROOT / "assets" / "castle_grounds" / "collision.npz"
+COLLISION_OBJECTS = ROOT / "assets" / "castle_grounds" / "collision_objects.json"
 WATER_TEXTURE = ROOT / "assets" / "bevy" / "water.png"
 OUTPUT = ROOT / "assets" / "levels" / "castle.blend"
 
@@ -90,6 +93,13 @@ ACTORS = [
     ("ant", (-29.0, 3.0, 21.0)),
     ("ant", (4.0, 3.0, 19.0)),
 ]
+
+
+def trees():
+    """The decomp placements this one-shot migration moves into Blender."""
+    objects = json.loads(COLLISION_OBJECTS.read_text())
+    return [tuple(float(axis) * SCALE for axis in obj["pos"])
+            for obj in objects if obj["preset"] == "special_bubble_tree"]
 
 #: `world::CASTLE_SPAWN`.
 SPAWN = (-13.28, 3.0, 46.64)
@@ -318,7 +328,8 @@ def main():
                     display="SINGLE_ARROW", size=6.0)
     gravity["mode"] = "down"
 
-    models = link_models({SHOWS["pipe"]}
+    tree_positions = trees()
+    models = link_models({SHOWS["pipe"], SHOWS["tree"]}
                          | {SHOWS[kind] for kind, _ in ACTORS})
     for spawns, interval, at in PIPES:
         # Every pipe shows a warp pipe. What comes out of it is a property, not
@@ -329,12 +340,15 @@ def main():
         pipe["interval"] = interval
     for kind, at in ACTORS:
         placement(kind, at, models, furniture)
+    for at in tree_positions:
+        placement("tree", at, models, furniture)
 
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=str(OUTPUT), compress=True,
                                 relative_remap=True)
     print(f"wrote {OUTPUT}: {boxes} water boxes, 1 waterfall, "
-          f"{len(PIPES)} pipes, {len(ACTORS)} actors")
+          f"{len(PIPES)} pipes, {len(ACTORS)} actors, "
+          f"{len(tree_positions)} trees")
 
 
 if __name__ == "__main__":

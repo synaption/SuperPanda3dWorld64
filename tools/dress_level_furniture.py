@@ -141,8 +141,8 @@ def dress(obj, holder, model):
     obj.instance_collection = holder
     # A pipe's size is the level's to decide and the exporter carries it
     # through, so it is not this tool's to overwrite. Everything else is drawn
-    # at the factor the game draws that model at, which for a model authored at
-    # its final size -- all of them but Mario -- is one.
+    # at the factor the game draws that model at. Most models are authored at
+    # their final size; Mario and the decomp tree card retain source units.
     scale = DISPLAY_SCALE.get(model, 1.0)
     if stem(obj.name) != "pipe" and tuple(obj.scale) != (scale, scale, scale):
         obj.scale = (scale, scale, scale)

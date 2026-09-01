@@ -5,11 +5,11 @@
 
 Furniture is everything in a level that is placed rather than modelled: where
 the player starts, which way gravity points, where the water is, where the warp
-pipes are and what comes out of each, and what is standing about when the level
-comes up. All of it used to be literals in `src/world.rs`, `src/water.rs` and
-the decomp's collision data, which meant moving a warp pipe was a code change.
-Now it is an empty in `assets/levels/<level>.blend`, and this is the step that
-carries it across.
+pipes are and what comes out of each, where the trees grow, and what is standing
+about when the level comes up. All of it used to be literals in `src/world.rs`,
+`src/water.rs` and the decomp's collision data, which meant moving a tree or a
+warp pipe was a code change. Now it is an empty in
+`assets/levels/<level>.blend`, and this is the step that carries it across.
 
 Two outputs, because the game needs the two halves at different times:
 
@@ -29,6 +29,7 @@ duplicate Blender called `pipe.001` is still a pipe:
     empty   gravity      ["mode"] "down" or "radial"; radial uses its location
     empty   pipe         ["spawns"] mario|slime|ant, ["interval"] seconds
     empty   slime|ant    one of those, standing there when the level comes up
+    empty   tree         a billboard tree rooted at this point
     empty   stellarator  a machine, at the size and the turn it is drawn with
     mesh    water        a water box: its footprint, at the height it sits
     mesh    <anything>   a drawn surface, exported to the GLB. ["drift_u"],
@@ -88,12 +89,10 @@ DEFAULT_INTERVAL = 12.0
 #: the model and not of the level: `mario.glb` is 160 units tall because it came
 #: out of the decomp that way.
 #:
-#: A one here means the model is authored at its final size, which is what every
-#: model in this game ought to be and what the two Blender-made actors already
-#: are. The warp pipe was the last holdout at 0.01 -- it is the decomp's own
-#: 307-unit pipe -- and a placement of it that came back from an edit at
-#: Blender's default scale of one was a pipe 307 metres across. So it was
-#: resized in `assets/actors/warp_pipe.blend` and this became a one as well.
+#: A one here means the model is authored at its final size, which is what most
+#: models in this game are. The tree card and Mario retain their source units;
+#: their factors make the linked models truthful in the level viewport. The
+#: warp pipe was resized in its own source, so its placement stays at one.
 #:
 #: Only the pipe's is read back out (see `read_furniture` below). An actor's
 #: size is measured off its own glTF by `enemy::Kind::body` and is what its
@@ -101,6 +100,7 @@ DEFAULT_INTERVAL = 12.0
 #: creature at a size it does not collide at.
 DISPLAY_SCALE = {
     "warp_pipe": 1.0,
+    "tree": 0.01,
     "luna": 1.0,
     "stellarator": 1.0,
     "mario": 0.00667,
@@ -119,6 +119,7 @@ DISPLAY_SCALE = {
 #: off it, and a level file that has never been dressed exports identically.
 SHOWS = {
     "pipe": "warp_pipe",
+    "tree": "tree",
     "spawn": "luna",
     "stellarator": "stellarator",
     "mario": "mario",
@@ -131,6 +132,7 @@ SHOWS = {
 #: in every level is the new ant, next time the file is opened.
 MODEL_SOURCE = {
     "warp_pipe": "assets/actors/warp_pipe.blend",
+    "tree": "assets/actors/tree.blend",
     "stellarator": "assets/actors/stellarator.blend",
     "luna": "assets/luna/Luna.blend",
     "mario": "assets/mario/mario.blend",
@@ -220,7 +222,7 @@ def footprint(obj):
 def read_furniture():
     """Every recognised object, sorted into the placements the game reads."""
     level = {"spawn": None, "gravity": None, "water": [], "pipes": [],
-             "actors": [], "props": [], "surfaces": []}
+             "actors": [], "trees": [], "props": [], "surfaces": []}
     meshes = []
     unknown = []
     for obj in furniture_objects():
@@ -256,6 +258,9 @@ def read_furniture():
         elif kind in ACTOR_KINDS:
             check_display_scale(obj, kind)
             level["actors"].append({"kind": kind, "at": at})
+        elif kind == "tree":
+            check_display_scale(obj, kind)
+            level["trees"].append(at)
         elif kind in PROP_KINDS:
             # A structure, and so the same three numbers a pipe gets. Nothing
             # walks, so nothing overwrites the turn a second later, and the
@@ -292,24 +297,21 @@ def actor_kind(obj, value):
 
 
 def check_display_scale(obj, kind):
-    """An actor's size is its model's, so say so rather than dropping it.
+    """A fixed-size placement's size is its model's, so report any edit.
 
-    The instance is scaled to `DISPLAY_SCALE` purely so that the viewport draws
-    it at the size the game does. Rescaling it there looks like it should work
-    and cannot: `enemy::Kind::body` measures the collision radius off the model
-    the game loads, so an actor drawn at half size would still shoulder its way
-    around the level at full size. Resizing a creature means resizing the
-    creature -- `tools/resize_actor.py`, then a rebuild.
+    The instance is scaled to `DISPLAY_SCALE` purely so the viewport draws it
+    at the size the game does. Actors derive collision from their model and
+    trees have one model-wide runtime scale, so neither can be resized per
+    placement here.
     """
     want = DISPLAY_SCALE.get(kind, 1.0)
     have = uniform_scale(obj)
     if abs(have - want) > 1e-4:
         print(f"  {obj.name!r} is scaled {have:g}, not the {want:g} the game "
-              f"draws a {kind} at. Scale is ignored for actors: use "
-              f"tools/resize_actor.py to change how big one is")
+              f"draws a {kind} at. Per-placement scale is ignored")
     if abs(yaw_of(obj)) > 1e-4:
         print(f"  {obj.name!r} is turned {yaw_of(obj):.3f} rad, which is "
-              "ignored: an actor faces wherever its behaviour points it")
+              "ignored: this placement's facing is decided at runtime")
 
 
 def gravity(obj, at):
@@ -406,9 +408,16 @@ def export_inside_blender(argv):
         out.write("\n")
     print(f"wrote {args.json}: {len(level['water'])} water boxes, "
           f"{len(level['pipes'])} pipes, {len(level['actors'])} actors, "
+          f"{len(level['trees'])} trees, "
           f"{len(level['props'])} props, {len(level['surfaces'])} surfaces, "
           f"gravity {level['gravity']['mode']}")
     print(f"wrote {args.glb}: {len(meshes)} surface meshes, {size:,} bytes")
+    # A saved BlenderMCP handler can leave a server or audio thread alive even
+    # in background/factory mode. Both outputs are closed above, so leave
+    # directly instead of hanging a build after reporting that it succeeded.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 # ---------------------------------------------------------------------------

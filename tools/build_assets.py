@@ -308,11 +308,19 @@ def build_castle(_staging, blender):
     draws. Neither shows up as an error anywhere.
 
     So the castle is built by the tool that actually produces what the game
-    loads. It reads the committed NPZs under `assets/castle_grounds/` -- the
-    decomp's geometry, parsed once -- and writes all three runtime files
-    together. The mesh still does not come out of Blender, but its world-space
-    bounds do: one metre in the authoring copy is one metre in the game, and
-    applying object scale back to one does not change the generated size.
+    loads. It reads the committed `mesh.npz` under `assets/castle_grounds/` --
+    the decomp's geometry, parsed once -- and writes all three runtime files
+    together. The *render* mesh still does not come out of Blender, but its
+    world-space bounds do: one metre in the authoring copy is one metre in the
+    game, and applying object scale back to one does not change the generated
+    size.
+
+    The **collision** does come out of Blender, and is the same mesh the level
+    is drawn with. It was `collision.npz`, the decomp's separate 879-triangle
+    hull, which meant the level shipped two meshes nobody could compare -- see
+    `convert_level` for what that cost and what the change gives up with the
+    hull. That file is still an input to `build_castle_furniture`, which reads
+    its water boxes; nothing the game loads reads it any more.
     """
     command = [sys.executable, TOOLS / "convert_level.py"]
     if blender:
@@ -329,9 +337,9 @@ def plan_castle():
         # is not in the repository. Stamped all the same: absent is a state
         # like any other here, and a run made with the pack present is not the
         # same run as one made without it.
+        # The blend is a geometry input now rather than a scale reference,
+        # which is why editing it has to re-run this stage.
         inputs=(grounds / "mesh.npz",
-                grounds / "collision.npz",
-                grounds / "collision_objects.json",
                 grounds / "mesh_materials.json",
                 ROOT / "assets/bevy/castle_grounds.blend",
                 ROOT / "reference/RENDER96-HD-TEXTURE-PACK/gfx/textures/"
@@ -356,9 +364,9 @@ def plan_levels():
 
     The source is `assets/levels/<level>.blend`, which links the level's own
     geometry in as a backdrop to place against and exports none of it. Water,
-    warp pipes and what each produces, the enemies standing about, the spawn
-    point and which way gravity points were all literals in the Rust until
-    this existed.
+    trees, warp pipes and what each produces, the enemies standing about, the
+    spawn point and which way gravity points were all literals or extracted
+    data until this existed.
     """
     units = []
     for level in LEVELS:

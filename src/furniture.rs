@@ -1,11 +1,12 @@
 //! What a level has in it, placed in Blender rather than written down here.
 //!
 //! Everything a level is made of used to be a literal. The three warp pipes
-//! and what each produced, the five enemies standing about, where the player
-//! was put down, which way down was, and the two boxes of water -- those were
-//! arrays in [`crate::world`], constants in [`crate::water`] and a field of the
-//! decomp's collision data. Moving a warp pipe six metres was a code change,
-//! and the only way to see where one was going to end up was to run the game.
+//! and what each produced, the five enemies standing about, the trees, where
+//! the player was put down, which way down was, and the two boxes of water --
+//! those were arrays in [`crate::world`], constants in [`crate::water`] and
+//! fields of the decomp's collision data. Moving a tree or a warp pipe six
+//! metres was a code change, and the only way to see where one was going to
+//! end up was to run the game.
 //!
 //! So they are authored in `assets/levels/<level>.blend` instead, as empties
 //! you can drag around against the level's own geometry, and
@@ -53,6 +54,8 @@ pub struct Furniture {
     pipes: Vec<PipeSpec>,
     #[serde(default)]
     actors: Vec<ActorSpec>,
+    #[serde(default)]
+    trees: Vec<[f32; 3]>,
     #[serde(default)]
     props: Vec<PropSpec>,
     #[serde(default)]
@@ -299,6 +302,12 @@ impl Furniture {
             .collect()
     }
 
+    /// The trees rooted in the level. Their model and billboard behaviour are
+    /// properties of a tree; the level owns only where each one grows.
+    pub fn trees(&self) -> Vec<Vec3> {
+        self.trees.iter().copied().map(point).collect()
+    }
+
     /// The structures standing in the level when it comes up.
     pub fn props(&self) -> Vec<Prop> {
         self.props
@@ -334,6 +343,7 @@ mod tests {
         assert_eq!(castle.water_boxes().len(), 2, "the moat and the bay");
         assert_eq!(castle.pipes().len(), 3);
         assert_eq!(castle.actors().len(), 5);
+        assert_eq!(castle.trees().len(), 26);
         assert_eq!(castle.surfaces().len(), 1, "the waterfall");
     }
 
@@ -358,6 +368,9 @@ mod tests {
         }
         for (_, at) in castle.actors() {
             placements.push(("an actor", at));
+        }
+        for at in castle.trees() {
+            placements.push(("a tree", at));
         }
         for prop in castle.props() {
             placements.push(("a machine", prop.at));
@@ -490,6 +503,7 @@ mod tests {
         )
         .expect("that should parse");
         assert!(bare.props().is_empty());
+        assert!(bare.trees().is_empty());
         let error = serde_json::from_str::<Furniture>(
             r#"{"level":"test","spawn":[0,0,0],"gravity":{"mode":"down"},
                 "props":[{"kind":"tokamak","at":[0,0,0]}]}"#,
