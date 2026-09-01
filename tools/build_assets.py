@@ -295,8 +295,8 @@ def plan_weapons():
     return units
 
 
-def build_castle(_staging, _blender):
-    """The one stage that does not come out of Blender, deliberately.
+def build_castle(_staging, blender):
+    """Build NPZ castle geometry at its Blender-authored dimensions.
 
     `assets/bevy/castle_grounds.blend` exists and opens, and exporting it
     produces a castle that looks wrong in two ways at once. It loses
@@ -309,11 +309,15 @@ def build_castle(_staging, _blender):
 
     So the castle is built by the tool that actually produces what the game
     loads. It reads the committed NPZs under `assets/castle_grounds/` -- the
-    decomp's geometry, parsed once -- and writes all three of the runtime
-    files together, reproducibly. The .blend stays an authoring copy for
-    looking at and editing by hand; it is not a source this can build from.
+    decomp's geometry, parsed once -- and writes all three runtime files
+    together. The mesh still does not come out of Blender, but its world-space
+    bounds do: one metre in the authoring copy is one metre in the game, and
+    applying object scale back to one does not change the generated size.
     """
-    run([sys.executable, TOOLS / "convert_level.py"])
+    command = [sys.executable, TOOLS / "convert_level.py"]
+    if blender:
+        command.extend(["--blender", blender])
+    run(command)
 
 
 def plan_castle():
@@ -329,13 +333,16 @@ def plan_castle():
                 grounds / "collision.npz",
                 grounds / "collision_objects.json",
                 grounds / "mesh_materials.json",
+                ROOT / "assets/bevy/castle_grounds.blend",
                 ROOT / "reference/RENDER96-HD-TEXTURE-PACK/gfx/textures/"
                        "segment2/segment2.11C58.rgba16.png",
                 TOOLS / "convert_level.py",
+                TOOLS / "blend_to_glb.py",
                 TOOLS / "glb.py"),
         outputs=(ROOT / "assets/bevy/castle.glb",
                  ROOT / "assets/bevy/castle.bin",
                  ROOT / "assets/bevy/water.png"),
+        blender=True,
     )]
 
 

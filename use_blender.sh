@@ -1,0 +1,1 @@
+WAYLAND_DISPLAY=disabled ./blender-5.2.0-linux-x64/blender

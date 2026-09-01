@@ -161,7 +161,7 @@ Eight stages, and `--only <stage>` runs just one of them:
 | `mario` | `assets/mario/mario.glb` + clips | `mario.blend` |
 | `luna` | `assets/luna/luna.glb` + clips | `Luna.blend`, via `build_luna.py` |
 | `weapons` | `assets/weapons/target_pistol.glb` | the weapon `.blend` files |
-| `castle` | `assets/bevy/castle.glb`, `castle.bin`, `water.png` | the committed NPZs, via `convert_level.py` |
+| `castle` | `assets/bevy/castle.glb`, `castle.bin`, `water.png` | committed NPZ geometry at its authored Blender dimensions, via `convert_level.py` |
 | `levels` | `assets/bevy/<level>_furniture.json`, `.glb` | `assets/levels/<level>.blend` |
 | `planet` | `assets/bevy/planet.glb` | `experimental/planet_gen/out/planet.glb`, copied |
 | `actors` | `assets/actors/*.glb` + a clips sidecar each | the actor `.blend` files |
@@ -193,14 +193,17 @@ automatically beside every save and are worth 67 MB of history for nothing; the
 
 Two things about that table are worth knowing, because both used to be traps:
 
-- **The castle is not built from its `.blend`.** `castle_grounds.blend` exists
+- **The castle mesh is not exported from its `.blend`.** `castle_grounds.blend` exists
   and opens, and exporting it produces a castle that is wrong in two ways at
   once — it loses the `KHR_materials_unlit` that every one of the level's 45
   materials carries, so the baked vertex lighting gets lit a second time on top
   of itself, and it gains `alphaMode: BLEND` on all 45, which makes the whole
   level a sorted draw. Neither surfaces as an error. `convert_level.py` is the
   tool that produces what the game actually loads, so that is what this stage
-  runs; the `.blend` is an authoring copy.
+  runs. It measures the castle's world-space bounds in the `.blend` and derives
+  the uniform NPZ conversion needed to reproduce those dimensions for both
+  render vertices and collision vertices; the Blender mesh itself remains an
+  authoring/reference copy.
 - **The impostor sheets are baked by the game, not by Blender.** That is why
   they belong in this script: no Blender-facing tool would ever touch them, and
   an enemy whose model was re-exported without them is drawn two different ways
@@ -597,6 +600,14 @@ python3 tools/import_sounds.py
 ### The level blob
 
 `tools/convert_level.py` writes three files out of the committed NPZs:
+
+Before writing them it measures the world-space castle bounds in
+`assets/bevy/castle_grounds.blend` and compares them with the NPZ bounds. Those
+Blender dimensions are metres and directly become game metres. Object scale is
+therefore ordinary authoring state: applying it back to `(1, 1, 1)` preserves
+the castle's dimensions and does not change the generated game size. The
+measurement must retain the source proportions because the same uniform
+conversion is applied to collision.
 
 - `assets/bevy/castle.bin` — positions, normals, UVs, the collision triangles
   and their surface types, and the tree placements, in a flat
