@@ -27,6 +27,56 @@ pub enum Shape {
     Planet { centre: Vec3, radius: f32 },
 }
 
+/// Where one copy of a planet stands: the turn it has made about its own
+/// centre, and where that centre has got to relative to the authored one.
+///
+/// The mapping every query goes through on a copied or turning world. World
+/// space and the filed geometry's space are related by "rotate about the
+/// authored centre, then shift to where the copy stands", and the two
+/// directions of that are [`Self::to_local`] and [`Self::to_world`]. The
+/// authored centre is carried inside the frame so the arithmetic reads at the
+/// call site as the two verbs and not as six terms.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PlanetFrame {
+    /// The centre the geometry was filed about.
+    centre: Vec3,
+    /// The copy's centre minus the authored one. Zero for the geometry as
+    /// filed.
+    offset: Vec3,
+    /// The copy's spin about its own centre.
+    rotation: Quat,
+}
+
+impl PlanetFrame {
+    /// The geometry exactly as filed: no shift, no turn. What every query on
+    /// a flat level and a lone stationary planet goes through, at the cost of
+    /// one identity-quaternion multiply.
+    const IDENTITY: Self = Self {
+        centre: Vec3::ZERO,
+        offset: Vec3::ZERO,
+        rotation: Quat::IDENTITY,
+    };
+
+    /// A world-space point, asked where it is in the filed geometry.
+    fn to_local(&self, point: Vec3) -> Vec3 {
+        self.centre + self.rotation.inverse() * (point - self.centre - self.offset)
+    }
+
+    /// A filed-geometry point, answered where it stands in the world.
+    fn to_world(&self, point: Vec3) -> Vec3 {
+        self.centre + self.offset + self.rotation * (point - self.centre)
+    }
+
+    /// Directions -- ups, normals, pushes -- turn but do not shift.
+    fn direction_to_local(&self, direction: Vec3) -> Vec3 {
+        self.rotation.inverse() * direction
+    }
+
+    fn direction_to_world(&self, direction: Vec3) -> Vec3 {
+        self.rotation * direction
+    }
+}
+
 /// The spatial index, one variant per [`Shape`].
 enum Index {
     Flat {
@@ -49,6 +99,23 @@ enum Index {
         /// planet that split depends on where the triangle is and cannot be
         /// decided when it is filed.
         cells: Vec<Vec<u32>>,
+        /// Where copies of this planet stand and how far each has turned.
+        /// Always holds the identity frame -- the geometry as filed -- and one
+        /// more per copy.
+        ///
+        /// A second planet is not a second set of 786,432 triangles: it is the
+        /// same geometry standing somewhere else, so every query maps its
+        /// question into the nearest copy's frame, asks the one index that
+        /// exists, and maps the answer back. What that costs is the assumption
+        /// that no query spans two planets at once -- and none does: the
+        /// planets sit hundreds of metres apart, and every probe in the game
+        /// reaches metres.
+        ///
+        /// A frame and not just an offset, because the solar system's planets
+        /// *spin*: [`crate::orbit::advance`] re-places this list every tick,
+        /// and the rotation is what lets one filed set of triangles be a
+        /// turning world -- the query turns instead of the geometry.
+        instances: Vec<PlanetFrame>,
     },
 }
 
@@ -429,8 +496,58 @@ impl LevelData {
                 radius,
                 sea,
                 cells,
+                instances: vec![PlanetFrame {
+                    centre,
+                    ..PlanetFrame::IDENTITY
+                }],
             },
         }
+    }
+
+    /// Stands a second copy of this planet at `offset` from the first.
+    ///
+    /// A builder on the finished collision rather than a parameter threaded
+    /// through [`Self::planet`], because every caller but one wants one planet
+    /// and a parameter they must all pass is a question they should not all
+    /// have to answer.
+    ///
+    /// Re-places every copy of the planet at once: one `(centre, spin)` per
+    /// world, in body order. Called every tick by [`crate::orbit::advance`],
+    /// which is the only way a filed set of triangles gets to orbit a sun.
+    ///
+    /// Replaces rather than edits, so the caller's list *is* the truth and a
+    /// body it stopped naming is a body that is gone.
+    pub fn place_planets(&mut self, worlds: &[(Vec3, Quat)]) {
+        if let Index::Planet {
+            centre, instances, ..
+        } = &mut self.index
+        {
+            instances.clear();
+            instances.extend(worlds.iter().map(|&(stands_at, rotation)| PlanetFrame {
+                centre: *centre,
+                offset: stands_at - *centre,
+                rotation,
+            }));
+        }
+    }
+
+    /// The frame of the planet copy nearest to `reference`: the one a query
+    /// asked around that point is answered in. The identity on a flat level,
+    /// and the planet's own frame -- wherever [`Self::place_planets`] last put
+    /// it -- everywhere else.
+    fn instance_frame(&self, reference: Vec3) -> PlanetFrame {
+        let Index::Planet { instances, .. } = &self.index else {
+            return PlanetFrame::IDENTITY;
+        };
+        instances
+            .iter()
+            .copied()
+            .min_by(|a, b| {
+                (reference - (a.centre + a.offset))
+                    .length_squared()
+                    .total_cmp(&(reference - (b.centre + b.offset)).length_squared())
+            })
+            .unwrap_or(PlanetFrame::IDENTITY)
     }
 
     /// What shape of world this is, and where its middle is if it has one.
@@ -450,7 +567,8 @@ impl LevelData {
         match self.index {
             Index::Flat { .. } => point.y < -20.0,
             Index::Planet { centre, radius, .. } => {
-                (point - centre).length() < radius - PLANET_REACH * 0.5
+                let core = centre + self.instance_frame(point).offset;
+                (point - core).length() < radius - PLANET_REACH * 0.5
             }
         }
     }
@@ -571,7 +689,8 @@ impl LevelData {
     /// is standing on.
     pub fn water_depth(&self, point: Vec3) -> Option<f32> {
         if let Index::Planet { centre, sea, .. } = self.index {
-            return sea.map(|surface| surface - (point - centre).length());
+            let core = centre + self.instance_frame(point).offset;
+            return sea.map(|surface| surface - (point - core).length());
         }
         self.water_boxes
             .iter()
@@ -772,7 +891,13 @@ impl LevelData {
     /// plain loop over the candidate list does, makes where a body ends up a
     /// function of how the level was built.
     pub fn resolve_walls(&self, position: Vec3, up: Vec3, radius: f32, height: f32) -> Vec3 {
-        let mut result = position;
+        // The whole resolution runs in the nearest copy's frame. Chosen once
+        // rather than per pass: the passes move a body centimetres, and the
+        // copies stand hundreds of metres apart. The up is carried into that
+        // frame too -- on a turned world "vertical" is turned with it.
+        let frame = self.instance_frame(position);
+        let up = frame.direction_to_local(up);
+        let mut result = frame.to_local(position);
         let mut candidates = Vec::new();
         let mut cells = Vec::new();
         let mut contacts: Vec<Contact> = Vec::new();
@@ -816,7 +941,7 @@ impl LevelData {
             }
             result += push;
         }
-        result
+        frame.to_world(result)
     }
 
     /// What one wall does to the capsule running from `foot` to `head`, or
@@ -931,6 +1056,11 @@ impl LevelData {
     /// and what a caller probing for a surface wants is the side it arrived
     /// from.
     pub fn surface_hit(&self, start: Vec3, end: Vec3) -> Option<(Vec3, Vec3)> {
+        // Into the nearest copy's frame, judged from the segment's middle so a
+        // probe reaching down towards a planet answers to the planet it is
+        // reaching for. The identity for the castle and for a lone planet.
+        let frame = self.instance_frame((start + end) * 0.5);
+        let (start, end) = (frame.to_local(start), frame.to_local(end));
         let direction = end - start;
         let mut nearest = 1.0_f32;
         let mut hit = None;
@@ -1020,7 +1150,10 @@ impl LevelData {
                 }
             }
         }
-        hit
+        // And back out of the copy's frame, so the caller's answer is where
+        // the surface actually is -- the normal turned with it, or a turned
+        // world's ground would push bodies along last hour's vertical.
+        hit.map(|(point, normal)| (frame.to_world(point), frame.direction_to_world(normal)))
     }
 
     /// Every triangle in the level, tested in order. Kept as what
@@ -1451,9 +1584,13 @@ pub struct DebugCell {
 /// use for any of it is answering "why did the collision do that", and a view
 /// that works the answer out its own way cannot.
 impl LevelData {
-    /// Every triangle filed within `reach` of `at`.
+    /// Every triangle filed within `reach` of `at`, with each face reported
+    /// where it stands -- which on a copied planet is the copy's frame, not
+    /// the filed geometry's.
     pub fn faces_near(&self, at: Vec3, reach: f32, out: &mut Vec<DebugFace>) {
         out.clear();
+        let frame = self.instance_frame(at);
+        let at = frame.to_local(at);
         let mut found: Vec<u32> = Vec::new();
         match &self.index {
             Index::Flat { cells, .. } => {
@@ -1510,7 +1647,12 @@ impl LevelData {
                 Index::Planet { .. } => true,
             };
             if near {
-                out.push(self.face(tri));
+                let mut face = self.face(tri);
+                for corner in &mut face.corners {
+                    *corner = frame.to_world(*corner);
+                }
+                face.normal = frame.direction_to_world(face.normal);
+                out.push(face);
             }
         }
     }
@@ -1531,6 +1673,11 @@ impl LevelData {
         out: &mut Vec<DebugWall>,
     ) {
         out.clear();
+        // The same frame [`Self::resolve_walls`] works in, or the overlay
+        // disagrees with the resolution it exists to explain.
+        let frame = self.instance_frame(at);
+        let at = frame.to_local(at);
+        let up = frame.direction_to_local(up);
         let mut cells = Vec::new();
         let mut candidates = Vec::new();
         self.walls_near(at, up, &mut cells, &mut candidates);
@@ -1542,10 +1689,15 @@ impl LevelData {
             let push = self
                 .contact(index, foot, head, up, radius)
                 .map_or(Vec3::ZERO, |contact| contact.direction * contact.depth);
+            let mut face = self.face(tri);
+            for corner in &mut face.corners {
+                *corner = frame.to_world(*corner);
+            }
+            face.normal = frame.direction_to_world(face.normal);
             out.push(DebugWall {
-                face: self.face(tri),
-                nearest,
-                push,
+                face,
+                nearest: frame.to_world(nearest),
+                push: frame.direction_to_world(push),
             });
         }
     }
@@ -1984,6 +2136,134 @@ mod tests {
                 (out - sunk).length()
             );
         }
+    }
+
+    /// A copied planet is the same world standing somewhere else: every query
+    /// asked beside the copy is answered by the copy, in the copy's own
+    /// coordinates, and the original is untouched by its existence.
+    #[test]
+    fn a_copied_planet_answers_where_it_stands() {
+        let radius = 300.0;
+        let offset = Vec3::new(1100.0, 0.0, 0.0);
+        let mut planet = ball(radius);
+        planet.place_planets(&[(Vec3::ZERO, Quat::IDENTITY), (offset, Quat::IDENTITY)]);
+
+        // Ground under a point over the copy is the copy's surface.
+        let up = Vec3::Y;
+        let standing = offset + up * (radius + 1.0);
+        let (point, normal) = planet
+            .ground_below(standing, up)
+            .expect("no ground on the second planet");
+        assert!(
+            ((point - offset).length() - radius).abs() < 1.0,
+            "the copy's ground is {} from its middle",
+            (point - offset).length()
+        );
+        assert!(normal.dot(up) > 0.8);
+
+        // And the original still answers exactly as it did alone.
+        let (home, _) = ball(radius)
+            .ground_below(up * (radius + 1.0), up)
+            .expect("the lone planet lost its ground");
+        let (still, _) = planet
+            .ground_below(up * (radius + 1.0), up)
+            .expect("the first planet lost its ground to the copy");
+        assert!((home - still).length() < 1e-4);
+
+        // Wall resolution beside the copy is the original's answer, moved.
+        // Same algorithm, same triangles, frames apart by exactly `offset` --
+        // so the two must agree to the bit, wherever on the world the capsule
+        // stands and whether or not anything there pushes.
+        let lone = ball(radius);
+        for local_up in [Vec3::Y, Vec3::X, Vec3::new(1., 1., 1.).normalize()] {
+            let local = local_up * (radius - 0.5);
+            let by_the_copy =
+                planet.resolve_walls(local + offset, local_up, 0.42, 1.75) - offset;
+            let alone = lone.resolve_walls(local, local_up, 0.42, 1.75);
+            assert!(
+                (by_the_copy - alone).length() < 1e-4,
+                "{local_up}: the copy resolved to {by_the_copy}, the original to {alone}"
+            );
+        }
+
+        // The copy's core is out of bounds and the space between is not.
+        assert!(planet.out_of_bounds(offset));
+        assert!(!planet.out_of_bounds(Vec3::X * 550.0));
+    }
+
+    /// The copy's sea sits round the copy: depth is measured from whichever
+    /// planet the point is nearest, so both shorelines are wet and the space
+    /// between the worlds is very, very dry.
+    #[test]
+    fn a_copied_planet_carries_its_sea_with_it() {
+        let radius = 300.0;
+        let offset = Vec3::new(1100.0, 0.0, 0.0);
+        let mut planet = LevelData::planet(&[], &[], Vec3::ZERO, radius, Some(radius));
+        planet.place_planets(&[(Vec3::ZERO, Quat::IDENTITY), (offset, Quat::IDENTITY)]);
+        let depth_home = planet.water_depth(Vec3::X * (radius - 2.0)).unwrap();
+        let depth_copy = planet.water_depth(offset + Vec3::Y * (radius - 2.0)).unwrap();
+        assert!((depth_home - 2.0).abs() < 1e-3, "{depth_home}");
+        assert!((depth_copy - 2.0).abs() < 1e-3, "{depth_copy}");
+        let space = planet.water_depth(Vec3::X * 550.0).unwrap();
+        assert!(space < -200.0, "space is {space} m deep");
+    }
+
+    /// A turned planet is the same world mid-spin: a query asked in world
+    /// space goes through the turn, reaches the filed geometry, and comes back
+    /// turned -- point and normal both. This is the whole of what
+    /// [`LevelData::place_planets`] promises the orbit, and it is checked as
+    /// an equivalence against the lone planet rather than against numbers:
+    /// same triangles, one frame apart.
+    #[test]
+    fn a_turned_planet_answers_through_its_own_spin() {
+        let radius = 300.0;
+        let lone = ball(radius);
+        let stands_at = Vec3::new(2600.0, 0.0, -400.0);
+        let spin = Quat::from_rotation_y(1.1);
+        let mut placed = ball(radius);
+        placed.place_planets(&[(stands_at, spin)]);
+        // Directions off the test ball's seams and poles: a probe *on* one
+        // lands exactly on a triangle edge, where which facet answers is a
+        // float coin-toss the equivalence must not depend on.
+        for local_up in [
+            Vec3::new(0.3, 0.9, 0.2).normalize(),
+            Vec3::new(0.9, 0.2, -0.4).normalize(),
+            Vec3::new(-0.5, -0.7, 0.6).normalize(),
+        ] {
+            let (point, normal) = lone
+                .ground_below(local_up * (radius + 2.0), local_up)
+                .expect("the lone planet has no ground");
+            let world_up = spin * local_up;
+            let (turned, turned_normal) = placed
+                .ground_below(stands_at + world_up * (radius + 2.0), world_up)
+                .expect("the turned planet has no ground");
+            assert!(
+                (turned - (stands_at + spin * point)).length() < 1e-2,
+                "{local_up}: the spin left the ground at {turned} rather than {}",
+                stands_at + spin * point
+            );
+            // A facet's worth of slack: the round-tripped probe can land a
+            // whisker into the neighbouring triangle, whose normal differs by
+            // the tessellation's step and no more.
+            assert!(
+                (turned_normal - spin * normal).length() < 0.12,
+                "{local_up}: the ground's facing did not turn with the world"
+            );
+            // The capsule resolution goes through the same frame.
+            let sunk_local = local_up * (radius - 0.5);
+            let alone = lone.resolve_walls(sunk_local, local_up, 0.42, 1.75);
+            let by_the_turn =
+                placed.resolve_walls(stands_at + spin * sunk_local, world_up, 0.42, 1.75);
+            assert!(
+                (by_the_turn - (stands_at + spin * alone)).length() < 1e-2,
+                "{local_up}: the turned capsule came out somewhere else"
+            );
+        }
+        // And the bounds went with it: the core is where the planet now is,
+        // and where it used to be is open space.
+        assert!(placed.out_of_bounds(stands_at));
+        assert!(!placed.out_of_bounds(stands_at + Vec3::Y * radius));
+        assert!(!placed.out_of_bounds(Vec3::ZERO));
     }
 
     /// The flat level must come through the generalisation unchanged: the same

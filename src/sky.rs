@@ -42,15 +42,18 @@
 //! **Two skies, and one level with none.** The shells are put up once and
 //! follow the camera for the rest of the run. Over the castle the sky is a
 //! clock: up is `+Y` everywhere and the sun runs round [`ORBIT_AXIS`] once a
-//! day. Over the orbiting planet the same four shells are hung in a different
-//! frame ([`Overhead`]): up is whichever way the core is not, so the dome is
-//! turned to put its horizon on the player's own horizon, and the sun is where
-//! [`Sky::orbit_sun`] says -- the planet's spin carrying it round the poles
-//! once a day, and the planet's orbit drifting it through the star field
-//! across the year, with the axial tilt swinging noon up and down the sky as
-//! the seasons turn. The plain planet level keeps the fixed noon it always
-//! had: [`advance`] puts the constant light back and hides all four shells
-//! there.
+//! day. Over the solar system the sun is not a clock and not a picture: it is
+//! the real body at [`crate::orbit::SUN_CENTRE`], and everything here simply
+//! *looks at it* -- the light comes from where it stands, the dome's glow is
+//! painted towards it, and day turns to night because the planet underfoot
+//! genuinely rotates you away from it ([`crate::orbit`] owns that motion).
+//! The two billboard discs stand down there in favour of [`SkyPart::SunBody`],
+//! a luminous sphere hung at the sun's actual position, which is what makes
+//! "can I fly to the sun" a question with a yes: the thing in the sky and the
+//! thing you arrive at are one entity. The stars hold still in the world's
+//! frame and wheel overhead only because you are on something turning. The
+//! plain planet level keeps the fixed noon it always had: [`advance`] puts
+//! the constant light back and hides every shell there.
 
 use crate::{
     console::GameTuning,
@@ -63,7 +66,7 @@ use bevy::{
     asset::RenderAssetUsages,
     ecs::{schedule::ScheduleConfigs, system::ScheduleSystem},
     mesh::{Indices, PrimitiveTopology},
-    pbr::DistanceFog,
+    pbr::{DistanceFog, FogFalloff},
     prelude::*,
     render::render_resource::{Extent3d, TextureDimension, TextureFormat},
 };
@@ -152,21 +155,37 @@ const SUNRISE: Vec3 = Vec3::X;
 const DAWN_HOUR: f32 = 6.0;
 const HOURS: f32 = 24.0;
 
-/// How long the orbiting planet's year is, in its own days, and how far its
-/// spin axis leans out of its orbit.
+/// The colour the sun's own sphere burns at. Constant rather than read off
+/// the [`RAMP`]: the ramp's disc colour is an *appearance through
+/// atmosphere*, keyed on the viewer's horizon, and the physical body seen
+/// from space has no horizon to redden it.
+const SUN_GLOW: Vec3 = Vec3::new(1.0, 0.93, 0.62);
+
+/// How far a camera in the solar system sees: where its haze starts and
+/// closes, how far its clipping plane reaches, and how much further out its
+/// sky shells are hung than the castle's.
 ///
-/// Eight days to the year rather than hundreds, because an orbit is only
-/// visible in what it changes -- the sun drifting through the constellations,
-/// the seasons swinging noon up and down the sky -- and at 365 days to a
-/// five-minute day a single season would take a working week of play to turn.
-/// Eight puts a whole year, solstice to solstice and back, inside three
-/// quarters of an hour.
-///
-/// The tilt is Earth's, and it is what makes the orbit *show*. With the axis
-/// square to the orbital plane the sun would ride the same circle every day of
-/// the year, and the only witness to the year would be the stars behind it.
-const YEAR_DAYS: f32 = 8.0;
-const AXIAL_TILT: f32 = 23.4_f32.to_radians();
+/// The castle's numbers cannot serve, and the far planet is why. With the
+/// worlds out on real orbits -- `planet2_dist` defaults to 4,200 m from the
+/// sun -- the far surface can stand six or seven kilometres from a player on
+/// the near one: past the castle's total haze at 200 m, past its far plane at
+/// 1,000, and past the opaque dome at 620 -- three separate ways for the
+/// destination to not be on the screen while you are flying at it. So on this
+/// level the haze closes at 9,000 m, the far plane moves out to 12,000, and
+/// every shell is scaled by [`SPACE_REACH`], which keeps the dome the
+/// outermost surface there is (620 x 16 = 9,920, inside the far plane) with
+/// the whole system inside it.
+const SPACE_FOG: (f32, f32) = (400.0, 9000.0);
+const SPACE_FAR: f32 = 12_000.0;
+const SPACE_REACH: f32 = 16.0;
+
+/// What is behind everything once the air is gone: not quite black, because
+/// a pure-black clear colour reads as a dead monitor rather than as night.
+const SPACE_COLOUR: Vec3 = Vec3::new(0.004, 0.005, 0.010);
+
+/// The far plane every other level runs at: the 1,000 m the camera is built
+/// with in `main::setup`, put back on leaving the system.
+const BASE_FAR: f32 = 1000.0;
 
 /// How far the sun has to move before the world is relit and the dome
 /// recoloured.
@@ -440,13 +459,10 @@ const RAMP: [(f32, Look); 8] = [
 /// writing it sets the clock. See [`advance`], which does the handshake.
 #[derive(Resource, Debug)]
 pub struct Sky {
-    /// The hour of the day, 0 to 24.
+    /// The hour of the day, 0 to 24. The castle's clock; the solar system
+    /// tells time by its own rotation instead, so the slider does nothing to
+    /// its sun.
     pub hours: f32,
-    /// How far through the year the orbiting planet is, in days, 0 to
-    /// [`YEAR_DAYS`]. Advanced by the same clock as `hours` while that level
-    /// is up, and left where it was everywhere else: the year is that
-    /// planet's year, and it does not pass while nobody is on it.
-    pub year: f32,
     /// The hour last written into `GameTuning::sky_hour`, so a value that
     /// differs from it can only have come from the player.
     published: f32,
@@ -457,6 +473,10 @@ pub struct Sky {
     /// walks the horizon out from under it, and elevation over *that* horizon
     /// is what every colour in the [`RAMP`] is keyed on.
     lit_from: Option<Vec3>,
+    /// How much air the world was last relit under -- see [`advance`]'s
+    /// `air`. A second gate beside `lit_from`, because climbing out of the
+    /// atmosphere changes the light without moving the sun a degree.
+    lit_air: f32,
 }
 
 impl Default for Sky {
@@ -466,9 +486,6 @@ impl Default for Sky {
             // every screenshot of this game has been taken in and what the
             // impostor sheets were baked under.
             hours: GameTuning::default().sky_hour,
-            // The year opens at a solstice, so the first season a player sees
-            // is a season and not the year's most average day.
-            year: 0.0,
             // Agreeing with `hours` from the start, so the first frame reads
             // the slider as untouched and advances the clock rather than
             // taking a scrub nobody made.
@@ -476,6 +493,7 @@ impl Default for Sky {
             // Nothing has been lit yet, which is what makes the first frame
             // light the world whatever the step below would have said.
             lit_from: None,
+            lit_air: 1.0,
         }
     }
 }
@@ -494,40 +512,6 @@ impl Sky {
         let turned = (self.hours - DAWN_HOUR) / HOURS * std::f32::consts::TAU;
         Quat::from_axis_angle(ORBIT_AXIS.normalize(), turned)
     }
-
-    /// Where the sun is from the orbiting planet, as a unit vector in the
-    /// planet's own frame -- the frame its mesh, its collision and everyone
-    /// standing on it all live in.
-    ///
-    /// Built from the outside in. In the orbit's frame the sun is a point on
-    /// a circle the year moves round; the axial tilt then leans that whole
-    /// frame off the planet's equator, which is where the seasons come from;
-    /// and the day's spin carries it round the poles. The spin is about `Y`
-    /// and not [`ORBIT_AXIS`]: the planet's poles are its mesh's poles, and
-    /// the tilt has already been applied by the middle term.
-    pub fn orbit_sun(&self) -> Vec3 {
-        let along = self.year / YEAR_DAYS * std::f32::consts::TAU;
-        let toward = Vec3::new(along.cos(), 0.0, along.sin());
-        self.orbit_spin() * (Quat::from_rotation_z(-AXIAL_TILT) * toward)
-    }
-
-    /// The turn the day's spin has put on the orbiting planet's sky: about
-    /// the poles, backwards -- the planet turns one way, so everything over
-    /// it appears to go the other -- once every [`HOURS`].
-    fn orbit_spin(&self) -> Quat {
-        let turned = (self.hours - DAWN_HOUR) / HOURS * std::f32::consts::TAU;
-        Quat::from_rotation_y(-turned)
-    }
-
-    /// The turn the star field has made over the orbiting planet. The tilt is
-    /// in it and the year is not: the stars sit in the same frame as the sun,
-    /// but they are infinitely far away, so the orbit that moves the sun
-    /// round its circle moves them not at all. That difference is the orbit's
-    /// one signature in the sky -- the sun drifts through the constellations
-    /// and comes back round in exactly a year.
-    fn orbit_stars(&self) -> Quat {
-        self.orbit_spin() * Quat::from_rotation_z(-AXIAL_TILT)
-    }
 }
 
 /// Which sky a level stands under.
@@ -542,8 +526,8 @@ enum SkyKind {
     /// The castle's: up is `+Y` everywhere and the sun keeps the hours its
     /// slider is labelled with.
     Clock,
-    /// The orbiting planet's: up is local, the spin is the day, and the orbit
-    /// is the year.
+    /// The solar system's: up is local, and the sun is wherever the real one
+    /// stands from where the camera is -- see [`crate::orbit`].
     Orbit,
     /// No sky at all -- the constant noon light, and all four shells hidden.
     None,
@@ -585,19 +569,24 @@ impl Overhead {
     }
 }
 
-/// The sky over an `up`. [`SkyKind::None`] never gets here -- both callers
-/// have returned before asking -- so the castle's answer stands in for it
-/// harmlessly.
-fn overhead(kind: SkyKind, sky: &Sky, up: Vec3) -> Overhead {
+/// The sky over an `up`, seen from `eye`. [`SkyKind::None`] never gets here
+/// -- both callers have returned before asking -- so the castle's answer
+/// stands in for it harmlessly.
+fn overhead(kind: SkyKind, sky: &Sky, up: Vec3, eye: Vec3) -> Overhead {
     match kind {
         SkyKind::Orbit => {
-            let sun = sky.orbit_sun();
+            // The real one: the direction to the body at the middle of the
+            // system. Day and night need no simulating -- the planet's spin
+            // carries the eye around, and this line simply keeps looking.
+            let sun = (crate::orbit::SUN_CENTRE - eye).normalize_or(Vec3::X);
             let frame = Quat::from_rotation_arc(Vec3::Y, up);
             Overhead {
                 sun,
                 frame,
                 apparent: frame.inverse() * sun,
-                stars: sky.orbit_stars(),
+                // The stars hold still in the world: they wheel overhead
+                // because the ground is turning, which is now literally true.
+                stars: Quat::IDENTITY,
             }
         }
         SkyKind::Clock | SkyKind::None => {
@@ -615,12 +604,17 @@ fn overhead(kind: SkyKind, sky: &Sky, up: Vec3) -> Overhead {
 /// Which shell of the sky an entity is. One component with four values rather
 /// than four marker components, because every one of them is moved by the same
 /// system and three quarters of it would be `Option`s otherwise.
-#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Component, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum SkyPart {
     Dome,
     Stars,
     Sun,
     Moon,
+    /// The sun as a *place*: a luminous sphere at
+    /// [`crate::orbit::SUN_CENTRE`], drawn only over the solar system --
+    /// where the billboard discs above stand down, because a sun you can fly
+    /// to cannot be a picture pinned to a shell round the camera.
+    SunBody,
 }
 
 /// Puts the sky up. Called once from `main::setup`, beside the other two
@@ -642,8 +636,19 @@ pub fn prepare(
         SkyPart::Dome,
         Name::new("sky: dome"),
         Mesh3d(meshes.add(dome())),
-        MeshMaterial3d(materials.add(shell(Some(white), AlphaMode::Opaque))),
+        MeshMaterial3d(materials.add(shell(Some(white.clone()), AlphaMode::Opaque))),
         Transform::default(),
+    ));
+    // The physical sun. In the world rather than on the camera's shells,
+    // because the solar system's sun is somewhere you go: [`follow`] shows it
+    // over that level alone and never moves it.
+    commands.spawn((
+        SkyPart::SunBody,
+        Name::new("sky: sun body"),
+        Mesh3d(meshes.add(Sphere::new(crate::orbit::SUN_RADIUS))),
+        MeshMaterial3d(materials.add(shell(Some(white), AlphaMode::Opaque))),
+        Transform::from_translation(crate::orbit::SUN_CENTRE),
+        Visibility::Hidden,
     ));
     commands.spawn((
         SkyPart::Stars,
@@ -1010,7 +1015,7 @@ pub fn advance(
     mut sky: ResMut<Sky>,
     mut lighting: ResMut<N64Lighting>,
     mut clear: ResMut<ClearColor>,
-    mut fog: Query<(&mut DistanceFog, &GlobalTransform), With<Camera3d>>,
+    mut fog: Query<(&mut DistanceFog, &mut Projection, &GlobalTransform), With<Camera3d>>,
 ) {
     let kind = sky_of(*level);
     if kind == SkyKind::None {
@@ -1029,11 +1034,21 @@ pub fn advance(
             lighting.ambient = noon.ambient;
             lighting.daylight = Vec3::ONE;
             lighting.to_light = N64Lighting::default().to_light;
+            if let Ok((mut fog, mut projection, _)) = fog.single_mut() {
+                // The camera's reach goes back with the light: arriving from
+                // the orbiting system, the far plane and the haze are still
+                // sized for space until somebody puts them back.
+                set_far(&mut projection, BASE_FAR);
+                if !medium.submerged() {
+                    fog.color = water::SKY_COLOUR;
+                    fog.falloff = FogFalloff::Linear {
+                        start: water::AIR_FOG.0,
+                        end: water::AIR_FOG.1,
+                    };
+                }
+            }
             if !medium.submerged() {
                 clear.0 = water::SKY_COLOUR;
-                if let Ok((mut fog, _)) = fog.single_mut() {
-                    fog.color = water::SKY_COLOUR;
-                }
             }
         }
         return;
@@ -1043,41 +1058,66 @@ pub fn advance(
     if (tuning.sky_hour - sky.published).abs() > 1e-4 {
         sky.hours = tuning.sky_hour;
     } else if tuning.day_length > 0.0 {
-        let step = HOURS * time.delta_secs() / tuning.day_length;
-        sky.hours += step;
-        if kind == SkyKind::Orbit {
-            sky.year = (sky.year + step / HOURS).rem_euclid(YEAR_DAYS);
-        }
+        sky.hours += HOURS * time.delta_secs() / tuning.day_length;
     }
     sky.hours = sky.hours.rem_euclid(HOURS);
     sky.published = sky.hours;
     tuning.sky_hour = sky.hours;
 
-    // Which way is up under the camera: `+Y` on the castle, and off the
-    // planet's core under anywhere the player has walked to. Missing pieces
-    // fall back to `+Y` rather than skipping the frame -- a headless world
-    // with no camera still wants its light run.
-    let up = match &gravity {
-        Some(gravity) => fog
-            .single()
-            .map(|(_, eye)| gravity.up(eye.translation()))
-            .unwrap_or(Vec3::Y),
-        None => Vec3::Y,
+    // Which way is up under the camera, and where the camera is -- the
+    // system's sun is looked at rather than computed, so the eye matters
+    // there. Missing pieces fall back rather than skipping the frame: a
+    // headless world with no camera still wants its light run.
+    let (up, eye) = match (&gravity, fog.single()) {
+        (Some(gravity), Ok((_, _, camera))) => {
+            (gravity.up(camera.translation()), camera.translation())
+        }
+        _ => (Vec3::Y, Vec3::ZERO),
     };
-    let view = overhead(kind, &sky, up);
+    let view = overhead(kind, &sky, up, eye);
     let look = Look::at(view.apparent.y);
+    // How much air there is where the camera stands: the planet's own pull,
+    // as a fraction of its full strength. The two fade over the same band on
+    // purpose -- "the atmosphere should be completely gone by the time you
+    // hit 0 g" is a spec, and tying the haze to `Gravity::strength` makes it
+    // an identity rather than two curves kept in step by hand.
+    let air = match (kind, &gravity) {
+        (SkyKind::Orbit, Some(gravity)) => {
+            (gravity.strength(eye) / gravity.accel().max(1e-6)).clamp(0.0, 1.0)
+        }
+        _ => 1.0,
+    };
+    let vacuum = 1.0 - air;
+
+    // How far this sky lets the camera see: the castle's own numbers, or the
+    // system's -- see [`SPACE_FOG`], whose whole reason is that the second
+    // planet has to be on the screen to be flown to.
+    let (haze, far) = match kind {
+        SkyKind::Orbit => (SPACE_FOG, SPACE_FAR),
+        SkyKind::Clock | SkyKind::None => (water::AIR_FOG, BASE_FAR),
+    };
 
     // The fog and the clear colour are the horizon, so the world fades into
-    // the sky rather than into a colour that used to match it. Left alone
-    // underwater: `water::camera_medium` owns both down there, and the whole
-    // point of the underwater fog is that it is *not* the sky.
-    if !medium.submerged() {
-        let horizon = look.horizon;
-        let colour = Color::srgb(horizon.x, horizon.y, horizon.z);
-        clear.0 = colour;
-        if let Ok((mut fog, _)) = fog.single_mut() {
+    // the sky rather than into a colour that used to match it -- and both
+    // thin out with the air, all the way to none: in space the haze's onset
+    // is pushed past the far plane, which is a fog that fogs nothing. Left
+    // alone underwater: `water::camera_medium` owns both down there, and the
+    // whole point of the underwater fog is that it is *not* the sky.
+    if let Ok((mut fog, mut projection, _)) = fog.single_mut() {
+        set_far(&mut projection, far);
+        if !medium.submerged() {
+            let horizon = look.horizon.lerp(SPACE_COLOUR, vacuum);
+            let colour = Color::srgb(horizon.x, horizon.y, horizon.z);
+            clear.0 = colour;
             fog.color = colour;
+            fog.falloff = FogFalloff::Linear {
+                start: haze.0 + (far - haze.0) * vacuum,
+                end: haze.1 + (far * 2.0 - haze.1) * vacuum,
+            };
         }
+    } else if !medium.submerged() {
+        let horizon = look.horizon.lerp(SPACE_COLOUR, vacuum);
+        clear.0 = Color::srgb(horizon.x, horizon.y, horizon.z);
     }
 
     // The light, at a quarter of a degree of sun rather than every frame. See
@@ -1087,11 +1127,13 @@ pub fn advance(
     // change of light.
     let moved = sky
         .lit_from
-        .is_none_or(|last| last.dot(view.apparent).clamp(-1.0, 1.0).acos() >= RELIGHT_STEP);
+        .is_none_or(|last| last.dot(view.apparent).clamp(-1.0, 1.0).acos() >= RELIGHT_STEP)
+        || (sky.lit_air - air).abs() > 0.04;
     if !moved {
         return;
     }
     sky.lit_from = Some(view.apparent);
+    sky.lit_air = air;
     // Where the key light comes from, once the sun is down: from the moon,
     // which is the only thing left up there. Crossfaded rather than switched,
     // because a key that jumps from one side of the sky to the other flips
@@ -1099,13 +1141,18 @@ pub fn advance(
     let day = above_horizon(view.apparent.y);
     let night = above_horizon(-view.apparent.y) * (1.0 - day);
     let direction = (view.sun * day + view.moon() * night).normalize_or(up);
-    lighting.to_light = direction;
-    lighting.key = look.key;
-    lighting.ambient = look.ambient;
+    // Out of the air, the atmosphere's whole grammar of dusk and night stops
+    // applying: nothing stands between a body in space and the sun, so the
+    // light climbs back to full and comes straight from the sun's own
+    // bearing however the nearest planet's horizon happens to lean.
+    let noon = RAMP[RAMP.len() - 1].1;
+    lighting.to_light = direction.lerp(view.sun, vacuum).normalize_or(up);
+    lighting.key = look.key.lerp(noon.key, vacuum);
+    lighting.ambient = look.ambient.lerp(noon.ambient, vacuum);
     // What the castle and the impostor sheets are dimmed by. Neither of them
     // takes the two terms above at all -- their light was resolved before the
     // game ran -- so without this the sun sets on the actors alone.
-    lighting.daylight = daylight(&look);
+    lighting.daylight = daylight(&look).lerp(Vec3::ONE, vacuum);
 }
 
 /// Moves the sky. Every shell is centred on the camera, the two discs are
@@ -1149,8 +1196,22 @@ pub fn follow(
         Some(gravity) => gravity.up(eye),
         None => Vec3::Y,
     };
-    let view = overhead(kind, &sky, up);
+    let view = overhead(kind, &sky, up, eye);
     let look = Look::at(view.apparent.y);
+    // The same air [`advance`] thins the fog by, so the dome and the haze
+    // give out together: at 0 g both are gone.
+    let air = match (kind, &gravity) {
+        (SkyKind::Orbit, Some(gravity)) => {
+            (gravity.strength(eye) / gravity.accel().max(1e-6)).clamp(0.0, 1.0)
+        }
+        _ => 1.0,
+    };
+    // How far out every shell is hung. `1` over the castle; over the system,
+    // far enough that the opaque dome stays outside the second planet.
+    let reach = match kind {
+        SkyKind::Orbit => SPACE_REACH,
+        SkyKind::Clock | SkyKind::None => 1.0,
+    };
 
     for (part, mut transform, mut visibility, mesh, material) in &mut parts {
         if !shown {
@@ -1158,13 +1219,35 @@ pub fn follow(
             continue;
         }
         match part {
+            // Over the system the sun is a body, not a billboard: the discs
+            // stand down and the sphere stands up, and neither treads on the
+            // other's level.
+            SkyPart::Sun | SkyPart::Moon if kind == SkyKind::Orbit => {
+                visibility.set_if_neq(Visibility::Hidden);
+            }
+            SkyPart::SunBody => {
+                visibility.set_if_neq(match kind {
+                    SkyKind::Orbit => Visibility::Visible,
+                    SkyKind::Clock | SkyKind::None => Visibility::Hidden,
+                });
+                // Where it is, always: the one shell that does not ride the
+                // camera, because it is not a shell at all.
+                *transform = Transform::from_translation(crate::orbit::SUN_CENTRE);
+                tint(&mut materials, material, linear(SUN_GLOW), 1.0);
+            }
             SkyPart::Dome => {
                 visibility.set_if_neq(Visibility::Visible);
                 transform.translation = eye;
+                transform.scale = Vec3::splat(reach);
                 // The dome's pole is the player's up: identity on the castle,
                 // and on the planet the turn that keeps its painted horizon
                 // lying along the real one as he walks round the world.
                 transform.rotation = view.frame;
+                // The painted atmosphere darkens to space as the air thins:
+                // the tint multiplies the vertex colours, so at 0 g the whole
+                // gradient -- horizon band, sun glow and all -- is simply
+                // black, and the dome is the void the stars hang in.
+                tint(&mut materials, material, Vec3::splat(air), 1.0);
                 // Only when the light has moved: the same gate `advance` uses,
                 // read off the same field, so the dome and the world's light
                 // step together and never disagree about what time it is.
@@ -1177,23 +1260,28 @@ pub fn follow(
                 }
             }
             SkyPart::Stars => {
-                visibility.set_if_neq(match look.stars > 0.0 {
+                // Out of the air the stars are out whatever the hour: the
+                // daylight that hides them is scattered by the very air that
+                // has run out.
+                let showing = look.stars.max(1.0 - air);
+                visibility.set_if_neq(match showing > 0.0 {
                     true => Visibility::Visible,
                     false => Visibility::Hidden,
                 });
                 transform.translation = eye;
+                transform.scale = Vec3::splat(reach);
                 // The stars are the one thing that actually turns. The dome's
                 // gradient is fixed to the horizon and the two discs are moved
                 // rather than spun, so this is where "the sky rotates" lives.
                 transform.rotation = view.stars;
-                tint(&mut materials, material, Vec3::ONE, look.stars);
+                tint(&mut materials, material, Vec3::ONE, showing);
             }
             SkyPart::Sun => {
                 let fade = above_horizon(view.apparent.y);
                 visibility.set_if_neq(visible(fade));
                 // Wider on the horizon than overhead. `SUN_SWELL`.
                 let swell = 1.0 + SUN_SWELL * (1.0 - smooth_step(0.0, 0.30, view.apparent.y));
-                *transform = body(eye, view.sun, SUN_SIZE * swell);
+                *transform = body(eye, view.sun, SUN_SIZE * swell, reach);
                 tint(&mut materials, material, linear(look.disc), fade);
             }
             SkyPart::Moon => {
@@ -1202,25 +1290,38 @@ pub fn follow(
                 let fade =
                     above_horizon(-view.apparent.y) * (1.0 - daylight * (1.0 - DAYTIME_MOON));
                 visibility.set_if_neq(visible(fade));
-                *transform = body(eye, view.moon(), MOON_SIZE);
+                *transform = body(eye, view.moon(), MOON_SIZE, reach);
                 tint(&mut materials, material, Vec3::ONE, fade);
             }
         }
     }
 }
 
+/// Writes the camera's far plane, if it moved. The one projection field the
+/// sky owns: a system's second planet stands past the plane every other level
+/// clips at, and the shells scaled by [`SPACE_REACH`] stand past it further.
+fn set_far(projection: &mut Projection, far: f32) {
+    if let Projection::Perspective(perspective) = projection {
+        if perspective.far != far {
+            perspective.far = far;
+        }
+    }
+}
+
 /// A body of `size` hung in the direction `at` from an eye at `eye`, turned
-/// square-on to it.
+/// square-on to it, all of it `reach` times further out than the castle hangs
+/// its own -- scaled with the distance, so the disc subtends the same arc.
 ///
 /// `looking_to` points an entity's forward -- its local `-Z` -- along the
 /// direction given, so handing it the direction of the body points the quad's
 /// `+Z` face, which is the one the mesh was built on, straight back at the eye.
-fn body(eye: Vec3, at: Vec3, size: f32) -> Transform {
-    Transform::from_translation(eye + at * BODY_RADIUS)
-        // The orbit is tilted, so nothing ever reaches the pole and this can
-        // never be handed a direction parallel to its up vector.
+fn body(eye: Vec3, at: Vec3, size: f32, reach: f32) -> Transform {
+    Transform::from_translation(eye + at * (BODY_RADIUS * reach))
+        // The orbit is tilted -- and on the orbiting planet the sun keeps
+        // within the tilt of the equator -- so nothing ever reaches the pole
+        // and this can never be handed a direction parallel to its up vector.
         .looking_to(at, Vec3::Y)
-        .with_scale(Vec3::splat(size))
+        .with_scale(Vec3::splat(size * reach))
 }
 
 /// Hidden rather than drawn at nothing, which is a quad's worth of blending to
@@ -1307,82 +1408,14 @@ mod tests {
         }
     }
 
-    /// The orbiting planet's sun is on the unit sphere whatever the hour and
-    /// the season, for the same reason the castle's is: every colour in the
-    /// [`RAMP`] is keyed on its elevation, and a sun that shortens is a sun
-    /// read from the wrong row.
+    /// Day and night over the solar system come from geometry rather than
+    /// from a clock: the world is lit from wherever the real sun stands
+    /// relative to the camera, so the sunward face of a planet is noon and
+    /// the far face is midnight -- with no hour anywhere in the reckoning.
+    /// This is what replaced the simulated year: the planet's own spin,
+    /// carrying the camera round, is now the only clock the system has.
     #[test]
-    fn the_orbiting_sun_is_a_unit_vector_all_year() {
-        for day in 0..8 {
-            for hour in 0..24 {
-                let mut sky = at(hour as f32);
-                sky.year = day as f32;
-                let sun = sky.orbit_sun();
-                assert!(
-                    (sun.length() - 1.0).abs() < 1e-5,
-                    "the sun on day {day} at {hour}:00 is {} long",
-                    sun.length()
-                );
-            }
-        }
-    }
-
-    /// The tilt is what turns the orbit into seasons: across the year the
-    /// subsolar point swings from one tropic to the other and back. Without
-    /// this the sun would ride the same circle every day and the year would
-    /// be invisible from the ground.
-    #[test]
-    fn the_year_swings_the_sun_between_the_tropics() {
-        let mut sky = at(12.0);
-        let solstice = AXIAL_TILT.sin();
-        sky.year = 0.0;
-        assert!(
-            (sky.orbit_sun().y + solstice).abs() < 1e-5,
-            "the year does not open at a solstice: {}",
-            sky.orbit_sun().y
-        );
-        sky.year = YEAR_DAYS / 2.0;
-        assert!(
-            (sky.orbit_sun().y - solstice).abs() < 1e-5,
-            "half a year later the other pole does not have the sun"
-        );
-        sky.year = YEAR_DAYS / 4.0;
-        assert!(
-            sky.orbit_sun().y.abs() < 1e-5,
-            "the equinox sun is off the equator by {}",
-            sky.orbit_sun().y
-        );
-    }
-
-    /// The orbit's one signature in the sky: measured against the stars the
-    /// sun holds still across a day and drifts across the year. Break the
-    /// shared spin between [`Sky::orbit_sun`] and [`Sky::orbit_stars`] and
-    /// the constellations slide behind the sun in a single evening.
-    #[test]
-    fn the_sun_drifts_through_the_stars_across_the_year() {
-        let against_the_stars = |sky: &Sky| sky.orbit_stars().inverse() * sky.orbit_sun();
-        let mut sky = at(6.0);
-        sky.year = 1.0;
-        let morning = against_the_stars(&sky);
-        sky.hours = 20.0;
-        assert!(
-            (against_the_stars(&sky) - morning).length() < 1e-5,
-            "the sun moved against the stars over one day"
-        );
-        sky.year = 3.0;
-        assert!(
-            (against_the_stars(&sky) - morning).length() > 0.5,
-            "a quarter of a year did not move the sun through the constellations"
-        );
-    }
-
-    /// The whole point of the orbiting level, held at the resource level: the
-    /// season changes what the ground gets. At the north pole -- which is
-    /// where the fallback up of `+Y` stands -- the year opens in polar night,
-    /// and half a year later the same midnight hour is under the midnight
-    /// sun.
-    #[test]
-    fn the_seasons_reach_the_ground_on_the_orbiting_planet() {
+    fn the_system_is_lit_from_where_the_sun_really_is() {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .init_resource::<GameTuning>()
@@ -1391,28 +1424,117 @@ mod tests {
             .init_resource::<CameraMedium>()
             .init_resource::<ClearColor>()
             .insert_resource(LevelId::PlanetOrbit)
-            .insert_resource(Gravity::towards(Vec3::ZERO))
+            .insert_resource(Gravity::binary(Vec3::X * 2600.0, Vec3::Z * 4200.0, 300.0))
             .add_systems(Update, advance);
+        // The camera on the sunward face of the first planet: the sun -- at
+        // the system's origin -- stands straight overhead there.
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera3d::default(),
+                DistanceFog::default(),
+                Projection::default(),
+                GlobalTransform::from(Transform::from_translation(Vec3::X * 2300.0)),
+            ))
+            .id();
         app.update();
-        let winter = app.world().resource::<N64Lighting>().daylight;
+        let lit = *app.world().resource::<N64Lighting>();
         assert!(
-            winter.max_element() < 0.2,
-            "the pole's winter night still gets {winter:?} of the daylight"
+            lit.to_light.dot(Vec3::NEG_X) > 0.99,
+            "the light comes from {:?} while the sun stands sunward at -X",
+            lit.to_light
         );
-        // And the sky was painted for it rather than left at the fixed noon
-        // the plain planet keeps.
+        assert!(
+            (lit.daylight - Vec3::ONE).length() < 0.05,
+            "the sunward face is not in daylight: {:?}",
+            lit.daylight
+        );
+        // Walk round to the far face and it is midnight there, whatever the
+        // slider says.
+        app.world_mut()
+            .entity_mut(camera)
+            .insert(GlobalTransform::from(Transform::from_translation(
+                Vec3::X * 2900.0,
+            )));
+        app.update();
+        let dark = *app.world().resource::<N64Lighting>();
+        assert!(
+            dark.daylight.max_element() < 0.2,
+            "the far face of the planet still gets {:?} of the daylight",
+            dark.daylight
+        );
+        // And its sky was repainted for that night rather than left at the
+        // fixed noon the plain planet keeps -- which noon alone could not
+        // show, because the noon horizon *is* the castle's stand-in colour.
         assert_ne!(
             app.world().resource::<ClearColor>().0,
             water::SKY_COLOUR,
-            "the orbiting planet is under the castle's stand-in sky"
+            "the night side of the system is under the castle's noon sky"
+        );
+    }
+
+    /// At 0 g the atmosphere is *gone*: the clear colour is space, the fog
+    /// has been pushed past the far plane where it fogs nothing, and the
+    /// sunlight is back to full however the nearest planet's horizon leans
+    /// -- because nothing stands between a body in vacuum and the sun.
+    #[test]
+    fn the_atmosphere_is_gone_at_zero_g() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<GameTuning>()
+            .init_resource::<Sky>()
+            .init_resource::<N64Lighting>()
+            .init_resource::<CameraMedium>()
+            .init_resource::<ClearColor>()
+            .insert_resource(LevelId::PlanetOrbit)
+            .insert_resource(Gravity::binary(Vec3::X * 2600.0, Vec3::Z * 4200.0, 300.0))
+            .add_systems(Update, advance);
+        // Adrift, kilometres from either planet's pull.
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera3d::default(),
+                DistanceFog::default(),
+                Projection::default(),
+                GlobalTransform::from(Transform::from_translation(Vec3::Y * 3000.0)),
+            ))
+            .id();
+        app.update();
+        let clear = app.world().resource::<ClearColor>().0.to_srgba();
+        assert!(
+            clear.red < 0.05 && clear.blue < 0.06,
+            "space is still painted with atmosphere: {clear:?}"
+        );
+        let fog = app.world().entity(camera).get::<DistanceFog>().unwrap();
+        let FogFalloff::Linear { start, .. } = fog.falloff else {
+            panic!("the fog changed shape");
+        };
+        assert!(
+            start >= SPACE_FAR - 1.0,
+            "at 0 g the haze still starts at {start} m, inside the far plane"
+        );
+        let lit = *app.world().resource::<N64Lighting>();
+        assert!(
+            (lit.daylight - Vec3::ONE).length() < 0.05,
+            "vacuum sunlight is dimmed to {:?}",
+            lit.daylight
         );
 
-        app.world_mut().resource_mut::<Sky>().year = YEAR_DAYS / 2.0;
+        // Drop the same camera to a planet's surface and the air is back on.
+        app.world_mut()
+            .entity_mut(camera)
+            .insert(GlobalTransform::from(Transform::from_translation(
+                Vec3::X * 2300.0,
+            )));
         app.update();
-        let summer = app.world().resource::<N64Lighting>().daylight;
+        let fog = app.world().entity(camera).get::<DistanceFog>().unwrap();
+        let FogFalloff::Linear { start, .. } = fog.falloff else {
+            panic!("the fog changed shape");
+        };
         assert!(
-            summer.min_element() > winter.max_element() * 2.0,
-            "the midnight sun ({summer:?}) is no brighter than the polar night ({winter:?})"
+            (start - SPACE_FOG.0).abs() < 1.0,
+            "on the ground the haze starts at {start} m rather than {}",
+            SPACE_FOG.0
         );
     }
 
@@ -1455,9 +1577,9 @@ mod tests {
     /// not, so the night has something in it.
     #[test]
     fn the_moon_is_up_at_night_and_the_sun_is_not() {
-        let midnight = overhead(SkyKind::Clock, &at(0.0), Vec3::Y);
+        let midnight = overhead(SkyKind::Clock, &at(0.0), Vec3::Y, Vec3::ZERO);
         assert!(midnight.sun.y < 0.0 && midnight.moon().y > 0.0);
-        let noon = overhead(SkyKind::Clock, &at(12.0), Vec3::Y);
+        let noon = overhead(SkyKind::Clock, &at(12.0), Vec3::Y, Vec3::ZERO);
         assert!(noon.sun.y > 0.0 && noon.moon().y < 0.0);
     }
 
@@ -1637,7 +1759,7 @@ mod tests {
         let eye = Vec3::new(-13.0, 10.0, 56.0);
         for hours in [7.0, 12.0, 17.0] {
             let sun = at(hours).sun();
-            let placed = body(eye, sun, SUN_SIZE);
+            let placed = body(eye, sun, SUN_SIZE, 1.0);
             assert!(
                 (placed.translation - eye).normalize().dot(sun) > 0.999,
                 "the sun is not drawn in the direction it is in"

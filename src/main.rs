@@ -28,8 +28,11 @@ mod impostor;
 mod input;
 mod level;
 mod menu;
+mod autopilot;
 mod n64;
 mod nuclonium;
+mod orbit;
+mod orrery;
 mod path;
 mod pipe;
 mod player;
@@ -401,7 +404,10 @@ pub fn add_game(app: &mut App) {
     // overlay has nothing to say about one, and a blank where a body should be
     // reads as a broken body. See that system for what it draws instead.
     app.add_systems(Startup, path::configure)
-        .add_systems(Update, (path::draw, enemy::draw_crawlers, collide::draw));
+        .add_systems(
+            Update,
+            (path::draw, enemy::draw_crawlers, collide::draw, orrery::draw),
+        );
 }
 
 /// Every resource the game's systems expect to find.
@@ -464,6 +470,8 @@ pub fn game_resources(app: &mut App) {
         .init_resource::<world::LevelLoad>()
         .init_resource::<world::Respawn>()
         .init_resource::<gravity::Gravity>()
+        .init_resource::<orbit::SolarSystem>()
+        .init_resource::<autopilot::Autopilot>()
         .add_message::<world::LoadLevel>()
         .insert_resource(Time::<Fixed>::from_hz(30.0));
 }
@@ -582,7 +590,24 @@ fn simulation() -> ScheduleConfigs<ScheduleSystem> {
         // this puts the simulated one back before anything reads it. See
         // [`squad::Glide`], and `squad::bank` at the bottom of this list, which
         // is the other half of it.
-        (squad::steady, player::movement, pylon::supply).chain(),
+        // `player::remember` opens the tick before anything can move him:
+        // what it files is the pose the drawn frames blend *from*, and it has
+        // to be taken before `orbit::advance` rides him round with his planet
+        // or the ride falls outside the blend window and the model buzzes in
+        // place on the moving ground. Then the clockwork turns -- the ground
+        // the player is about to be resolved against has to be the ground as
+        // it stands this tick -- and the autopilot reads its target's
+        // position off that same fresh state before the movement burns
+        // towards it.
+        (
+            player::remember,
+            orbit::advance,
+            autopilot::select,
+            squad::steady,
+            player::movement,
+            pylon::supply,
+        )
+            .chain(),
         // Before anything that reads it. The field is what the crowd tier
         // navigates by, and one built from last tick's player position would
         // send two thousand enemies a step behind him.
@@ -721,7 +746,13 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
         // Both before the camera, which frames her, and long before
         // `nuclonium::swim`, which swims a carried ball after the pose its
         // carrier is actually drawn at.
-        (player::sync_visual, squad::glide).chain(),
+        // `orbit::glide` first in the whole frame: it re-points the world --
+        // scenery, collision, gravity -- at the render-rate pose, and every
+        // line below that probes the level or asks which way is up has to
+        // ask about the world as this frame draws it, not as the last tick
+        // simulated it. The camera especially: its boom probe and its idea
+        // of the horizon both chatter at 30 Hz otherwise.
+        (orbit::glide, player::sync_visual, squad::glide).chain(),
         camera::update,
         animation::resolve_clips,
         animation::claim_players,
@@ -759,11 +790,16 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
             nuclonium::trail,
         )
             .chain(),
-        water::drift,
-        water::adopt_surfaces,
-        water::find_ocean,
-        water::drift_ocean,
-        water::camera_medium,
+        // Nested rather than five entries, because Bevy's system tuples stop
+        // at twenty and this outer one is full.
+        (
+            water::drift,
+            water::adopt_surfaces,
+            water::find_ocean,
+            water::drift_ocean,
+            water::camera_medium,
+        )
+            .chain(),
         // Reads the light the sky wrote *last* frame, which is what lets it sit
         // ahead of the sky rather than in the middle of it -- a frame of lag on
         // a colour that takes a minute to cross the sunset is not a thing that
@@ -783,6 +819,11 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
             update_hud,
             health::draw_player_bar,
             energy::draw_player_bar,
+            // After the burn they are reporting on, so "braking" reaches the
+            // console -- and the bracket turns amber -- the frame the brake
+            // begins and not the frame after.
+            autopilot::hud,
+            autopilot::report,
         )
             .chain(),
     )
@@ -935,6 +976,10 @@ fn setup(
         Player,
         PreviousPose::new(&spawn),
         Controller::default(),
+        // Which world currently holds him, and how hard -- the parenting
+        // record the orbiting level keeps so he is drawn through his
+        // planet's own frame. Inert everywhere else. See [`orbit::Rider`].
+        orbit::Rider::default(),
         // A hundred points, which is a different kind of number from the three
         // hearts this used to be: what threatens him is a crowd's worth of
         // small hits rather than any one enemy. See [`health`].
@@ -1094,6 +1139,7 @@ fn setup(
     commands.spawn(console::tuning_tray_bundle());
     menu::spawn(&mut commands);
     action::spawn(&mut commands);
+    autopilot::spawn_hud(&mut commands);
     if let Ok(mut cursor) = cursor.single_mut() {
         cursor.grab_mode = CursorGrabMode::Locked;
         cursor.visible = false;

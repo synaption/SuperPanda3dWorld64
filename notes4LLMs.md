@@ -27,3 +27,4 @@ blender should include
 
 Use bevy plugins if they help.  
 
+Blender is the level editor

@@ -64,7 +64,9 @@ pub const UNDERWATER_COLOUR: Color = Color::srgb(0.06, 0.28, 0.36);
 /// more than the surface quad does, because the water is a single flat sheet
 /// with nothing behind it and the camera below the line would otherwise look
 /// identical to the camera above it.
-const AIR_FOG: (f32, f32) = (90.0, 200.0);
+/// `AIR_FOG` is crate-visible because [`crate::sky`] owns the fog above water
+/// and has to put these numbers back after a level that widened them.
+pub(crate) const AIR_FOG: (f32, f32) = (90.0, 200.0);
 const UNDERWATER_FOG: (f32, f32) = (2.0, 42.0);
 
 /// How far anything can be seen above water: where the haze becomes total.

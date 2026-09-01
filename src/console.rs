@@ -96,6 +96,20 @@ pub const SPECS: &[TunableSpec] = &[
         doc: "booster terminal rise speed",
     },
     TunableSpec {
+        name: "fly_accel",
+        low: 1.0,
+        high: 120.0,
+        step: 1.0,
+        doc: "thrust in space, metres per second squared",
+    },
+    TunableSpec {
+        name: "infinite_thrust",
+        low: 0.0,
+        high: 1.0,
+        step: 1.0,
+        doc: "1: booster never runs dry, no speed cap -- fly to the other planet",
+    },
+    TunableSpec {
         name: "mario_swim",
         low: 0.5,
         high: 15.0,
@@ -377,6 +391,13 @@ pub const SPECS: &[TunableSpec] = &[
         doc: "draw collision bodies (1), the mesh (2), the grid and candidates (3)",
     },
     TunableSpec {
+        name: "space_debug",
+        low: 0.0,
+        high: 2.0,
+        step: 1.0,
+        doc: "draw gravity, velocity and the coast ahead (1), the whole system (2)",
+    },
+    TunableSpec {
         name: "enemy_sight",
         low: 0.0,
         high: 200.0,
@@ -530,6 +551,51 @@ pub const SPECS: &[TunableSpec] = &[
         step: 0.25,
         doc: "time of day, in hours -- drag it to scrub the sky",
     },
+    // The solar system's shape and pace, one row per fact per world. Degrees
+    // a second rather than seconds a lap, because a slider dragged to zero
+    // should mean "stopped" and not "infinitely fast".
+    TunableSpec {
+        name: "planet1_dist",
+        low: 800.0,
+        high: 20_000.0,
+        step: 100.0,
+        doc: "first planet's distance from the sun, in metres",
+    },
+    TunableSpec {
+        name: "planet2_dist",
+        low: 800.0,
+        high: 20_000.0,
+        step: 100.0,
+        doc: "second planet's distance from the sun, in metres",
+    },
+    TunableSpec {
+        name: "planet1_orbit",
+        low: 0.0,
+        high: 10.0,
+        step: 0.05,
+        doc: "first planet's orbit, in degrees round the sun per second",
+    },
+    TunableSpec {
+        name: "planet2_orbit",
+        low: 0.0,
+        high: 10.0,
+        step: 0.05,
+        doc: "second planet's orbit, in degrees round the sun per second",
+    },
+    TunableSpec {
+        name: "planet1_spin",
+        low: 0.0,
+        high: 30.0,
+        step: 0.1,
+        doc: "first planet's spin, in degrees per second (1.2 is a five-minute day)",
+    },
+    TunableSpec {
+        name: "planet2_spin",
+        low: 0.0,
+        high: 30.0,
+        step: 0.1,
+        doc: "second planet's spin, in degrees per second",
+    },
 ];
 
 #[derive(Resource, Clone, Debug)]
@@ -543,6 +609,14 @@ pub struct GameTuning {
     pub skate_accel: f32,
     pub jet_thrust: f32,
     pub jet_rise: f32,
+    /// How hard the booster pushes out in the weightless space between
+    /// planets, where there is no ground speed to inherit and no gravity to
+    /// fight -- see `player::movement`'s flight branch.
+    pub fly_accel: f32,
+    /// Not a quantity, a switch: past half, the booster ignores the energy
+    /// bar and every speed cap. The console command for crossing the system:
+    /// `infinite_thrust 1`.
+    pub infinite_thrust: f32,
     pub mario_swim: f32,
     /// Luna does not swim, he wades: `WADE_SPEED_SCALE` in
     /// `sm64py/hero/constants.py` is 0.45 of his walk, which is where the
@@ -638,6 +712,10 @@ pub struct GameTuning {
     /// and the grid and candidate lists behind that (3). See
     /// [`crate::collide::draw`].
     pub collide_debug: f32,
+    /// The gravity and flight overlay: the pull, the velocity, the coast
+    /// ahead (1), and the whole system's shells, axis, sun and terminator
+    /// (2). See [`crate::orrery::draw`].
+    pub space_debug: f32,
     pub enemy_speed: f32,
     pub enemy_sight: f32,
     pub enemy_alert: f32,
@@ -712,6 +790,17 @@ pub struct GameTuning {
     /// it here every frame, so the row reads the time and dragging it sets the
     /// time. See `sky::advance`, which does the handshake.
     pub sky_hour: f32,
+    /// The solar system's geometry and clockwork, read every tick by
+    /// [`crate::orbit::advance`]: how far each planet stands from the sun and
+    /// how fast it runs round it and turns on itself. Live rather than fixed,
+    /// because "the proportions are a bit off" is a judgement only a player
+    /// flying the system can make, and these rows are how they make it stick.
+    pub planet1_dist: f32,
+    pub planet2_dist: f32,
+    pub planet1_orbit: f32,
+    pub planet2_orbit: f32,
+    pub planet1_spin: f32,
+    pub planet2_spin: f32,
 }
 
 impl Default for GameTuning {
@@ -726,6 +815,8 @@ impl Default for GameTuning {
             skate_accel: 9.0,
             jet_thrust: 2.4,
             jet_rise: 6.0,
+            fly_accel: 24.0,
+            infinite_thrust: 0.0,
             mario_swim: 5.5,
             luna_wade: 5.13,
             torso_limit: 60.0,
@@ -796,6 +887,7 @@ impl Default for GameTuning {
             path_group: 10.0,
             path_debug: 0.0,
             collide_debug: 0.0,
+            space_debug: 0.0,
             enemy_speed: 1.8,
             enemy_sight: 14.0,
             enemy_alert: 9.0,
@@ -863,6 +955,18 @@ impl Default for GameTuning {
             // top stop of `sky::RAMP` is the light it used to have all the
             // time, and this is close enough to it to be that game.
             sky_hour: 9.0,
+            // Outer Wilds proportions rather than astronomical ones: worlds a
+            // few hundred metres across, orbits a few kilometres out, so the
+            // whole system fits in one glance and a crossing is minutes. The
+            // inner world laps the sun in twelve minutes and spins through a
+            // five-minute day; the outer runs slower on both counts, the way
+            // an outer planet does.
+            planet1_dist: 2600.0,
+            planet2_dist: 4200.0,
+            planet1_orbit: 0.5,
+            planet2_orbit: 0.3,
+            planet1_spin: 1.2,
+            planet2_spin: 0.8,
         }
     }
 }
@@ -879,6 +983,8 @@ impl GameTuning {
             "skate_accel" => self.skate_accel,
             "jet_thrust" => self.jet_thrust,
             "jet_rise" => self.jet_rise,
+            "fly_accel" => self.fly_accel,
+            "infinite_thrust" => self.infinite_thrust,
             "mario_swim" => self.mario_swim,
             "luna_wade" => self.luna_wade,
             "torso_limit" => self.torso_limit,
@@ -915,6 +1021,7 @@ impl GameTuning {
             "path_group" => self.path_group,
             "path_debug" => self.path_debug,
             "collide_debug" => self.collide_debug,
+            "space_debug" => self.space_debug,
             "enemy_speed" => self.enemy_speed,
             "enemy_sight" => self.enemy_sight,
             "enemy_alert" => self.enemy_alert,
@@ -935,6 +1042,12 @@ impl GameTuning {
             "pipe_brood" => self.pipe_brood,
             "day_length" => self.day_length,
             "sky_hour" => self.sky_hour,
+            "planet1_dist" => self.planet1_dist,
+            "planet2_dist" => self.planet2_dist,
+            "planet1_orbit" => self.planet1_orbit,
+            "planet2_orbit" => self.planet2_orbit,
+            "planet1_spin" => self.planet1_spin,
+            "planet2_spin" => self.planet2_spin,
             _ => return None,
         })
     }
@@ -955,6 +1068,8 @@ impl GameTuning {
             "skate_accel" => self.skate_accel = value,
             "jet_thrust" => self.jet_thrust = value,
             "jet_rise" => self.jet_rise = value,
+            "fly_accel" => self.fly_accel = value,
+            "infinite_thrust" => self.infinite_thrust = value,
             "mario_swim" => self.mario_swim = value,
             "luna_wade" => self.luna_wade = value,
             "torso_limit" => self.torso_limit = value,
@@ -991,6 +1106,7 @@ impl GameTuning {
             "path_group" => self.path_group = value,
             "path_debug" => self.path_debug = value,
             "collide_debug" => self.collide_debug = value,
+            "space_debug" => self.space_debug = value,
             "enemy_speed" => self.enemy_speed = value,
             "enemy_sight" => self.enemy_sight = value,
             "enemy_alert" => self.enemy_alert = value,
@@ -1011,6 +1127,12 @@ impl GameTuning {
             "pipe_brood" => self.pipe_brood = value,
             "day_length" => self.day_length = value,
             "sky_hour" => self.sky_hour = value,
+            "planet1_dist" => self.planet1_dist = value,
+            "planet2_dist" => self.planet2_dist = value,
+            "planet1_orbit" => self.planet1_orbit = value,
+            "planet2_orbit" => self.planet2_orbit = value,
+            "planet1_spin" => self.planet1_spin = value,
+            "planet2_spin" => self.planet2_spin = value,
             _ => unreachable!(),
         }
         Ok((previous, value))

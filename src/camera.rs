@@ -63,6 +63,19 @@ pub struct FollowCamera {
     /// `None` until the first frame places it, so the camera arrives already
     /// framed rather than flying in from the origin.
     pub focus: Option<Vec3>,
+    /// Whether the last frame was flown weightless. In space the look is
+    /// free -- see [`update`]'s first branch -- and this is the edge that
+    /// says a fold or a landing is happening this frame rather than every
+    /// frame.
+    pub free: bool,
+    /// Seconds of grace after a landing during which a large gap between the
+    /// view and the ground's frame is *eased* across rather than snapped.
+    /// Coming back from free flight upside down is exactly such a gap, and
+    /// it is the one kind that must roll the horizon over visibly -- the
+    /// player flew themselves into that attitude and the camera showing the
+    /// recovery is the camera being honest. See [`UP_SNAP`], which this
+    /// suspends.
+    pub landing: f32,
 }
 
 impl Default for FollowCamera {
@@ -78,6 +91,8 @@ impl Default for FollowCamera {
             frame: Quat::IDENTITY,
             view: Quat::IDENTITY,
             focus: None,
+            free: false,
+            landing: 0.0,
         }
     }
 }
@@ -126,6 +141,19 @@ const BOOM_RISE: f32 = 0.8 / 9.5;
 /// known -- they are holding the aim button.
 const AIM_SENSITIVITY: f32 = 0.5;
 
+/// The most the focus may trail behind the player, in metres.
+///
+/// The focus ease is a fraction of the remaining gap per frame, and a
+/// fraction of a gap that grows without bound is a lag that does too. At
+/// walking speed the trail is well under a metre and the cap never touches
+/// it; at the speeds the jetpack reaches between planets it was tens of
+/// metres -- far enough to drag the focus underground on lift-off, where the
+/// boom probe read the terrain overhead as a wall and pulled the camera all
+/// the way in to the player's head. First person, uninvited, at exactly the
+/// moment there was a planet to look back at. Capped, the ease keeps its feel
+/// at the speeds it was tuned for and turns into a rigid follow past them.
+const FOCUS_TRAIL: f32 = 2.5;
+
 /// How fast the view's idea of up chases the ground's, per second.
 ///
 /// A ninth of a second of lag. The prototype in `experimental/ow` uses 20 on
@@ -134,6 +162,12 @@ const AIM_SENSITIVITY: f32 = 0.5;
 /// chain -- the body's own levelling in [`crate::player`] runs slower again,
 /// and what reaches the screen is the two of them in series.
 const UP_ALIGN_RATE: f32 = 9.0;
+
+/// How long after leaving free flight a large view-to-ground gap is still
+/// eased rather than snapped. Long enough for [`UP_ALIGN_RATE`] to close even
+/// an upside-down arrival; a respawn inside this window is eased too, which
+/// is rare enough not to matter.
+const LANDING_EASE: f32 = 1.2;
 
 /// Past this much of an angle between the two ups, the gap is not something to
 /// ease across.
@@ -182,52 +216,89 @@ pub fn update(
     let Ok((mut camera, mut follow)) = cameras.single_mut() else {
         return;
     };
-    // Carried onto this frame's up before anything is measured in it. On the
-    // castle `up` is `+Y`, the correction is the identity, and every line below
-    // is the line that was there before.
+    // `input.aim` rather than `state.aiming`, which is this system's own
+    // output and is not written until further down.
+    let sensitivity = tuning.mouse_sens * if input.aim { AIM_SENSITIVITY } else { 1.0 };
+    // The stick is a rate rather than a displacement, so it is scaled by the
+    // frame's length where the mouse is not.
+    let stick = time.delta_secs() * tuning.pad_look;
     let up = gravity.up(player.translation);
-    follow.frame = Quat::from_rotation_arc(follow.frame * Vec3::Y, up) * follow.frame;
-    // And the view eases onto the frame. That is the whole of the lag, and
-    // every axis below is measured in `view` rather than `frame`, so the camera
-    // answers the ground through a filter while still answering the mouse
-    // directly.
-    let carried = follow.view * Vec3::Y;
-    follow.view = if carried.angle_between(up) > UP_SNAP {
-        follow.frame
+    let free = gravity.weightless(player.translation);
+    if free {
+        // Weightless, there is no floor and so no reason the look should
+        // have one. The yaw/pitch orbit cannot give that -- its pitch clamp
+        // is what keeps a grounded camera off the poles of its own frame --
+        // so out here the orbit is folded into the view once, and the mouse
+        // then turns the *view itself* about its own axes: every turn is
+        // relative to the screen, straight up keeps going, and there is no
+        // pole because nothing is fixed enough to have one.
+        if !follow.free {
+            follow.view = follow.view
+                * Quat::from_rotation_y(follow.yaw)
+                * Quat::from_rotation_x(follow.pitch);
+            follow.yaw = 0.0;
+            follow.pitch = 0.0;
+        }
+        let mut turn = -input.look_mouse.x * sensitivity - stick_curve(input.look_stick.x) * stick;
+        if keys.pressed(KeyCode::KeyQ) {
+            turn += 0.035;
+        }
+        if keys.pressed(KeyCode::KeyE) {
+            turn -= 0.035;
+        }
+        let tilt = -input.look_mouse.y * sensitivity * 0.8333
+            + stick_curve(input.look_stick.y) * stick * 0.8333;
+        follow.view = follow.view * Quat::from_rotation_y(turn) * Quat::from_rotation_x(tilt);
+        // The frame follows the view rather than the ground: the ground is
+        // whichever planet happens to be nearest, and a free camera answering
+        // to it would lurch every time the crossing's midpoint went by.
+        follow.frame = follow.view;
     } else {
-        let rate = gravity::settle(UP_ALIGN_RATE, time.delta_secs());
-        follow.view.slerp(follow.frame, rate)
-    };
+        // Carried onto this frame's up before anything is measured in it. On
+        // the castle `up` is `+Y`, the correction is the identity, and every
+        // line below is the line that was there before.
+        follow.frame = Quat::from_rotation_arc(follow.frame * Vec3::Y, up) * follow.frame;
+        // And the view eases onto the frame. That is the whole of the lag, and
+        // every axis below is measured in `view` rather than `frame`, so the
+        // camera answers the ground through a filter while still answering the
+        // mouse directly.
+        if follow.free {
+            follow.landing = LANDING_EASE;
+        }
+        follow.landing = (follow.landing - time.delta_secs()).max(0.0);
+        let carried = follow.view * Vec3::Y;
+        follow.view = if carried.angle_between(up) > UP_SNAP && follow.landing <= 0.0 {
+            follow.frame
+        } else {
+            let rate = gravity::settle(UP_ALIGN_RATE, time.delta_secs());
+            follow.view.slerp(follow.frame, rate)
+        };
+        follow.yaw -= input.look_mouse.x * sensitivity;
+        follow.pitch = (follow.pitch - input.look_mouse.y * sensitivity * 0.8333)
+            .clamp(PITCH_LIMITS.0, PITCH_LIMITS.1);
+        follow.yaw -= stick_curve(input.look_stick.x) * stick;
+        follow.pitch = (follow.pitch + stick_curve(input.look_stick.y) * stick * 0.8333)
+            .clamp(PITCH_LIMITS.0, PITCH_LIMITS.1);
+        if keys.pressed(KeyCode::KeyQ) {
+            follow.yaw += 0.035;
+        }
+        if keys.pressed(KeyCode::KeyE) {
+            follow.yaw -= 0.035;
+        }
+        if InputState::take(&mut input.recenter) {
+            // Behind the player means behind him *in the camera's own frame*,
+            // which is what taking the facing back out of that frame asks.
+            let forward = follow.view.inverse() * (player.rotation * Vec3::NEG_Z);
+            follow.yaw = forward.x.atan2(forward.z);
+        }
+    }
+    follow.free = free;
     // Roll is the axis this matters most on. Taking the camera's up straight
     // off the ground puts every wobble in the surface onto the horizon, and a
     // tilting horizon is the most legible motion there is on a screen -- far
     // more so than the same wobble in pitch. Which is why `up` is not read
     // again below this line.
     let view_up = follow.view * Vec3::Y;
-    // `input.aim` rather than `state.aiming`, which is this system's own
-    // output and is not written until further down.
-    let sensitivity = tuning.mouse_sens * if input.aim { AIM_SENSITIVITY } else { 1.0 };
-    follow.yaw -= input.look_mouse.x * sensitivity;
-    follow.pitch = (follow.pitch - input.look_mouse.y * sensitivity * 0.8333)
-        .clamp(PITCH_LIMITS.0, PITCH_LIMITS.1);
-    // The stick is a rate rather than a displacement, so it is scaled by the
-    // frame's length where the mouse is not.
-    let stick = time.delta_secs() * tuning.pad_look;
-    follow.yaw -= stick_curve(input.look_stick.x) * stick;
-    follow.pitch = (follow.pitch + stick_curve(input.look_stick.y) * stick * 0.8333)
-        .clamp(PITCH_LIMITS.0, PITCH_LIMITS.1);
-    if keys.pressed(KeyCode::KeyQ) {
-        follow.yaw += 0.035;
-    }
-    if keys.pressed(KeyCode::KeyE) {
-        follow.yaw -= 0.035;
-    }
-    if InputState::take(&mut input.recenter) {
-        // Behind the player means behind him *in the camera's own frame*, which
-        // is what taking the facing back out of that frame asks.
-        let forward = follow.view.inverse() * (player.rotation * Vec3::NEG_Z);
-        follow.yaw = forward.x.atan2(forward.z);
-    }
     state.aiming = input.aim;
     let desired_distance = if state.aiming {
         tuning.cam_aim_distance
@@ -243,6 +314,10 @@ pub fn update(
         Some(previous) => previous.lerp(standing, smoothing),
         None => standing,
     };
+    // However fast the player is going, the focus stays within arm's reach of
+    // him. See [`FOCUS_TRAIL`]: past the cap the ease has nothing left to
+    // smooth, it is simply behind.
+    let focus = standing + (focus - standing).clamp_length_max(FOCUS_TRAIL);
     follow.focus = Some(focus);
     let orbit =
         follow.view * Quat::from_rotation_y(follow.yaw) * Quat::from_rotation_x(follow.pitch);
@@ -379,6 +454,72 @@ mod tests {
         assert!(
             view_up(&mut world).angle_between(Vec3::NEG_Z) < 1e-4,
             "eased across a teleport"
+        );
+    }
+
+    /// However fast the player goes, the focus stays within arm's reach.
+    ///
+    /// The ease is a fraction of the gap per frame, so before the cap its lag
+    /// grew with speed without bound. At jetpack speeds it trailed tens of
+    /// metres -- through the terrain on lift-off, where the boom probe read
+    /// the ground as a wall between camera and player and collapsed the boom
+    /// to zero: first person, uninvited. The cap is the fix, and this holds
+    /// it: one enormous step, and the focus is still beside the player.
+    #[test]
+    fn the_focus_cannot_be_outrun() {
+        let mut world = planet_world(Vec3::X * PLANET);
+        frames(&mut world, 10);
+        // Two hundred metres in one frame, which is faster than even the
+        // infinite booster manages and exactly what it looks like to the
+        // camera when it does.
+        let bolted = Vec3::X * (PLANET + 200.0);
+        world.resource_mut::<RenderPose>().translation = bolted;
+        frames(&mut world, 1);
+        let mut query = world.query::<&FollowCamera>();
+        let follow = query.single(&world).unwrap();
+        let standing = bolted + (follow.view * Vec3::Y) * world.resource::<GameTuning>().cam_height;
+        let trail = (follow.focus.expect("the focus was never placed") - standing).length();
+        assert!(
+            trail <= FOCUS_TRAIL + 1e-3,
+            "the focus trails {trail} m behind a fast player"
+        );
+    }
+
+    /// In space the look has no floor and no ceiling: a held pitch input
+    /// carries the view clean over the top and round again -- the full turn
+    /// the grounded orbit's clamp exists to forbid, forbidden no longer.
+    #[test]
+    fn weightless_look_pitches_clean_over_the_pole() {
+        let mut world = planet_world(Vec3::X * 2000.0);
+        // A system whose midpoint the player floats at: genuinely weightless,
+        // which is what frees the look.
+        world.insert_resource(Gravity::binary(Vec3::ZERO, Vec3::X * 4000.0, 300.0));
+        frames(&mut world, 1);
+        let forward = |world: &mut World| {
+            let mut query = world.query_filtered::<&Transform, With<FollowCamera>>();
+            Vec3::from(query.single(world).unwrap().forward())
+        };
+        let start = forward(&mut world);
+        // Pitch input adding up to one whole turn across 120 frames.
+        let per_frame = std::f32::consts::TAU / 120.0;
+        let counts = per_frame / (world.resource::<GameTuning>().mouse_sens * 0.8333);
+        for _ in 0..60 {
+            world.resource_mut::<InputState>().look_mouse = Vec2::new(0.0, counts);
+            frames(&mut world, 1);
+        }
+        let halfway = forward(&mut world);
+        assert!(
+            halfway.dot(start) < -0.9,
+            "half a turn of pitch left the view at {halfway:?}, which is a clamp"
+        );
+        for _ in 0..60 {
+            world.resource_mut::<InputState>().look_mouse = Vec2::new(0.0, counts);
+            frames(&mut world, 1);
+        }
+        world.resource_mut::<InputState>().look_mouse = Vec2::ZERO;
+        assert!(
+            forward(&mut world).dot(start) > 0.9,
+            "a full turn of pitch did not come back round"
         );
     }
 

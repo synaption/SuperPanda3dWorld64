@@ -50,12 +50,14 @@ pub enum LevelId {
     /// The generated planet, from `experimental/planet_gen`. Round, and
     /// gravity points at the middle of it.
     Planet,
-    /// The same planet, set in motion: spinning through a day and a night and
-    /// running round a sun through a year of seasons. The motion is all in the
-    /// sky -- see [`crate::sky`] -- because a planet watched from its own
-    /// surface moves by everything *else* wheeling over it: the ground, the
-    /// collision and the player all live in the planet's own frame, which is
-    /// the one frame in which none of them move.
+    /// The solar system: a sun you can fly to, and the same planet standing
+    /// twice, each copy genuinely running its own circle round the sun and
+    /// turning on its own axis -- [`crate::orbit`] is the clockwork, and the
+    /// `planet1_*`/`planet2_*` console rows are its dials. Whoever is inside
+    /// a world's gravity rides that world's frame; the space between is
+    /// weightless, inertial, and crossed on the booster (`infinite_thrust 1`
+    /// takes its limits off) or on the autopilot (Tab, then X to pick a
+    /// destination).
     PlanetOrbit,
 }
 
@@ -67,7 +69,7 @@ impl LevelId {
         match self {
             LevelId::Castle => "Castle grounds",
             LevelId::Planet => "Planet",
-            LevelId::PlanetOrbit => "Planet in orbit",
+            LevelId::PlanetOrbit => "Solar system",
         }
     }
 
@@ -206,10 +208,12 @@ pub fn spawn(
     // A level that has no authored surfaces must not be handed the last
     // level's. `water::expect_surfaces` puts this back for the ones that do.
     commands.remove_resource::<water::PendingSurfaces>();
-    commands.spawn((
-        LevelEntity,
-        WorldAssetRoot(assets.load(format!("{}#Scene0", id.scene()))),
-    ));
+    let scenery = commands
+        .spawn((
+            LevelEntity,
+            WorldAssetRoot(assets.load(format!("{}#Scene0", id.scene()))),
+        ))
+        .id();
     match id {
         LevelId::Castle => {
             let furniture = furniture::castle();
@@ -257,6 +261,25 @@ pub fn spawn(
             commands.insert_resource(FlowField::new(&empty));
             commands.insert_resource(empty);
             commands.insert_resource(Gravity::towards(PLANET_CENTRE));
+            if id == LevelId::PlanetOrbit {
+                // The clockwork starts over: fresh orbit angles, and no seat
+                // for the respawn until the ground exists to sit it on.
+                let system = crate::orbit::SolarSystem::default();
+                // Both scene roots are named for the body they draw, so
+                // [`crate::orbit::advance`] can keep each under its planet as
+                // the planets go round. The second is the same glTF drawn
+                // again, not a second 14 MB of anything; both collisions are
+                // one filed set of triangles answered through each body's
+                // frame ([`LevelData::place_planets`]).
+                commands.entity(scenery).insert(crate::orbit::PlanetBody(0));
+                commands.spawn((
+                    LevelEntity,
+                    crate::orbit::PlanetBody(1),
+                    WorldAssetRoot(assets.load(format!("{}#Scene0", id.scene()))),
+                    Transform::from_translation(system.bodies[1].centre),
+                ));
+                commands.insert_resource(system);
+            }
             load.pending = Some(id);
             load.handle = assets.load(id.scene());
         }
@@ -456,6 +479,14 @@ fn put_the_player_down(
         // would spend the first second of the level rolling the horizon over.
         follow.view = follow.frame;
         follow.clearance = 1.0;
+        // Forgotten, this is the second-worst arrival the camera can make:
+        // the focus is eased toward the player from wherever it last was,
+        // and "wherever it last was" is the previous level -- which from a
+        // planet's spawn is a point deep inside the planet. The camera spent
+        // the first seconds of every visit flying through the core, underwater
+        // as far as the fog could tell, with the whole sky hidden. Cleared,
+        // the next `camera::update` starts it where it belongs.
+        follow.focus = None;
         camera.translation = at + up * 3.0 - facing * follow.distance;
         camera.look_at(at + up, up);
     }
@@ -502,6 +533,7 @@ pub fn finish_planet(
     gltf_meshes: Res<Assets<GltfMesh>>,
     meshes: Res<Assets<Mesh>>,
     gravity: Res<Gravity>,
+    mut system: ResMut<crate::orbit::SolarSystem>,
     mut placement: ParamSet<(PlacePlayer<'_, '_>, PlaceCamera<'_, '_>)>,
 ) {
     let Some(id @ (LevelId::Planet | LevelId::PlanetOrbit)) = load.pending else {
@@ -533,13 +565,46 @@ pub fn finish_planet(
     };
     let (centre, radius) = sphere_of(&geometry.vertices);
     let sea = sea_level_of(&geometry.ocean, centre);
-    let collision = LevelData::planet(&geometry.vertices, &geometry.indices, centre, radius, sea);
+    let mut collision =
+        LevelData::planet(&geometry.vertices, &geometry.indices, centre, radius, sea);
     // Sea level rather than the measured mean wherever there is a sea. The
     // mean sits four metres above the water on this planet -- it is an average
     // over land and seabed both -- and "the lowest dry land" measured against
     // it is land that is four metres dry, which is a beach the player never
     // arrives on.
+    //
+    // Searched in the geometry's own filed coordinates, before any orbital
+    // placement: on the solar system the planets are already out on their
+    // circles, and a search around the authored centre would be a search of
+    // empty space.
     let spawn = ground_to_stand_on(&collision, centre, sea.unwrap_or(radius));
+    // The orbiting level is a system: the same ground standing twice, each
+    // copy where its orbit has it, gravity answering to whichever world is
+    // nearer and to neither in the middle. Installed here rather than in
+    // `spawn` because everything wants the measured radius, which did not
+    // exist until this frame.
+    let spawn = match id {
+        LevelId::PlanetOrbit => {
+            let placed: Vec<(Vec3, Quat)> = system
+                .bodies
+                .iter()
+                .map(|body| (body.centre, body.rotation))
+                .collect();
+            collision.place_planets(&placed);
+            commands.insert_resource(Gravity::binary(
+                system.bodies[0].centre,
+                system.bodies[1].centre,
+                radius,
+            ));
+            // The respawn is a seat on the first planet rather than a
+            // coordinate: `orbit::advance` re-resolves it as the planet goes
+            // round.
+            system.respawn_local = Some(spawn);
+            let home = system.bodies[0];
+            home.centre + home.rotation * (spawn - centre)
+        }
+        _ => spawn,
+    };
     console.report(match sea {
         Some(sea) => format!(
             "planet: {} triangles, radius {radius:.0} m, sea level {sea:.0} m",
@@ -551,7 +616,15 @@ pub fn finish_planet(
         ),
     });
 
-    put_the_player_down(spawn, gravity.up(spawn), &mut commands, &mut placement);
+    // Which way is up where he lands. The system's new gravity was inserted
+    // through `Commands` and is not readable yet, so the answer is taken off
+    // the body he is standing on rather than off the stale resource -- which
+    // still points at the authored centre, a spot the planet has left.
+    let up = match id {
+        LevelId::PlanetOrbit => (spawn - system.bodies[0].centre).normalize_or(Vec3::Y),
+        _ => gravity.up(spawn),
+    };
+    put_the_player_down(spawn, up, &mut commands, &mut placement);
 
     commands.insert_resource(FlowField::new(&collision));
     commands.insert_resource(Respawn(spawn));
@@ -1026,9 +1099,23 @@ mod tests {
             );
         }
         assert_eq!(*app.world().resource::<LevelId>(), LevelId::PlanetOrbit);
-        assert_eq!(
-            *app.world().resource::<Gravity>(),
-            Gravity::towards(PLANET_CENTRE)
+        // A system's gravity, not a lone planet's: one centre per orbiting
+        // world, exactly where the clockwork has it, and weightlessness in
+        // the middle of the crossing.
+        let system_centres = app.world().resource::<crate::orbit::SolarSystem>().centres();
+        let gravity = *app.world().resource::<Gravity>();
+        let Gravity::System { centres, .. } = gravity else {
+            panic!("the orbiting level's gravity is {gravity:?}, not a system");
+        };
+        assert_eq!(centres, system_centres);
+        assert!(
+            (centres[0] - crate::orbit::SUN_CENTRE).length() > 1000.0,
+            "the first planet is not out on its orbit"
+        );
+        let midway = (centres[0] + centres[1]) * 0.5;
+        assert!(
+            gravity.weightless(midway),
+            "the middle of the crossing still pulls"
         );
         let Shape::Planet { radius, .. } = app.world().resource::<LevelData>().shape() else {
             panic!("the orbiting planet's collision is still flat");
@@ -1036,6 +1123,100 @@ mod tests {
         assert!(
             (250.0..350.0).contains(&radius),
             "planet.glb measured {radius} m across the middle"
+        );
+
+        // The second world is really there, twice over: its ground answers
+        // where its orbit has it, and its scene is drawn there. Probed from
+        // sixty metres up, the same clearance the spawn search uses: `radius`
+        // is a mean and the terrain rises tens of metres over it, so a probe
+        // from one metre up can begin inside a mountain.
+        let level = app.world().resource::<LevelData>();
+        let over_the_copy = centres[1] + Vec3::Y * (radius + 60.0);
+        let (ground, _) = level
+            .ground_below(over_the_copy, Vec3::Y)
+            .expect("no ground on the second planet");
+        assert!(
+            ((ground - centres[1]).length() - radius).abs() < 60.0,
+            "the copy's ground is {} m from its middle",
+            (ground - centres[1]).length()
+        );
+        let mut roots = app
+            .world_mut()
+            .query_filtered::<&Transform, With<bevy::world_serialization::WorldAssetRoot>>();
+        assert!(
+            roots
+                .iter(app.world())
+                .any(|at| (at.translation - centres[1]).length() < radius),
+            "no scene stands under the second planet"
+        );
+    }
+
+    /// The player arrives on the system with a sky over him and a camera
+    /// behind him -- immediately, not after a scenic tour of the core.
+    ///
+    /// The regression this pins down: `put_the_player_down` reset everything
+    /// about the camera except its eased focus, so arriving from the castle
+    /// left the focus at the castle's coordinates -- which, from a planet's
+    /// surface, is a point deep inside the planet. The camera then spent
+    /// several seconds easing out through rock and sea, the fog read it as
+    /// underwater the whole way, and the medium check hid the sun, the moon
+    /// and the stars. From the player's chair: no sky, and a camera that
+    /// arrives in his head.
+    #[test]
+    fn arriving_on_the_system_keeps_the_camera_out_of_the_core() {
+        let mut app = with_a_loader();
+        app.update();
+        app.world_mut().write_message(LoadLevel(LevelId::PlanetOrbit));
+        let started = std::time::Instant::now();
+        let mut frames = 0;
+        while app.world().resource::<LevelLoad>().busy() || frames == 0 {
+            app.update();
+            frames += 1;
+            assert!(started.elapsed().as_secs() < 60, "the system never loaded");
+        }
+        // Against the player rather than against the spawn point: the planet
+        // is genuinely moving now, and it carries him with it.
+        for step in 0..10 {
+            app.update();
+            let mut players = app
+                .world_mut()
+                .query_filtered::<&Transform, With<player::Player>>();
+            let standing = players.single(app.world()).unwrap().translation;
+            let mut cameras = app
+                .world_mut()
+                .query_filtered::<&Transform, With<Camera3d>>();
+            let camera = cameras.single(app.world()).unwrap().translation;
+            assert!(
+                (camera - standing).length() < 25.0,
+                "frame {step}: the camera is {} m from the player, touring the core",
+                (camera - standing).length()
+            );
+        }
+        assert!(
+            !app.world()
+                .resource::<crate::water::CameraMedium>()
+                .submerged(),
+            "the camera arrived underwater, which is the hidden-sky bug"
+        );
+        // And the sun is *there*: over the system the billboard disc stands
+        // down and the physical sphere at the middle of the system stands
+        // up, which is the body a player can actually fly to.
+        let mut parts = app
+            .world_mut()
+            .query::<(&crate::sky::SkyPart, &Visibility)>();
+        let mut seen = std::collections::HashMap::new();
+        for (part, visibility) in parts.iter(app.world()) {
+            seen.insert(*part, *visibility);
+        }
+        assert_eq!(
+            seen.get(&crate::sky::SkyPart::SunBody),
+            Some(&Visibility::Visible),
+            "the real sun is not in the sky"
+        );
+        assert_eq!(
+            seen.get(&crate::sky::SkyPart::Sun),
+            Some(&Visibility::Hidden),
+            "the billboard sun is still up beside the real one"
         );
     }
 

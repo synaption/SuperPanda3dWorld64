@@ -53,11 +53,22 @@ pub enum Mode {
     /// Open a circle on the ground and call every loose ball in it to heel.
     /// See [`crate::nuclonium::call`].
     Nuclonium,
+    /// Lock the flight computer onto the body under the crosshair. Only
+    /// means anything over the solar system, which is exactly why it lives
+    /// in the picker rather than on a key of its own: on every other level
+    /// it is a row you never select. See [`crate::autopilot`].
+    Autopilot,
 }
 
 impl Mode {
     /// Every mode, in picker order.
-    pub const ALL: [Mode; 4] = [Mode::Squad, Mode::Pylon, Mode::Stellarator, Mode::Nuclonium];
+    pub const ALL: [Mode; 5] = [
+        Mode::Squad,
+        Mode::Pylon,
+        Mode::Stellarator,
+        Mode::Nuclonium,
+        Mode::Autopilot,
+    ];
 
     /// What the picker calls it.
     pub fn name(self) -> &'static str {
@@ -66,6 +77,7 @@ impl Mode {
             Mode::Pylon => "Pylon",
             Mode::Stellarator => "Stellarator",
             Mode::Nuclonium => "Nuclonium",
+            Mode::Autopilot => "Autopilot",
         }
     }
 
@@ -80,6 +92,7 @@ impl Mode {
             Mode::Pylon => "hold to open a site, release to plant a mast",
             Mode::Stellarator => "hold to aim, release to build a machine",
             Mode::Nuclonium => "hold to open a circle, release to call what is in it",
+            Mode::Autopilot => "aim at a body and press to lock on; empty sky lets go",
         }
     }
 
@@ -159,6 +172,7 @@ fn keyboard(keys: &ButtonInput<KeyCode>) -> Press {
         KeyCode::Digit2,
         KeyCode::Digit3,
         KeyCode::Digit4,
+        KeyCode::Digit5,
     ];
     Press {
         toggle: keys.just_pressed(KeyCode::Tab),
@@ -232,6 +246,10 @@ pub fn aim(mode: Mode, picking: bool, input: &mut InputState) {
         Mode::Nuclonium => {
             input.grab |= held;
             input.grab_released |= released;
+        }
+        Mode::Autopilot => {
+            input.autopilot |= held;
+            input.autopilot_released |= released;
         }
     }
 }
@@ -485,11 +503,14 @@ mod tests {
         assert!(pressed(Mode::Pylon, false).pylon);
         assert!(pressed(Mode::Stellarator, false).build);
         assert!(pressed(Mode::Nuclonium, false).grab);
+        assert!(pressed(Mode::Autopilot, false).autopilot_released);
         // Nothing leaks across.
         assert!(!pressed(Mode::Pylon, false).squad);
         assert!(!pressed(Mode::Squad, false).grab);
+        assert!(!pressed(Mode::Nuclonium, false).autopilot_released);
         // And the press that closes the picker does not also fire.
         let inert = pressed(Mode::Nuclonium, true);
         assert!(!inert.grab && !inert.squad && !inert.build && !inert.pylon);
+        assert!(!pressed(Mode::Autopilot, true).autopilot_released);
     }
 }

@@ -79,6 +79,11 @@ pub struct InputState {
     /// train. See [`crate::nuclonium::call`].
     pub grab: bool,
     pub grab_released: bool,
+    /// The autopilot button, held, and its release. Only ever written by the
+    /// Tab picker's routing -- there is no direct key -- and the *release* is
+    /// the press that steps the target: see [`crate::autopilot::select`].
+    pub autopilot: bool,
+    pub autopilot_released: bool,
     pub swap: bool,
     /// Cycle the weapon in Luna's hand. Latched: `weapon::swap` takes it.
     pub swap_weapon: bool,
@@ -247,6 +252,8 @@ pub fn gather(
     // aimed.
     state.squad = false;
     state.grab = false;
+    state.autopilot = false;
+    state.autopilot_released = false;
     state.build = build;
     state.pylon = pylon;
     // Edges accumulate rather than overwrite: a press seen on a frame whose

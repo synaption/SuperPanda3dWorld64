@@ -1,9 +1,11 @@
 use crate::{
     audio::{Sfx, SoundQueue},
+    autopilot::{self, Autopilot},
     console::GameTuning,
     gravity::{self, Gravity},
     input::InputState,
-    level::LevelData,
+    level::{LevelData, Shape},
+    orbit::SolarSystem,
     weapon::Loadout,
     world::Respawn,
     ActiveCharacter, GameState,
@@ -58,6 +60,26 @@ const COMBO_WINDOW: f32 = 1.2;
 /// of a second is short enough that standing still looks level and long enough
 /// that a surface turning under the feet arrives as a lean rather than a jolt.
 const UPRIGHT_RATE: f32 = 8.0;
+
+/// How far off a surface a swept step is stopped, in metres. See [`sweep`].
+const SWEEP_SKIN: f32 = 0.05;
+
+/// How much harder the booster pushes with `infinite_thrust` set, over the
+/// tuned [`GameTuning::fly_accel`]. Six is "the crossing takes seconds": from
+/// a standstill in the middle of the system it reaches the far planet's
+/// gravity in about three. `pub(crate)` because [`crate::orrery`] predicts
+/// the autopilot's path with the same burn the flight will use.
+pub(crate) const INFINITE_BURN: f32 = 6.0;
+
+/// How fast a weightless body lies down along its line of flight, per
+/// second. Gentler than [`UPRIGHT_RATE`] on purpose: standing up on landing
+/// is a correction, but leaning into the crossing is a pose, and a pose
+/// snapped into is a glitch where a pose eased into is a manoeuvre.
+const FLIGHT_ALIGN_RATE: f32 = 2.5;
+
+/// Slower than this, a flyer has no line of flight worth lying along, and
+/// the nearest world's up keeps the body instead. Metres a second.
+const FLIGHT_ALIGN_SPEED: f32 = 2.0;
 
 /// How fast the feet close a gap to the floor beneath them, per second, and
 /// the most daylight allowed under them while it closes.
@@ -234,6 +256,8 @@ pub fn movement(
     state: Res<GameState>,
     tuning: Res<GameTuning>,
     loadout: Res<Loadout>,
+    system: Res<SolarSystem>,
+    mut pilot: ResMut<Autopilot>,
     mut sounds: ResMut<SoundQueue>,
     mut player: Query<
         (
@@ -260,8 +284,11 @@ pub fn movement(
     let Ok((mut transform, mut previous, mut ctrl, mut health)) = player.single_mut() else {
         return;
     };
-    previous.translation = transform.translation;
-    previous.rotation = transform.rotation;
+    // Where this tick's integration starts, for the sweeps below. Not
+    // `previous` -- [`remember`] filed that before `orbit::advance` carried
+    // him round with his planet, and a sweep opened from the pre-ride
+    // position would cross ground he never crossed, only rode.
+    let opened_at = transform.translation;
     let Ok(cam) = camera.single() else {
         return;
     };
@@ -278,6 +305,97 @@ pub fn movement(
     // shoots and never does both.
     let attack_pressed = !loadout.equipped.is_ranged() && InputState::take(&mut input_state.attack);
     let input = input_state.move_axis;
+    // Whether he began this tick in the air, taken before anything below can
+    // change its mind. [`sweep`] is gated on it so that a step *starting* on
+    // the ground -- whose segment begins on the very surface it would hit --
+    // is never swept against the floor it is walking along.
+    let was_airborne = !ctrl.grounded;
+    let infinite = tuning.infinite_thrust > 0.5;
+
+    // -- between the worlds -------------------------------------------------
+    //
+    // Weightless, the jetpack is the whole controller. `experimental/ow` is
+    // the model: thrust is applied along where you are actually pointing --
+    // the camera itself, not its shadow on a ground there no longer is -- so
+    // the far planet is exactly where you aim, and what speed you have you
+    // keep, because nothing out here brakes, pulls or stands on anything.
+    // The walking machinery below never runs; gravity's fade hands the body
+    // back to it on the way down, and the sweep keeps a fast arrival from
+    // passing through the world it arrived at.
+    if gravity.weightless(transform.translation) && !ctrl.submersion.in_water() {
+        let mut push = cam.forward() * input.y + cam.right() * input.x;
+        if push.length_squared() > 1.0 {
+            push = push.normalize();
+        }
+        let accel = tuning.fly_accel * if infinite { INFINITE_BURN } else { 1.0 };
+        // The stick outranks the computer, but it does not fire it: manual
+        // thrust flies this tick and idles the burn, and centring the stick
+        // hands the crossing back. The *lock* survives the whole time -- it
+        // is also the HUD's rangefinder, and grabbing the controls should
+        // not black out the instruments. Letting go entirely is a press at
+        // empty sky, in `autopilot::select`.
+        if push != Vec3::ZERO {
+            if pilot.engaged() {
+                pilot.phase = autopilot::Phase::Idle;
+            }
+        } else {
+            let radius = match level.shape() {
+                Shape::Planet { radius, .. } => radius,
+                Shape::Flat => 0.0,
+            };
+            if let Some(steered) = autopilot::steer(
+                &mut pilot,
+                &system,
+                radius,
+                transform.translation,
+                ctrl.velocity,
+                accel,
+            ) {
+                push = steered;
+            }
+        }
+        // The same bar the booster burns in the air, unless the console said
+        // otherwise: `infinite_thrust 1` is how a whole crossing is made under
+        // power rather than on whatever speed the bar bought.
+        let burning = push != Vec3::ZERO
+            && (infinite
+                || energy
+                    .as_deref_mut()
+                    .is_none_or(|energy| energy.thrust(FIXED_DT)));
+        if burning {
+            ctrl.velocity += push * (accel * FIXED_DT);
+        }
+        transform.translation += ctrl.velocity * FIXED_DT;
+        sweep(&level, opened_at, &mut ctrl, &mut transform);
+        ctrl.grounded = false;
+        ctrl.motion = if burning { Motion::Fly } else { Motion::Fall };
+        // Underway, the body lies down along its own line of flight --
+        // head first into the crossing, gradually, which is the pose that
+        // reads as flying rather than as falling upright. Only adrift, with
+        // no line to speak of, does the nearest world's up keep the body,
+        // so a flyer hanging still is not slowly toppled by nothing.
+        let (lean, rate) = if ctrl.velocity.length() > FLIGHT_ALIGN_SPEED {
+            (ctrl.velocity.normalize(), FLIGHT_ALIGN_RATE)
+        } else {
+            (up, UPRIGHT_RATE)
+        };
+        let facing = gravity::flatten(transform.rotation * Vec3::Z, lean);
+        if facing != Vec3::ZERO {
+            let upright = Transform::default().looking_to(-facing, lean).rotation;
+            transform.rotation = transform
+                .rotation
+                .slerp(upright, gravity::settle(rate, FIXED_DT));
+        }
+        return;
+    }
+    // Inside a planet's pull the gravity is the pilot: an approach that was
+    // mid-burn when it got this far has arrived, and lets go. A lock that
+    // never flew -- made standing on the ground, lining up the trip --
+    // stays, marker and all, waiting for the lift-off.
+    if pilot.engaged() && pilot.phase != autopilot::Phase::Idle {
+        pilot.disengage();
+    }
+
     // `forward`/`right` hand back a `Direction3d` rather than a `Vec3`: a
     // vector the type system knows is unit length. Flattening one onto the
     // ground plane is exactly the operation that stops it being unit length,
@@ -378,20 +496,28 @@ pub fn movement(
     let thrusting = boost
         && !ctrl.grounded
         && !ctrl.submersion.in_water()
-        && energy
-            .as_deref_mut()
-            .is_none_or(|energy| energy.thrust(FIXED_DT));
+        && (infinite
+            || energy
+                .as_deref_mut()
+                .is_none_or(|energy| energy.thrust(FIXED_DT)));
     // Water supplies its own vertical motion either way -- buoyancy for a
     // swimmer, the pull toward the surface below for a wader -- so gravity and
     // Luna's booster do not operate until the capsule leaves the box.
     if !ctrl.submersion.in_water() {
         if thrusting {
-            rise = (rise + tuning.jet_thrust).min(tuning.jet_rise);
+            // `infinite_thrust` takes the ceiling off: the tuned terminal
+            // rise is what keeps the booster a hop on a level with a roof
+            // over it, and is exactly what stops it clearing a planet's
+            // gravity, which the command exists to do.
+            let ceiling = if infinite { f32::INFINITY } else { tuning.jet_rise };
+            rise = (rise + tuning.jet_thrust).min(ceiling);
         } else if !ctrl.grounded {
             // The original stepped a flat -1.2 onto the speed every frame at
             // 30 Hz. Same number, said as the rate it always was, so that a
-            // planet can point it somewhere else without also changing it.
-            rise -= gravity.accel() * FIXED_DT;
+            // planet can point it somewhere else without also changing it --
+            // and, in a system, weaken it: `strength` fades with altitude on
+            // the way out to the weightless middle the branch above owns.
+            rise -= gravity.strength(transform.translation) * FIXED_DT;
         }
     }
 
@@ -434,6 +560,18 @@ pub fn movement(
         }
     }
     transform.translation = corrected;
+    // A step longer than the body is swept rather than trusted: this is the
+    // fix for falling through the ground. Falls are point-sampled, and a long
+    // one covers several metres a tick -- past the whole thickness of a
+    // hillside between one sample and the next, after which the ground query
+    // looks *down*, finds nothing overhead of the core, and the player is
+    // gone. Gated on having started the tick airborne, because a grounded
+    // step begins its segment on the very surface it stands on.
+    if was_airborne && sweep(&level, opened_at, &mut ctrl, &mut transform) {
+        // The fall was spent into the surface; what is left of the velocity
+        // is tangent to it, and the rise carried by hand has to agree.
+        rise = gravity.split(ctrl.velocity, transform.translation).0;
+    }
     // A head bump stops the rise but not the run: the horizontal step above
     // has already been resolved against the walls, and a low arch should slow
     // a jump under it rather than stopping the player dead.
@@ -596,19 +734,123 @@ pub fn movement(
     }
 }
 
+/// Stops a step that crossed a surface on the surface it crossed, and takes
+/// the crossing speed out of the velocity.
+///
+/// Movement here is point-sampled -- a position, stepped, then asked about --
+/// and a sample can only tunnel when the step between two samples is longer
+/// than what it stepped through. So this runs only when the step outruns the
+/// body's own radius, which walking never does and falling from altitude
+/// always does: the everyday path pays one length test, and the one class of
+/// motion that tunnels cannot.
+///
+/// Returns whether anything was hit, so the caller can reconcile whatever it
+/// was carrying about the velocity by hand.
+fn sweep(
+    level: &LevelData,
+    from: Vec3,
+    ctrl: &mut Controller,
+    transform: &mut Transform,
+) -> bool {
+    let travel = transform.translation - from;
+    if travel.length_squared() <= PLAYER_RADIUS * PLAYER_RADIUS {
+        return false;
+    }
+    let Some((point, normal)) = level.surface_hit(from, transform.translation) else {
+        return false;
+    };
+    transform.translation = point + normal * SWEEP_SKIN;
+    // The inbound half of the velocity is spent; the tangent half is kept, so
+    // a shallow arrival is a skid rather than a full stop. The same choice
+    // `experimental/ow`'s `resolve_collision` makes, for the same reason:
+    // leaving it in accumulates speed into the surface, and a body that has
+    // been "resting" against one for seconds launches when it finally leaves.
+    let into = ctrl.velocity.dot(normal);
+    if into < 0.0 {
+        ctrl.velocity -= normal * into;
+    }
+    true
+}
+
+/// Files where the last tick left the player, before anything in this tick
+/// moves him.
+///
+/// This is the anchor [`sync_visual`] blends the drawn frame from, and it has
+/// to be taken at the very top of the fixed step. It used to be taken at the
+/// top of [`movement`], which is one system too late: [`crate::orbit::advance`]
+/// rides a held player round with his planet in between, and a ride outside
+/// the blend window is a ride the drawn frames never show -- the model stood
+/// a full tick of orbital motion ahead of terrain gliding smoothly under it,
+/// snapping back every step, which is the buzzing-in-place stutter on a
+/// planet's surface. The sweeps in `movement` open from where the tick opens
+/// instead, because they must *include* the ride the blend must not.
+pub fn remember(mut player: Query<(&Transform, &mut PreviousPose), With<Player>>) {
+    let Ok((transform, mut previous)) = player.single_mut() else {
+        return;
+    };
+    previous.translation = transform.translation;
+    previous.rotation = transform.rotation;
+}
+
+/// The drawn pose, part-way between two fixed ticks.
+///
+/// Adrift it is the straight blend it always was. Held by a world it blends
+/// the *seat* instead: each end of the tick is measured in that tick's own
+/// planet frame, blended there, and carried back out through the frame the
+/// terrain is drawn at this frame -- so a figure standing still on a moving
+/// planet has a constant seat and lands exactly on the moving ground, rather
+/// than cutting the chord between two of his positions while the ground rides
+/// the arc. `hold` fades one answer into the other through the gravity band,
+/// exactly as the physical ride lets go; and against a system that is not
+/// moving the two answers are identical (a rigid frame commutes with the
+/// blend), which is what makes a stale [`crate::orbit::Rider`] on the castle
+/// harmless.
+fn ride_blend(
+    system: &crate::orbit::SolarSystem,
+    rider: crate::orbit::Rider,
+    previous: &PreviousPose,
+    root: &Transform,
+    alpha: f32,
+) -> (Vec3, Quat) {
+    let loose = (
+        previous.translation.lerp(root.translation, alpha),
+        previous.rotation.slerp(root.rotation, alpha),
+    );
+    let Some(world) = rider.world.filter(|_| rider.hold > 0.0) else {
+        return loose;
+    };
+    let (was, is) = (system.previous[world], system.bodies[world]);
+    let seat = was
+        .seat_of(previous.translation)
+        .lerp(is.seat_of(root.translation), alpha);
+    let turn = (was.rotation.inverse() * previous.rotation)
+        .slerp(is.rotation.inverse() * root.rotation, alpha);
+    let (centre, spin) = system.blended(alpha)[world];
+    (
+        loose.0.lerp(centre + spin * seat, rider.hold),
+        loose.1.slerp(spin * turn, rider.hold),
+    )
+}
+
 #[allow(clippy::type_complexity)]
 pub fn sync_visual(
     fixed_time: Res<Time<Fixed>>,
-    player: Query<(&Transform, &PreviousPose), (With<Player>, Without<PlayerVisual>)>,
+    system: Res<crate::orbit::SolarSystem>,
+    player: Query<
+        (&Transform, &PreviousPose, Option<&crate::orbit::Rider>),
+        (With<Player>, Without<PlayerVisual>),
+    >,
     mut render_pose: ResMut<RenderPose>,
     mut visuals: Query<(&ActiveCharacter, &mut Transform), With<PlayerVisual>>,
 ) {
-    let Ok((root, previous)) = player.single() else {
+    let Ok((root, previous, rider)) = player.single() else {
         return;
     };
     let alpha = fixed_time.overstep_fraction().clamp(0.0, 1.0);
-    render_pose.translation = previous.translation.lerp(root.translation, alpha);
-    render_pose.rotation = previous.rotation.slerp(root.rotation, alpha);
+    let rider = rider.copied().unwrap_or_default();
+    let (translation, rotation) = ride_blend(&system, rider, previous, root, alpha);
+    render_pose.translation = translation;
+    render_pose.rotation = rotation;
     for (kind, mut visual) in &mut visuals {
         visual.translation = render_pose.translation;
         visual.rotation = render_pose.rotation;
@@ -650,6 +892,8 @@ mod tests {
         world.insert_resource(InputState::default());
         world.insert_resource(SoundQueue::default());
         world.insert_resource(Loadout::default());
+        world.insert_resource(SolarSystem::default());
+        world.insert_resource(Autopilot::default());
         let spawn = Transform::from_translation(spawn_at);
         world.spawn((
             Player,
@@ -1065,6 +1309,168 @@ mod tests {
         assert!(in_water > 1.0, "wading is not movement at all: {in_water}");
     }
 
+    /// The fix for falling through the ground. A fall long enough covers
+    /// metres per tick -- more than a floor is thick -- and a point-sampled
+    /// step crosses it between samples, after which the ground query looks
+    /// down from underneath and finds nothing. The sweep stops the step on
+    /// the surface it crossed.
+    #[test]
+    fn a_long_fall_lands_on_the_floor_instead_of_passing_through() {
+        let mut world = world_with(room(500.0), Vec3::Y * 40.0);
+        {
+            let mut query = world.query_filtered::<&mut Controller, With<Player>>();
+            // Four metres a tick: ten times the sweep's own trigger and well
+            // past the floor's thickness of exactly zero.
+            query.single_mut(&mut world).unwrap().velocity = Vec3::NEG_Y * 120.0;
+        }
+        tick(&mut world, 30);
+        let (position, _, grounded, _) = player(&mut world);
+        assert!(grounded, "never landed: he is at {position}");
+        assert!(position.y > -0.5, "fell through the floor to {}", position.y);
+    }
+
+    /// Weightless between two planets, the jetpack is the whole controller and
+    /// it thrusts along the camera itself -- the `experimental/ow` model --
+    /// so the far planet is exactly where you point. And space does not brake:
+    /// releasing the keys keeps every bit of the speed.
+    #[test]
+    fn the_space_between_planets_is_flown_on_the_camera_axes() {
+        let mut world = world_with(
+            level::LevelData::planet(&[], &[], Vec3::ZERO, 300.0, None),
+            Vec3::X * 550.0,
+        );
+        world.insert_resource(Gravity::binary(Vec3::ZERO, Vec3::X * 1100.0, 300.0));
+        world.resource_mut::<InputState>().move_axis = Vec2::new(0.0, 1.0);
+        tick(&mut world, 30);
+        let (position, velocity, grounded, motion) = player(&mut world);
+        assert!(!grounded);
+        assert_eq!(motion, Motion::Fly);
+        // The test camera faces -Z, so a second of forward thrust goes there
+        // -- not along the ground plane, of which there is none out here.
+        assert!(velocity.z < -10.0, "a second of thrust gave {velocity:?}");
+        assert!(
+            velocity.x.abs() < 1.0 && velocity.y.abs() < 1.0,
+            "the thrust leaked off the camera axis: {velocity:?}"
+        );
+        assert!(position.z < -5.0, "he barely moved: {position}");
+
+        // Hands off: a coasting body keeps its velocity to the bit. Anything
+        // else is air friction in a place with no air.
+        world.resource_mut::<InputState>().move_axis = Vec2::ZERO;
+        tick(&mut world, 1);
+        let (_, held, ..) = player(&mut world);
+        tick(&mut world, 30);
+        let (_, after, ..) = player(&mut world);
+        assert_eq!(held, after, "space slowed him down");
+    }
+
+    /// The console command the crossing needs. The stock booster's terminal
+    /// rise is tuned for hops and cannot leave a planet's gravity; with
+    /// `infinite_thrust 1` the same held button climbs straight out into the
+    /// weightless middle.
+    #[test]
+    fn infinite_thrust_leaves_gravity_and_the_stock_booster_cannot() {
+        let launch = |infinite: f32| {
+            let mut world = world_with(
+                level::LevelData::planet(&[], &[], Vec3::ZERO, 300.0, None),
+                Vec3::X * 301.0,
+            );
+            world.insert_resource(Gravity::binary(Vec3::ZERO, Vec3::X * 1100.0, 300.0));
+            world.resource_mut::<GameTuning>().infinite_thrust = infinite;
+            world.resource_mut::<InputState>().boost = true;
+            tick(&mut world, 150);
+            player(&mut world).0.length()
+        };
+        let free = 300.0 + gravity::GRAVITY_RANGE + gravity::GRAVITY_FADE;
+        let stock = launch(0.0);
+        assert!(
+            stock < free,
+            "the tuned booster reached {stock} m from the core, which is escape"
+        );
+        let escaped = launch(1.0);
+        assert!(
+            escaped > free,
+            "five seconds of infinite thrust only reached {escaped} m from the core"
+        );
+    }
+
+    /// Underway in space the body lies down along its line of flight, and it
+    /// gets there by degrees: one tick leans, a couple of seconds arrive.
+    #[test]
+    fn a_weightless_flyer_leans_into_the_line_of_flight() {
+        let mut world = world_with(
+            level::LevelData::planet(&[], &[], Vec3::ZERO, 300.0, None),
+            Vec3::new(0.0, 2000.0, 0.0),
+        );
+        world.insert_resource(Gravity::binary(Vec3::ZERO, Vec3::X * 4000.0, 300.0));
+        {
+            let mut query = world.query_filtered::<&mut Controller, With<Player>>();
+            query.single_mut(&mut world).unwrap().velocity = Vec3::X * 60.0;
+        }
+        let head = |world: &mut World| {
+            let mut query = world.query_filtered::<&Transform, With<Player>>();
+            query.single(world).unwrap().rotation * Vec3::Y
+        };
+        let start = head(&mut world).dot(Vec3::X);
+        tick(&mut world, 1);
+        let leaning = head(&mut world).dot(Vec3::X);
+        assert!(leaning > start + 0.01, "one tick did not begin the lean");
+        assert!(leaning < 0.9, "the pose snapped instead of easing: {leaning}");
+        tick(&mut world, 90);
+        assert!(
+            head(&mut world).dot(Vec3::X) > 0.95,
+            "three seconds on, the body still is not lying along its flight"
+        );
+    }
+
+    /// The autopilot flies with the player's own engine: engaged and with the
+    /// stick centred it burns towards its body, and the first touch of manual
+    /// thrust takes the crossing back and shuts it off.
+    #[test]
+    fn the_autopilot_burns_when_the_stick_is_centred_and_yields_when_it_is_not() {
+        let adrift = Vec3::new(0.0, 2500.0, 0.0);
+        let mut world = world_with(
+            level::LevelData::planet(&[], &[], Vec3::ZERO, 300.0, None),
+            adrift,
+        );
+        let system = SolarSystem::default();
+        world.insert_resource(Gravity::binary(
+            system.bodies[0].centre,
+            system.bodies[1].centre,
+            300.0,
+        ));
+        let target = system.bodies[1].centre;
+        world.insert_resource(system);
+        world.resource_mut::<Autopilot>().target = Some(autopilot::Target::Planet(1));
+        tick(&mut world, 30);
+        let (_, velocity, grounded, motion) = player(&mut world);
+        assert!(!grounded);
+        assert_eq!(motion, Motion::Fly, "the burn is not a burn");
+        assert!(
+            velocity.length() > 10.0,
+            "a second of autopilot bought {velocity:?}"
+        );
+        assert!(
+            velocity.normalize().dot((target - adrift).normalize()) > 0.95,
+            "the burn points {velocity:?}, not at the second planet"
+        );
+        // A thumb on the stick takes the flying back -- the burn idles --
+        // but the lock stays: it is also the rangefinder on the screen, and
+        // steering for a moment should not black it out.
+        world.resource_mut::<InputState>().move_axis = Vec2::new(0.0, 1.0);
+        tick(&mut world, 1);
+        let pilot = world.resource::<Autopilot>();
+        assert!(
+            pilot.engaged(),
+            "a touch of manual thrust threw the whole lock away"
+        );
+        assert_eq!(
+            pilot.phase,
+            autopilot::Phase::Idle,
+            "the computer kept burning against the player's thumb"
+        );
+    }
+
     #[test]
     fn a_ceiling_stops_a_jump_without_stopping_the_run() {
         // Head room of a third of a metre: enough to stand in, not enough to
@@ -1092,5 +1498,98 @@ mod tests {
         // And the bump stopped the rise without stopping the run.
         let (position, _, _, _) = player(&mut world);
         assert!(position.z.abs() > 2.0, "the head bump halted the run");
+    }
+
+    /// `remember` is the blend's anchor: whatever the tick is about to do to
+    /// him, the drawn frames start from where the last one left him.
+    #[test]
+    fn the_tick_opens_by_remembering_where_he_stood() {
+        let mut world = world_with(
+            level::LevelData::new(Vec::new(), Vec::new(), Vec::new()),
+            Vec3::new(4.0, 5.0, 6.0),
+        );
+        world
+            .run_system_once(remember)
+            .expect("remember could not run");
+        let mut query = world.query_filtered::<(&Transform, &PreviousPose), With<Player>>();
+        let (transform, previous) = query.single(&world).unwrap();
+        assert_eq!(previous.translation, transform.translation);
+        assert_eq!(previous.rotation, transform.rotation);
+    }
+
+    /// The parenting concept, at the drawn end: a rider held at full grip is
+    /// drawn on his planet's blended ground, exactly where the terrain is
+    /// drawn this frame -- while the plain world-space chord, mid-tick on a
+    /// turning planet, visibly is not. This gap between the chord and the arc
+    /// is the buzzing-in-place stutter the seat blend exists to remove.
+    #[test]
+    fn a_held_rider_is_drawn_on_the_moving_ground() {
+        let mut system = SolarSystem::default();
+        // One tick's worth of story, exaggerated so the chord-versus-arc gap
+        // is metres rather than microns: the home world has swung on along
+        // its orbit and turned two fifths of a radian on its axis.
+        system.bodies[0] = crate::orbit::Body {
+            angle: system.previous[0].angle,
+            spin: 0.4,
+            centre: system.previous[0].centre + Vec3::new(3.0, 0.0, 7.0),
+            rotation: Quat::from_rotation_y(0.4),
+        };
+        // The same seat at both ends of the tick: he stood still on his spot
+        // of ground, and only the world moved.
+        let seat = Vec3::new(212.0, 212.0, 0.0);
+        let previous =
+            PreviousPose::new(&Transform::from_translation(system.previous[0].seated(seat)));
+        let root = Transform::from_translation(system.bodies[0].seated(seat));
+        let held = crate::orbit::Rider {
+            world: Some(0),
+            hold: 1.0,
+        };
+        let ground = {
+            let (centre, spin) = system.blended(0.5)[0];
+            centre + spin * seat
+        };
+        let (drawn, _) = ride_blend(&system, held, &previous, &root, 0.5);
+        assert!(
+            (drawn - ground).length() < 1e-2,
+            "held at full grip he should sit on the blended ground, not {} away",
+            (drawn - ground).length()
+        );
+        let (chord, _) = ride_blend(&system, crate::orbit::Rider::default(), &previous, &root, 0.5);
+        assert!(
+            (chord - ground).length() > 1.0,
+            "the chord should visibly miss the arc here, or this test proves nothing"
+        );
+    }
+
+    /// Against a system that is not moving, the parent's frame is rigid and
+    /// commutes with the blend: the seat path and the plain path agree
+    /// exactly. This is what makes a `Rider` gone stale on the castle -- a
+    /// level whose clockwork never advances -- harmless rather than a bug.
+    #[test]
+    fn a_stale_rider_on_still_ground_draws_as_if_adrift() {
+        let system = SolarSystem::default();
+        let previous = PreviousPose::new(
+            &Transform::from_translation(system.bodies[0].seated(Vec3::new(0.0, 300.0, 0.0)))
+                .looking_to(Vec3::X, Vec3::Y),
+        );
+        let root = Transform::from_translation(system.bodies[0].seated(Vec3::new(4.0, 299.0, 2.0)))
+            .looking_to(Vec3::Z, Vec3::Y);
+        let held = crate::orbit::Rider {
+            world: Some(0),
+            hold: 1.0,
+        };
+        let (ridden_t, ridden_r) = ride_blend(&system, held, &previous, &root, 0.4);
+        let (loose_t, loose_r) =
+            ride_blend(&system, crate::orbit::Rider::default(), &previous, &root, 0.4);
+        assert!(
+            (ridden_t - loose_t).length() < 1e-3,
+            "a still frame changed the drawn position by {}",
+            (ridden_t - loose_t).length()
+        );
+        assert!(
+            ridden_r.angle_between(loose_r) < 1e-3,
+            "a still frame changed the drawn facing by {}",
+            ridden_r.angle_between(loose_r)
+        );
     }
 }

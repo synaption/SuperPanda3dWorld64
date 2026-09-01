@@ -26,11 +26,31 @@ use bevy::prelude::*;
 /// equal.
 pub const FALL: f32 = 36.0;
 
+/// How far above a planet's surface its pull keeps its full strength, and how
+/// much further it takes to die away to nothing.
+///
+/// The numbers make the space between two planets genuinely weightless: the
+/// system's worlds sit some five hundred metres apart surface to surface, so a
+/// pull that is gone two hundred and forty metres up leaves a coasting zone in
+/// the middle wider than either planet's grip.
+///
+/// A fade rather than an edge, because a body crossing a hard boundary at
+/// speed picks up its whole weight in one tick, which reads as hitting
+/// something invisible. `experimental/ow` faces the same choice and goes the
+/// other way -- its pull turns *constant* beyond the falloff distance, because
+/// its planets are meant to tug at you from across the system. These are not:
+/// "leave the gravity of the planets and fly between them" is the feature, and
+/// leaving means there is somewhere the gravity is not.
+pub const GRAVITY_RANGE: f32 = 120.0;
+pub const GRAVITY_FADE: f32 = 120.0;
+
 /// Where down is, and how hard.
 ///
 /// A resource rather than a component: every body in a level falls the same
-/// way, and a level that wanted two gravities at once would want two centres,
-/// which is a different feature and not this one.
+/// way. What a level with two planets wants is not two gravities at once but
+/// one answer built from two centres -- see [`Gravity::System`] -- because no
+/// body is ever under both at full strength and the movement code still asks
+/// one question.
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
 pub enum Gravity {
     /// A flat level. Down is `-Y` wherever you are standing.
@@ -38,6 +58,21 @@ pub enum Gravity {
     /// A planet. Down is towards `centre`, so "up" turns under your feet as you
     /// walk and the horizon closes rather than running out.
     Radial { centre: Vec3, accel: f32 },
+    /// A solar system: planets, and the space between them. Down is towards
+    /// the *nearest* centre -- the one change that keeps every surface level,
+    /// which `experimental/ow`'s README works out the hard way: summing every
+    /// body leaves the field tens of degrees off vertical and slides you off
+    /// the world. The pull is full strength to [`GRAVITY_RANGE`] above the
+    /// surface, gone [`GRAVITY_FADE`] later, and zero across the middle.
+    ///
+    /// One radius for every centre, because the system is the same planet
+    /// twice. The day it is not, the radius moves into the array beside its
+    /// centre.
+    System {
+        centres: [Vec3; 2],
+        radius: f32,
+        accel: f32,
+    },
 }
 
 impl Default for Gravity {
@@ -60,24 +95,93 @@ impl Gravity {
         }
     }
 
+    /// Gravity for a pair of planets of the same `radius`: each pulls at the
+    /// strength a flat level does, and between them there is none at all.
+    pub fn binary(first: Vec3, second: Vec3, radius: f32) -> Self {
+        Self::System {
+            centres: [first, second],
+            radius,
+            accel: FALL,
+        }
+    }
+
+    /// Moves a system's worlds without touching what they weigh. Called every
+    /// tick by [`crate::orbit::advance`], because in the solar system the
+    /// planets genuinely go somewhere; on any other gravity it is a no-op, so
+    /// the caller does not have to know what kind of level is up.
+    pub fn place_system(&mut self, at: [Vec3; 2]) {
+        if let Gravity::System { centres, .. } = self {
+            *centres = at;
+        }
+    }
+
+    /// The centre this point answers to: the nearest one. With one radius for
+    /// every centre, nearest centre and nearest surface are the same test.
+    fn nearest(centres: &[Vec3; 2], at: Vec3) -> Vec3 {
+        if (at - centres[0]).length_squared() <= (at - centres[1]).length_squared() {
+            centres[0]
+        } else {
+            centres[1]
+        }
+    }
+
     /// Which way is up at `at`. Always unit length.
     ///
     /// The fallback matters more than it looks: exactly at a planet's centre
     /// there is no radial direction at all, and a zero vector handed to the
     /// movement code is a character with no floor, no facing and no jump.
     /// `+Y` is as good an answer as any there and is at least an answer.
+    ///
+    /// A system keeps answering out in the weightless middle, and that is
+    /// deliberate: nothing *falls* along the answer there -- [`Self::strength`]
+    /// is zero -- but the body still stands along it and the camera still
+    /// rights itself by it, so a flyer arrives at the far planet the right way
+    /// up instead of at whatever angle the last surface left him.
     pub fn up(&self, at: Vec3) -> Vec3 {
         match *self {
             Gravity::Down { .. } => Vec3::Y,
             Gravity::Radial { centre, .. } => (at - centre).normalize_or(Vec3::Y),
+            Gravity::System { ref centres, .. } => {
+                (at - Self::nearest(centres, at)).normalize_or(Vec3::Y)
+            }
         }
     }
 
-    /// How fast the pull accelerates a body, in metres a second squared.
+    /// How fast the pull accelerates a body, in metres a second squared,
+    /// ignoring where the body is. The number the level was tuned with:
+    /// everything that launches, lobs or lets fall near the ground wants this.
+    /// The thing actually falling wants [`Self::strength`].
     pub fn accel(&self) -> f32 {
         match *self {
-            Gravity::Down { accel } | Gravity::Radial { accel, .. } => accel,
+            Gravity::Down { accel }
+            | Gravity::Radial { accel, .. }
+            | Gravity::System { accel, .. } => accel,
         }
+    }
+
+    /// The pull at `at`, in metres a second squared: [`Self::accel`] with the
+    /// altitude counted. On a flat level and a lone planet the two are the
+    /// same number everywhere; in a system the pull fades with height and the
+    /// middle is weightless.
+    pub fn strength(&self, at: Vec3) -> f32 {
+        match *self {
+            Gravity::Down { accel } | Gravity::Radial { accel, .. } => accel,
+            Gravity::System {
+                ref centres,
+                radius,
+                accel,
+            } => {
+                let altitude = (at - Self::nearest(centres, at)).length() - radius;
+                let faded = ((altitude - GRAVITY_RANGE) / GRAVITY_FADE).clamp(0.0, 1.0);
+                accel * (1.0 - faded)
+            }
+        }
+    }
+
+    /// Whether a body at `at` is out from under every planet's pull: the coast
+    /// between worlds, where the movement code flies instead of falling.
+    pub fn weightless(&self, at: Vec3) -> bool {
+        self.strength(at) <= 0.0
     }
 
     /// Splits a vector into how much of it runs along up at `at`, and what is
@@ -162,6 +266,39 @@ mod tests {
     fn the_centre_of_a_planet_still_has_an_up() {
         let gravity = Gravity::towards(Vec3::ZERO);
         assert_eq!(gravity.up(Vec3::ZERO), Vec3::Y, "a zero up is no up at all");
+    }
+
+    /// The one change that makes a two-planet system walkable: each surface
+    /// answers to its own centre and no other. A summed field -- what
+    /// `experimental/ow` ports and then has to switch off -- would lean every
+    /// up towards the other world.
+    #[test]
+    fn each_planet_in_a_system_owns_its_own_down() {
+        let gravity = Gravity::binary(Vec3::ZERO, Vec3::X * 1100.0, 300.0);
+        assert_eq!(gravity.up(Vec3::new(0.0, 300.0, 0.0)), Vec3::Y);
+        assert_eq!(gravity.up(Vec3::new(1100.0, 300.0, 0.0)), Vec3::Y);
+        // On the facing sides, up points at the *other* planet's sky, not away
+        // from some blended middle.
+        assert_eq!(gravity.up(Vec3::X * 300.0), Vec3::X);
+        assert_eq!(gravity.up(Vec3::X * 800.0), Vec3::NEG_X);
+    }
+
+    /// Leaving is the feature: full weight on the ground, nothing at all in
+    /// the middle, and a fade rather than an edge between the two.
+    #[test]
+    fn the_space_between_the_planets_is_weightless() {
+        let gravity = Gravity::binary(Vec3::ZERO, Vec3::X * 1100.0, 300.0);
+        assert_eq!(gravity.strength(Vec3::X * 300.0), FALL);
+        assert_eq!(gravity.strength(Vec3::X * (300.0 + GRAVITY_RANGE)), FALL);
+        let far = 300.0 + GRAVITY_RANGE + GRAVITY_FADE;
+        assert_eq!(gravity.strength(Vec3::X * far), 0.0);
+        assert!(gravity.weightless(Vec3::X * 550.0), "the middle still pulls");
+        assert!(!gravity.weightless(Vec3::X * 310.0));
+        // Halfway through the fade is half the pull: continuous, not a cliff.
+        let half = gravity.strength(Vec3::X * (300.0 + GRAVITY_RANGE + GRAVITY_FADE * 0.5));
+        assert!((half - FALL * 0.5).abs() < 1e-3, "{half}");
+        // And the flat level is untouched by any of this.
+        assert_eq!(Gravity::default().strength(Vec3::Y * 5000.0), FALL);
     }
 
     #[test]
