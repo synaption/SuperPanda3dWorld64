@@ -561,10 +561,7 @@ pub fn draw_unit_bars(
     settings: Res<DisplaySettings>,
     time: Res<Time>,
     mut fades: ResMut<BarFades>,
-    camera: Query<
-        (&Camera, &GlobalTransform),
-        (With<Camera3d>, Without<crate::portal::PortalView>),
-    >,
+    camera: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     // `GlobalTransform` rather than `Transform` for the same reason the camera
     // is: this is the pose the frame is being drawn from, and a bar has to be

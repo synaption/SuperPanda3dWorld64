@@ -1566,19 +1566,11 @@ const FALL_SPEED: f32 = 14.0;
 ///
 /// A Mario walks four metres a second, so a third of a metre is a busy tick and
 /// six metres is not a walk at all -- it is a warp pipe, a level swapping under
-/// it, a portal, or a body being put somewhere. Interpolating one of those
-/// draws the ally sliding across the map over the next thirty-third of a
-/// second, through everything in between.
-///
-/// **[`crate::player::sync_visual`] uses this too, and did not always.** It
-/// used to say here that the player needed no such guard because he was never
-/// moved that way with the visual still attached -- which was true of every
-/// system in the game until [`crate::portal::transit`], and is the shape of
-/// bug that comment exists to stop somebody else re-deriving. A player stepping
-/// through a gate is a player moved a hundred metres between two ticks, and
-/// interpolated he is a player, a camera and a crosshair all flying across the
-/// castle for the third of a second it takes to arrive.
-pub const GLIDE_JUMP: f32 = 6.0;
+/// it, or a body being put somewhere. Interpolating one of those draws the ally
+/// sliding across the map over the next thirty-third of a second, through
+/// everything in between. `player::sync_visual` has no equivalent because the
+/// player is never moved that way with the visual still attached.
+const GLIDE_JUMP: f32 = 6.0;
 
 /// Where an ally stood at the end of each of the last two ticks.
 ///
@@ -1823,7 +1815,6 @@ pub fn spawn_circle(
 /// Runs at the render rate rather than on the fixed step, because the circle
 /// grows with wall-clock time and is drawn every frame; the orders it produces
 /// are one-shot writes onto the squad, which the fixed step then acts on.
-#[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 pub fn whistle(
     time: Res<Time>,
@@ -1835,14 +1826,7 @@ pub fn whistle(
     mut whistle: ResMut<Whistle>,
     mut mark: ResMut<OrderMark>,
     mut squad: ResMut<Squad>,
-    camera: Query<
-        &Transform,
-        (
-            With<Camera3d>,
-            Without<Player>,
-            Without<crate::portal::PortalView>,
-        ),
-    >,
+    camera: Query<&Transform, (With<Camera3d>, Without<Player>)>,
     player: Query<&Transform, With<Player>>,
     allies: Query<(Entity, &Transform), With<Ally>>,
     mut circle: CircleQuery,

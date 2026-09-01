@@ -168,19 +168,6 @@ impl Route {
         self.forget();
     }
 
-    /// Throws away the route in hand, keeping where this body was going.
-    ///
-    /// For anything that has moved a body somewhere its route no longer makes
-    /// sense from -- which today is [`crate::portal::transit`] and nothing else.
-    /// A route is a list of corners on the ground the body was standing on, and
-    /// a body carried across the map still holding one walks back at the first
-    /// of them. Dropped, it is replanned from where it now is on whichever of
-    /// the next few ticks the budget reaches it, which is the same wait a body
-    /// has for a route anywhere.
-    pub fn replan(&mut self) {
-        self.forget();
-    }
-
     fn forget(&mut self) {
         // The lane is not forgotten. It is which of the group this body is,
         // rather than anything about the walk, and a body that drew a new one
@@ -711,7 +698,7 @@ pub fn draw(
     field: Res<FlowField>,
     mut gizmos: Gizmos,
     followers: Query<(&Transform, &Route)>,
-    camera: Query<&Transform, (With<Camera3d>, Without<crate::portal::PortalView>)>,
+    camera: Query<&Transform, With<Camera3d>>,
 ) {
     let level = tuning.path_debug.round() as u32;
     if level == 0 {

@@ -1083,11 +1083,7 @@ pub enum CrowdKind {
 /// command table be tested without a renderer. Putting a crowd on the map needs
 /// `Commands`, the asset server and the level's collision, so the command
 /// records what it wants here and [`crate::enemy::crowd`] does it.
-///
-/// `Eq` rather than only `PartialEq` was possible while every field was an
-/// integer. [`Request::PlacePortals`] carries coordinates, and a float has no
-/// total equality, so the derive lost the half of it nothing was using.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
     /// Put this many enemies on the map, of this mix.
     Crowd(usize, CrowdKind),
@@ -1126,30 +1122,6 @@ pub enum Request {
     /// Take every loose ball of nuclonium off the map. The red ones are swept
     /// with `medkit 0`, which is the same thing said the other way.
     ClearNuclonium,
-    /// Take both ends of the portal pair off the map.
-    ///
-    /// `pylon`'s reason: a state that takes two accurate shots to reach is a
-    /// state a screenshot cannot reproduce, and one that takes none to leave is
-    /// worth having. There is deliberately no request to *place* a pair -- where
-    /// a portal goes is the whole of the decision, and a pair put down at two
-    /// numbers typed into a console is a pair on the wrong two walls.
-    ClearPortals,
-    /// Put a pair down at two spots in the world.
-    ///
-    /// The one thing about a portal a screenshot cannot otherwise reach. Where
-    /// a pair goes is the whole of the decision a player makes with the gun, so
-    /// there is no version of this that is a shortcut for playing -- and that is
-    /// exactly why a picture of one needs it: two accurate shots at two named
-    /// walls is not a thing a headless run can take, and every other state in
-    /// this game that is hard to reach by hand has a command that reaches it.
-    ///
-    /// Each triple is a *spot* rather than a gate: the ground under it is what
-    /// the gate is stood on, and it is turned to face the player, exactly as
-    /// one planted through the crosshair is. See `portal::drop_onto`.
-    ///
-    /// The `bool` is whether to build them as bubbles rather than arches -- see
-    /// `portal::Shape`, and `portals` below for how it is asked for.
-    PlacePortals([f32; 3], [f32; 3], bool),
     /// Put this much straight into every stellarator's store.
     ///
     /// The only way to look at a full machine. A field is grown out of what has
@@ -1292,7 +1264,6 @@ impl ConsoleState {
         match words[0].to_ascii_lowercase().as_str() {
             "help" | "?" => self.echo("commands: <name> [value], vars, reset <name|all>, close <name|all>, clear\ncrowd <n> [slime|ant|mix] puts a whole field down at once; crowd clear takes it away.
 pylon <n> plants a line of masts and a machine to feed them; pylon clear takes them away.
-portal x,y,z x,y,z [orb] stands a pair of gates at two spots; portal clear closes both.
 nuclonium <n> scatters balls for the squad to carry to the network; medkit <n> scatters the red ones; nuclonium store <n> loads the machines; nuclonium clear sweeps up.
 weapon <sword|pistol> puts one in Luna's hand; Y cycles it in play.\nLeft/Right/Home/End move the caret; Up/Down recall; Tab completes.\nSelect a variable then use [ and ] (Shift = 10x) to tune it. Wheel/PageUp/PageDown scroll the log."),
             "vars" | "list" => {
@@ -1303,7 +1274,6 @@ weapon <sword|pistol> puts one in Luna's hand; Y cycles it in play.\nLeft/Right/
             "clear" => self.log.clear(),
             "crowd" => self.crowd(&words[1..]),
             "pylon" | "pylons" | "grid" => self.pylons(&words[1..]),
-            "portal" | "portals" => self.portals(&words[1..]),
             "nuclonium" | "nuc" | "loot" | "resource" | "resources" => self.nuclonium(&words[1..]),
             "medkit" | "medkits" | "health" => self.medkits(&words[1..]),
             "weapon" | "equip" => self.weapon(&words[1..]),
@@ -1388,49 +1358,6 @@ weapon <sword|pistol> puts one in Luna's hand; Y cycles it in play.\nLeft/Right/
         };
         self.pending.push(Request::Pylons(count));
         self.echo(format!("pylon: planting {count}"));
-    }
-
-    /// `portal clear`: takes both ends of the pair away.
-    ///
-    /// Clearing is the only thing it does. See [`Request::ClearPortals`] for
-    /// why there is no way to place one from here.
-    fn portals(&mut self, args: &[&str]) {
-        match args.first() {
-            Some(&"clear") | Some(&"none") | None => {
-                self.pending.push(Request::ClearPortals);
-                self.echo("portal: closing both ends");
-                return;
-            }
-            Some(_) => {}
-        }
-        let spot = |word: &str| -> Option<[f32; 3]> {
-            let parts: Vec<f32> = word
-                .split(',')
-                .filter_map(|part| part.trim().parse().ok())
-                .collect();
-            match parts[..] {
-                [x, y, z] => Some([x, y, z]),
-                _ => None,
-            }
-        };
-        // `orb` anywhere in the line rather than positionally: the two spots are
-        // already three numbers each, and a third position to count would be a
-        // command nobody could type from memory.
-        let orb = args.iter().any(|word| *word == "orb" || *word == "sphere");
-        let spots: Vec<[f32; 3]> = args.iter().filter_map(|word| spot(word)).collect();
-        match spots[..] {
-            [blue, orange] => {
-                self.pending.push(Request::PlacePortals(blue, orange, orb));
-                let kind = if orb { "bubbles" } else { "arches" };
-                self.echo(format!(
-                    "portal: standing {kind} at {blue:?} and {orange:?}"
-                ));
-            }
-            _ => self.echo(
-                "portal: `portal clear`, or `portal x,y,z x,y,z [orb]` to stand a gate \
-                 on the ground under each of two spots",
-            ),
-        }
     }
 
     /// `nuclonium <n>`, or `nuclonium clear`. Spelled `nuc`, `loot` or

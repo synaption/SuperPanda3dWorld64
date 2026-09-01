@@ -64,27 +64,9 @@ struct Shot {
 /// Every frame rather than once, because `camera::update` is in the running
 /// schedule and will happily drag the camera back to the player between the
 /// placement and the picture.
-#[allow(clippy::type_complexity)]
-fn aim(
-    shot: Res<Shot>,
-    mut camera: Query<
-        (&mut Transform, Option<&mut crate::camera::FollowCamera>),
-        (With<Camera3d>, Without<crate::portal::PortalView>),
-    >,
-) {
-    for (mut view, follow) in &mut camera {
+fn aim(shot: Res<Shot>, mut camera: Query<&mut Transform, With<Camera3d>>) {
+    for mut view in &mut camera {
         *view = Transform::from_translation(shot.eye).looking_at(shot.at, shot.up);
-        let Some(mut follow) = follow else {
-            continue;
-        };
-        // The eye is placed outright here, so there is no boom -- and a boom is
-        // the whole of what `portal::carry_camera` asks about. Pinning the
-        // focus to the eye makes that boom zero-length, which is the honest
-        // description of this camera and stops a gate between the requested eye
-        // and the player flying the picture to the other end of the pair. A
-        // screenshot goes where it was told to go.
-        follow.focus = Some(shot.eye);
-        follow.eye = *view;
     }
 }
 
@@ -93,7 +75,7 @@ fn capture(
     mut commands: Commands,
     mut shot: ResMut<Shot>,
     target: Option<Res<SceneTarget>>,
-    camera: Query<Entity, (With<Camera3d>, Without<crate::portal::PortalView>)>,
+    camera: Query<Entity, With<Camera3d>>,
 ) {
     let Some(target) = target else {
         return;
@@ -206,22 +188,7 @@ pub fn run(path: &std::path::Path, crowd: usize, eye: Option<Vec3>, at: Option<V
     // would otherwise drag it straight back to the player.
     .add_systems(
         PostUpdate,
-        // `portal::aim_cameras` between the two, and it has to be *here*
-        // rather than left to the copy `add_game` already registered. Both are
-        // in `PostUpdate` before the transforms propagate and neither is
-        // ordered against the other, so which one runs first is down to
-        // whichever thread is free -- and a portal camera derived from the
-        // camera position `aim` is about to overwrite is a portal showing the
-        // view from wherever the player happened to be standing. Running it
-        // twice in a frame costs a pair of matrix multiplies and writes the
-        // same answer, which is a great deal cheaper than a screenshot that is
-        // right four times out of five.
-        (
-            aim,
-            crate::portal::carry_camera,
-            crate::portal::aim_cameras,
-            capture,
-        )
+        (aim, capture)
             .chain()
             .before(bevy::transform::TransformSystems::Propagate),
     )

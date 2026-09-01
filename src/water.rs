@@ -491,15 +491,11 @@ pub fn drift(
 /// Tested against the camera rather than the player: swimming just below the
 /// surface leaves the camera in open air looking down through it, and tinting
 /// the whole world in that case looks wrong.
-#[allow(clippy::type_complexity)]
 pub fn camera_medium(
     level: Res<LevelData>,
     mut medium: ResMut<CameraMedium>,
     mut clear: ResMut<ClearColor>,
-    mut cameras: Query<
-        (&Transform, &mut DistanceFog),
-        (With<Camera3d>, Without<crate::portal::PortalView>),
-    >,
+    mut cameras: Query<(&Transform, &mut DistanceFog), With<Camera3d>>,
 ) {
     let Ok((camera, mut fog)) = cameras.single_mut() else {
         return;

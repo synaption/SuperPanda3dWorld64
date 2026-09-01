@@ -113,25 +113,7 @@ pub fn facing(here: Vec3, target: Vec3) -> Quat {
 /// Aims everything billboarded at the camera, once per rendered frame.
 #[allow(clippy::type_complexity)]
 pub fn aim(
-    // **The eye the player is actually looking from, which is not always where
-    // the camera entity is.** A gate the boom goes through flies the camera to
-    // the far end of the pair for the frame it is drawn on -- see
-    // [`crate::portal::carry_camera`] -- and a card turned to face *that* is a
-    // card turned across the map. `FollowCamera::eye` is where the view
-    // logically is, beside the player, which is the right answer for the
-    // overwhelming majority of what is on the screen at that moment.
-    //
-    // It is `Option` because the impostor baker runs this same chain with a
-    // camera of its own and no follow rig on it; there the entity's own
-    // transform is the only eye there is.
-    camera: Query<
-        (&GlobalTransform, Option<&crate::camera::FollowCamera>),
-        (
-            With<Camera3d>,
-            Without<BillboardAxis>,
-            Without<crate::portal::PortalView>,
-        ),
-    >,
+    camera: Query<&GlobalTransform, (With<Camera3d>, Without<BillboardAxis>)>,
     globals: Query<&GlobalTransform>,
     mut objects: Query<(&mut Transform, &GlobalTransform), With<BillboardAxis>>,
     mut joints: Query<
@@ -139,10 +121,10 @@ pub fn aim(
         (With<BillboardJoint>, Without<BillboardAxis>),
     >,
 ) {
-    let Ok((view, follow)) = camera.single() else {
+    let Ok(view) = camera.single() else {
         return;
     };
-    let eye = follow.map_or_else(|| view.translation(), |follow| follow.eye.translation);
+    let eye = view.translation();
     for (mut transform, global) in &mut objects {
         transform.rotation = facing(global.translation(), eye);
     }

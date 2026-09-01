@@ -300,53 +300,6 @@ pub struct Node {
     pub feed: Option<usize>,
 }
 
-/// A beam between two masts, and the way it gets there.
-///
-/// **The `through` is the whole of why this is a struct rather than the pair of
-/// indices it used to be.** A beam is light, and light goes through a portal:
-/// two masts on opposite sides of a hill with no sight of each other are
-/// nonetheless linked when each of them can see one mouth of an open pair. What
-/// comes out is a beam with a corner in it -- and every part of the game that
-/// touches a link has to know, because a beam drawn as one straight line
-/// between two masts that cannot see each other is a beam drawn through the
-/// hill, and a packet flown along it is a packet flying through solid rock.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Link {
-    pub a: usize,
-    pub b: usize,
-    /// Which mouth the beam enters travelling from `a` to `b`, or `None` for
-    /// one that simply crosses the open air.
-    ///
-    /// Nought is the first of the pair and one the second, in the order
-    /// [`crate::portal::Portals::optics`] hands them over. Which way round
-    /// matters: the same two masts might be joined either way, and drawing the
-    /// wrong one puts the corner of the beam at the wrong end of the map.
-    pub through: Option<usize>,
-}
-
-impl Link {
-    /// A beam across the open air.
-    pub fn direct(a: usize, b: usize) -> Self {
-        Self {
-            a,
-            b,
-            through: None,
-        }
-    }
-
-    /// Whether this link joins these two masts, whichever way round they are
-    /// given.
-    pub fn joins(&self, a: usize, b: usize) -> bool {
-        (self.a == a && self.b == b) || (self.a == b && self.b == a)
-    }
-
-    /// The two masts it joins, in ascending order, for anything that wants a
-    /// link as a plain pair.
-    pub fn pair(&self) -> (usize, usize) {
-        (self.a.min(self.b), self.a.max(self.b))
-    }
-}
-
 /// The live network: who is linked to whom, who has power, and the round the
 /// supply packet is flying.
 ///
@@ -358,22 +311,10 @@ impl Link {
 pub struct Network {
     pub nodes: Vec<Node>,
     /// Every linked pair, each once, as indices into [`Self::nodes`].
-    pub links: Vec<Link>,
+    pub links: Vec<(usize, usize)>,
     /// The masts the packet flies between, in order, each linked to the next.
     /// Empty while there is nothing live to visit.
     pub run: Vec<usize>,
-    /// The same run as the points a packet actually flies between, which is
-    /// not the same list once a beam goes through a portal.
-    ///
-    /// A leg of the run is one beam, and a beam through a portal is a beam with
-    /// a corner in it -- three points rather than two, in two places a hundred
-    /// metres apart. Expanded once, here, rather than by the system that flies
-    /// the packet: [`carry`] runs every frame and this changes when somebody
-    /// plants a mast.
-    pub run_points: Vec<Vec3>,
-    /// The two points a beam may be threaded through, if a portal pair is
-    /// open. See [`crate::portal::Portals::optics`].
-    pub optics: Option<(Vec3, Vec3)>,
     /// Where the machines feeding the network were when it was last built.
     ///
     /// Positions rather than the count this used to be, because a shipment
@@ -424,7 +365,6 @@ impl Network {
         &mut self,
         masts: Vec<(Entity, Vec3)>,
         machines: &[Vec3],
-        optics: Option<(Vec3, Vec3)>,
         sees: impl Fn(Vec3, Vec3) -> bool,
     ) {
         let lift = Vec3::Y * mast().emitter;
@@ -439,8 +379,7 @@ impl Network {
             })
             .collect();
         let tops: Vec<Vec3> = self.nodes.iter().map(|node| node.top).collect();
-        self.optics = optics;
-        self.links = links(&tops, optics, &sees);
+        self.links = links(&tops, &sees);
         self.feeds = machines.to_vec();
 
         // Power. The sources are the masts a machine can reach and see; the
@@ -454,12 +393,7 @@ impl Network {
             let feed = machines
                 .iter()
                 .enumerate()
-                // The machine's own beam is a beam: a stellarator on the far
-                // side of a portal from the mast it lights is exactly the case
-                // the pair is for, and a rule that held here and not two lines
-                // down would be a network with power that can cross a portal
-                // and a source that cannot.
-                .filter(|(_, feed)| threaded(**feed, *top, optics, &sees).is_some())
+                .filter(|(_, feed)| in_reach(**feed, *top) && sees(**feed, *top))
                 .min_by(|(_, a), (_, b)| {
                     a.distance_squared(*top)
                         .total_cmp(&b.distance_squared(*top))
@@ -470,7 +404,11 @@ impl Network {
                 touching.push(index);
             }
         }
-        let wired = self.adjacency();
+        let mut wired = vec![Vec::new(); self.nodes.len()];
+        for &(a, b) in &self.links {
+            wired[a].push(b);
+            wired[b].push(a);
+        }
         let powered = route::flood(self.nodes.len(), touching, |here| wired[here].clone());
         for (index, node) in self.nodes.iter_mut().enumerate() {
             node.hops = powered.steps(index);
@@ -482,7 +420,6 @@ impl Network {
         // of calls is joined by the shortest chain of links between them, so
         // every leg of the finished run is one beam long.
         self.run.clear();
-        self.run_points.clear();
         let live: Vec<usize> = (0..self.nodes.len()).filter(|&i| self.powered(i)).collect();
         if live.len() < 2 {
             self.revision = self.revision.wrapping_add(1);
@@ -505,81 +442,10 @@ impl Network {
             }
             if self.run.is_empty() {
                 self.run.push(chain[0]);
-                self.run_points.push(self.nodes[chain[0]].top);
             }
             self.run.extend_from_slice(&chain[1..]);
-            for hop in chain.windows(2) {
-                // The beam's own corners, and then the mast at the far end of
-                // it. Skipping the first point of each hop is what keeps the
-                // packet's path continuous rather than stuttering back to every
-                // mast it has just left.
-                let along = self.beam_between(hop[0], hop[1]);
-                self.run_points.extend_from_slice(&along[1..]);
-            }
         }
         self.revision = self.revision.wrapping_add(1);
-    }
-
-    /// Who touches whom, as an adjacency list over [`Self::links`].
-    ///
-    /// Built rather than kept, because the two things that want it -- the flood
-    /// that decides which masts are lit, and the shortest chain between two
-    /// stops on the supply run -- both run inside a rebuild, and a rebuild is
-    /// what would have to keep it in step.
-    fn adjacency(&self) -> Vec<Vec<usize>> {
-        let mut wired = vec![Vec::new(); self.nodes.len()];
-        for link in &self.links {
-            wired[link.a].push(link.b);
-            wired[link.b].push(link.a);
-        }
-        wired
-    }
-
-    /// The link joining two masts, if there is one.
-    pub fn link_between(&self, a: usize, b: usize) -> Option<&Link> {
-        self.links.iter().find(|link| link.joins(a, b))
-    }
-
-    /// The points a beam runs through, from `link.a` to `link.b`: the two
-    /// emitter heads, and the two mouths in between where it goes through a
-    /// portal.
-    ///
-    /// Never fewer than two and never more than four, and everything that draws
-    /// or flies a beam walks the list rather than taking its ends: a beam with a
-    /// corner in it is still one beam, and asking every caller to remember that
-    /// is asking one of them to forget.
-    pub fn beam(&self, link: &Link) -> Vec<Vec3> {
-        let mut points = vec![self.nodes[link.a].top];
-        if let (Some(which), Some((first, second))) = (link.through, self.optics) {
-            let (near, far) = if which == 0 {
-                (first, second)
-            } else {
-                (second, first)
-            };
-            points.push(near);
-            points.push(far);
-        }
-        points.push(self.nodes[link.b].top);
-        points
-    }
-
-    /// The same list, in the direction actually being travelled.
-    ///
-    /// A link is stored once, in whatever order the pair-wise sweep found it,
-    /// and a packet flying it the other way has to turn the corner the other
-    /// way too -- through the mouth it would otherwise be coming *out* of.
-    pub fn beam_between(&self, from: usize, to: usize) -> Vec<Vec3> {
-        let Some(link) = self.link_between(from, to) else {
-            // No link at all: the two ends, which is what the caller would
-            // have drawn anyway, and is what the shortest-path expansion
-            // guarantees never happens.
-            return vec![self.nodes[from].top, self.nodes[to].top];
-        };
-        let mut points = self.beam(link);
-        if link.a != from {
-            points.reverse();
-        }
-        points
     }
 
     /// The way home from `node`: the points a delivered ball flies through to
@@ -599,7 +465,11 @@ impl Network {
     /// see, and the last leg drops to the machine's own coils.
     pub fn supply_route(&self, node: usize) -> Option<Vec<Vec3>> {
         let mut hops = self.nodes.get(node)?.hops?;
-        let wired = self.adjacency();
+        let mut wired = vec![Vec::new(); self.nodes.len()];
+        for &(a, b) in &self.links {
+            wired[a].push(b);
+            wired[b].push(a);
+        }
         let mut legs = vec![self.nodes[node].top];
         let mut here = node;
         while hops > 0 {
@@ -611,13 +481,9 @@ impl Network {
                 .copied()
                 .filter(|&other| self.nodes[other].hops.is_some_and(|theirs| theirs < hops))
                 .min_by_key(|&other| self.nodes[other].hops.unwrap_or(u32::MAX))?;
-            // The beam's corners as well as the mast at the end of it, so a
-            // ball going home through a portal is watched going *through* it
-            // rather than through the hill the portal was the way round.
-            let along = self.beam_between(here, next);
-            legs.extend_from_slice(&along[1..]);
             here = next;
             hops = self.nodes[here].hops?;
+            legs.push(self.nodes[here].top);
         }
         // Off the end of the network and into the machine that lit it. The mast
         // the walk finished on is one with no hops, which is one `rebuild`
@@ -636,14 +502,14 @@ impl Network {
     /// its last mast is linked back to its first -- so this wraps rather than
     /// stopping at the end.
     pub fn packet_at(&self, along: f32) -> Option<(Vec3, Vec3)> {
-        if self.run_points.len() < 2 {
+        if self.run.len() < 2 {
             return None;
         }
-        let legs = self.run_points.len();
+        let legs = self.run.len();
         let leg = (along.floor() as usize) % legs;
         let fraction = along - along.floor();
-        let from = self.run_points[leg];
-        let to = self.run_points[(leg + 1) % legs];
+        let from = self.nodes[self.run[leg]].top;
+        let to = self.nodes[self.run[(leg + 1) % legs]].top;
         Some((from.lerp(to, fraction), (to - from).normalize_or_zero()))
     }
 }
@@ -668,56 +534,16 @@ pub fn in_reach(from: Vec3, to: Vec3) -> bool {
 ///
 /// Each pair once, in ascending order, so a caller drawing them draws one beam
 /// per link rather than two through each other.
-pub fn links(
-    tops: &[Vec3],
-    optics: Option<(Vec3, Vec3)>,
-    sees: impl Fn(Vec3, Vec3) -> bool,
-) -> Vec<Link> {
+pub fn links(tops: &[Vec3], sees: impl Fn(Vec3, Vec3) -> bool) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for a in 0..tops.len() {
         for b in a + 1..tops.len() {
-            if let Some(through) = threaded(tops[a], tops[b], optics, &sees) {
-                out.push(Link { a, b, through });
+            if in_reach(tops[a], tops[b]) && sees(tops[a], tops[b]) {
+                out.push((a, b));
             }
         }
     }
     out
-}
-
-/// Whether a beam can be strung between two points, and which portal it would
-/// have to go through to manage it.
-///
-/// `Some(None)` is a beam across the open air; `Some(Some(mouth))` one that
-/// enters that mouth of the pair and leaves the other; `None` is no beam at all.
-/// The nesting reads badly and the alternative -- a three-way enum used in two
-/// places -- reads worse.
-///
-/// **The straight line is tried first and that ordering is not tidiness.** A
-/// portal is a way round something in the way, so a pair of masts that can see
-/// each other must be joined the way they can see each other; joined through a
-/// portal instead, the beam between two masts standing side by side would be
-/// drawn as a dog-leg across the map and back.
-///
-/// The range test for a threaded beam is the length of the *whole* dog-leg
-/// against [`REACH`], because that is how far the light has to travel -- the
-/// portal moves it, it does not lend it any.
-fn threaded(
-    from: Vec3,
-    to: Vec3,
-    optics: Option<(Vec3, Vec3)>,
-    sees: &impl Fn(Vec3, Vec3) -> bool,
-) -> Option<Option<usize>> {
-    if in_reach(from, to) && sees(from, to) {
-        return Some(None);
-    }
-    let (first, second) = optics?;
-    for (which, near, far) in [(0, first, second), (1, second, first)] {
-        let span = from.distance(near) + far.distance(to);
-        if span <= REACH && sees(from, near) && sees(far, to) {
-            return Some(Some(which));
-        }
-    }
-    None
 }
 
 // -- placing ----------------------------------------------------------------
@@ -915,7 +741,6 @@ type SiteQuery<'w, 's> = Query<
 /// [`crate::stellarator::place`]'s reason -- the preview is drawn every frame
 /// -- and it takes the released edge the same latched way, so a press is
 /// neither lost nor counted twice across the fixed-step boundary.
-#[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 pub fn place(
     time: Res<Time>,
@@ -925,14 +750,7 @@ pub fn place(
     level: Res<LevelData>,
     art: Res<GridArt>,
     mut plant: ResMut<Plant>,
-    camera: Query<
-        &Transform,
-        (
-            With<Camera3d>,
-            Without<Player>,
-            Without<crate::portal::PortalView>,
-        ),
-    >,
+    camera: Query<&Transform, (With<Camera3d>, Without<Player>)>,
     player: Query<&Transform, With<Player>>,
     planted: Query<(&Transform, &Pylon)>,
     machines: Query<(&Transform, &Stellarator)>,
@@ -1037,25 +855,15 @@ fn feed_point(transform: &Transform) -> Vec3 {
 /// game moves a mast once it is planted.
 pub fn relink(
     level: Res<LevelData>,
-    portals: Res<crate::portal::Portals>,
     mut network: ResMut<Network>,
-    mut wired_for: Local<Option<u64>>,
     masts: Query<(Entity, &Transform), With<Pylon>>,
     machines: Query<&Transform, With<Stellarator>>,
 ) {
     let standing = masts.iter().count();
     let feeding = machines.iter().count();
-    // A portal moving is the fourth thing that changes the graph, and it is the
-    // only one that changes it without changing what is standing on the map:
-    // fire the gun at a hillside and two masts that never had a beam between
-    // them have one, with nothing planted and nothing built. Watched by the
-    // pair's own counter, which is the same thing the navigation grid watches.
-    // See [`crate::portal::Portals::revision`].
-    let moved = *wired_for != Some(portals.revision);
-    if !moved && standing == network.nodes.len() && feeding == network.feeds.len() {
+    if standing == network.nodes.len() && feeding == network.feeds.len() {
         return;
     }
-    *wired_for = Some(portals.revision);
     let mut planted: Vec<(Entity, Vec3)> = masts
         .iter()
         .map(|(entity, transform)| (entity, transform.translation))
@@ -1070,7 +878,7 @@ pub fn relink(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     let feeds: Vec<Vec3> = machines.iter().map(feed_point).collect();
-    network.rebuild(planted, &feeds, portals.optics(), |from, to| {
+    network.rebuild(planted, &feeds, |from, to| {
         level.segment_hit(from, to).is_none()
     });
 }
@@ -1110,17 +918,12 @@ pub fn draw(
             .and_then(|which| network.feeds.get(which))
             .map(|feed| (*feed, node.top, true))
     });
-    // A beam is a polyline rather than a pair of points, because one going
-    // through a portal has a corner in it -- see [`Network::beam`] -- and each
-    // straight stretch of it is one of these cuboids. A beam across the open
-    // air has exactly one stretch, which is what it always had.
-    let links = network.links.iter().flat_map(|link| {
-        let live = network.powered(link.a) && network.powered(link.b);
-        let points = network.beam(link);
-        points
-            .windows(2)
-            .map(|leg| (leg[0], leg[1], live))
-            .collect::<Vec<_>>()
+    let links = network.links.iter().map(|&(a, b)| {
+        (
+            network.nodes[a].top,
+            network.nodes[b].top,
+            network.powered(a) && network.powered(b),
+        )
     });
     for (from, to, live) in links.chain(feeds) {
         let span = to - from;
@@ -1171,10 +974,7 @@ pub fn carry(
         ));
         return;
     };
-    // The expanded run rather than the list of masts: a leg is one *straight*
-    // stretch of beam, and a beam through a portal has three of them. See
-    // [`Network::run_points`].
-    let Some(legs) = (network.run_points.len() > 1).then(|| network.run_points.len()) else {
+    let Some(legs) = (network.run.len() > 1).then(|| network.run.len()) else {
         *visible = Visibility::Hidden;
         packet.along = 0.0;
         return;
@@ -1183,8 +983,8 @@ pub fn carry(
     // takes longer than a short one between two masts on a lawn: the speed is
     // in metres and the leg it is on says how many of them this leg is.
     let leg = (packet.along.floor() as usize) % legs;
-    let from = network.run_points[leg];
-    let to = network.run_points[(leg + 1) % legs];
+    let from = network.nodes[network.run[leg]].top;
+    let to = network.nodes[network.run[(leg + 1) % legs]].top;
     let length = from.distance(to).max(0.01);
     packet.along = (packet.along + PACKET_SPEED * time.delta_secs() / length) % legs as f32;
     if let Some((at, heading)) = network.packet_at(packet.along) {
@@ -1407,104 +1207,14 @@ mod tests {
     #[test]
     fn a_beam_needs_both_range_and_sight() {
         let tops = [at(0.0, 0.0), at(REACH * 0.5, 0.0), at(REACH * 2.0, 0.0)];
-        let near = links(&tops, None, open);
-        assert_eq!(
-            near,
-            vec![Link::direct(0, 1)],
-            "only the pair within reach links"
-        );
+        let near = links(&tops, open);
+        assert_eq!(near, vec![(0, 1)], "only the pair within reach links");
         // A wall between the two that were in reach leaves nothing at all.
-        let blind = links(&tops, None, |_, _| false);
+        let blind = links(&tops, |_, _| false);
         assert!(blind.is_empty(), "{blind:?}");
         // Each pair once and in order, never both ways round.
         let ring = [at(0.0, 0.0), at(5.0, 0.0), at(0.0, 5.0)];
-        assert_eq!(
-            links(&ring, None, open),
-            vec![Link::direct(0, 1), Link::direct(0, 2), Link::direct(1, 2)]
-        );
-    }
-
-    /// Two masts that cannot see each other, on either side of an open pair.
-    ///
-    /// The visibility rule is the one the level actually enforces, stated here
-    /// as a function of the points rather than of a hillside: the two masts
-    /// cannot see each other, and each can see the mouth on its own side. That
-    /// is the whole of the situation a player creates by shooting a portal
-    /// through a ridge.
-    #[test]
-    fn a_beam_goes_through_an_open_portal() {
-        let (west, east) = (at(0.0, 0.0), at(0.0, 400.0));
-        let (near, far) = (at(4.0, 0.0), at(4.0, 400.0));
-        let sees = |a: Vec3, b: Vec3| {
-            let pair = (a.min(b), a.max(b));
-            pair != (west.min(east), west.max(east))
-        };
-        let tops = [west, east];
-        // With no pair open there is nothing at all: too far apart to reach and
-        // blind to each other besides.
-        assert!(links(&tops, None, sees).is_empty());
-        // With one open they are joined, and the link records which mouth the
-        // beam enters on the way.
-        let joined = links(&tops, Some((near, far)), sees);
-        assert_eq!(
-            joined,
-            vec![Link {
-                a: 0,
-                b: 1,
-                through: Some(0)
-            }]
-        );
-
-        // And the beam that comes out of it has the corner in it. Four points:
-        // the near mast, the mouth beside it, the far mouth, the far mast.
-        let mut network = Network::default();
-        network.rebuild(
-            vec![
-                (Entity::from_raw_u32(1).unwrap(), west),
-                (Entity::from_raw_u32(2).unwrap(), east),
-            ],
-            &[],
-            Some((near, far)),
-            sees,
-        );
-        let link = *network.links.first().expect("the pair joined them");
-        let beam = network.beam(&link);
-        assert_eq!(beam.len(), 4, "{beam:?}");
-        assert_eq!(beam[1], near);
-        assert_eq!(beam[2], far);
-        // Flown the other way it turns the same corner the other way round,
-        // which is what stops a packet leaving through the mouth it should be
-        // arriving at.
-        let back = network.beam_between(link.b, link.a);
-        assert_eq!(back[1], far);
-        assert_eq!(back[2], near);
-    }
-
-    /// A straight line beats a portal even when both would do.
-    ///
-    /// Two masts standing side by side, with a pair of portals open somewhere
-    /// they can both also see: joined the way they can see each other, or the
-    /// beam between two neighbours is drawn as a dog-leg across the map.
-    #[test]
-    fn a_beam_that_can_go_straight_does() {
-        let tops = [at(0.0, 0.0), at(10.0, 0.0)];
-        let joined = links(&tops, Some((at(0.0, 20.0), at(10.0, 20.0))), open);
-        assert_eq!(joined, vec![Link::direct(0, 1)]);
-    }
-
-    /// The dog-leg still has to be short enough to be a beam.
-    #[test]
-    fn a_beam_through_a_portal_still_has_a_range() {
-        let (west, east) = (at(0.0, 0.0), at(0.0, 400.0));
-        let sees = |a: Vec3, b: Vec3| {
-            let pair = (a.min(b), a.max(b));
-            pair != (west.min(east), west.max(east))
-        };
-        // Each mouth is most of the reach from the mast beside it, so the two
-        // halves together are over it.
-        let near = at(REACH * 0.8, 0.0);
-        let far = at(REACH * 0.8, 400.0);
-        assert!(links(&[west, east], Some((near, far)), sees).is_empty());
+        assert_eq!(links(&ring, open), vec![(0, 1), (0, 2), (1, 2)]);
     }
 
     #[test]
@@ -1521,7 +1231,7 @@ mod tests {
             (Entity::from_raw_u32(3).unwrap(), at(REACH * 1.8, 0.0)),
             (Entity::from_raw_u32(4).unwrap(), at(REACH * 9.0, 0.0)),
         ];
-        network.rebuild(masts, &[at(-REACH * 0.5, 0.0)], None, open);
+        network.rebuild(masts, &[at(-REACH * 0.5, 0.0)], open);
         assert!(network.powered(0) && network.powered(1) && network.powered(2));
         assert!(!network.powered(3), "power jumped a gap it cannot cross");
         assert_eq!(network.live(), 3);
@@ -1538,7 +1248,7 @@ mod tests {
             (Entity::from_raw_u32(1).unwrap(), at(0.0, 0.0)),
             (Entity::from_raw_u32(2).unwrap(), at(REACH * 0.5, 0.0)),
         ];
-        network.rebuild(masts, &[], None, open);
+        network.rebuild(masts, &[], open);
         // Linked -- the beams are there and drawn dark -- but not live.
         assert_eq!(network.links.len(), 1);
         assert_eq!(network.live(), 0);
@@ -1561,7 +1271,7 @@ mod tests {
             .enumerate()
             .map(|(index, &at)| (Entity::from_raw_u32(index as u32 + 1).unwrap(), at))
             .collect();
-        network.rebuild(masts, &[at(1.0, 1.0)], None, open);
+        network.rebuild(masts, &[at(1.0, 1.0)], open);
         assert_eq!(network.live(), 4);
         // Every live mast is called at.
         for node in 0..4 {
@@ -1577,7 +1287,7 @@ mod tests {
         for pair in network.run.windows(2) {
             let (a, b) = (pair[0].min(pair[1]), pair[0].max(pair[1]));
             assert!(
-                network.links.iter().any(|link| link.pair() == (a, b)),
+                network.links.contains(&(a, b)),
                 "the run flies {a}->{b}, which is not a beam"
             );
         }
@@ -1601,7 +1311,7 @@ mod tests {
             })
             .collect();
         let feed = at(-REACH * 0.5, 0.0);
-        network.rebuild(masts, &[feed], None, open);
+        network.rebuild(masts, &[feed], open);
         assert_eq!(network.live(), 4);
         assert_eq!(network.nodes[3].hops, Some(3));
 
@@ -1639,7 +1349,6 @@ mod tests {
         dark.rebuild(
             vec![(Entity::from_raw_u32(1).unwrap(), at(0.0, 0.0))],
             &[],
-            None,
             open,
         );
         assert!(dark.supply_route(0).is_none());

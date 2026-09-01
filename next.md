@@ -89,7 +89,6 @@ enemies are getting inside walls a lot, I still fall through things often
 
 need a way to spawn mario
 
-X portals - an arch or a bubble you plant like a pylon: walk through half in and half out, momentum kept, the camera comes through with you; the crowd paths through it and beams cross it
 
 VRR support?
 

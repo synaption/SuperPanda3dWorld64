@@ -225,7 +225,6 @@ impl Controller {
     }
 }
 
-#[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 pub fn movement(
     mut input_state: ResMut<InputState>,
@@ -246,14 +245,7 @@ pub fn movement(
         With<Player>,
     >,
     mut energy: Query<&mut crate::energy::Energy, With<Player>>,
-    camera: Query<
-        &Transform,
-        (
-            With<Camera3d>,
-            Without<Player>,
-            Without<crate::portal::PortalView>,
-        ),
-    >,
+    camera: Query<&Transform, (With<Camera3d>, Without<Player>)>,
 ) {
     // A query of its own rather than another column on the one below, so that
     // a player assembled without an `Energy` -- in a test, or at a spawn site
@@ -609,31 +601,12 @@ pub fn sync_visual(
     fixed_time: Res<Time<Fixed>>,
     player: Query<(&Transform, &PreviousPose), (With<Player>, Without<PlayerVisual>)>,
     mut render_pose: ResMut<RenderPose>,
-    // `Without<Ghost>` for the reason the character swap has it: a ghost stands
-    // where the player *already is on the far side of a gate*, and putting it
-    // back on him every frame is the one thing that would stop it being a ghost.
-    // Its scale is still this system's business -- see below -- so it is set
-    // where the ghost is spawned rather than here.
-    mut visuals: Query<
-        (&ActiveCharacter, &mut Transform),
-        (With<PlayerVisual>, Without<crate::portal::Ghost>),
-    >,
+    mut visuals: Query<(&ActiveCharacter, &mut Transform), With<PlayerVisual>>,
 ) {
     let Ok((root, previous)) = player.single() else {
         return;
     };
-    // A teleport is not interpolated, which is [`crate::squad::Glide`]'s rule
-    // and now the player's for the same reason: a step through a portal moves
-    // him further between two ticks than he could walk in a second, and drawn
-    // *between* those two poses he crosses everything in the middle -- with the
-    // camera's focus and the crosshair riding along, because both are measured
-    // off this pose. Snapped, the frame he steps through is the frame he
-    // arrives on, which is what makes the walk-through read as a walk rather
-    // than as a lurch. See [`crate::portal::transit`].
-    let alpha = match previous.translation.distance(root.translation) > crate::squad::GLIDE_JUMP {
-        true => 1.0,
-        false => fixed_time.overstep_fraction().clamp(0.0, 1.0),
-    };
+    let alpha = fixed_time.overstep_fraction().clamp(0.0, 1.0);
     render_pose.translation = previous.translation.lerp(root.translation, alpha);
     render_pose.rotation = previous.rotation.slerp(root.rotation, alpha);
     for (kind, mut visual) in &mut visuals {

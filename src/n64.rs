@@ -444,7 +444,7 @@ pub fn nearest(eye: Vec3, asked: Reach, mut lit: Vec<(Vec3, f32, Lamp)>) -> Lamp
 pub fn lamplight(
     tuning: Res<crate::console::GameTuning>,
     mut buffers: ResMut<Assets<ShaderBuffer>>,
-    camera: Query<&GlobalTransform, (With<Camera3d>, Without<crate::portal::PortalView>)>,
+    camera: Query<&GlobalTransform, With<Camera3d>>,
     lit: Query<(&Lamp, &GlobalTransform, Option<&InheritedVisibility>)>,
 ) {
     let field = match camera.iter().next() {

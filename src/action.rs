@@ -20,12 +20,6 @@
 //! moments. One button cannot ask which without a second gesture, and a second
 //! gesture is the thing this module exists to remove.
 //!
-//! Five now. The portal gate is the first thing to arrive *after* the picker,
-//! and so the first with no direct key at all -- which is the arrangement this
-//! module was written to make possible, and the reason the row is worth what it
-//! costs: a fifth thing to build is a fifth entry here and nothing anywhere
-//! else.
-//!
 //! Nothing here decides what any mode *does*. It routes one held button and one
 //! release onto whichever pair of flags in [`crate::input::InputState`] the
 //! chosen mode already reads, so [`crate::squad::whistle`],
@@ -59,33 +53,11 @@ pub enum Mode {
     /// Open a circle on the ground and call every loose ball in it to heel.
     /// See [`crate::nuclonium::call`].
     Nuclonium,
-    /// Stand a portal gate on the lawn. See [`crate::portal::place`].
-    ///
-    /// **Last, rather than beside the two buildings where it belongs.** A gate
-    /// is a thing you put up and would read better after the machine -- but the
-    /// number keys are positions in this list, and slotting it in there would
-    /// move the broom from `4` to `5` under somebody who has learnt `4`. The
-    /// order is a claim about how often each is wanted and this one entry is a
-    /// claim about not moving the others; the second wins, because a row that
-    /// renumbers itself every time the game grows is a row nobody can learn.
-    Portal,
-    /// Hang a bubble instead. The same gate built as a sphere -- see
-    /// [`crate::portal::Shape`] -- and a mode of its own rather than a
-    /// modifier, because it is the same gesture at the same site and the only
-    /// thing being chosen is what stands there.
-    Orb,
 }
 
 impl Mode {
     /// Every mode, in picker order.
-    pub const ALL: [Mode; 6] = [
-        Mode::Squad,
-        Mode::Pylon,
-        Mode::Stellarator,
-        Mode::Nuclonium,
-        Mode::Portal,
-        Mode::Orb,
-    ];
+    pub const ALL: [Mode; 4] = [Mode::Squad, Mode::Pylon, Mode::Stellarator, Mode::Nuclonium];
 
     /// What the picker calls it.
     pub fn name(self) -> &'static str {
@@ -94,8 +66,6 @@ impl Mode {
             Mode::Pylon => "Pylon",
             Mode::Stellarator => "Stellarator",
             Mode::Nuclonium => "Nuclonium",
-            Mode::Portal => "Portal",
-            Mode::Orb => "Orb",
         }
     }
 
@@ -110,8 +80,6 @@ impl Mode {
             Mode::Pylon => "hold to open a site, release to plant a mast",
             Mode::Stellarator => "hold to aim, release to build a machine",
             Mode::Nuclonium => "hold to open a circle, release to call what is in it",
-            Mode::Portal => "hold to open a site, release to stand an arch on it",
-            Mode::Orb => "hold to open a site, release to rest a bubble on it",
         }
     }
 
@@ -191,8 +159,6 @@ fn keyboard(keys: &ButtonInput<KeyCode>) -> Press {
         KeyCode::Digit2,
         KeyCode::Digit3,
         KeyCode::Digit4,
-        KeyCode::Digit5,
-        KeyCode::Digit6,
     ];
     Press {
         toggle: keys.just_pressed(KeyCode::Tab),
@@ -266,17 +232,6 @@ pub fn aim(mode: Mode, picking: bool, input: &mut InputState) {
         Mode::Nuclonium => {
             input.grab |= held;
             input.grab_released |= released;
-        }
-        // And the fifth, which is the first to have arrived with no direct key
-        // of its own -- the picker is how it is reached, on a keyboard as much
-        // as on a pad. See [`crate::input::InputState::portal`].
-        Mode::Portal => {
-            input.portal |= held;
-            input.portal_released |= released;
-        }
-        Mode::Orb => {
-            input.orb |= held;
-            input.orb_released |= released;
         }
     }
 }
@@ -458,62 +413,6 @@ mod tests {
         );
         assert_eq!(action.mode, Mode::Nuclonium);
         assert!(!action.picking, "choosing by number left the picker up");
-    }
-
-    /// Every mode points the button at a pair of flags, and no two share one.
-    ///
-    /// **The half of this module the integration tests cannot see.** The
-    /// headless harness runs the game's own schedules but not the input
-    /// pipeline -- there is no window behind it -- so [`route`] never runs
-    /// there and every end-to-end test writes the mode's own flags directly.
-    /// That leaves exactly this table untested, and a mode wired to its
-    /// neighbour's flags is a button that builds the wrong thing.
-    #[test]
-    fn every_mode_aims_the_button_at_its_own_pair_of_flags() {
-        let held = |mode: Mode| {
-            let mut input = InputState {
-                action: true,
-                action_released: true,
-                ..default()
-            };
-            aim(mode, false, &mut input);
-            // The raw button is always spent, whatever it was aimed at: a mode
-            // that left it set would let the next frame fire it again.
-            assert!(!input.action && !input.action_released, "{mode:?}");
-            [
-                (input.squad, input.squad_released),
-                (input.pylon, input.pylon_released),
-                (input.build, input.build_released),
-                (input.grab, input.grab_released),
-                (input.portal, input.portal_released),
-                (input.orb, input.orb_released),
-            ]
-        };
-        for (index, mode) in Mode::ALL.iter().enumerate() {
-            let flags = held(*mode);
-            let lit: Vec<usize> = flags
-                .iter()
-                .enumerate()
-                .filter(|(_, (held, released))| *held || *released)
-                .map(|(at, _)| at)
-                .collect();
-            assert_eq!(lit, vec![index], "{mode:?} lit {lit:?}");
-            assert_eq!(flags[index], (true, true), "{mode:?} dropped its release");
-        }
-        // And with the picker open the button is inert, whatever it is aimed
-        // at: the press that chose a mode must not also fire the mode it left.
-        for mode in Mode::ALL {
-            let mut input = InputState {
-                action: true,
-                action_released: true,
-                ..default()
-            };
-            aim(mode, true, &mut input);
-            assert!(
-                !input.pylon && !input.build && !input.portal && !input.orb,
-                "{mode:?}"
-            );
-        }
     }
 
     /// The rows reach the screen, and they say which one is chosen.

@@ -451,7 +451,7 @@ pub fn project(
     gravity: Res<Gravity>,
     art: Res<ShadowArt>,
     tuning: Res<crate::console::GameTuning>,
-    camera: Query<&GlobalTransform, (With<Camera3d>, Without<crate::portal::PortalView>)>,
+    camera: Query<&GlobalTransform, With<Camera3d>>,
     casters: Query<(&Transform, &ShadowCaster, Option<&Visibility>), Without<Shadow>>,
     mut shadows: Query<(
         &Shadow,

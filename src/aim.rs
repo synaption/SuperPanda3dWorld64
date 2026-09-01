@@ -185,7 +185,7 @@ pub fn drive(
     loadout: Res<Loadout>,
     level: Res<LevelData>,
     mut aim: ResMut<Aim>,
-    camera: Query<&GlobalTransform, (With<Camera3d>, Without<crate::portal::PortalView>)>,
+    camera: Query<&GlobalTransform, With<Camera3d>>,
     player: Query<&Transform, With<Player>>,
     mut pivot: Query<&mut Transform, (With<AimTorso>, Without<Player>)>,
 ) {

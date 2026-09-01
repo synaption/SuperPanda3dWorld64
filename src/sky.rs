@@ -860,7 +860,7 @@ pub fn advance(
     mut sky: ResMut<Sky>,
     mut lighting: ResMut<N64Lighting>,
     mut clear: ResMut<ClearColor>,
-    mut fog: Query<&mut DistanceFog, (With<Camera3d>, Without<crate::portal::PortalView>)>,
+    mut fog: Query<&mut DistanceFog, With<Camera3d>>,
 ) {
     if *level != LevelId::Castle {
         // Not this level's sky. Everything the castle's clock was driving goes
@@ -955,7 +955,7 @@ pub fn follow(
     sky: Res<Sky>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<N64Material>>,
-    camera: Query<&GlobalTransform, (With<Camera3d>, Without<crate::portal::PortalView>)>,
+    camera: Query<&GlobalTransform, With<Camera3d>>,
     mut parts: Query<(
         &SkyPart,
         &mut Transform,
