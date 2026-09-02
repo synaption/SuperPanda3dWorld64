@@ -596,6 +596,15 @@ pub const SPECS: &[TunableSpec] = &[
         step: 0.1,
         doc: "second planet's spin, in degrees per second",
     },
+    // The debug toggle `flatten.rs` promises: 0 draws the true sphere, 1 the
+    // full map, and anything between is a blend you can stand in and compare.
+    TunableSpec {
+        name: "flatten",
+        low: 0.0,
+        high: 1.0,
+        step: 0.05,
+        doc: "how flat the ground being stood on is drawn (0 the true sphere, 1 a flat plain)",
+    },
 ];
 
 #[derive(Resource, Clone, Debug)]
@@ -801,6 +810,11 @@ pub struct GameTuning {
     pub planet2_orbit: f32,
     pub planet1_spin: f32,
     pub planet2_spin: f32,
+    /// How flat the ground being stood on is drawn, `0..=1`. The picture
+    /// only: [`crate::flatten`] scales its map by this, and nothing physical
+    /// reads it. It is the module's promised debug toggle, kept as a dial so
+    /// the two halves can be compared by degrees rather than by whiplash.
+    pub flatten: f32,
 }
 
 impl Default for GameTuning {
@@ -967,6 +981,11 @@ impl Default for GameTuning {
             planet2_orbit: 0.3,
             planet1_spin: 1.2,
             planet2_spin: 0.8,
+            // The full map: the flattening exists because the true sphere
+            // made aiming feel like standing on a rolling deck, so the game
+            // opens with the cure applied and the row is how you look at the
+            // disease.
+            flatten: 1.0,
         }
     }
 }
@@ -1048,6 +1067,7 @@ impl GameTuning {
             "planet2_orbit" => self.planet2_orbit,
             "planet1_spin" => self.planet1_spin,
             "planet2_spin" => self.planet2_spin,
+            "flatten" => self.flatten,
             _ => return None,
         })
     }
@@ -1133,6 +1153,7 @@ impl GameTuning {
             "planet2_orbit" => self.planet2_orbit = value,
             "planet1_spin" => self.planet1_spin = value,
             "planet2_spin" => self.planet2_spin = value,
+            "flatten" => self.flatten = value,
             _ => unreachable!(),
         }
         Ok((previous, value))

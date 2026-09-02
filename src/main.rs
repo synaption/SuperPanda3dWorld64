@@ -18,6 +18,7 @@ mod console;
 mod display;
 mod enemy;
 mod energy;
+mod flatten;
 mod flow;
 mod frame_chart;
 mod furniture;
@@ -481,6 +482,7 @@ pub fn game_resources(app: &mut App) {
         .init_resource::<gravity::Gravity>()
         .init_resource::<orbit::SolarSystem>()
         .init_resource::<autopilot::Autopilot>()
+        .init_resource::<flatten::Curve>()
         .add_message::<world::LoadLevel>()
         .insert_resource(Time::<Fixed>::from_hz(30.0));
 }
@@ -505,6 +507,9 @@ pub fn game_systems(app: &mut App) {
         .add_systems(FixedUpdate, simulation())
         .add_systems(Update, presentation())
         .add_systems(Update, overlay())
+        // Anywhere in the frame: it only ever *adds* a marker, and a mesh
+        // spawned this frame is culled honestly for one frame at worst.
+        .add_systems(Update, flatten::uncull)
         // Chained: `weapon::carry` points the gun down `aim::Aim`, which
         // `aim::drive` writes. Unordered they would still both run in this
         // window, but the gun would spend half its frames a step behind the
@@ -761,7 +766,17 @@ fn presentation() -> ScheduleConfigs<ScheduleSystem> {
         // ask about the world as this frame draws it, not as the last tick
         // simulated it. The camera especially: its boom probe and its idea
         // of the horizon both chatter at 30 Hz otherwise.
-        (orbit::glide, player::sync_visual, squad::glide).chain(),
+        // `flatten::chart` closes the chain: it anchors the frame's flat-map
+        // to the player's freshly-written `RenderPose` over the world's
+        // blended centre, so the map and the terrain it bends agree about
+        // which frame is being painted.
+        (
+            orbit::glide,
+            player::sync_visual,
+            squad::glide,
+            flatten::chart,
+        )
+            .chain(),
         camera::update,
         animation::resolve_clips,
         animation::claim_players,

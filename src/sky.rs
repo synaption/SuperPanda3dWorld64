@@ -709,6 +709,11 @@ fn shell(texture: Option<Handle<Image>>, alpha_mode: AlphaMode) -> N64Material {
         // The binding still has to be filled -- a material pointing at nothing
         // has no bind group and draws no pixels at all.
         lamps: crate::n64::LAMPLIGHT,
+        // Bound but never applied: the shells are unfogged, and unfogged is
+        // exactly the flag the vertex stage skips the flattening on -- the
+        // sky is the picture of the true distance, and bending it by the map
+        // of the ground would fold the stars at the horizon.
+        curve: crate::flatten::CURVE,
         alpha_mode,
         double_sided: true,
         // Never read: an unlit surface is drawn by the same pipeline whichever

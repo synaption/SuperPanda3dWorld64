@@ -285,4 +285,4 @@ When finished, explain:
 
 One particularly important issue: CPU-side frustum culling may think an object is outside the camera view based on its true spherical position even though the shader bends it into view. Please check how Bevy handles this in the version used by the project and propose or implement an appropriate workaround if necessary.
 
-Please make the smallest useful implementation first, verify it compiles, and then iterate from there rather than rewriting the entire renderer.
+

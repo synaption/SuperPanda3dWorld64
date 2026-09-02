@@ -367,6 +367,7 @@ pub fn hud(
     gravity: Res<Gravity>,
     tuning: Res<GameTuning>,
     pose: Res<RenderPose>,
+    curve: Res<crate::flatten::Curve>,
     fixed: Res<Time<Fixed>>,
     player: Query<&Controller, With<Player>>,
     camera: Query<(&Camera, &Transform), With<Camera3d>>,
@@ -413,7 +414,12 @@ pub fn hud(
         Target::Planet(index) => (blended[index.min(1)].0, planet_radius(&level)),
         Target::Sun => (SUN_CENTRE, SUN_RADIUS),
     };
-    let Ok(screen) = camera.world_to_viewport(&eye, centre) else {
+    // Bent through the frame's flat-map before projecting, like every world
+    // position that has to land where the *picture* is. Today a lockable body
+    // always sits far outside the map's altitude band, so the bend is the
+    // identity -- but the bracket asking the same question as the vertex
+    // shader is what keeps that true by construction rather than by luck.
+    let Ok(screen) = camera.world_to_viewport(&eye, curve.bend(centre)) else {
         hide();
         return;
     };
@@ -421,7 +427,7 @@ pub fn hud(
     // body at any range without swallowing the screen up close.
     let rim: Vec3 = eye.right().into();
     let projected = camera
-        .world_to_viewport(&eye, centre + rim * body_radius)
+        .world_to_viewport(&eye, curve.bend(centre + rim * body_radius))
         .map(|edge| (edge - screen).length())
         .unwrap_or(20.0);
     let size = (projected * 2.0 + 18.0).clamp(44.0, 320.0);
@@ -695,6 +701,7 @@ mod tests {
         ));
         world.insert_resource(Gravity::default());
         world.insert_resource(GameTuning::default());
+        world.init_resource::<crate::flatten::Curve>();
         world.insert_resource(RenderPose {
             translation: Vec3::ZERO,
             rotation: Quat::IDENTITY,

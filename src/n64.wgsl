@@ -100,12 +100,30 @@ struct N64Lamplight {
     lamps: array<N64Lamp, #{N64_LAMPS}>,
 }
 
+// How the round world is drawn flat under the player's feet. One per frame,
+// shared by every material the way the lamps are; `flatten.rs` measures it,
+// and `Curve::bend` over there is the reference for `n64_unbend` below -- the
+// two must stay the same function, and only that one has tests.
+struct N64Curve {
+    // xyz: the ridden world's centre as drawn this frame. w: its sea radius.
+    home: vec4<f32>,
+    // xyz: unit up under the player's drawn feet -- the map's axis.
+    // w: the grip, 0 for the true sphere through 1 for the full map.
+    zenith: vec4<f32>,
+    // x: metres above sea level where a vertex starts to slip off the map.
+    // y: where it is free of it. zw: padding.
+    band: vec4<f32>,
+}
+
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> material: N64Material;
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var base_color_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(2) var base_color_sampler: sampler;
 // Every material in the world binds the *same* buffer here. It is rewritten
 // once a frame; no material is touched when a light moves.
 @group(#{MATERIAL_BIND_GROUP}) @binding(3) var<storage, read> lamplight: N64Lamplight;
+// And the same again for the flattening: one shared buffer, rewritten once a
+// frame by `flatten::chart`, read by every vertex in the world.
+@group(#{MATERIAL_BIND_GROUP}) @binding(4) var<storage, read> curve: N64Curve;
 
 // What the vertex stage hands the fragment stage.
 //
@@ -218,6 +236,55 @@ fn n64_lamplight(world_position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
     return sum;
 }
 
+// Where the flattening draws a true world position: `flatten.rs`'s
+// `Curve::bend`, line for line. A vertex is measured off the ridden world's
+// centre -- its height above sea level and its polar angle from the zenith
+// under the player -- and put down on the tangent plane instead: its geodesic
+// distance `R·θ` out along the direction it lies in, its height straight up.
+// That is the azimuthal equidistant map, and it is chosen because it keeps
+// walking distances and directions from the player exact, so the near field
+// never swims and a thing due east is drawn due east.
+//
+// The horizontal direction comes out of `dir - up·cosθ`, whose length is
+// exactly sinθ, so the unrolling multiplies by θ/sinθ: 1 under the player's
+// feet, growing gently with distance, and clamped at the antipode where it is
+// genuinely singular -- uncapped, a triangle with a vertex in the last
+// fraction of a degree is flung millions of metres and smeared across the sky.
+//
+// The grip blends the true position towards the map, faded per vertex over
+// the altitude band, which is what keeps the sun, the other planet and the
+// rest of the true sky exactly where they are.
+fn n64_unbend(world: vec3<f32>) -> vec3<f32> {
+    let grip = curve.zenith.w;
+    if grip <= 0.0 {
+        return world;
+    }
+    let centre = curve.home.xyz;
+    let radius = curve.home.w;
+    let up = curve.zenith.xyz;
+    let arm = world - centre;
+    let reach = length(arm);
+    if reach < 1e-3 {
+        return world;
+    }
+    let height = reach - radius;
+    let share = grip * (1.0 - smoothstep(curve.band.x, curve.band.y, height));
+    if share <= 0.0 {
+        return world;
+    }
+    let dir = arm / reach;
+    let cos_polar = clamp(dot(dir, up), -1.0, 1.0);
+    let polar = acos(cos_polar);
+    let level = dir - up * cos_polar;
+    let sin_polar = length(level);
+    var stretch = 1.0;
+    if sin_polar > 1e-6 {
+        stretch = min(polar / sin_polar, 8.0);
+    }
+    let flat = centre + up * (radius + height) + level * (radius * stretch);
+    return mix(world, flat, share);
+}
+
 @vertex
 fn vertex(vertex: Vertex) -> N64VertexOutput {
     var out: N64VertexOutput;
@@ -237,7 +304,23 @@ fn vertex(vertex: Vertex) -> N64VertexOutput {
         world_from_local,
         vec4<f32>(vertex.position, 1.0),
     );
-    out.position = position_world_to_clip(out.world_position.xyz);
+    // The flattening bends only the *clip* position. `out.world_position`
+    // stays true on purpose: the key light, the lamps and the fog all read it
+    // in the fragment stage, and lighting the true sphere is what keeps the
+    // terminator where the sky says the sun is and a lamp's glow on the
+    // ground its ball is truly lying on. The map moves where a triangle lands
+    // on the glass and changes nothing about its colour -- so no normal needs
+    // reconstructing either.
+    //
+    // The sky is the one opt-out, and it already carries the flag: `fogged`
+    // is zero exactly for the shells that *are* the distance rather than
+    // standing in it, and bending the picture of the sky by the map of the
+    // ground would fold the stars at the horizon.
+    var drawn = out.world_position.xyz;
+    if material.fogged > 0.0 {
+        drawn = n64_unbend(drawn);
+    }
+    out.position = position_world_to_clip(drawn);
 #endif
 
 #ifdef VERTEX_UVS_A

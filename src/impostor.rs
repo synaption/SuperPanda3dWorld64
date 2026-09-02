@@ -490,6 +490,11 @@ pub fn prepare(
             // ball of nuclonium at the swap distance ought to catch its glow
             // the same way the model just behind it does.
             lamps: crate::n64::LAMPLIGHT,
+            // And the same flattening: a sheet stands in for a distant model,
+            // so it has to ride the same map or the crowd would split in two
+            // at the swap distance -- models on the flattened ground, sheets
+            // hanging where the true sphere put them.
+            curve: crate::flatten::CURVE,
             alpha_mode: match opacity < 1.0 {
                 true => AlphaMode::Blend,
                 false => AlphaMode::Mask(ALPHA_CUTOFF),

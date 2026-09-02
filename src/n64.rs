@@ -594,6 +594,12 @@ pub struct N64Material {
     /// is what lets a hundred moving lights cost no material writes at all.
     #[storage(3, read_only)]
     pub lamps: Handle<ShaderBuffer>,
+    /// The flattening, shared the same way and for the same reason: its
+    /// anchor moves every frame the player does, so it lives in one buffer
+    /// [`crate::flatten::chart`] rewrites rather than in a uniform that would
+    /// drag every material with it. See [`crate::flatten::CURVE`].
+    #[storage(4, read_only)]
+    pub curve: Handle<ShaderBuffer>,
     pub alpha_mode: AlphaMode,
     /// Drawn from both sides. True for every billboarded quad, because which of
     /// its faces was authored towards the viewer is not something this port can
@@ -980,6 +986,7 @@ pub fn translate(
         },
         base_color_texture: source.base_color_texture.clone(),
         lamps: LAMPLIGHT,
+        curve: crate::flatten::CURVE,
         alpha_mode,
         double_sided: source.cull_mode.is_none(),
         shading: lighting.shading,
@@ -1048,10 +1055,20 @@ impl Plugin for N64Plugin {
     }
 }
 
-/// Puts an empty lamp buffer in the world before the first material asks for
-/// one. See the `Startup` registration above.
+/// Puts an empty lamp buffer and a flat-off curve in the world before the
+/// first material asks for either. See the `Startup` registration above.
+///
+/// Both here rather than one per module, because this is the plugin the
+/// material belongs to: every buffer the material *binds* has to exist the
+/// moment the material does, and an app that added [`N64Plugin`] without also
+/// remembering some other module's blanking system would draw nothing, with
+/// nothing in a log to say why.
 pub fn kindle(mut buffers: ResMut<Assets<ShaderBuffer>>) {
     let _ = buffers.insert(&LAMPLIGHT, ShaderBuffer::from(Lamplight::default()));
+    let _ = buffers.insert(
+        &crate::flatten::CURVE,
+        ShaderBuffer::from(crate::flatten::Curve::default()),
+    );
 }
 
 /// The swap runs where [`crate::billboard::two_sided`] leaves off, and that
