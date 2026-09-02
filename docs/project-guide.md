@@ -259,7 +259,7 @@ actors' `collision.inc.c` is not loaded, so you can walk through one.
 
 `assets/bevy/planet.glb` is the generated planet from
 [`experimental/planet_gen`](../experimental/planet_gen/readme.md): a cube-sphere
-about 300 m in radius with ±40 m of terrain on it, 786,432 triangles across 96
+about 600 m in radius with ±80 m of terrain on it, 786,432 triangles across 96
 tiles. Its collision **is** its render mesh, read back out of the glTF once
 Bevy has finished loading it. That is why choosing it is a wait rather than a
 frame: the pause menu stays up saying `LOADING PLANET` and, because the menu

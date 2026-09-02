@@ -403,10 +403,19 @@ pub fn add_game(app: &mut App) {
     // it cannot ride in `path::draw`: an ant is never routed, so the route
     // overlay has nothing to say about one, and a blank where a body should be
     // reads as a broken body. See that system for what it draws instead.
+    // After `sync_visual` -- and through it, after `orbit::glide` -- or the
+    // ordering is the scheduler's to pick. Picked wrong, the overlays read
+    // the gravity and the collision while they still hold the *tick* poses
+    // (`orbit::advance` re-points them at the top of every fixed step,
+    // before any Update system runs) and last frame's `RenderPose` besides:
+    // the local-down arrow and the gravity shells then saw back and forth at
+    // 30 Hz across a world that glides, which on the orbiting level was a
+    // genuinely nauseating thing to stand under.
     app.add_systems(Startup, path::configure)
         .add_systems(
             Update,
-            (path::draw, enemy::draw_crawlers, collide::draw, orrery::draw),
+            (path::draw, enemy::draw_crawlers, collide::draw, orrery::draw)
+                .after(player::sync_visual),
         );
 }
 

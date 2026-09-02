@@ -187,22 +187,30 @@ const SPACE_COLOUR: Vec3 = Vec3::new(0.004, 0.005, 0.010);
 /// with in `main::setup`, put back on leaving the system.
 const BASE_FAR: f32 = 1000.0;
 
-/// How far the sun has to move before the world is relit and the dome
-/// recoloured.
+/// How far the sun has to move before the world is relit.
 ///
 /// Not every frame, and this is the one number in the module that is a real
 /// trade rather than a look. Relighting means rewriting the uniform of *every*
 /// material in the game -- the castle alone has forty-five -- because this
 /// renderer keeps its light in each material rather than in a bind group of its
-/// own. At a five-minute day the sun crosses a quarter of a degree about five
-/// times a second, and a quarter of a degree of sun is a change of at most one
-/// step in an eight-bit colour channel: below what the frame buffer can show
-/// and far below what a vertex-lit scene can. So the sky is continuous and the
-/// *light* is not, and nothing can tell.
+/// own. So the light steps while the sun sweeps, and the step is sized to be
+/// invisible: while the sun holds still -- which is most of every frame's
+/// life on the castle's slow clock -- the gate closes completely and the
+/// materials are not touched at all.
 ///
-/// The sun and moon discs are exempt -- they are transforms, not uniforms, and
-/// they move every frame. A disc that stepped would be obvious.
-const RELIGHT_STEP: f32 = 0.25_f32.to_radians();
+/// A fiftieth of a degree, and it used to be a quarter. A quarter degree is
+/// one step in an eight-bit channel *on average*, which sounded safe -- but
+/// the [`RAMP`] is steep round the terminator, every surface in the world
+/// steps in the same frame, and on the planet the walker's own stride sweeps
+/// the apparent sun as fast as a five-minute day: five synchronised pops a
+/// second, read by the eye as the whole scene ticking round. At a fiftieth
+/// the gate opens roughly every frame while the sun is genuinely sweeping and
+/// each step is far below one colour count everywhere on the ramp.
+///
+/// The dome's painting, the sun and moon discs ride no gate at all -- they
+/// are *picture*, not light, and any held picture visibly jumps; see the dome
+/// arm of [`follow`].
+const RELIGHT_STEP: f32 = 0.02_f32.to_radians();
 
 /// How tightly the warm glow gathers about the sun, and how far the same warmth
 /// spreads along the horizon under it.
@@ -467,12 +475,16 @@ pub struct Sky {
     /// differs from it can only have come from the player.
     published: f32,
     /// Where the sun last stood in the local sky -- [`Overhead::apparent`] --
-    /// when the world was last relit and the dome last recoloured. See
-    /// [`RELIGHT_STEP`]. The apparent sun rather than the world one, because
-    /// on the planet the sun can stand still in the world while the player
-    /// walks the horizon out from under it, and elevation over *that* horizon
-    /// is what every colour in the [`RAMP`] is keyed on.
+    /// when the world was last relit. See [`RELIGHT_STEP`]. The apparent sun
+    /// rather than the world one, because on the planet the sun can stand
+    /// still in the world while the player walks the horizon out from under
+    /// it, and elevation over *that* horizon is what every colour in the
+    /// [`RAMP`] is keyed on.
     lit_from: Option<Vec3>,
+    /// Where the sun stood when the dome was last *painted*, which rides no
+    /// gate at all -- see the dome arm of [`follow`] for why the picture and
+    /// the light are allowed different cadences.
+    painted: Option<Vec3>,
     /// How much air the world was last relit under -- see [`advance`]'s
     /// `air`. A second gate beside `lit_from`, because climbing out of the
     /// atmosphere changes the light without moving the sun a degree.
@@ -493,6 +505,7 @@ impl Default for Sky {
             // Nothing has been lit yet, which is what makes the first frame
             // light the world whatever the step below would have said.
             lit_from: None,
+            painted: None,
             lit_air: 1.0,
         }
     }
@@ -1015,7 +1028,13 @@ pub fn advance(
     mut sky: ResMut<Sky>,
     mut lighting: ResMut<N64Lighting>,
     mut clear: ResMut<ClearColor>,
-    mut fog: Query<(&mut DistanceFog, &mut Projection, &GlobalTransform), With<Camera3d>>,
+    // `&Transform`, not `&GlobalTransform`: this runs after `camera::update`
+    // in the frame's chain, and the camera rides at the root, so its local
+    // transform is its world pose *this* frame. The global one is only
+    // written back in `PostUpdate` -- a frame stale -- and an `up` taken from
+    // last frame's eye against this frame's planet centres is a horizon that
+    // breathes against the camera's own by however long the frame took.
+    mut fog: Query<(&mut DistanceFog, &mut Projection, &Transform), With<Camera3d>>,
 ) {
     let kind = sky_of(*level);
     if kind == SkyKind::None {
@@ -1070,7 +1089,7 @@ pub fn advance(
     // headless world with no camera still wants its light run.
     let (up, eye) = match (&gravity, fog.single()) {
         (Some(gravity), Ok((_, _, camera))) => {
-            (gravity.up(camera.translation()), camera.translation())
+            (gravity.up(camera.translation), camera.translation)
         }
         _ => (Vec3::Y, Vec3::ZERO),
     };
@@ -1125,10 +1144,13 @@ pub fn advance(
     // *apparent* sun: on the planet the world's sun can hold still while the
     // player walks the horizon round underneath it, and either motion is a
     // change of light.
+    // The chord, not `acos` of the dot: at a fiftieth of a degree the dot of
+    // two unit vectors rounds to exactly 1.0 in `f32` and the angle reads as
+    // zero, while the chord between them is still a perfectly healthy number.
     let moved = sky
         .lit_from
-        .is_none_or(|last| last.dot(view.apparent).clamp(-1.0, 1.0).acos() >= RELIGHT_STEP)
-        || (sky.lit_air - air).abs() > 0.04;
+        .is_none_or(|last| last.distance(view.apparent) >= RELIGHT_STEP)
+        || (sky.lit_air - air).abs() > 0.005;
     if !moved {
         return;
     }
@@ -1157,7 +1179,7 @@ pub fn advance(
 
 /// Moves the sky. Every shell is centred on the camera, the two discs are
 /// turned to face it, the star field is turned with the sun, and the dome is
-/// repainted when the light has moved far enough to be worth repainting.
+/// repainted whenever the sun has moved in the local sky at all.
 ///
 /// Split from [`advance`] because they touch nothing in common: this one holds
 /// the meshes and the materials and does not care what time it is beyond
@@ -1168,17 +1190,23 @@ pub fn follow(
     level: Res<LevelId>,
     medium: Res<CameraMedium>,
     gravity: Option<Res<Gravity>>,
-    sky: Res<Sky>,
+    mut sky: ResMut<Sky>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<N64Material>>,
-    camera: Query<&GlobalTransform, With<Camera3d>>,
-    mut parts: Query<(
-        &SkyPart,
-        &mut Transform,
-        &mut Visibility,
-        &Mesh3d,
-        &MeshMaterial3d<N64Material>,
-    )>,
+    // The fresh pose, for the same reason [`advance`] reads it: see the note
+    // on its fog query.
+    camera: Query<&Transform, With<Camera3d>>,
+    mut parts: Query<
+        (
+            &SkyPart,
+            &mut Transform,
+            &mut Visibility,
+            &Mesh3d,
+            &MeshMaterial3d<N64Material>,
+        ),
+        // Bevy will not take on trust that no shell is the camera.
+        Without<Camera3d>,
+    >,
 ) {
     // Underwater the sky is behind a wall of fog that closes at forty metres,
     // and an unfogged dome six hundred metres out would be drawn straight
@@ -1188,7 +1216,7 @@ pub fn follow(
     let Ok(camera) = camera.single() else {
         return;
     };
-    let eye = camera.translation();
+    let eye = camera.translation;
     // The same up, the same `overhead`, the same inputs as `advance` this
     // frame, so the picture and the light agree to the bit -- which the dome's
     // repaint gate below compares them on.
@@ -1248,14 +1276,25 @@ pub fn follow(
                 // gradient -- horizon band, sun glow and all -- is simply
                 // black, and the dome is the void the stars hang in.
                 tint(&mut materials, material, Vec3::splat(air), 1.0);
-                // Only when the light has moved: the same gate `advance` uses,
-                // read off the same field, so the dome and the world's light
-                // step together and never disagree about what time it is.
-                if sky.lit_from == Some(view.apparent) {
+                // Repainted whenever the sun has moved in the local sky *at
+                // all* -- deliberately not `advance`'s [`RELIGHT_STEP`] gate,
+                // and the difference is colour against position. A quarter
+                // degree of light is under one eight-bit colour step and
+                // nothing can tell; a quarter degree of *picture* is several
+                // pixels of the whole gradient, and the dome held to the
+                // light's gate advanced in visible five-a-second pops on the
+                // spinning planet, where the ground's own turn sweeps the
+                // apparent sun as fast as a five-minute day. The repaint is
+                // two thousand vertices, which is nothing; the relight is
+                // every material in the game, which is the trade the gate
+                // exists for. So the picture is continuous and the light is
+                // not, and now genuinely nothing can tell.
+                if sky.painted != Some(view.apparent) {
                     if let Some(mut mesh) = meshes.get_mut(&mesh.0) {
                         // The apparent sun, because the vertices being painted
                         // are in the dome's own frame.
                         repaint(&mut mesh, view.apparent, &look);
+                        sky.painted = Some(view.apparent);
                     }
                 }
             }
@@ -1369,10 +1408,10 @@ fn repaint(mesh: &mut Mesh, sun: Vec3, look: &Look) {
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
 }
 
-/// The clock first, then the geometry that shows it: [`follow`] reads
-/// `Sky::lit_from` to decide whether to repaint, and [`advance`] is what writes
-/// it. The other way round, the dome would be painted for a sun a frame behind
-/// the one the world was lit by.
+/// The clock first, then the geometry that shows it: [`advance`] moves the
+/// hour and the light that [`follow`]'s painting is keyed on. The other way
+/// round, the dome would be painted for a sun a frame behind the one the
+/// world was lit by.
 pub fn systems() -> ScheduleConfigs<ScheduleSystem> {
     (advance, follow).chain()
 }
@@ -1434,7 +1473,7 @@ mod tests {
                 Camera3d::default(),
                 DistanceFog::default(),
                 Projection::default(),
-                GlobalTransform::from(Transform::from_translation(Vec3::X * 2300.0)),
+                Transform::from_translation(Vec3::X * 2300.0),
             ))
             .id();
         app.update();
@@ -1453,9 +1492,7 @@ mod tests {
         // slider says.
         app.world_mut()
             .entity_mut(camera)
-            .insert(GlobalTransform::from(Transform::from_translation(
-                Vec3::X * 2900.0,
-            )));
+            .insert(Transform::from_translation(Vec3::X * 2900.0));
         app.update();
         let dark = *app.world().resource::<N64Lighting>();
         assert!(
@@ -1470,6 +1507,76 @@ mod tests {
             app.world().resource::<ClearColor>().0,
             water::SKY_COLOUR,
             "the night side of the system is under the castle's noon sky"
+        );
+    }
+
+    /// The picture is continuous even where the light is stepped: with the
+    /// apparent sun moved well inside [`RELIGHT_STEP`] -- so the world is
+    /// *not* relit -- the dome is repainted anyway. This is the pop the
+    /// spinning planet exposed: a quarter degree of light is one eight-bit
+    /// colour step, but a quarter degree of held picture is several pixels of
+    /// the whole sky jumping five times a second.
+    #[test]
+    fn the_picture_outruns_the_lights_gate() {
+        let centre = Vec3::X * 2600.0;
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<GameTuning>()
+            .init_resource::<Sky>()
+            .init_resource::<N64Lighting>()
+            .init_resource::<CameraMedium>()
+            .init_resource::<ClearColor>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<N64Material>>()
+            .insert_resource(LevelId::PlanetOrbit)
+            .insert_resource(Gravity::binary(centre, Vec3::Z * 4200.0, 300.0))
+            .add_systems(Update, systems());
+        let painted = app.world_mut().resource_mut::<Assets<Mesh>>().add(dome());
+        app.world_mut().spawn((
+            SkyPart::Dome,
+            Transform::default(),
+            Visibility::default(),
+            Mesh3d(painted.clone()),
+            MeshMaterial3d::<N64Material>(Handle::default()),
+        ));
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera3d::default(),
+                DistanceFog::default(),
+                Projection::default(),
+                Transform::from_translation(Vec3::X * 2300.0),
+            ))
+            .id();
+        let colours = |app: &App| -> Vec<[f32; 4]> {
+            let meshes = app.world().resource::<Assets<Mesh>>();
+            let Some(bevy::mesh::VertexAttributeValues::Float32x4(colours)) = meshes
+                .get(&painted)
+                .and_then(|mesh| mesh.attribute(Mesh::ATTRIBUTE_COLOR))
+            else {
+                panic!("the dome lost its colours");
+            };
+            colours.clone()
+        };
+        app.update();
+        let noon = colours(&app);
+        let lit = app.world().resource::<N64Lighting>().to_light;
+        // A hundredth of a degree round the planet: the sun shifts in the
+        // local sky, and the light's fiftieth-of-a-degree gate does not fire.
+        let stepped = centre + Quat::from_rotation_z(0.01_f32.to_radians()) * (Vec3::NEG_X * 300.0);
+        app.world_mut()
+            .entity_mut(camera)
+            .insert(Transform::from_translation(stepped));
+        app.update();
+        assert_eq!(
+            app.world().resource::<N64Lighting>().to_light,
+            lit,
+            "a tenth of a degree relit the world through its quarter-degree gate"
+        );
+        assert_ne!(
+            colours(&app),
+            noon,
+            "the picture held still with the light instead of moving with the sun"
         );
     }
 
@@ -1496,7 +1603,7 @@ mod tests {
                 Camera3d::default(),
                 DistanceFog::default(),
                 Projection::default(),
-                GlobalTransform::from(Transform::from_translation(Vec3::Y * 3000.0)),
+                Transform::from_translation(Vec3::Y * 3000.0),
             ))
             .id();
         app.update();
@@ -1523,9 +1630,7 @@ mod tests {
         // Drop the same camera to a planet's surface and the air is back on.
         app.world_mut()
             .entity_mut(camera)
-            .insert(GlobalTransform::from(Transform::from_translation(
-                Vec3::X * 2300.0,
-            )));
+            .insert(Transform::from_translation(Vec3::X * 2300.0));
         app.update();
         let fog = app.world().entity(camera).get::<DistanceFog>().unwrap();
         let FogFalloff::Linear { start, .. } = fog.falloff else {

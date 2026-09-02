@@ -127,7 +127,7 @@ def main():
     render(cam, out / "planet_lod1.png", eye, (0, 0, 0), 50, 1, sun_space)
 
     # Down on the surface. Aimed along the ground rather than at it, so the
-    # horizon curve is in frame -- on a 300 m planet that curve is the whole
+    # horizon curve is in frame -- on a 600 m planet that curve is the whole
     # point and a shot pointed at your feet hides it.
     centre, alt, name, variety = vista_tile(m["sea_level"])
     up = centre.normalized()

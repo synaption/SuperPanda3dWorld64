@@ -3,6 +3,7 @@ use crate::{
     gravity::{self, Gravity},
     input::InputState,
     level::LevelData,
+    orbit::{Rider, SolarSystem},
     player::{Player, RenderPose},
     GameState,
 };
@@ -24,6 +25,14 @@ pub struct FollowCamera {
     /// is turned by the smallest rotation that takes its own up onto the local
     /// one, which is parallel transport and is the only part of this that is
     /// not obvious.
+    ///
+    /// On a planet that *turns*, transport is not enough by itself: it keeps
+    /// the view level but not pointed, and the difference between following
+    /// the up and riding the ground accumulates as a slow pirouette of the
+    /// view round a player standing still -- a Foucault pendulum with the
+    /// camera for a bob. So the frame is first carried by the ground's own
+    /// turn ([`Self::ridden`]), and the arc correction is left only what
+    /// walking actually earned.
     ///
     /// The obvious thing -- rebuilding the frame from scratch out of the local
     /// up every frame -- does not work. `Quat::from_rotation_arc(Vec3::Y, up)`
@@ -76,6 +85,17 @@ pub struct FollowCamera {
     /// recovery is the camera being honest. See [`UP_SNAP`], which this
     /// suspends.
     pub landing: f32,
+    /// Which world carried the view last frame, and where that world stood
+    /// then -- centre and turn, the whole frame -- the camera's half of the
+    /// parenting in [`crate::orbit::Rider`]. `None` adrift or on the castle,
+    /// where the ground goes nowhere. The centre matters as much as the turn:
+    /// [`Self::focus`] is eased in world space, and easing across the
+    /// planet's own carriage leaves the focus permanently trailing the orbit
+    /// -- a lag that slowly swings through the local frame as the orbit
+    /// curves, which was the camera sinking over the minutes. Carried first,
+    /// the ease is left to filter what it was built for: the player's own
+    /// steps and bumps.
+    pub ridden: Option<(usize, (Vec3, Quat))>,
 }
 
 impl Default for FollowCamera {
@@ -93,6 +113,7 @@ impl Default for FollowCamera {
             focus: None,
             free: false,
             landing: 0.0,
+            ridden: None,
         }
     }
 }
@@ -210,6 +231,9 @@ pub fn update(
     player: Res<RenderPose>,
     level: Res<LevelData>,
     gravity: Res<Gravity>,
+    system: Res<SolarSystem>,
+    fixed: Res<Time<Fixed>>,
+    riders: Query<&Rider, With<Player>>,
     mut state: ResMut<GameState>,
     tuning: Res<GameTuning>,
 ) {
@@ -224,6 +248,36 @@ pub fn update(
     let stick = time.delta_secs() * tuning.pad_look;
     let up = gravity.up(player.translation);
     let free = gravity.weightless(player.translation);
+    // The ground's own turn first, before any up is measured: the camera is
+    // parented to the world that holds the player, at the same grip the
+    // physics rides it with -- see [`crate::orbit::Rider`] and
+    // [`FollowCamera::frame`] for why the up correction below cannot do this
+    // job. Both quaternions come along, so the lag between them is carried
+    // rather than re-fought; the drawn-frame blend, so the view turns exactly
+    // as fast as the terrain it is looking at.
+    let rider = riders.single().ok().copied().unwrap_or_default();
+    follow.ridden = match rider.world {
+        Some(held) if rider.hold > 0.0 => {
+            let (centre, spin) = system.blended(fixed.overstep_fraction().clamp(0.0, 1.0))[held];
+            if let Some((was, (centre_last, spin_last))) = follow.ridden {
+                if was == held {
+                    let whole = spin * spin_last.inverse();
+                    let turn = Quat::IDENTITY.slerp(whole, rider.hold);
+                    follow.frame = turn * follow.frame;
+                    follow.view = turn * follow.view;
+                    // The focus comes along bodily -- centre and turn, the
+                    // same carriage `orbit::advance` gives the player -- so
+                    // the ease below never sees the planet move at all.
+                    if let Some(focus) = follow.focus.as_mut() {
+                        let carried = centre + whole * (*focus - centre_last);
+                        *focus = focus.lerp(carried, rider.hold);
+                    }
+                }
+            }
+            Some((held, (centre, spin)))
+        }
+        _ => None,
+    };
     if free {
         // Weightless, there is no floor and so no reason the look should
         // have one. The yaw/pitch orbit cannot give that -- its pitch clamp
@@ -391,6 +445,8 @@ mod tests {
         world.insert_resource(GameTuning::default());
         world.insert_resource(ButtonInput::<KeyCode>::default());
         world.init_resource::<Time>();
+        world.init_resource::<Time<Fixed>>();
+        world.insert_resource(SolarSystem::default());
         let aligned = Quat::from_rotation_arc(Vec3::Y, at.normalize());
         world.spawn((
             Transform::default(),
@@ -541,6 +597,88 @@ mod tests {
     /// A flat level with the player standing on it, which is what the two aim
     /// tests below want: gravity is `+Y` everywhere, so the view frame never
     /// moves and the only thing that could turn the camera is the camera.
+    /// Parallel transport keeps the view level; it does not keep it pointed.
+    /// Stand at the pole of a spinning planet: the up never moves, so the arc
+    /// correction has nothing to say, while the ground itself twists under
+    /// the boots -- and the view must twist with it, or the world slowly
+    /// pirouettes round a player who is standing perfectly still.
+    #[test]
+    fn the_view_rides_the_ground_round_the_spin() {
+        let mut world = planet_world(Vec3::Y * PLANET);
+        world.spawn((
+            Player,
+            Rider {
+                world: Some(0),
+                hold: 1.0,
+            },
+        ));
+        // The first frame only files where the ground stood.
+        frames(&mut world, 1);
+        let before = {
+            let mut query = world.query::<&FollowCamera>();
+            query.single(&world).unwrap().view
+        };
+        // The ground turns an eighth of a radian. The up does not move at all.
+        let spun = Quat::from_rotation_y(0.125);
+        {
+            let mut system = world.resource_mut::<SolarSystem>();
+            system.bodies[0].rotation = spun;
+            system.previous[0].rotation = spun;
+        }
+        frames(&mut world, 1);
+        let after = {
+            let mut query = world.query::<&FollowCamera>();
+            query.single(&world).unwrap().view
+        };
+        assert!(
+            after.angle_between(spun * before) < 1e-3,
+            "the view was left {} radians behind the ground's turn",
+            after.angle_between(spun * before)
+        );
+    }
+
+    /// The focus's smoothing is for the player's own steps, not the planet's
+    /// carriage. Carried thirty metres between frames -- pure orbit, no spin
+    /// -- the focus rides bodily, and its lag relative to the ground does not
+    /// change. Left uncarried it trailed the orbit by its full leash, and the
+    /// trail swung slowly through the local frame as the orbit curved round
+    /// the sun -- which was the camera sinking over the minutes.
+    #[test]
+    fn the_focus_rides_the_orbit_instead_of_trailing_it() {
+        let mut world = planet_world(Vec3::Y * PLANET);
+        world.spawn((
+            Player,
+            Rider {
+                world: Some(0),
+                hold: 1.0,
+            },
+        ));
+        frames(&mut world, 8);
+        let offset = |world: &mut World| -> Vec3 {
+            let standing = world.resource::<RenderPose>().translation;
+            let mut query = world.query::<&FollowCamera>();
+            let follow = query.single(world).unwrap();
+            follow.focus.expect("the focus was never placed") - standing
+        };
+        let before = offset(&mut world);
+        // Straight up, so the local up -- and with it the view -- is exactly
+        // what it was, and the only thing under test is the carriage.
+        let carried = Vec3::Y * 30.0;
+        {
+            let mut system = world.resource_mut::<SolarSystem>();
+            system.bodies[0].centre += carried;
+            system.previous[0].centre += carried;
+        }
+        world.resource_mut::<RenderPose>().translation += carried;
+        frames(&mut world, 1);
+        let after = offset(&mut world);
+        assert!(
+            (after - before).length() < 0.05,
+            "the focus was left {} behind the world's carriage",
+            (after - before).length()
+        );
+    }
+
     fn flat_world(at: Vec3) -> World {
         let mut world = planet_world(Vec3::Y * PLANET);
         world.insert_resource(Gravity::default());

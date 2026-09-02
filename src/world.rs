@@ -479,6 +479,10 @@ fn put_the_player_down(
         // would spend the first second of the level rolling the horizon over.
         follow.view = follow.frame;
         follow.clearance = 1.0;
+        // The ride's memory goes with the history: a rotation remembered off
+        // the previous level's clockwork, compared against a fresh one, would
+        // spend the arrival frame un-turning a turn nobody made.
+        follow.ridden = None;
         // Forgotten, this is the second-worst arrival the camera can make:
         // the focus is eased toward the player from wherever it last was,
         // and "wherever it last was" is the previous level -- which from a
@@ -949,7 +953,7 @@ mod tests {
         assert_eq!(*app.world().resource::<LevelId>(), LevelId::Castle);
 
         app.world_mut().write_message(LoadLevel(LevelId::Planet));
-        // Bounded by the wall clock rather than by frames: this reads 14 MB of
+        // Bounded by the wall clock rather than by frames: this reads 33 MB of
         // glTF off disk, and how many frames that takes is a property of the
         // machine. A cap on a hang, not a deadline -- it takes tens of
         // milliseconds.
@@ -975,7 +979,7 @@ mod tests {
             panic!("the planet's collision is still flat");
         };
         assert!(
-            (250.0..350.0).contains(&radius),
+            (550.0..650.0).contains(&radius),
             "planet.glb measured {radius} m across the middle"
         );
 
@@ -985,7 +989,7 @@ mod tests {
         // The planet has a sea, and the player is on the dry side of it.
         //
         // Measured against the water rather than against `radius`, which is
-        // the mean distance to the surface and sits four metres above the
+        // the mean distance to the surface and sits eight metres above the
         // waterline on this planet -- an average taken over the mountains and
         // the seabed alike.
         let level = app.world().resource::<LevelData>();
@@ -993,7 +997,7 @@ mod tests {
             .sea_radius()
             .expect("planet.glb has no ocean node, so there is no sea");
         assert!(
-            (250.0..350.0).contains(&sea),
+            (550.0..650.0).contains(&sea),
             "the sea came out at r={sea} m round a planet of r={radius} m"
         );
         let depth = level.water_depth(start).unwrap();
@@ -1121,7 +1125,7 @@ mod tests {
             panic!("the orbiting planet's collision is still flat");
         };
         assert!(
-            (250.0..350.0).contains(&radius),
+            (550.0..650.0).contains(&radius),
             "planet.glb measured {radius} m across the middle"
         );
 

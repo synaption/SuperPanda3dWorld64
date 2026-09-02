@@ -30,7 +30,7 @@ import numpy as np
 from .cubesphere import VertexGrid, grid_parameters, welded_triangles
 
 #: Quads along one face edge. 64 matches the LOD1 terrain tile, and puts the
-#: sphere within 2.3 cm of round at 300 m -- a millimetre of sagitta per metre
+#: sphere within 4.6 cm of round at 600 m -- a millimetre of sagitta per metre
 #: of surface, which no camera in this game gets close enough to see.
 DEFAULT_RES = 64
 

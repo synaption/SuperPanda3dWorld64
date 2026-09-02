@@ -176,27 +176,29 @@ three -- the cube corners, found rather than special-cased.
 
 ## Scale
 
-Kept from the existing script, which is Outer Wilds scale and already has the
-castle placed against it:
+Twice the linear scale of the original 300 m-radius prototype. Radius, relief,
+altitude bands, and area thresholds scale together so the terrain keeps the
+same slopes and topology; authored props and texture repeats remain measured
+in world metres:
 
 | | |
 |---|---|
-| Radius | 300 m |
-| Circumference | ~1885 m |
-| Face edge arc | ~471 m |
+| Radius | 600 m |
+| Circumference | ~3770 m |
+| Face edge arc | ~942 m |
 
 Proposed working grid, **depth 2**:
 
 | Depth | Tiles | Tile edge | Role |
 |---|---|---|---|
-| 0 | 6 | ~471 m | LOD1, the space mesh |
-| 2 | 96 | ~118 m | LOD0, the working tile grid |
+| 0 | 6 | ~942 m | LOD1, the space mesh |
+| 2 | 96 | ~236 m | LOD0, the working tile grid |
 
-At depth 2 a tile is a little smaller than the castle grounds' 164x150 m
-footprint, so the castle occupies roughly one tile plus a margin.
+At depth 2 a tile is larger than the castle grounds' 164x150 m footprint, so
+the castle occupies most of one tile.
 
 Each LOD0 tile carries a **65x65 vertex grid** — 64 quads, 2^6+1, the `+1`
-being the shared ring. That is ~1.84 m between vertices, which is a sensible
+being the shared ring. That is ~3.68 m between vertices, which is a sensible
 floor for platforming at this scale. The whole planet is then ~405k vertices
 and ~790k triangles, which Blender handles without complaint as long as tiles
 are separate objects.
@@ -339,8 +341,8 @@ over unchanged; the only difference is that the flatten now writes into tile
 heightfields rather than into one monolithic mesh, and a patch straddling a
 tile boundary writes into both.
 
-Authored content is flat, and the planet is not. At 300 m radius the sagitta
-across the castle's 164 m footprint is about 11 m — far too much to ignore.
+Authored content is flat, and the planet is not. At 600 m radius the sagitta
+across the castle's 164 m footprint is about 5.6 m — still too much to ignore.
 The tangent patch is the answer: the terrain is bent to meet the flat asset
 rather than the asset being bent to meet the terrain, and the blend band
 absorbs the difference.
@@ -506,7 +508,7 @@ As geometry, in a node named `ocean`, in the same `.glb` as the terrain.
 The alternative was arithmetic, and it does not work. The game measures a
 planet by averaging the distance from its centre out to every vertex, which
 is an average over the mountains and the seabed alike: on this planet it comes
-to 304.1 m against a sea at 300.0. Four metres is the difference between a
+to 608.2 m against a sea at 600.0. Eight metres is the difference between a
 beach and a drowned one. Sea level is a number in `planet.json`, the game
 deliberately does not read `planet.json` — one file for a planet, not two —
 and a sphere of water is a perfectly good way to write a number down, since

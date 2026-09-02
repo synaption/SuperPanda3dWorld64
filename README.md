@@ -91,7 +91,7 @@ it lies there until there is somebody it is for.
 
 There is a second level, and it is round. The pause menu's **Level** page also
 offers the generated planet from
-[`experimental/planet_gen`](experimental/planet_gen/readme.md) — 300 m across,
+[`experimental/planet_gen`](experimental/planet_gen/readme.md) — 1.2 km across,
 786,432 triangles of terrain, and gravity pointing at the middle of it. Walking
 far enough turns the ground over under your feet and takes you back where you
 started. Its collision is its render mesh, read out of the glTF as it loads, so
