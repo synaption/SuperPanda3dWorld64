@@ -102,6 +102,13 @@ pub struct Fixture {
     /// The measured one lives in the gravity well; a `const` table cannot
     /// wait for a glb, and metres of difference do not matter to navigation.
     pub radius: f32,
+    /// Where its collision is *filed from*, relative to its measured middle.
+    /// Zero for anything round. The flat platform files from well below its
+    /// face: filed from its own middle -- a quarter metre off the disc's
+    /// plane -- the triangles beside the centre subtend nearly the whole sky,
+    /// the sampling that sorts a triangle into face cells cannot cover that,
+    /// and the holes it left swallowed anyone landing near the middle.
+    pub file_from: Vec3,
     /// `Some(down)` gives its [`crate::gravity::Well`] a uniform pull -- the
     /// flat platform, which wants to be level the way the castle is level.
     /// `None` pulls at its middle like any planet.
@@ -125,6 +132,7 @@ pub const FIXTURES: [Fixture; 3] = [
         tag: "SPHERE",
         stands_at: Vec3::new(-1800.0, 0.0, 0.0),
         radius: 300.0,
+        file_from: Vec3::ZERO,
         down: None,
         cored: true,
     },
@@ -134,6 +142,7 @@ pub const FIXTURES: [Fixture; 3] = [
         tag: "PLATFORM",
         stands_at: Vec3::new(0.0, 0.0, -2600.0),
         radius: 150.0,
+        file_from: Vec3::new(0.0, -100.0, 0.0),
         down: Some(Vec3::NEG_Y),
         cored: false,
     },
@@ -143,6 +152,7 @@ pub const FIXTURES: [Fixture; 3] = [
         tag: "TORUS",
         stands_at: Vec3::new(2400.0, 0.0, 2400.0),
         radius: 410.0,
+        file_from: Vec3::ZERO,
         down: None,
         cored: false,
     },
@@ -629,7 +639,6 @@ pub fn finish_planet(
     nodes: Res<Assets<GltfNode>>,
     gltf_meshes: Res<Assets<GltfMesh>>,
     meshes: Res<Assets<Mesh>>,
-    gravity: Res<Gravity>,
     mut system: ResMut<crate::orbit::SolarSystem>,
     mut placement: ParamSet<(PlacePlayer<'_, '_>, PlaceCamera<'_, '_>)>,
 ) {
@@ -660,7 +669,7 @@ pub fn finish_planet(
     let Some(geometry) = read_geometry(gltf, &nodes, &gltf_meshes, &meshes) else {
         return;
     };
-    let (centre, radius) = sphere_of(&geometry.vertices);
+    let (centre, radius) = true_middle_of(&geometry);
     let sea = sea_level_of(&geometry.ocean, centre);
     let mut collision =
         LevelData::planet(&geometry.vertices, &geometry.indices, centre, radius, sea);
@@ -700,7 +709,19 @@ pub fn finish_planet(
             let home = system.bodies[0];
             home.centre + home.rotation * (spawn - centre)
         }
-        _ => spawn,
+        _ => {
+            // The pull re-aimed at the *measured* middle. The stand-in
+            // gravity from `spawn` points at the authored origin, and this
+            // planet's geometry is centred some twenty-five metres off it:
+            // left stale, down is over two degrees off the surface normal
+            // everywhere on the world -- a lean fixed in world space, so as
+            // the player walks round the sphere the camera holding itself to
+            // that down slowly tilts against the ground under him. The
+            // "camera gradually shifting downwards" as he moves, in as many
+            // words.
+            commands.insert_resource(Gravity::towards(centre));
+            spawn
+        }
     };
     console.report(match sea {
         Some(sea) => format!(
@@ -713,13 +734,13 @@ pub fn finish_planet(
         ),
     });
 
-    // Which way is up where he lands. The system's new gravity was inserted
+    // Which way is up where he lands. Both arms' new gravity was inserted
     // through `Commands` and is not readable yet, so the answer is taken off
-    // the body he is standing on rather than off the stale resource -- which
-    // still points at the authored centre, a spot the planet has left.
+    // the measured world rather than off the stale resource -- which still
+    // points at the authored origin, a spot neither planet's middle is.
     let up = match id {
         LevelId::PlanetOrbit => (spawn - system.bodies[0].centre).normalize_or(Vec3::Y),
-        _ => gravity.up(spawn),
+        _ => (spawn - centre).normalize_or(Vec3::Y),
     };
     put_the_player_down(spawn, up, &mut commands, &mut placement);
 
@@ -783,11 +804,20 @@ pub fn finish_fixtures(
             .iter()
             .map(|vertex| (*vertex - centre).length())
             .fold(0.0, f32::max);
+        // The collision files from `file_from`, and its reach is measured
+        // from there too -- the filing point and the extent the ray walk is
+        // paced by have to agree about where the middle is.
+        let filed_from = centre + fixture.file_from;
+        let filed_reach = geometry
+            .vertices
+            .iter()
+            .map(|vertex| (*vertex - filed_from).length())
+            .fold(0.0, f32::max);
         collision.add_world(
             &geometry.vertices,
             &geometry.indices,
-            centre,
-            reach,
+            filed_from,
+            filed_reach,
             fixture.cored,
             fixture.stands_at,
         );
@@ -941,9 +971,10 @@ fn read_node(
 /// side of sea level lands near sea level. Measured rather than read out of
 /// `planet.json` so that the game needs one file for the planet and not two,
 /// and so that a regenerated planet at a different scale needs no edit here.
-/// Nothing depends on it being exact: it is what "above sea level" is judged
-/// against when choosing where to put the player down, and where the bottom of
-/// the world is for the fell-out-of-it test.
+///
+/// A bounding box leans with the terrain, though: one tall massif drags the
+/// centre metres towards itself. Fine for a fixture; not for the planet --
+/// see [`true_middle_of`], which corrects it wherever there is a sea.
 fn sphere_of(vertices: &[Vec3]) -> (Vec3, f32) {
     if vertices.is_empty() {
         return (PLANET_CENTRE, 1.0);
@@ -953,12 +984,49 @@ fn sphere_of(vertices: &[Vec3]) -> (Vec3, f32) {
         |(low, high), &vertex| (low.min(vertex), high.max(vertex)),
     );
     let centre = (low + high) * 0.5;
-    let radius = vertices
+    (centre, mean_reach(vertices, centre))
+}
+
+/// The mean distance from `centre` out to the vertices, summed in `f64`
+/// because three-quarters of a million values near six hundred overflow an
+/// `f32` accumulator's precision long before they overflow anything else.
+fn mean_reach(vertices: &[Vec3], centre: Vec3) -> f32 {
+    if vertices.is_empty() {
+        return 1.0;
+    }
+    let total: f64 = vertices
         .iter()
-        .map(|&vertex| (vertex - centre).length())
-        .sum::<f32>()
-        / vertices.len() as f32;
-    (centre, radius.max(1.0))
+        .map(|&vertex| (vertex - centre).length() as f64)
+        .sum();
+    ((total / vertices.len() as f64) as f32).max(1.0)
+}
+
+/// Where the planet's middle *really* is: the sea's own centre when there is
+/// a sea, and [`sphere_of`]'s bounding-box estimate otherwise.
+///
+/// The generator authors the ocean as a perfect sphere, so the mean of its
+/// vertices is its centre to within float dust -- measured on this planet,
+/// its radii come back 600.000 +- 0.05. The bounding box of the *terrain*,
+/// by contrast, leans 25 m towards the tallest massif. Everything downstream
+/// pivoted on that leaning point: gravity pulled at it, the spin turned
+/// about it, the flat-map unbent around it -- so "down" stood 2.4 degrees
+/// off the real ground everywhere on the world, in a direction fixed in
+/// world space, and the camera holding itself to that down slowly tilted
+/// against the surface as the player walked round the sphere. The felt
+/// version was "the camera gradually shifts downwards as I move".
+fn true_middle_of(geometry: &Geometry) -> (Vec3, f32) {
+    let (estimate, _) = sphere_of(&geometry.vertices);
+    if geometry.ocean.is_empty() {
+        return (estimate, mean_reach(&geometry.vertices, estimate));
+    }
+    let total = geometry
+        .ocean
+        .iter()
+        .fold(bevy::math::DVec3::ZERO, |sum, &vertex| {
+            sum + vertex.as_dvec3()
+        });
+    let centre = (total / geometry.ocean.len() as f64).as_vec3();
+    (centre, mean_reach(&geometry.vertices, centre))
 }
 
 /// Somewhere on a planet to put the player down: the lowest dry land it can
@@ -1665,6 +1733,294 @@ mod tests {
         kicks
     }
 
+    /// A long walk on the moving planet stays *on* it: thousands of ticks of
+    /// held input over the turning, orbiting terrain, and the walker is never
+    /// under the ground and never snapped away by the void respawn. The
+    /// fall-through report, reproduced or refuted headlessly.
+    #[test]
+    fn a_long_walk_on_the_moving_planet_stays_on_the_ground() {
+        let mut app = with_a_loader();
+        app.update();
+        app.world_mut()
+            .write_message(LoadLevel(LevelId::PlanetOrbit));
+        let started = std::time::Instant::now();
+        let mut frames = 0;
+        while app.world().resource::<LevelLoad>().busy() || frames == 0 {
+            app.update();
+            frames += 1;
+            assert!(started.elapsed().as_secs() < 60, "the system never loaded");
+        }
+        let mut last = {
+            let mut players = app
+                .world_mut()
+                .query_filtered::<&Transform, With<player::Player>>();
+            players.single(app.world()).expect("no player").translation
+        };
+        let mut troubles: Vec<String> = Vec::new();
+        for step in 0..3000 {
+            // Forward, with a slow steady turn, so the walk covers fresh
+            // terrain in every direction instead of one lucky great circle.
+            app.world_mut()
+                .resource_mut::<crate::input::InputState>()
+                .move_axis = Vec2::new((step as f32 * 0.002).sin() * 0.6, 1.0).normalize();
+            app.update();
+            let at = {
+                let mut players = app
+                    .world_mut()
+                    .query_filtered::<&Transform, With<player::Player>>();
+                players.single(app.world()).expect("no player").translation
+            };
+            let centre = app.world().resource::<crate::orbit::SolarSystem>().bodies[0].centre;
+            let up = (at - centre).normalize_or(Vec3::Y);
+            // A teleport is the void respawn firing, which means he was
+            // already through the world. The planet itself moves three
+            // metres a tick; a walker rides that plus his own stride, so
+            // forty metres in a frame is nothing but a snap.
+            if (at - last).length() > 40.0 {
+                troubles.push(format!(
+                    "step {step}: snapped {} m in one frame",
+                    (at - last).length()
+                ));
+            }
+            last = at;
+            // Under the terrain: the surface along his own radial stands
+            // higher than his feet by more than any step or dip explains.
+            let ground = app
+                .world()
+                .resource::<LevelData>()
+                .ground_below(at + up * 50.0, up)
+                .map(|(ground, _)| (ground - centre).length());
+            if let Some(ground) = ground {
+                let depth = ground - (at - centre).length();
+                if depth > 3.0 {
+                    troubles.push(format!("step {step}: {depth:.1} m under the terrain"));
+                }
+            }
+            if troubles.len() > 5 {
+                break;
+            }
+        }
+        assert!(
+            troubles.is_empty(),
+            "the walk left the ground: {troubles:?}"
+        );
+    }
+
+    /// Hard arrivals on the moving planet land *on* it: dozens of dives at
+    /// speeds past anything the booster reaches, straight down and dragged
+    /// sideways across mountainsides, spread over the turning terrain. A
+    /// finish under the surface is the tunnelling the sweep exists to stop.
+    #[test]
+    fn hard_dives_at_the_moving_planet_never_tunnel() {
+        let mut app = with_a_loader();
+        app.update();
+        app.world_mut()
+            .write_message(LoadLevel(LevelId::PlanetOrbit));
+        let started = std::time::Instant::now();
+        let mut frames = 0;
+        while app.world().resource::<LevelLoad>().busy() || frames == 0 {
+            app.update();
+            frames += 1;
+            assert!(started.elapsed().as_secs() < 60, "the system never loaded");
+        }
+        let golden = std::f32::consts::PI * (3.0 - 5.0_f32.sqrt());
+        let mut troubles: Vec<String> = Vec::new();
+        for dive in 0..30 {
+            // Spread over the sphere, every latitude band.
+            let height = 0.9 - 1.8 * (dive as f32 + 0.5) / 30.0;
+            let ring = (1.0 - height * height).max(0.01).sqrt();
+            let yaw = golden * dive as f32;
+            let radial = Vec3::new(ring * yaw.cos(), height, ring * yaw.sin()).normalize();
+            {
+                let centre = app.world().resource::<crate::orbit::SolarSystem>().bodies[0].centre;
+                let start = centre + radial * 800.0;
+                let sideways = radial.any_orthonormal_vector();
+                let mut players = app
+                    .world_mut()
+                    .query_filtered::<(&mut Transform, &mut Controller), With<player::Player>>();
+                let (mut transform, mut ctrl) =
+                    players.single_mut(app.world_mut()).expect("no player");
+                transform.translation = start;
+                // Straight down at 120 with a 60 m/s sideways drag: a
+                // steeper, faster arrival than any glide the game flies.
+                ctrl.velocity = -radial * 120.0 + sideways * 60.0;
+                ctrl.grounded = false;
+                ctrl.kick = None;
+            }
+            for _ in 0..300 {
+                app.update();
+                let grounded = {
+                    let mut players = app
+                        .world_mut()
+                        .query_filtered::<&Controller, With<player::Player>>();
+                    players.single(app.world()).expect("no player").grounded
+                };
+                if grounded {
+                    break;
+                }
+            }
+            let at = {
+                let mut players = app
+                    .world_mut()
+                    .query_filtered::<&Transform, With<player::Player>>();
+                players.single(app.world()).expect("no player").translation
+            };
+            let centre = app.world().resource::<crate::orbit::SolarSystem>().bodies[0].centre;
+            let up = (at - centre).normalize_or(Vec3::Y);
+            let ground = app
+                .world()
+                .resource::<LevelData>()
+                .ground_below(at + up * 50.0, up)
+                .map(|(ground, _)| (ground - centre).length());
+            match ground {
+                Some(ground) => {
+                    let depth = ground - (at - centre).length();
+                    if depth > 3.0 {
+                        troubles.push(format!("dive {dive}: ended {depth:.1} m under the terrain"));
+                    }
+                }
+                None => troubles.push(format!(
+                    "dive {dive}: no ground over him at all -- through the world"
+                )),
+            }
+        }
+        assert!(troubles.is_empty(), "dives tunnelled: {troubles:?}");
+    }
+
+    /// Hard arrivals on the fixtures land on them too -- most of all the
+    /// platform's dead centre, whose widest triangles are the hardest ones
+    /// for the face-cell filing to place.
+    #[test]
+    fn hard_dives_at_the_fixtures_never_tunnel() {
+        let mut app = system_with_fixtures();
+        let mut troubles: Vec<String> = Vec::new();
+        let spots: [(usize, Vec3, Vec3); 7] = [
+            // The platform: dead centre, a stride out, mid-face, near rim.
+            (1, Vec3::new(0.0, 1.0, 0.0), Vec3::NEG_Y),
+            (1, Vec3::new(1.5, 1.0, 0.0), Vec3::NEG_Y),
+            (1, Vec3::new(60.0, 1.0, 30.0), Vec3::NEG_Y),
+            (1, Vec3::new(-130.0, 1.0, 40.0), Vec3::NEG_Y),
+            // The sphere: pole and mid-latitude.
+            (0, Vec3::new(0.0, 300.0, 0.0), Vec3::NEG_Y),
+            (
+                0,
+                Vec3::new(212.0, 212.0, 0.0),
+                Vec3::new(-0.707, -0.707, 0.0),
+            ),
+            // The torus: outer equator.
+            (2, Vec3::new(410.0, 0.0, 0.0), Vec3::NEG_X),
+        ];
+        for (which, (fixture, surface, down)) in spots.into_iter().enumerate() {
+            let stands_at = FIXTURES[fixture].stands_at;
+            {
+                let mut players = app
+                    .world_mut()
+                    .query_filtered::<(&mut Transform, &mut Controller), With<player::Player>>();
+                let (mut transform, mut ctrl) =
+                    players.single_mut(app.world_mut()).expect("no player");
+                transform.translation = stands_at + surface - down * 120.0;
+                ctrl.velocity = down * 110.0;
+                ctrl.grounded = false;
+                ctrl.kick = None;
+            }
+            for _ in 0..240 {
+                app.update();
+                let mut players = app
+                    .world_mut()
+                    .query_filtered::<&Controller, With<player::Player>>();
+                if players.single(app.world()).expect("no player").grounded {
+                    break;
+                }
+            }
+            let at = {
+                let mut players = app
+                    .world_mut()
+                    .query_filtered::<&Transform, With<player::Player>>();
+                players.single(app.world()).expect("no player").translation
+            };
+            // Landed near where the surface is, on the arriving side of it.
+            let miss = (at - (stands_at + surface)).dot(down);
+            if miss > 3.0 {
+                troubles.push(format!(
+                    "dive {which} at {}: ended {miss:.1} m past the surface, at {at}",
+                    FIXTURES[fixture].scene
+                ));
+            }
+        }
+        assert!(troubles.is_empty(), "fixture dives tunnelled: {troubles:?}");
+    }
+
+    /// Walking the real planet, the camera stays level with the ground under
+    /// it: the view's up never leaves the local surface up by more than a
+    /// fraction of a degree, and the look direction holds. This locks in the
+    /// planet's *true* centre -- with the old bounding-box centre, gravity
+    /// leant 2.4 degrees off the real ground in a direction fixed in world
+    /// space, and the camera holding itself to that down slowly tilted
+    /// against the surface as the player walked: the reported "camera
+    /// gradually shifts downwards as I move", whatever `flatten` said.
+    #[test]
+    fn the_camera_stays_level_over_a_planet_walk() {
+        let mut app = with_a_loader();
+        app.update();
+        app.world_mut().write_message(LoadLevel(LevelId::Planet));
+        let started = std::time::Instant::now();
+        let mut frames = 0;
+        while app.world().resource::<LevelLoad>().busy() || frames == 0 {
+            app.update();
+            frames += 1;
+            assert!(started.elapsed().as_secs() < 60, "the planet never loaded");
+        }
+        let centre = match app.world().resource::<LevelData>().shape() {
+            Shape::Planet { centre, .. } => centre,
+            Shape::Flat => panic!("flat"),
+        };
+        let mut baseline: Option<f32> = None;
+        let mut worst_tilt = 0.0_f32;
+        let mut worst_drift = 0.0_f32;
+        for step in 0..2400 {
+            app.world_mut()
+                .resource_mut::<crate::input::InputState>()
+                .move_axis = Vec2::new(0.0, 1.0);
+            app.update();
+            // The first seconds are the landing and the view settling onto
+            // the ground's frame; the walk after that is what must hold.
+            if step < 300 || step % 20 != 0 {
+                continue;
+            }
+            let player = {
+                let mut players = app
+                    .world_mut()
+                    .query_filtered::<&Transform, With<player::Player>>();
+                players.single(app.world()).expect("no player").translation
+            };
+            let up = (player - centre).normalize();
+            let (level_off, look) = {
+                let mut cams = app.world_mut().query::<(
+                    &Transform,
+                    &crate::camera::FollowCamera,
+                    &bevy::camera::Camera3d,
+                )>();
+                let (transform, follow, _) = cams.single(app.world()).expect("no camera");
+                let forward = transform.rotation * Vec3::NEG_Z;
+                (
+                    (follow.view * Vec3::Y).dot(up).acos().to_degrees(),
+                    forward.dot(up),
+                )
+            };
+            worst_tilt = worst_tilt.max(level_off);
+            let base = *baseline.get_or_insert(look);
+            worst_drift = worst_drift.max((look - base).abs());
+        }
+        assert!(
+            worst_tilt < 0.6,
+            "the view leant {worst_tilt}° off the ground's own up"
+        );
+        assert!(
+            worst_drift < 0.03,
+            "the look direction drifted {worst_drift} against the ground mid-walk"
+        );
+    }
+
     /// The whole feature, end to end, on the real `assets/bevy/planet.glb`: ask
     /// for the planet from a running game, wait for it, and then stand on it.
     ///
@@ -1695,15 +2051,28 @@ mod tests {
         }
         assert_eq!(*app.world().resource::<LevelId>(), LevelId::Planet);
 
-        // Gravity points at the middle of it, which is the thing asked for.
-        let gravity = *app.world().resource::<Gravity>();
-        assert_eq!(gravity, Gravity::towards(PLANET_CENTRE));
-
         // And the collision is the real generated terrain rather than the empty
         // stand-in the level came up with.
         let Shape::Planet { centre, radius } = app.world().resource::<LevelData>().shape() else {
             panic!("the planet's collision is still flat");
         };
+
+        // Gravity points at the middle of it -- the *measured* middle, the
+        // same one the collision answers around, which for this planet is
+        // the sea sphere's own centre a few centimetres off the authored
+        // origin. Pointing anywhere else is the 2.4-degree lean the camera
+        // used to slowly tilt by.
+        let gravity = *app.world().resource::<Gravity>();
+        let Gravity::Radial {
+            centre: pulls_at, ..
+        } = gravity
+        else {
+            panic!("the planet's gravity is {gravity:?}, not radial");
+        };
+        assert!(
+            (pulls_at - centre).length() < 1e-3,
+            "gravity pulls at {pulls_at}, the ground's middle is {centre}"
+        );
         assert!(
             (550.0..650.0).contains(&radius),
             "planet.glb measured {radius} m across the middle"
@@ -1864,16 +2233,17 @@ mod tests {
 
         // The second world is really there, twice over: its ground answers
         // where its orbit has it, and its scene is drawn there. Probed from
-        // sixty metres up, the same clearance the spawn search uses: `radius`
-        // is a mean and the terrain rises tens of metres over it, so a probe
-        // from one metre up can begin inside a mountain.
+        // well over the highest terrain: `radius` is a mean and this
+        // planet's peaks stand sixty-five metres over it, so a lower probe
+        // can begin inside a mountain and cast down through solid rock to
+        // nothing.
         let level = app.world().resource::<LevelData>();
-        let over_the_copy = centres[1] + Vec3::Y * (radius + 60.0);
+        let over_the_copy = centres[1] + Vec3::Y * (radius + 120.0);
         let (ground, _) = level
             .ground_below(over_the_copy, Vec3::Y)
             .expect("no ground on the second planet");
         assert!(
-            ((ground - centres[1]).length() - radius).abs() < 60.0,
+            ((ground - centres[1]).length() - radius).abs() < 100.0,
             "the copy's ground is {} m from its middle",
             (ground - centres[1]).length()
         );

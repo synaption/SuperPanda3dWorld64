@@ -259,26 +259,43 @@ pub fn chart(
     mut buffers: ResMut<Assets<ShaderBuffer>>,
 ) {
     let mut measured = Curve::default();
-    if *id == LevelId::PlanetOrbit {
-        if let Shape::Planet { radius, .. } = collision.shape() {
-            let rider = riders.single().ok().copied().unwrap_or_default();
-            if let Rider {
-                world: Some(held),
-                hold,
-            } = rider
-            {
-                if hold > 0.0 {
-                    let alpha = fixed.overstep_fraction().clamp(0.0, 1.0);
-                    let (centre, _) = system.blended(alpha)[held];
-                    let up = (pose.translation - centre).normalize_or(Vec3::Y);
-                    // The grip is the rider's hold times the console row: the
-                    // hold is what fades the map out through the gravity band,
-                    // and the row is the debug toggle -- `flatten 0` is the
-                    // true sphere for the price of one console line.
-                    measured = Curve::over(centre, radius, up, hold * tuning.flatten);
+    match *id {
+        LevelId::PlanetOrbit => {
+            if let Shape::Planet { radius, .. } = collision.shape() {
+                let rider = riders.single().ok().copied().unwrap_or_default();
+                if let Rider {
+                    world: Some(held),
+                    hold,
+                } = rider
+                {
+                    if hold > 0.0 {
+                        let alpha = fixed.overstep_fraction().clamp(0.0, 1.0);
+                        let (centre, _) = system.blended(alpha)[held];
+                        let up = (pose.translation - centre).normalize_or(Vec3::Y);
+                        // The grip is the rider's hold times the console row:
+                        // the hold is what fades the map out through the
+                        // gravity band, and the row is the debug toggle --
+                        // `flatten 0` is the true sphere for the price of one
+                        // console line.
+                        measured = Curve::over(centre, radius, up, hold * tuning.flatten);
+                    }
                 }
             }
         }
+        // The lone planet flattens too: it does not orbit and nothing ever
+        // lets go of you, so there is no rider to read a hold off -- the
+        // planet holds you always, and the picture is flat at the full
+        // console grip. Without this arm the level always drew the true
+        // sphere, and the camera holding itself to the turning local up read
+        // as "constantly adjusting downwards" against it -- the very
+        // curvature this module exists to take out of the picture.
+        LevelId::Planet => {
+            if let Shape::Planet { centre, radius } = collision.shape() {
+                let up = (pose.translation - centre).normalize_or(Vec3::Y);
+                measured = Curve::over(centre, radius, up, tuning.flatten);
+            }
+        }
+        LevelId::Castle => {}
     }
     *curve = measured;
     let _ = buffers.insert(&CURVE, ShaderBuffer::from(measured));
@@ -305,11 +322,16 @@ pub fn uncull(
     id: Res<LevelId>,
     fenced: Query<Entity, (With<Mesh3d>, Without<NoFrustumCulling>)>,
 ) {
-    if *id != LevelId::PlanetOrbit {
+    // Both planet levels bend their vertices now, so both must not cull
+    // against where the meshes truly stand.
+    if !matches!(*id, LevelId::Planet | LevelId::PlanetOrbit) {
         return;
     }
     for entity in &fenced {
-        commands.entity(entity).insert(NoFrustumCulling);
+        // `try_insert`: a level switch this same frame despawns the meshes
+        // this query saw, and a queued insert on one of those must be a
+        // no-op, not a panic.
+        commands.entity(entity).try_insert(NoFrustumCulling);
     }
 }
 
@@ -507,6 +529,33 @@ mod tests {
             Curve::read(buffers.get(&CURVE).expect("the buffer should exist"))
         };
         assert_eq!(adrift.zenith.w, 0.0, "an adrift player still got a map");
+
+        // The lone planet grips with no rider at all: it never lets go of
+        // you, so the flat picture is simply on -- this is the arm that
+        // stops that level drawing the true sphere and the camera visibly
+        // chasing its curvature.
+        world.insert_resource(LevelId::Planet);
+        world.insert_resource(LevelData::planet(
+            &[],
+            &[],
+            Vec3::new(4.0, -2.0, 9.0),
+            RADIUS,
+            None,
+        ));
+        world.insert_resource(RenderPose {
+            translation: Vec3::new(4.0, -2.0, 9.0) + Vec3::Y * (RADIUS + 2.0),
+            rotation: Quat::IDENTITY,
+        });
+        world.run_system_once(chart).expect("the chart should run");
+        let lone = {
+            let buffers = world.resource::<Assets<ShaderBuffer>>();
+            Curve::read(buffers.get(&CURVE).expect("the buffer should exist"))
+        };
+        assert!(lone.zenith.w > 0.99, "the lone planet did not grip the map");
+        assert!(
+            (lone.home.truncate() - Vec3::new(4.0, -2.0, 9.0)).length() < 1e-3,
+            "the lone planet's map is over the wrong middle"
+        );
     }
 }
 
