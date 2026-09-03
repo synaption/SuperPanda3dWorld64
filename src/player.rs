@@ -189,6 +189,47 @@ fn approach(value: f32, target: f32, step: f32) -> f32 {
     }
 }
 
+/// One discontinuous change something made to the velocity: what did it, how
+/// much speed it added or removed, how far off the ground the body was, and
+/// how long ago. Only the orrery's readout reads it -- it exists so "my
+/// straight line bent" can be answered with the name of the code that bent
+/// it instead of a guess. The height settles the argument the name alone
+/// cannot: a wall push at half a metre is the terrain being brushed, and a
+/// wall push at twenty metres of clear air is a bug in the wall resolution
+/// itself, and the two need entirely different fixes.
+#[derive(Clone, Copy, Debug)]
+pub struct Kick {
+    pub cause: &'static str,
+    pub speed: f32,
+    pub age: f32,
+    /// Metres between the feet and the ground beneath them when it happened;
+    /// infinite where the cast found no ground at all.
+    pub height: f32,
+}
+
+/// Files a kick for the readout, if it is big enough to be felt rather than
+/// arithmetic dust.
+fn note(kick: &mut Option<Kick>, cause: &'static str, speed: f32, height: f32) {
+    if speed >= 0.05 {
+        *kick = Some(Kick {
+            cause,
+            speed,
+            age: 0.0,
+            height,
+        });
+    }
+}
+
+/// How far off the ground a body at `at` is, along its own up, for the kick
+/// record. Only computed when a kick actually fires, so the extra cast costs
+/// nothing on a clean tick.
+fn clearance_of(level: &LevelData, at: Vec3, up: Vec3) -> f32 {
+    match level.ground_below(at + up * 0.75, up) {
+        Some((ground, _)) => (at - ground).dot(up),
+        None => f32::INFINITY,
+    }
+}
+
 #[derive(Component)]
 pub struct Controller {
     pub velocity: Vec3,
@@ -207,6 +248,8 @@ pub struct Controller {
     /// last one, so a held button reads as a combo and a pause resets it.
     pub combo: u8,
     since_attack: f32,
+    /// The last thing that discontinuously changed the velocity. See [`Kick`].
+    pub kick: Option<Kick>,
 }
 
 impl Default for Controller {
@@ -223,6 +266,7 @@ impl Default for Controller {
             land_left: 0.0,
             combo: 0,
             since_attack: COMBO_WINDOW,
+            kick: None,
         }
     }
 }
@@ -284,6 +328,11 @@ pub fn movement(
     let Ok((mut transform, mut previous, mut ctrl, mut health)) = player.single_mut() else {
         return;
     };
+    // The kick record ages once a tick, here at the top so every note below
+    // starts its clock from zero.
+    if let Some(kick) = ctrl.kick.as_mut() {
+        kick.age += FIXED_DT;
+    }
     // Where this tick's integration starts, for the sweeps below. Not
     // `previous` -- [`remember`] filed that before `orbit::advance` carried
     // him round with his planet, and a sweep opened from the pre-ride
@@ -388,13 +437,13 @@ pub fn movement(
         }
         return;
     }
-    // Inside a planet's pull the gravity is the pilot: an approach that was
-    // mid-burn when it got this far has arrived, and lets go. A lock that
-    // never flew -- made standing on the ground, lining up the trip --
-    // stays, marker and all, waiting for the lift-off.
-    if pilot.engaged() && pilot.phase != autopilot::Phase::Idle {
-        pilot.disengage();
-    }
+    // Inside a planet's pull the crossing is not over: the computer that
+    // flew it rides the descent too, further down where the vertical speed
+    // lives -- the jet against the fall, held to the pace the height left
+    // can absorb -- and lets go on touchdown. What ends it early is the
+    // stick: unlike the weightless coast, where a thumb only borrows the
+    // tick, grabbing the controls on the descent ends the trip -- a lock
+    // left armed here is the lock that drags the next lift-off back down.
 
     // `forward`/`right` hand back a `Direction3d` rather than a `Vec3`: a
     // vector the type system knows is unit length. Flattening one onto the
@@ -414,6 +463,14 @@ pub fn movement(
         sounds.push(Sfx::Splash);
     }
     let boost = input_state.boost && state.active == ActiveCharacter::Luna;
+    // The stick is the abort while the computer is flying the descent, and
+    // water is as arrived as ground for a lock that flew here.
+    if pilot.phase != autopilot::Phase::Idle && (wish != Vec3::ZERO || jump_pressed || boost) {
+        pilot.disengage();
+    }
+    if pilot.flown && ctrl.submersion.in_water() {
+        pilot.disengage();
+    }
     let skate = boost && ctrl.grounded && !ctrl.submersion.in_water();
     if skate {
         // The skate is free, but it is not free *and* charging: holding the
@@ -509,7 +566,11 @@ pub fn movement(
             // rise is what keeps the booster a hop on a level with a roof
             // over it, and is exactly what stops it clearing a planet's
             // gravity, which the command exists to do.
-            let ceiling = if infinite { f32::INFINITY } else { tuning.jet_rise };
+            let ceiling = if infinite {
+                f32::INFINITY
+            } else {
+                tuning.jet_rise
+            };
             rise = (rise + tuning.jet_thrust).min(ceiling);
         } else if !ctrl.grounded {
             // The original stepped a flat -1.2 onto the speed every frame at
@@ -517,7 +578,37 @@ pub fn movement(
             // planet can point it somewhere else without also changing it --
             // and, in a system, weaken it: `strength` fades with altitude on
             // the way out to the weightless middle the branch above owns.
-            rise -= gravity.strength(transform.translation) * FIXED_DT;
+            let pull = gravity.strength(transform.translation);
+            rise -= pull * FIXED_DT;
+            // The flight computer rides the descent it began: the same jet,
+            // out of the same bar, fired whenever the fall outruns what the
+            // height still below can absorb -- the crossing's braking rule
+            // brought indoors, floored at a touchdown pace so it lands.
+            if pilot.engaged() && pilot.phase != autopilot::Phase::Idle {
+                let mut altitude = match level.shape() {
+                    Shape::Planet { centre, radius } => {
+                        (transform.translation - centre).length() - radius
+                    }
+                    Shape::Flat => transform.translation.y,
+                };
+                // Sea level is the reference; the terrain under the feet,
+                // where the cast reaches it, is the truth.
+                if let Some((ground, _)) = level.ground_below(transform.translation, up) {
+                    altitude = altitude.min((transform.translation - ground).dot(up));
+                }
+                let brake = tuning.jet_thrust / FIXED_DT - pull;
+                if rise < -autopilot::descent_limit(brake, altitude)
+                    && (infinite
+                        || energy
+                            .as_deref_mut()
+                            .is_none_or(|energy| energy.thrust(FIXED_DT)))
+                {
+                    let before = rise;
+                    rise = (rise + tuning.jet_thrust).min(tuning.jet_rise);
+                    note(&mut ctrl.kick, "autopilot brake", rise - before, altitude);
+                    pilot.phase = autopilot::Phase::Brake;
+                }
+            }
         }
     }
 
@@ -557,6 +648,8 @@ pub fn movement(
         let into_wall = ctrl.velocity.dot(normal);
         if into_wall < 0.0 {
             ctrl.velocity -= normal * into_wall;
+            let height = clearance_of(&level, transform.translation, up);
+            note(&mut ctrl.kick, "wall push", -into_wall, height);
         }
     }
     transform.translation = corrected;
@@ -580,13 +673,23 @@ pub fn movement(
             let head_room = (ceiling - transform.translation).dot(up);
             if head_room < PLAYER_HEIGHT {
                 transform.translation += up * (head_room - PLAYER_HEIGHT);
+                let height = clearance_of(&level, transform.translation, up);
+                note(&mut ctrl.kick, "ceiling bump", rise, height);
                 rise = 0.0;
             }
         }
     }
     let was_grounded = ctrl.grounded;
     let impact = rise;
-    let floor = level.ground_below(transform.translation + up * 0.75, up);
+    // A wall-steep face is not a floor, however squarely it sits underfoot:
+    // it belongs to `resolve_walls`, and settling the feet onto it while the
+    // walls shove the capsule out of it was the ground randomly kicking
+    // whoever walked the hills. Filtered here rather than inside
+    // `ground_below`, because every other reader of that query -- the
+    // shadow, the autopilot's altitude -- wants the surface as it is.
+    let floor = level
+        .ground_below(transform.translation + up * 0.75, up)
+        .filter(|&(_, normal)| normal.dot(up).abs() > crate::level::GROUND_NORMAL_Y);
     // A wader keeps the ordinary floor logic: in water shallower than the
     // float depth the bottom is under his feet and he walks along it, which is
     // the whole difference between wading and swimming.
@@ -615,9 +718,17 @@ pub fn movement(
             transform.translation = ground + up * gap;
             rise = 0.0;
             ctrl.grounded = true;
+            // Touchdown is the end of the errand: a lock the computer flew
+            // lets go the moment the feet are down, so the next lift-off is
+            // free. A lock made *standing* here, lining up a trip, never
+            // flew and stays.
+            if pilot.flown {
+                pilot.disengage();
+            }
             if !was_grounded && impact < -LANDING_IMPACT {
                 sounds.push(Sfx::Land);
                 ctrl.land_left = LAND_SECONDS;
+                note(&mut ctrl.kick, "landing", -impact, 0.0);
             }
         } else if ctrl.grounded {
             ctrl.grounded = false;
@@ -746,12 +857,7 @@ pub fn movement(
 ///
 /// Returns whether anything was hit, so the caller can reconcile whatever it
 /// was carrying about the velocity by hand.
-fn sweep(
-    level: &LevelData,
-    from: Vec3,
-    ctrl: &mut Controller,
-    transform: &mut Transform,
-) -> bool {
+fn sweep(level: &LevelData, from: Vec3, ctrl: &mut Controller, transform: &mut Transform) -> bool {
     let travel = transform.translation - from;
     if travel.length_squared() <= PLAYER_RADIUS * PLAYER_RADIUS {
         return false;
@@ -768,6 +874,8 @@ fn sweep(
     let into = ctrl.velocity.dot(normal);
     if into < 0.0 {
         ctrl.velocity -= normal * into;
+        // On the surface it was stopped on, by construction.
+        note(&mut ctrl.kick, "swept into surface", -into, 0.0);
     }
     true
 }
@@ -1326,7 +1434,11 @@ mod tests {
         tick(&mut world, 30);
         let (position, _, grounded, _) = player(&mut world);
         assert!(grounded, "never landed: he is at {position}");
-        assert!(position.y > -0.5, "fell through the floor to {}", position.y);
+        assert!(
+            position.y > -0.5,
+            "fell through the floor to {}",
+            position.y
+        );
     }
 
     /// Weightless between two planets, the jetpack is the whole controller and
@@ -1415,7 +1527,10 @@ mod tests {
         tick(&mut world, 1);
         let leaning = head(&mut world).dot(Vec3::X);
         assert!(leaning > start + 0.01, "one tick did not begin the lean");
-        assert!(leaning < 0.9, "the pose snapped instead of easing: {leaning}");
+        assert!(
+            leaning < 0.9,
+            "the pose snapped instead of easing: {leaning}"
+        );
         tick(&mut world, 90);
         assert!(
             head(&mut world).dot(Vec3::X) > 0.95,
@@ -1537,8 +1652,9 @@ mod tests {
         // The same seat at both ends of the tick: he stood still on his spot
         // of ground, and only the world moved.
         let seat = Vec3::new(212.0, 212.0, 0.0);
-        let previous =
-            PreviousPose::new(&Transform::from_translation(system.previous[0].seated(seat)));
+        let previous = PreviousPose::new(&Transform::from_translation(
+            system.previous[0].seated(seat),
+        ));
         let root = Transform::from_translation(system.bodies[0].seated(seat));
         let held = crate::orbit::Rider {
             world: Some(0),
@@ -1554,7 +1670,13 @@ mod tests {
             "held at full grip he should sit on the blended ground, not {} away",
             (drawn - ground).length()
         );
-        let (chord, _) = ride_blend(&system, crate::orbit::Rider::default(), &previous, &root, 0.5);
+        let (chord, _) = ride_blend(
+            &system,
+            crate::orbit::Rider::default(),
+            &previous,
+            &root,
+            0.5,
+        );
         assert!(
             (chord - ground).length() > 1.0,
             "the chord should visibly miss the arc here, or this test proves nothing"
@@ -1579,8 +1701,13 @@ mod tests {
             hold: 1.0,
         };
         let (ridden_t, ridden_r) = ride_blend(&system, held, &previous, &root, 0.4);
-        let (loose_t, loose_r) =
-            ride_blend(&system, crate::orbit::Rider::default(), &previous, &root, 0.4);
+        let (loose_t, loose_r) = ride_blend(
+            &system,
+            crate::orbit::Rider::default(),
+            &previous,
+            &root,
+            0.4,
+        );
         assert!(
             (ridden_t - loose_t).length() < 1e-3,
             "a still frame changed the drawn position by {}",

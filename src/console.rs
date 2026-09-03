@@ -377,6 +377,20 @@ pub const SPECS: &[TunableSpec] = &[
         doc: "most bodies that share one worked-out route",
     },
     TunableSpec {
+        name: "debug",
+        low: 0.0,
+        high: 1.0,
+        step: 1.0,
+        doc: "the always-on debug readouts: fps, frame chart, help text (0 hides)",
+    },
+    TunableSpec {
+        name: "test_world",
+        low: 0.0,
+        high: 1.0,
+        step: 1.0,
+        doc: "adds the diagnostic bodies to the solar system -- smooth sphere, flat platform, toroid (reload the level)",
+    },
+    TunableSpec {
         name: "path_debug",
         low: 0.0,
         high: 3.0,
@@ -717,6 +731,20 @@ pub struct GameTuning {
     /// Draws the routes (1), the navigation grid over them (2), and the crowd's
     /// flow field over that (3). See [`crate::path::draw`].
     pub path_debug: f32,
+    /// The always-on debug furniture -- the fps line, the frame chart, and
+    /// the F1 help text. On by default because this is a build under
+    /// development; `debug 0` clears the screen of all of it at once, where
+    /// the `*_debug` rows below each own one overlay.
+    pub debug: f32,
+    /// The solar system gains [`crate::world::FIXTURES`]'s diagnostic bodies
+    /// -- a perfectly smooth planet-sized sphere, a flat planet-sized
+    /// platform, and a toroid -- as separate entities in addition to the
+    /// planets, standing still in the belt between the sun and the orbits.
+    /// The control experiment for anything blamed on the ground: a jerk on
+    /// the sphere is not the terrain's doing, one on the platform is not the
+    /// curvature's either. Read at level load, so it wants a level reload to
+    /// take effect.
+    pub test_world: f32,
     /// Draws the collision bodies (1), the mesh they are resolved against (2),
     /// and the grid and candidate lists behind that (3). See
     /// [`crate::collide::draw`].
@@ -900,6 +928,8 @@ impl Default for GameTuning {
             // like two squads; one of fourteen behaves like a crowd.
             path_group: 10.0,
             path_debug: 0.0,
+            debug: 1.0,
+            test_world: 0.0,
             collide_debug: 0.0,
             space_debug: 0.0,
             enemy_speed: 1.8,
@@ -975,10 +1005,10 @@ impl Default for GameTuning {
             // inner world laps the sun in twelve minutes and spins through a
             // five-minute day; the outer runs slower on both counts, the way
             // an outer planet does.
-            planet1_dist: 2600.0,
-            planet2_dist: 4200.0,
-            planet1_orbit: 0.5,
-            planet2_orbit: 0.3,
+            planet1_dist: 5200.0,
+            planet2_dist: 8400.0,
+            planet1_orbit: 1.0,
+            planet2_orbit: 0.6,
             planet1_spin: 1.2,
             planet2_spin: 0.8,
             // The full map: the flattening exists because the true sphere
@@ -1038,6 +1068,8 @@ impl GameTuning {
             "path_clearance" => self.path_clearance,
             "path_spread" => self.path_spread,
             "path_group" => self.path_group,
+            "debug" => self.debug,
+            "test_world" => self.test_world,
             "path_debug" => self.path_debug,
             "collide_debug" => self.collide_debug,
             "space_debug" => self.space_debug,
@@ -1124,6 +1156,8 @@ impl GameTuning {
             "path_clearance" => self.path_clearance = value,
             "path_spread" => self.path_spread = value,
             "path_group" => self.path_group = value,
+            "debug" => self.debug = value,
+            "test_world" => self.test_world = value,
             "path_debug" => self.path_debug = value,
             "collide_debug" => self.collide_debug = value,
             "space_debug" => self.space_debug = value,
@@ -1157,6 +1191,81 @@ impl GameTuning {
             _ => unreachable!(),
         }
         Ok((previous, value))
+    }
+}
+
+/// Where the console's rows are kept between runs, beside wherever the game
+/// was launched from. Plain lines of `name value`, so it can be read, edited
+/// or deleted by hand -- deleting it is the factory reset.
+pub const TUNING_FILE: &str = "tuning.cfg";
+
+impl GameTuning {
+    /// The rows as saved: one line per row that is not at its default, so the
+    /// file reads as "what I changed" and a default that improves in a later
+    /// build is not pinned to its old value by every old save.
+    pub fn to_saved(&self) -> String {
+        let defaults = GameTuning::default();
+        let mut out = String::from("# console rows changed from their defaults; delete to reset\n");
+        for spec in SPECS {
+            let value = self.get(spec.name).unwrap_or_default();
+            if value != defaults.get(spec.name).unwrap_or_default() {
+                out.push_str(&format!("{} {}\n", spec.name, value));
+            }
+        }
+        out
+    }
+
+    /// Applies saved lines over whatever the values are now. Unknown names
+    /// and unparsable lines are skipped rather than fatal: a row renamed in a
+    /// later build loses its saved value, which is the least surprising thing
+    /// a rename can do to an old file.
+    pub fn apply_saved(&mut self, text: &str) {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut words = line.split_whitespace();
+            let (Some(name), Some(value)) = (words.next(), words.next()) else {
+                continue;
+            };
+            if let Ok(value) = value.parse::<f32>() {
+                let _ = self.set(name, value);
+            }
+        }
+    }
+
+    /// The defaults with [`TUNING_FILE`]'s changes over them, for the game's
+    /// startup. Only the windowed game loads this -- tests, screenshots and
+    /// benchmarks stay on the defaults, so a slider moved yesterday cannot
+    /// change what a test measures today.
+    pub fn load_saved() -> Self {
+        let mut tuning = Self::default();
+        if let Ok(text) = std::fs::read_to_string(TUNING_FILE) {
+            tuning.apply_saved(&text);
+        }
+        tuning
+    }
+}
+
+/// Writes the rows back to [`TUNING_FILE`] when they change.
+///
+/// Debounced by half a second of quiet rather than written on the frame of
+/// the change, because a slider being dragged changes the resource every
+/// frame it moves; the file lands when the hand comes off. Registered only by
+/// the windowed game, beside [`GameTuning::load_saved`].
+pub fn persist(tuning: Res<GameTuning>, time: Res<Time>, mut countdown: Local<Option<f32>>) {
+    if tuning.is_changed() && !tuning.is_added() {
+        *countdown = Some(0.5);
+    }
+    if let Some(left) = countdown.as_mut() {
+        *left -= time.delta_secs();
+        if *left <= 0.0 {
+            *countdown = None;
+            if let Err(trouble) = std::fs::write(TUNING_FILE, tuning.to_saved()) {
+                eprintln!("could not save {TUNING_FILE}: {trouble}");
+            }
+        }
     }
 }
 
@@ -2098,6 +2207,37 @@ pub fn draw(
 
 #[cfg(test)]
 mod tests {
+
+    /// What was changed is what comes back: the saved text round-trips the
+    /// changed rows, holds only them, and shrugs off the junk a hand-edited
+    /// file accumulates.
+    #[test]
+    fn saved_rows_survive_the_trip_and_defaults_stay_free() {
+        use super::GameTuning;
+        let mut tuning = GameTuning::default();
+        tuning.set("luna_speed", 17.0).unwrap();
+        tuning.set("debug", 0.0).unwrap();
+        let saved = tuning.to_saved();
+        assert!(saved.contains("luna_speed 17"), "{saved}");
+        assert!(saved.contains("debug 0"), "{saved}");
+        // A row left at its default is not pinned by the file.
+        assert!(!saved.contains("mario_speed"), "{saved}");
+        let mut back = GameTuning::default();
+        back.apply_saved(&saved);
+        assert_eq!(back.get("luna_speed"), Some(17.0));
+        assert_eq!(back.get("debug"), Some(0.0));
+        // Comments, blanks, unknown names and garbage numbers are all skipped.
+        back.apply_saved("# note\n\nno_such_row 4\njump_velocity eleven\ndecel 3\n");
+        assert_eq!(back.get("decel"), Some(3.0));
+        assert_eq!(
+            back.get("jump_velocity"),
+            GameTuning::default().get("jump_velocity")
+        );
+        // And a saved value beyond a row's rail is clamped onto it, exactly
+        // as typing it into the console would be.
+        back.apply_saved("luna_speed 9999\n");
+        assert_eq!(back.get("luna_speed"), Some(30.0));
+    }
 
     /// Every row on the panel actually reads and writes something.
     ///

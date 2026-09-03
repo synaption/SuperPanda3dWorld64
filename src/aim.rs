@@ -212,12 +212,18 @@ pub fn drive(
     let (mut wanted_yaw, mut wanted_pitch) = (0.0, 0.0);
     if armed {
         if let Ok(body) = player.single() {
-            let facing = body.rotation * Vec3::Z;
-            wanted_yaw = wrap(heading(direction) - heading(facing));
+            // The aim taken into the body's own frame, where the pivot's yaw
+            // and pitch actually live. On a flat level the body's frame is a
+            // yaw about `+Y` and this is exactly the old heading arithmetic;
+            // on a planet the body stands along the local up, and measuring
+            // against the world's axes instead would swing the torso as the
+            // ground turns underneath.
+            let local = body.rotation.inverse() * direction;
+            wanted_yaw = wrap(local.x.atan2(local.z));
             // A fraction of the shot's elevation rather than all of it: the
             // chest leans into a high shot, the arm does the rest. The doc's
             // 55%, and the reason the pivot alone does not look like a turret.
-            wanted_pitch = direction.y.clamp(-1.0, 1.0).asin() * tuning.torso_pitch;
+            wanted_pitch = local.y.clamp(-1.0, 1.0).asin() * tuning.torso_pitch;
         }
     }
     let limit = tuning.torso_limit.to_radians();
@@ -268,6 +274,7 @@ pub fn turn_body(
     tuning: Res<GameTuning>,
     loadout: Res<Loadout>,
     aim: Res<Aim>,
+    gravity: Res<crate::gravity::Gravity>,
     mut player: Query<(&mut Transform, &Controller), With<Player>>,
 ) {
     if !loadout.equipped.is_ranged() {
@@ -276,7 +283,11 @@ pub fn turn_body(
     let Ok((mut transform, ctrl)) = player.single_mut() else {
         return;
     };
-    let moving = Vec3::new(ctrl.velocity.x, 0.0, ctrl.velocity.z).length() > 0.25;
+    let moving = gravity
+        .split(ctrl.velocity, transform.translation)
+        .1
+        .length()
+        > 0.25;
     // Standing still he settles back to the comfortable twist; running, only
     // the hard limit moves him, because the legs already have a direction and
     // the doc is explicit that locomotion owns them.
@@ -292,7 +303,12 @@ pub fn turn_body(
     }
     let step = tuning.torso_turn_rate.to_radians() * FIXED_DT;
     let turn = owed.clamp(-step, step);
-    transform.rotation = Quat::from_rotation_y(heading(transform.rotation * Vec3::Z) + turn);
+    // Turned about the local up rather than rebuilt as a world-`Y` heading:
+    // on a flat level the two are the same rotation, and on a planet the old
+    // rebuild threw away the body's stand-on-the-ground orientation, snapping
+    // him flat to the world's axes the moment a gun came out.
+    let up = gravity.up(transform.translation);
+    transform.rotation = Quat::from_axis_angle(up, turn) * transform.rotation;
 }
 
 /// Claiming and driving, in the window where a pose may be written.

@@ -1,7 +1,19 @@
 {
+  "_walk": {
+    "frames": 26,
+    "loop_end": 26,
+    "loop_start": 0,
+    "start_frame": 0
+  },
   "bite": {
     "frames": 7,
     "loop_end": 7,
+    "loop_start": 0,
+    "start_frame": 0
+  },
+  "rigify_walk": {
+    "frames": 27,
+    "loop_end": 27,
     "loop_start": 0,
     "start_frame": 0
   },

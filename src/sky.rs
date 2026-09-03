@@ -1093,9 +1093,7 @@ pub fn advance(
     // there. Missing pieces fall back rather than skipping the frame: a
     // headless world with no camera still wants its light run.
     let (up, eye) = match (&gravity, fog.single()) {
-        (Some(gravity), Ok((_, _, camera))) => {
-            (gravity.up(camera.translation), camera.translation)
-        }
+        (Some(gravity), Ok((_, _, camera))) => (gravity.up(camera.translation), camera.translation),
         _ => (Vec3::Y, Vec3::ZERO),
     };
     let view = overhead(kind, &sky, up, eye);

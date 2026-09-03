@@ -30,6 +30,11 @@
 //!      is the agreement this overlay exists to check -- and the orbit rings
 //!      are the picture the `planet*_dist` rows redraw as they are dragged.
 //!
+//! Both layers share one panel of *numbers* -- the [`Readout`]: who holds the
+//! player, the grip, the altitude, the felt pull, and the velocity said in
+//! the ground's own frame. Arrows show direction and hide magnitude; when the
+//! question is "why did my straight line bend", the numbers are the evidence.
+//!
 //! One instrument is on without either layer: an engaged [`Autopilot`] draws
 //! its own line to its destination and the ring it will stop at, because the
 //! player flying that crossing is not debugging, they are navigating.
@@ -43,7 +48,7 @@ use crate::{
     console::GameTuning,
     gravity::{Gravity, FALL, GRAVITY_FADE, GRAVITY_RANGE},
     level::{LevelData, Shape},
-    orbit::{SolarSystem, SUN_CENTRE, SUN_RADIUS},
+    orbit::{Rider, SolarSystem, SUN_CENTRE, SUN_RADIUS},
     player::{Controller, Player, RenderPose},
     sky::Sky,
     world::LevelId,
@@ -84,17 +89,137 @@ const TETHER: Color = Color::srgba(0.9, 0.9, 0.9, 0.35);
 const SUNWARD: Color = Color::srgb(1.0, 0.85, 0.3);
 const TERMINATOR: Color = Color::srgba(1.0, 0.55, 0.2, 0.7);
 
+/// The instruments' one line of *text*: which world holds the player, how
+/// high above it he is, and how hard it pulls. The arrows of [`draw`] show
+/// direction well and magnitude poorly, and when the frame itself is in
+/// question -- "why did my straight line bend" -- the numbers behind the ride
+/// are the evidence: a grip that is not the 100% expected, an altitude inside
+/// the fade band, a ground speed that is not what the keys are asking for.
+#[derive(Component)]
+pub struct Readout;
+
+/// Puts the readout on the screen, hidden until `space_debug` asks for it.
+/// Top left: the frame chart owns the top right, the bars the bottom left,
+/// and the action picker the bottom right.
+pub fn spawn(commands: &mut Commands) {
+    commands.spawn((
+        Readout,
+        Text::new(""),
+        TextFont {
+            font_size: FontSize::Px(14.0),
+            ..default()
+        },
+        TextColor(Color::srgb(0.75, 0.9, 1.0)),
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(16.0),
+            top: Val::Px(40.0),
+            ..default()
+        },
+        Visibility::Hidden,
+        GlobalZIndex(20),
+    ));
+}
+
+/// Writes the readout, every frame `space_debug` is up.
+#[allow(clippy::too_many_arguments)]
+pub fn readout(
+    tuning: Res<GameTuning>,
+    level: Res<LevelData>,
+    gravity: Res<Gravity>,
+    id: Res<LevelId>,
+    pose: Res<RenderPose>,
+    player: Query<(&Controller, Option<&Rider>), With<Player>>,
+    mut text: Query<(&mut Text, &mut Visibility), With<Readout>>,
+) {
+    let Ok((mut text, mut visible)) = text.single_mut() else {
+        return;
+    };
+    if tuning.space_debug.round() as u32 == 0 {
+        *visible = Visibility::Hidden;
+        return;
+    }
+    *visible = Visibility::Inherited;
+    let Ok((ctrl, rider)) = player.single() else {
+        return;
+    };
+    let at = pose.translation;
+
+    // Who holds him: the same record the ride and `sync_visual` steer by, so
+    // when the picture is wrong this line says which frame it was drawn in.
+    let held = match *id {
+        LevelId::PlanetOrbit => {
+            let rider = rider.copied().unwrap_or_default();
+            match rider.world.filter(|_| rider.hold > 0.0) {
+                Some(world) => {
+                    format!(
+                        "held by planet {}  grip {:.0}%",
+                        world + 1,
+                        rider.hold * 100.0
+                    )
+                }
+                None => "held by nobody (inertial frame)".to_string(),
+            }
+        }
+        LevelId::Planet => "held by the planet  grip 100%".to_string(),
+        LevelId::Castle => "held by the castle (flat)".to_string(),
+    };
+
+    // Altitude over the nearest world the gravity answers for; sea level on
+    // the castle, which has no radius to be over.
+    let worlds = planets(&gravity, &level);
+    let altitude = worlds
+        .iter()
+        .map(|&(centre, radius)| (at - centre).length() - radius)
+        .min_by(f32::total_cmp)
+        .unwrap_or(at.y);
+
+    // The pull as the movement code will feel it, against the tuned full
+    // strength -- under 100% is the fade band, 0% is the weightless middle.
+    let pull = gravity.strength(at);
+    let fraction = 100.0 * pull / gravity.accel().max(1e-6);
+
+    // The velocity in the frame the ground defines: along it and out of it.
+    // This is the pair that should hold steady when walking or coasting
+    // "straight" -- if these are constant while the drawn arrow swings, the
+    // arrow is showing the world frame turning, not the path bending.
+    let (rise, flat) = gravity.split(ctrl.velocity, at);
+
+    // The last thing that bent the line. A jerk with a fresh "wall push" or
+    // "swept into surface" beside it is the collision's doing; one with the
+    // record standing minutes old is not the movement code at all. The
+    // height is the tiebreaker for "but I was in the air": a wall push at
+    // half a metre is terrain being brushed, and one at twenty metres of
+    // clear air is the wall resolution inventing a wall.
+    let kick = match ctrl.kick {
+        Some(kick) => {
+            let height = match kick.height.is_finite() {
+                true => format!("{:.1} m off the ground", kick.height),
+                false => "over nothing".to_string(),
+            };
+            format!(
+                "last kick: {} {:.2} m/s, {height}, {:.1} s ago",
+                kick.cause, kick.speed, kick.age
+            )
+        }
+        None => "last kick: none".to_string(),
+    };
+    **text = format!(
+        "{held}\naltitude {altitude:.1} m\ngravity {pull:.1} m/s\u{b2}  ({fraction:.0}%)\nground speed {:.2} m/s  climb {rise:+.2} m/s\n{kick}",
+        flat.length()
+    );
+}
+
 /// Every planet the gravity answers for, with the radius its shells are
 /// measured from. A system knows both of its own; a lone planet's pull knows
 /// its centre but not its size, which lives in the collision's shape.
 fn planets(gravity: &Gravity, level: &LevelData) -> Vec<(Vec3, f32)> {
     match (*gravity, level.shape()) {
-        (
-            Gravity::System {
-                centres, radius, ..
-            },
-            _,
-        ) => centres.iter().map(|&centre| (centre, radius)).collect(),
+        (Gravity::System { .. }, _) => gravity
+            .wells()
+            .iter()
+            .map(|well| (well.centre, well.radius))
+            .collect(),
         (Gravity::Radial { centre, .. }, Shape::Planet { radius, .. }) => vec![(centre, radius)],
         _ => Vec::new(),
     }
@@ -135,11 +260,13 @@ pub fn draw(
         };
         let centre = match target {
             autopilot::Target::Planet(index) => blended[index.min(1)].0,
-            autopilot::Target::Sun => crate::orbit::SUN_CENTRE,
+            // The sun and the fixtures stand still, so where they are is
+            // where they are drawn.
+            _ => target.centre(&system),
         };
         let colour = match pilot.phase {
             Phase::Brake => TERMINATOR,
-            Phase::Burn | Phase::Idle => VELOCITY,
+            Phase::Burn | Phase::Idle | Phase::Orbit => VELOCITY,
         };
         // The plan, flown ahead of time: the same guidance, the same burn
         // and the same gravity, integrated forward -- so the curve on the
@@ -159,6 +286,8 @@ pub fn draw(
             let mut ghost = Autopilot {
                 target: Some(target),
                 phase: pilot.phase,
+                mode: pilot.mode,
+                flown: false,
             };
             let mut here = at;
             let mut velocity = ctrl.velocity;
@@ -172,6 +301,15 @@ pub fn draw(
                 velocity -= gravity.up(here) * (gravity.strength(here) * PLAN_STEP);
                 here += velocity * PLAN_STEP;
                 points.push(here);
+                // A crossing's curve ends at the handover: past the stop
+                // radius the descent belongs to gravity and the jet, which
+                // this plan does not model -- drawn on, it would spear the
+                // terrain it is really landed onto.
+                if matches!(pilot.mode, autopilot::Mode::Approach)
+                    && (target.centre(&system) - here).length() <= target.stop_radius(radius)
+                {
+                    break;
+                }
             }
             // Bright at the hand, fading toward the far end: the eye reads
             // the fade as direction, so the curve says which way it is flown
@@ -288,7 +426,11 @@ pub fn draw(
     // runs -- which is the picture that answers "are the proportions right",
     // and answers it live as the `planet*_dist` rows are dragged.
     if *id == LevelId::PlanetOrbit {
-        gizmos.sphere(Isometry3d::from_translation(SUN_CENTRE), SUN_RADIUS, SUNWARD);
+        gizmos.sphere(
+            Isometry3d::from_translation(SUN_CENTRE),
+            SUN_RADIUS,
+            SUNWARD,
+        );
         let flat = Quat::from_rotation_arc(Vec3::Z, Vec3::Y);
         for &(centre, _) in &worlds {
             gizmos.circle(

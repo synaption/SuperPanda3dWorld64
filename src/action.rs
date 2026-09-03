@@ -92,7 +92,9 @@ impl Mode {
             Mode::Pylon => "hold to open a site, release to plant a mast",
             Mode::Stellarator => "hold to aim, release to build a machine",
             Mode::Nuclonium => "hold to open a circle, release to call what is in it",
-            Mode::Autopilot => "aim at a body and press to lock on; empty sky lets go",
+            Mode::Autopilot => {
+                "aim at a body and press to lock on; again to orbit; empty sky lets go"
+            }
         }
     }
 

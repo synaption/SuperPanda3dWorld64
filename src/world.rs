@@ -21,7 +21,7 @@
 //! saying so until the ground exists to stand on.
 
 use crate::{
-    console::ConsoleState,
+    console::{ConsoleState, GameTuning},
     enemy,
     flow::FlowField,
     furniture,
@@ -85,6 +85,69 @@ impl LevelId {
     }
 }
 
+/// One of the diagnostic bodies the console's `test_world` row adds to the
+/// solar system, in addition to the planets and standing still: where it is,
+/// how its gravity pulls, and whether its inside is anywhere to be.
+pub struct Fixture {
+    /// The glb under `assets/`, from `tools/build_test_world.py`.
+    pub scene: &'static str,
+    /// What the autopilot's console line calls it, and the short form its
+    /// lock-on tag wears.
+    pub name: &'static str,
+    pub tag: &'static str,
+    /// Where it stands, for ever. In the belt between the sun and the
+    /// planets' orbits, where nothing that moves ever comes.
+    pub stands_at: Vec3,
+    /// Its authored extent, for the autopilot's aiming disc and stop radius.
+    /// The measured one lives in the gravity well; a `const` table cannot
+    /// wait for a glb, and metres of difference do not matter to navigation.
+    pub radius: f32,
+    /// `Some(down)` gives its [`crate::gravity::Well`] a uniform pull -- the
+    /// flat platform, which wants to be level the way the castle is level.
+    /// `None` pulls at its middle like any planet.
+    pub down: Option<Vec3>,
+    /// Whether the inside of its bounding sphere is out-of-bounds the way a
+    /// planet's core is. False for the torus and the platform, whose insides
+    /// are honest sky.
+    pub cored: bool,
+}
+
+/// The control experiments for anything blamed on the terrain, which is why
+/// they ride a console row and not a build: the same flight can be flown over
+/// rough ground and over none. A perfectly smooth planet-sized sphere, a flat
+/// planet-sized platform, and a toroid -- each its own body with its own
+/// collision and its own pull, spawned by [`spawn`] and filed by
+/// [`finish_fixtures`] when `test_world` is on.
+pub const FIXTURES: [Fixture; 3] = [
+    Fixture {
+        scene: "bevy/test_sphere.glb",
+        name: "the test sphere",
+        tag: "SPHERE",
+        stands_at: Vec3::new(-1800.0, 0.0, 0.0),
+        radius: 300.0,
+        down: None,
+        cored: true,
+    },
+    Fixture {
+        scene: "bevy/test_platform.glb",
+        name: "the test platform",
+        tag: "PLATFORM",
+        stands_at: Vec3::new(0.0, 0.0, -2600.0),
+        radius: 150.0,
+        down: Some(Vec3::NEG_Y),
+        cored: false,
+    },
+    Fixture {
+        scene: "bevy/test_torus.glb",
+        name: "the test torus",
+        tag: "TORUS",
+        stands_at: Vec3::new(2400.0, 0.0, 2400.0),
+        radius: 410.0,
+        down: None,
+        cored: false,
+    },
+];
+
 /// Asked for a level. Written by the pause menu, read by [`switch`].
 ///
 /// A message rather than the menu doing the work, because changing level
@@ -134,6 +197,11 @@ pub struct LevelLoad {
     pub pending: Option<LevelId>,
     /// The glTF the collision is being read out of.
     handle: Handle<Gltf>,
+    /// The `test_world` fixtures still waiting to be filed: an index into
+    /// [`FIXTURES`] beside the glb it is arriving in. Emptied by
+    /// [`finish_fixtures`] once the planet itself is up, and cleared by every
+    /// [`spawn`] so a level change abandons the last level's.
+    fixtures: Vec<(usize, Handle<Gltf>)>,
     /// Why the last attempt did not work, if it did not.
     ///
     /// Kept so the pause menu can say so. A level that fails to load is
@@ -203,15 +271,20 @@ pub fn spawn(
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     load: &mut LevelLoad,
+    tuning: &GameTuning,
 ) {
     commands.insert_resource(id);
+    let scene = id.scene();
+    // Whatever fixtures the last level was still waiting on, it is not
+    // getting: a level change mid-load abandons them with everything else.
+    load.fixtures.clear();
     // A level that has no authored surfaces must not be handed the last
     // level's. `water::expect_surfaces` puts this back for the ones that do.
     commands.remove_resource::<water::PendingSurfaces>();
     let scenery = commands
         .spawn((
             LevelEntity,
-            WorldAssetRoot(assets.load(format!("{}#Scene0", id.scene()))),
+            WorldAssetRoot(assets.load(format!("{scene}#Scene0"))),
         ))
         .id();
     match id {
@@ -275,13 +348,28 @@ pub fn spawn(
                 commands.spawn((
                     LevelEntity,
                     crate::orbit::PlanetBody(1),
-                    WorldAssetRoot(assets.load(format!("{}#Scene0", id.scene()))),
+                    WorldAssetRoot(assets.load(format!("{scene}#Scene0"))),
                     Transform::from_translation(system.bodies[1].centre),
                 ));
                 commands.insert_resource(system);
+                // The diagnostic bodies, when asked for: separate entities in
+                // addition to the planets, standing still where [`FIXTURES`]
+                // puts them. Their scenery goes up now; their collision and
+                // their pull are filed by [`finish_fixtures`] as each glb
+                // arrives, after the planet's own ground is in.
+                if tuning.test_world > 0.5 {
+                    for (index, fixture) in FIXTURES.iter().enumerate() {
+                        commands.spawn((
+                            LevelEntity,
+                            WorldAssetRoot(assets.load(format!("{}#Scene0", fixture.scene))),
+                            Transform::from_translation(fixture.stands_at),
+                        ));
+                        load.fixtures.push((index, assets.load(fixture.scene)));
+                    }
+                }
             }
             load.pending = Some(id);
-            load.handle = assets.load(id.scene());
+            load.handle = assets.load(scene);
         }
     }
 }
@@ -407,7 +495,7 @@ pub fn switch(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut load: ResMut<LevelLoad>,
     mut squad: ResMut<squad::Squad>,
-    current: Res<LevelId>,
+    tuning: Res<GameTuning>,
     contents: Query<Entity, LevelContents>,
     mut placement: ParamSet<(PlacePlayer<'_, '_>, PlaceCamera<'_, '_>)>,
 ) {
@@ -417,9 +505,13 @@ pub fn switch(
         return;
     };
     let wanted = *wanted;
-    if load.busy() || wanted == *current {
+    if load.busy() {
         return;
     }
+    // Asking for the level already up *reloads* it -- there used to be an
+    // equality guard here, and it made `test_world` unusable: the row is read
+    // at load, so the one way to apply it from the level it changes was the
+    // menu, and the menu's request was thrown away as a no-op.
     load.failed = None;
     for entity in &contents {
         commands.entity(entity).despawn();
@@ -434,6 +526,7 @@ pub fn switch(
         &mut meshes,
         &mut materials,
         &mut load,
+        &tuning,
     );
     // A level that is ready now puts the player down now. The planet cannot --
     // there is nowhere to stand until its collision exists -- so it does it in
@@ -635,6 +728,82 @@ pub fn finish_planet(
     commands.insert_resource(collision);
     load.pending = None;
     load.handle = Handle::default();
+}
+
+/// Files each `test_world` fixture as its glb arrives: one more world in the
+/// planet's collision, one more well in the system's gravity, standing where
+/// [`FIXTURES`] says and never moving.
+///
+/// Waits for the planet itself first. [`finish_planet`] *replaces* both the
+/// collision and the gravity when it lands, so a fixture filed sooner would
+/// be silently thrown away with the stand-ins it was filed into.
+#[allow(clippy::too_many_arguments)]
+pub fn finish_fixtures(
+    mut load: ResMut<LevelLoad>,
+    assets: Res<AssetServer>,
+    mut console: ResMut<ConsoleState>,
+    gltfs: Res<Assets<Gltf>>,
+    nodes: Res<Assets<GltfNode>>,
+    gltf_meshes: Res<Assets<GltfMesh>>,
+    meshes: Res<Assets<Mesh>>,
+    collision: Option<ResMut<LevelData>>,
+    gravity: Option<ResMut<Gravity>>,
+) {
+    if load.pending.is_some() || load.fixtures.is_empty() {
+        return;
+    }
+    let (Some(mut collision), Some(mut gravity)) = (collision, gravity) else {
+        return;
+    };
+    let mut waiting = std::mem::take(&mut load.fixtures);
+    waiting.retain(|(index, handle)| {
+        let fixture = &FIXTURES[*index];
+        if let bevy::asset::LoadState::Failed(why) = assets.load_state(handle) {
+            // The planet is whole without its fixtures; a missing one is a
+            // console line, not a fall back to the castle.
+            console.report(format!("{} did not load: {why}", fixture.scene));
+            return false;
+        }
+        if !assets.is_loaded_with_dependencies(handle) {
+            return true;
+        }
+        let Some(gltf) = gltfs.get(handle) else {
+            return true;
+        };
+        let Some(geometry) = read_geometry(gltf, &nodes, &gltf_meshes, &meshes) else {
+            return true;
+        };
+        let (centre, _) = sphere_of(&geometry.vertices);
+        // The pull's radius is the body's true extent -- the farthest vertex
+        // -- rather than `sphere_of`'s mean: a torus's mean distance is out
+        // in the air over its tube, and a shell measured from it would put
+        // "the surface" thirty metres over the ground.
+        let reach = geometry
+            .vertices
+            .iter()
+            .map(|vertex| (*vertex - centre).length())
+            .fold(0.0, f32::max);
+        collision.add_world(
+            &geometry.vertices,
+            &geometry.indices,
+            centre,
+            reach,
+            fixture.cored,
+            fixture.stands_at,
+        );
+        gravity.add_well(crate::gravity::Well {
+            centre: fixture.stands_at + centre,
+            radius: reach,
+            down: fixture.down,
+        });
+        console.report(format!(
+            "{}: {} triangles, radius {reach:.0} m",
+            fixture.scene,
+            geometry.indices.len()
+        ));
+        false
+    });
+    load.fixtures = waiting;
 }
 
 /// What a planet's glTF is read for: the ground, and the sea over it.
@@ -939,6 +1108,563 @@ mod tests {
         assert!(!taken.contains(&bystander), "the filter takes everything");
     }
 
+    /// Loads the solar system with `test_world 1` and waits until the planet
+    /// and every fixture are filed, then hands the app back.
+    fn system_with_fixtures() -> App {
+        let mut app = with_a_loader();
+        app.world_mut()
+            .resource_mut::<crate::console::GameTuning>()
+            .test_world = 1.0;
+        app.update();
+        app.world_mut()
+            .write_message(LoadLevel(LevelId::PlanetOrbit));
+        let started = std::time::Instant::now();
+        let mut frames = 0;
+        while app.world().resource::<LevelLoad>().busy()
+            || frames == 0
+            || app.world().resource::<LevelData>().world_count() < 1 + FIXTURES.len()
+        {
+            app.update();
+            frames += 1;
+            assert!(
+                app.world().resource::<LevelLoad>().failed.is_none(),
+                "the system failed to load: {:?}",
+                app.world().resource::<LevelLoad>().failed
+            );
+            assert!(
+                started.elapsed().as_secs() < 60,
+                "the fixtures never finished filing: {} of {} worlds",
+                app.world().resource::<LevelData>().world_count(),
+                1 + FIXTURES.len()
+            );
+        }
+        app
+    }
+
+    /// Puts the player down at `at` with nothing carried over, ready to walk.
+    fn drop_player(app: &mut App, at: Vec3) {
+        let mut players = app
+            .world_mut()
+            .query_filtered::<(&mut Transform, &mut Controller), With<player::Player>>();
+        let (mut transform, mut ctrl) = players.single_mut(app.world_mut()).expect("no player");
+        transform.translation = at;
+        ctrl.velocity = Vec3::ZERO;
+        ctrl.grounded = false;
+        ctrl.kick = None;
+    }
+
+    /// Walks for `steps` frames, turning partway so more than one heading is
+    /// exercised, and returns every kick the controller filed.
+    fn walk(app: &mut App, steps: usize) -> Vec<(&'static str, usize)> {
+        let mut kicks = Vec::new();
+        for step in 0..steps {
+            app.world_mut()
+                .resource_mut::<crate::input::InputState>()
+                .move_axis = if step < steps / 2 {
+                Vec2::new(0.0, 1.0)
+            } else {
+                Vec2::new(1.0, 0.3)
+            };
+            app.update();
+            let mut players = app
+                .world_mut()
+                .query_filtered::<&Controller, With<player::Player>>();
+            let ctrl = players.single(app.world()).expect("no player");
+            // Only a kick noted this very frame: an old one re-sampled while
+            // it ages is the same event, not a new one.
+            if let Some(kick) = ctrl.kick.filter(|kick| kick.age < 0.02) {
+                kicks.push((kick.cause, step));
+            }
+        }
+        kicks
+    }
+
+    fn wall_pushes(kicks: &[(&'static str, usize)]) -> usize {
+        kicks
+            .iter()
+            .filter(|(cause, _)| *cause == "wall push")
+            .count()
+    }
+
+    /// The diagnostic fixtures do their one job: with `test_world 1` the
+    /// solar system holds the real planets *and* the three test bodies, each
+    /// with its own collision and its own pull -- and walking the perfectly
+    /// smooth sphere never trips the wall resolution. A "wall push" kick
+    /// there is the movement code inventing a wall on geometry that provably
+    /// has none, which is the exact bug the fixtures exist to expose.
+    #[test]
+    fn the_test_sphere_is_smooth_to_walk_on() {
+        let mut app = system_with_fixtures();
+        // The fixtures joined the system rather than replacing it: the
+        // planets' two wells, then one per fixture.
+        let wells = app.world().resource::<Gravity>().wells().len();
+        assert_eq!(wells, 2 + FIXTURES.len(), "{wells} wells");
+        // On top of the smooth sphere, which pulls at its own middle.
+        let top = FIXTURES[0].stands_at + Vec3::Y * 302.0;
+        let up = app.world().resource::<Gravity>().up(top);
+        assert!((up - Vec3::Y).length() < 1e-4, "up on the sphere is {up}");
+        drop_player(&mut app, top);
+        let kicks = walk(&mut app, 360);
+        assert_eq!(
+            wall_pushes(&kicks),
+            0,
+            "a perfectly smooth sphere pushed back: {kicks:?}"
+        );
+        let mut players = app
+            .world_mut()
+            .query_filtered::<(&Transform, &Controller), With<player::Player>>();
+        let (transform, ctrl) = players.single(app.world()).expect("no player");
+        assert!(ctrl.grounded, "the player never landed on the sphere");
+        let altitude = (transform.translation - FIXTURES[0].stands_at).length();
+        assert!(
+            (299.0..303.0).contains(&altitude),
+            "he walked the sphere at radius {altitude}"
+        );
+    }
+
+    /// The flat platform is the castle's lawn hung in space: uniform pull
+    /// along its own down, level ground everywhere, and walking it files no
+    /// kicks at all -- the flat control for everything the round worlds do.
+    #[test]
+    fn the_test_platform_is_flat_and_level() {
+        let mut app = system_with_fixtures();
+        let over = FIXTURES[1].stands_at + Vec3::Y * 2.0;
+        let gravity = *app.world().resource::<Gravity>();
+        let up = gravity.up(over);
+        assert!((up - Vec3::Y).length() < 1e-4, "up on the platform is {up}");
+        assert!(
+            gravity.strength(over) > 0.0,
+            "the platform's own surface is weightless"
+        );
+        // And the ground under that spot is the platform's face, not a
+        // phantom of some other body.
+        let ground = app
+            .world()
+            .resource::<LevelData>()
+            .ground_below(over, up)
+            .expect("no ground under the middle of the platform");
+        assert!(
+            (ground.0 - FIXTURES[1].stands_at).length() < 0.1,
+            "the platform's face is at {}",
+            ground.0
+        );
+        drop_player(&mut app, over);
+        let kicks = walk(&mut app, 240);
+        assert_eq!(
+            wall_pushes(&kicks),
+            0,
+            "a flat platform pushed back: {kicks:?}"
+        );
+        let mut players = app
+            .world_mut()
+            .query_filtered::<(&Transform, &Controller), With<player::Player>>();
+        let (transform, ctrl) = players.single(app.world()).expect("no player");
+        assert!(ctrl.grounded, "the player never landed on the platform");
+        let height = transform.translation.y - FIXTURES[1].stands_at.y;
+        assert!(
+            (-0.5..3.0).contains(&height),
+            "he walked the platform {height} m off its face"
+        );
+    }
+
+    /// The toroid is there, solid, and its own body: a probe down onto its
+    /// outer equator finds the tube, and the hole through the middle is
+    /// honest sky rather than an out-of-bounds respawn.
+    #[test]
+    fn the_test_torus_is_solid_and_its_hole_is_sky() {
+        let app = system_with_fixtures();
+        let level = app.world().resource::<LevelData>();
+        // Down onto the outer band: the tube's surface is 410 m out.
+        let out = Vec3::X;
+        let start = FIXTURES[2].stands_at + out * 450.0;
+        let (hit, _) = level
+            .surface_hit(start, FIXTURES[2].stands_at + out * 350.0)
+            .expect("no surface on the torus's outer equator");
+        let reach = (hit - FIXTURES[2].stands_at).length();
+        assert!(
+            (405.0..415.0).contains(&reach),
+            "the tube's outer face is {reach} m out"
+        );
+        // The hole is not the inside of a planet.
+        assert!(
+            !level.out_of_bounds(FIXTURES[2].stands_at),
+            "the middle of the torus counts as out of the world"
+        );
+    }
+
+    /// High flight over the real terrain planet meets no walls: a body forty
+    /// metres up and climbing has nothing within reach of its capsule, so a
+    /// "wall push" kick recorded here is the wall resolution pushing off
+    /// geometry that is nowhere near the player -- the reported bug, if it
+    /// exists, reproduced headlessly.
+    #[test]
+    fn high_flight_over_the_planet_meets_no_walls() {
+        let mut app = with_a_loader();
+        app.update();
+        app.world_mut().write_message(LoadLevel(LevelId::Planet));
+        let started = std::time::Instant::now();
+        let mut frames = 0;
+        while app.world().resource::<LevelLoad>().busy() || frames == 0 {
+            app.update();
+            frames += 1;
+            assert!(started.elapsed().as_secs() < 60, "the planet never loaded");
+        }
+        let start = app.world().resource::<Respawn>().0;
+        let gravity = *app.world().resource::<Gravity>();
+        let up = gravity.up(start);
+        {
+            let mut players = app
+                .world_mut()
+                .query_filtered::<(&mut Transform, &mut Controller), With<player::Player>>();
+            let (mut transform, mut ctrl) = players.single_mut(app.world_mut()).expect("no player");
+            transform.translation = start + up * 40.0;
+            ctrl.velocity = Vec3::ZERO;
+            ctrl.grounded = false;
+            ctrl.kick = None;
+        }
+        // Twenty seconds of powered flight, forward and climbing, with every
+        // fresh kick collected beside the height it happened at.
+        let mut kicks = Vec::new();
+        for step in 0..1200 {
+            {
+                let mut input = app.world_mut().resource_mut::<crate::input::InputState>();
+                input.boost = true;
+                input.move_axis = Vec2::new(0.0, 1.0);
+            }
+            app.update();
+            let mut players = app
+                .world_mut()
+                .query_filtered::<&Controller, With<player::Player>>();
+            let ctrl = players.single(app.world()).expect("no player");
+            if let Some(kick) = ctrl.kick.filter(|kick| kick.age < 0.02) {
+                kicks.push((kick.cause, kick.speed, kick.height, step));
+            }
+        }
+        let phantom: Vec<_> = kicks
+            .iter()
+            .filter(|(cause, _, height, _)| *cause == "wall push" && *height > 5.0)
+            .collect();
+        assert!(
+            phantom.is_empty(),
+            "clear air pushed back: {phantom:?} (all kicks: {kicks:?})"
+        );
+    }
+
+    /// The user's own flight, headless: the solar system level, spin and
+    /// orbit zeroed, fast tangential flight round the first planet at
+    /// several altitudes. Reported as "wall pushes, completely midair,
+    /// basically every time" -- so if the wall resolution invents contacts
+    /// out there, three hundred ticks a lap should be full of them.
+    #[test]
+    fn fast_flight_round_the_orbit_planet_meets_no_walls() {
+        let mut app = with_a_loader();
+        {
+            let mut tuning = app.world_mut().resource_mut::<crate::console::GameTuning>();
+            tuning.planet1_spin = 0.0;
+            tuning.planet1_orbit = 0.0;
+            tuning.planet2_spin = 0.0;
+            tuning.planet2_orbit = 0.0;
+        }
+        app.update();
+        app.world_mut()
+            .write_message(LoadLevel(LevelId::PlanetOrbit));
+        let started = std::time::Instant::now();
+        let mut frames = 0;
+        while app.world().resource::<LevelLoad>().busy() || frames == 0 {
+            app.update();
+            frames += 1;
+            assert!(started.elapsed().as_secs() < 60, "the system never loaded");
+        }
+        let Shape::Planet { radius, .. } = app.world().resource::<LevelData>().shape() else {
+            panic!("the system's collision is still flat");
+        };
+        let centre = app.world().resource::<crate::orbit::SolarSystem>().bodies[0].centre;
+        let mut kicks = Vec::new();
+        for altitude in [8.0_f32, 20.0, 60.0] {
+            {
+                let mut players = app
+                    .world_mut()
+                    .query_filtered::<(&mut Transform, &mut Controller), With<player::Player>>();
+                let (mut transform, mut ctrl) =
+                    players.single_mut(app.world_mut()).expect("no player");
+                transform.translation = centre + Vec3::Y * (radius + altitude);
+                ctrl.velocity = Vec3::ZERO;
+                ctrl.grounded = false;
+                ctrl.kick = None;
+            }
+            for step in 0..600 {
+                // A fast lap that *hugs the terrain*: each tick the body is
+                // re-hung `altitude` metres over the ground actually beneath
+                // it, so a mountain in the path raises the path rather than
+                // burying the flyer -- the first cut of this test flew a
+                // fixed radius and did exactly that, which proved only that
+                // mountains are solid. Held to true clearance, any wall push
+                // at all is a push from geometry that is nowhere near.
+                {
+                    let at = {
+                        let mut players = app
+                            .world_mut()
+                            .query_filtered::<&Transform, With<player::Player>>();
+                        players.single(app.world()).expect("no player").translation
+                    };
+                    let up = (at - centre).normalize();
+                    let over = {
+                        let level = app.world().resource::<LevelData>();
+                        let sea = level.sea_radius();
+                        // From 50 m over the flyer's head: the cast reaches
+                        // `PLANET_REACH` below its start, so a start too high
+                        // never reaches the ground under him at all.
+                        level.ground_below(at + up * 50.0, up).map(|(ground, _)| {
+                            // Over the sea the ground is the seabed, and
+                            // hugging it would fly the lap underwater
+                            // into another physics entirely; the water's
+                            // surface is the floor of this flight.
+                            let mut radius = (ground - centre).length() + altitude;
+                            if let Some(sea) = sea {
+                                radius = radius.max(sea + 2.0);
+                            }
+                            centre + up * radius
+                        })
+                    };
+                    let mut players = app
+                        .world_mut()
+                        .query_filtered::<(&mut Transform, &mut Controller), With<player::Player>>(
+                        );
+                    let (mut transform, mut ctrl) =
+                        players.single_mut(app.world_mut()).expect("no player");
+                    if let Some(over) = over {
+                        transform.translation = over;
+                    }
+                    let tangent = up.cross(Vec3::Z).normalize_or(Vec3::X);
+                    ctrl.velocity = tangent * 25.0;
+                    ctrl.grounded = false;
+                }
+                app.update();
+                let mut players = app
+                    .world_mut()
+                    .query_filtered::<&Controller, With<player::Player>>();
+                let ctrl = players.single(app.world()).expect("no player");
+                if let Some(kick) = ctrl.kick.filter(|kick| kick.age < 0.02) {
+                    kicks.push((kick.cause, kick.speed, kick.height, altitude, step));
+                }
+            }
+        }
+        assert!(
+            kicks.is_empty(),
+            "air held clear of the terrain pushed back: {kicks:?}"
+        );
+    }
+
+    /// The missing half of the flight above: the same clear air, but with the
+    /// planet *moving* -- spin and orbit at their defaults, exactly the game
+    /// the user plays. The smooth test sphere stands still and never kicks;
+    /// the terrain planet kicks constantly; besides the terrain, the one
+    /// thing that separates them is that the planet's frame moves under
+    /// every query. So: hover at true clearance over the turning, orbiting
+    /// ground, and any wall push at all is the moving-frame machinery --
+    /// ride, placement, or resolution -- inventing a contact.
+    #[test]
+    fn hovering_over_the_moving_planet_meets_no_walls() {
+        let mut app = with_a_loader();
+        app.update();
+        app.world_mut()
+            .write_message(LoadLevel(LevelId::PlanetOrbit));
+        let started = std::time::Instant::now();
+        let mut frames = 0;
+        while app.world().resource::<LevelLoad>().busy() || frames == 0 {
+            app.update();
+            frames += 1;
+            assert!(started.elapsed().as_secs() < 60, "the system never loaded");
+        }
+        {
+            let tuning = app.world().resource::<crate::console::GameTuning>();
+            assert!(
+                tuning.planet1_spin > 0.0 && tuning.planet1_orbit > 0.0,
+                "this test is about the defaults, and the defaults stopped moving"
+            );
+        }
+        let mut kicks = Vec::new();
+        for altitude in [12.0_f32, 25.0] {
+            {
+                let centre = app.world().resource::<crate::orbit::SolarSystem>().bodies[0].centre;
+                let Shape::Planet { radius, .. } = app.world().resource::<LevelData>().shape()
+                else {
+                    panic!("the system's collision is still flat");
+                };
+                let mut players = app
+                    .world_mut()
+                    .query_filtered::<(&mut Transform, &mut Controller), With<player::Player>>();
+                let (mut transform, mut ctrl) =
+                    players.single_mut(app.world_mut()).expect("no player");
+                transform.translation = centre + Vec3::Y * (radius + altitude);
+                ctrl.velocity = Vec3::ZERO;
+                ctrl.grounded = false;
+                ctrl.kick = None;
+            }
+            for step in 0..600 {
+                // Re-hung every tick at true clearance over whatever ground
+                // now stands beneath -- measured against where the planet
+                // *currently* is, because the whole point is that it moves.
+                {
+                    let centre =
+                        app.world().resource::<crate::orbit::SolarSystem>().bodies[0].centre;
+                    let at = {
+                        let mut players = app
+                            .world_mut()
+                            .query_filtered::<&Transform, With<player::Player>>();
+                        players.single(app.world()).expect("no player").translation
+                    };
+                    let up = (at - centre).normalize();
+                    let over = {
+                        let level = app.world().resource::<LevelData>();
+                        let sea = level.sea_radius();
+                        level.ground_below(at + up * 50.0, up).map(|(ground, _)| {
+                            let mut radius = (ground - centre).length() + altitude;
+                            if let Some(sea) = sea {
+                                radius = radius.max(sea + 2.0);
+                            }
+                            centre + up * radius
+                        })
+                    };
+                    let mut players = app
+                        .world_mut()
+                        .query_filtered::<(&mut Transform, &mut Controller), With<player::Player>>(
+                        );
+                    let (mut transform, mut ctrl) =
+                        players.single_mut(app.world_mut()).expect("no player");
+                    if let Some(over) = over {
+                        transform.translation = over;
+                    }
+                    ctrl.velocity = Vec3::ZERO;
+                    ctrl.grounded = false;
+                }
+                app.update();
+                let mut players = app
+                    .world_mut()
+                    .query_filtered::<&Controller, With<player::Player>>();
+                let ctrl = players.single(app.world()).expect("no player");
+                if let Some(kick) = ctrl.kick.filter(|kick| kick.age < 0.02) {
+                    kicks.push((kick.cause, kick.speed, kick.height, altitude, step));
+                }
+            }
+        }
+        assert!(
+            kicks.is_empty(),
+            "clear air over the moving planet pushed back {} times: {:?}",
+            kicks.len(),
+            &kicks[..kicks.len().min(12)]
+        );
+
+        // And the same at speed: a fast lap hugging the turning terrain, the
+        // flight the user actually flies -- flown once with each half of the
+        // motion alone, so a failure names the machinery that caused it.
+        for (label, spin, orbit) in [
+            ("spin only", 1.2_f32, 0.0_f32),
+            ("orbit only", 0.0, 1.0),
+            ("spin and orbit", 1.2, 1.0),
+        ] {
+            {
+                let mut tuning = app.world_mut().resource_mut::<crate::console::GameTuning>();
+                tuning.planet1_spin = spin;
+                tuning.planet1_orbit = orbit;
+            }
+            let kicks = fast_lap(&mut app, 20.0);
+            assert!(
+                kicks.is_empty(),
+                "fast flight in clear air, {label}: pushed back {} times: {:?}",
+                kicks.len(),
+                &kicks[..kicks.len().min(8)]
+            );
+        }
+    }
+
+    /// One fast lap over the orbiting level's first planet, re-hung at true
+    /// clearance over the live ground every step, with every fresh kick
+    /// collected -- and the first one anatomised to stderr, measured at the
+    /// position it happened rather than after the resolution moved it.
+    fn fast_lap(app: &mut App, altitude: f32) -> Vec<(&'static str, f32, f32, usize)> {
+        let mut kicks = Vec::new();
+        for step in 0..600 {
+            let hung = {
+                let centre = app.world().resource::<crate::orbit::SolarSystem>().bodies[0].centre;
+                let at = {
+                    let mut players = app
+                        .world_mut()
+                        .query_filtered::<&Transform, With<player::Player>>();
+                    players.single(app.world()).expect("no player").translation
+                };
+                let up = (at - centre).normalize();
+                let over = {
+                    let level = app.world().resource::<LevelData>();
+                    let sea = level.sea_radius();
+                    level.ground_below(at + up * 50.0, up).map(|(ground, _)| {
+                        let mut radius = (ground - centre).length() + altitude;
+                        if let Some(sea) = sea {
+                            radius = radius.max(sea + 2.0);
+                        }
+                        centre + up * radius
+                    })
+                };
+                let mut players = app
+                    .world_mut()
+                    .query_filtered::<(&mut Transform, &mut Controller), With<player::Player>>();
+                let (mut transform, mut ctrl) =
+                    players.single_mut(app.world_mut()).expect("no player");
+                if let Some(over) = over {
+                    transform.translation = over;
+                }
+                let tangent = up.cross(Vec3::Z).normalize_or(Vec3::X);
+                ctrl.velocity = tangent * 25.0;
+                ctrl.grounded = false;
+                ctrl.kick = None;
+                transform.translation
+            };
+            app.update();
+            let kick = {
+                let mut players = app
+                    .world_mut()
+                    .query_filtered::<&Controller, With<player::Player>>();
+                players.single(app.world()).expect("no player").kick
+            };
+            if let Some(kick) = kick.filter(|kick| kick.age < 0.02) {
+                if kicks.len() < 3 {
+                    let centre =
+                        app.world().resource::<crate::orbit::SolarSystem>().bodies[0].centre;
+                    let at = {
+                        let mut players = app
+                            .world_mut()
+                            .query_filtered::<&Transform, With<player::Player>>();
+                        players.single(app.world()).expect("no player").translation
+                    };
+                    let up = (at - centre).normalize();
+                    let level = app.world().resource::<LevelData>();
+                    let mut walls = Vec::new();
+                    level.wall_contacts(
+                        at,
+                        up,
+                        crate::player::PLAYER_RADIUS,
+                        crate::player::PLAYER_HEIGHT,
+                        &mut walls,
+                    );
+                    let nearest = walls
+                        .iter()
+                        .map(|wall| (wall.nearest - at).length())
+                        .fold(f32::INFINITY, f32::min);
+                    eprintln!(
+                        "kick {} {:.3} m/s height {:.2}: now at {at}, drifted {:.2} m from the hang, nearest of {} walls {nearest:.2} m off the spine",
+                        kick.cause,
+                        kick.speed,
+                        kick.height,
+                        (at - hung).length(),
+                        walls.len(),
+                    );
+                }
+                kicks.push((kick.cause, kick.speed, kick.height, step));
+            }
+        }
+        kicks
+    }
+
     /// The whole feature, end to end, on the real `assets/bevy/planet.glb`: ask
     /// for the planet from a running game, wait for it, and then stand on it.
     ///
@@ -1091,7 +1817,8 @@ mod tests {
     fn the_orbiting_planet_loads_down_the_same_path() {
         let mut app = with_a_loader();
         app.update();
-        app.world_mut().write_message(LoadLevel(LevelId::PlanetOrbit));
+        app.world_mut()
+            .write_message(LoadLevel(LevelId::PlanetOrbit));
         let started = std::time::Instant::now();
         let mut frames = 0;
         while app.world().resource::<LevelLoad>().busy() || frames == 0 {
@@ -1106,11 +1833,17 @@ mod tests {
         // A system's gravity, not a lone planet's: one centre per orbiting
         // world, exactly where the clockwork has it, and weightlessness in
         // the middle of the crossing.
-        let system_centres = app.world().resource::<crate::orbit::SolarSystem>().centres();
+        let system_centres = app
+            .world()
+            .resource::<crate::orbit::SolarSystem>()
+            .centres();
         let gravity = *app.world().resource::<Gravity>();
-        let Gravity::System { centres, .. } = gravity else {
-            panic!("the orbiting level's gravity is {gravity:?}, not a system");
-        };
+        let wells = gravity.wells();
+        assert!(
+            wells.len() >= 2,
+            "the orbiting level's gravity is {gravity:?}, not a system"
+        );
+        let centres = [wells[0].centre, wells[1].centre];
         assert_eq!(centres, system_centres);
         assert!(
             (centres[0] - crate::orbit::SUN_CENTRE).length() > 1000.0,
@@ -1170,7 +1903,8 @@ mod tests {
     fn arriving_on_the_system_keeps_the_camera_out_of_the_core() {
         let mut app = with_a_loader();
         app.update();
-        app.world_mut().write_message(LoadLevel(LevelId::PlanetOrbit));
+        app.world_mut()
+            .write_message(LoadLevel(LevelId::PlanetOrbit));
         let started = std::time::Instant::now();
         let mut frames = 0;
         while app.world().resource::<LevelLoad>().busy() || frames == 0 {

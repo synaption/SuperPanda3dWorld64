@@ -44,13 +44,64 @@ pub const FALL: f32 = 36.0;
 pub const GRAVITY_RANGE: f32 = 120.0;
 pub const GRAVITY_FADE: f32 = 120.0;
 
+/// The most bodies a [`Gravity::System`] answers for: the two orbiting
+/// planets, and [`crate::world::FIXTURES`]'s diagnostic bodies, with a little
+/// room. An array and not a `Vec` so the resource stays `Copy`.
+pub const MAX_WELLS: usize = 8;
+
+/// One body's pull in a [`Gravity::System`]: where it is, how big it is, and
+/// -- for the one body that is not a ball -- which way it pulls.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Well {
+    pub centre: Vec3,
+    /// The surface radius its [`GRAVITY_RANGE`] shell is measured from.
+    pub radius: f32,
+    /// `None` pulls towards `centre` the way every planet does. `Some(down)`
+    /// pulls uniformly along `down` within reach -- the flat test platform,
+    /// whose whole job is being level the way the castle is level, which no
+    /// radial pull towards the middle of a thin disc could ever be.
+    pub down: Option<Vec3>,
+}
+
+impl Well {
+    const EMPTY: Self = Self {
+        centre: Vec3::ZERO,
+        radius: 0.0,
+        down: None,
+    };
+
+    /// Which way is up on this body, at `at`.
+    fn up(&self, at: Vec3) -> Vec3 {
+        match self.down {
+            Some(down) => -down,
+            None => (at - self.centre).normalize_or(Vec3::Y),
+        }
+    }
+
+    /// How far `at` stands off this body's surface, for the fade. A ball
+    /// measures along the radial; a flat body measures off its plane, and off
+    /// its rim once the point is out past the edge, so its pull does not run
+    /// level across the whole system.
+    fn altitude(&self, at: Vec3) -> f32 {
+        match self.down {
+            Some(down) => {
+                let up = -down;
+                let height = (at - self.centre).dot(up);
+                let lateral = ((at - self.centre) - up * height).length();
+                height.abs().max(lateral - self.radius)
+            }
+            None => (at - self.centre).length() - self.radius,
+        }
+    }
+}
+
 /// Where down is, and how hard.
 ///
 /// A resource rather than a component: every body in a level falls the same
 /// way. What a level with two planets wants is not two gravities at once but
-/// one answer built from two centres -- see [`Gravity::System`] -- because no
-/// body is ever under both at full strength and the movement code still asks
-/// one question.
+/// one answer built from the nearest centre -- see [`Gravity::System`] --
+/// because no body is ever under two at full strength and the movement code
+/// still asks one question.
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
 pub enum Gravity {
     /// A flat level. Down is `-Y` wherever you are standing.
@@ -58,19 +109,20 @@ pub enum Gravity {
     /// A planet. Down is towards `centre`, so "up" turns under your feet as you
     /// walk and the horizon closes rather than running out.
     Radial { centre: Vec3, accel: f32 },
-    /// A solar system: planets, and the space between them. Down is towards
-    /// the *nearest* centre -- the one change that keeps every surface level,
-    /// which `experimental/ow`'s README works out the hard way: summing every
-    /// body leaves the field tens of degrees off vertical and slides you off
-    /// the world. The pull is full strength to [`GRAVITY_RANGE`] above the
+    /// A solar system: bodies, and the space between them. Down is whatever
+    /// the *nearest* body says -- the one change that keeps every surface
+    /// level, which `experimental/ow`'s README works out the hard way: summing
+    /// every body leaves the field tens of degrees off vertical and slides you
+    /// off the world. The pull is full strength to [`GRAVITY_RANGE`] above the
     /// surface, gone [`GRAVITY_FADE`] later, and zero across the middle.
     ///
-    /// One radius for every centre, because the system is the same planet
-    /// twice. The day it is not, the radius moves into the array beside its
-    /// centre.
+    /// The first two wells are always the orbiting planets, in
+    /// [`crate::orbit::SolarSystem::bodies`] order -- [`Self::place_system`]
+    /// moves exactly those two and [`crate::orbit::advance`] rides players on
+    /// no others. Anything after them is a fixture that stands still.
     System {
-        centres: [Vec3; 2],
-        radius: f32,
+        wells: [Well; MAX_WELLS],
+        count: usize,
         accel: f32,
     },
 }
@@ -98,31 +150,81 @@ impl Gravity {
     /// Gravity for a pair of planets of the same `radius`: each pulls at the
     /// strength a flat level does, and between them there is none at all.
     pub fn binary(first: Vec3, second: Vec3, radius: f32) -> Self {
-        Self::System {
-            centres: [first, second],
+        let mut wells = [Well::EMPTY; MAX_WELLS];
+        wells[0] = Well {
+            centre: first,
             radius,
+            down: None,
+        };
+        wells[1] = Well {
+            centre: second,
+            radius,
+            down: None,
+        };
+        Self::System {
+            wells,
+            count: 2,
             accel: FALL,
         }
     }
 
-    /// Moves a system's worlds without touching what they weigh. Called every
-    /// tick by [`crate::orbit::advance`], because in the solar system the
-    /// planets genuinely go somewhere; on any other gravity it is a no-op, so
-    /// the caller does not have to know what kind of level is up.
-    pub fn place_system(&mut self, at: [Vec3; 2]) {
-        if let Gravity::System { centres, .. } = self {
-            *centres = at;
+    /// Adds one more body's pull to a system. How the diagnostic fixtures get
+    /// theirs, one each as its collision is filed; a no-op on any other
+    /// gravity, and on a system already holding [`MAX_WELLS`].
+    pub fn add_well(&mut self, well: Well) {
+        if let Gravity::System { wells, count, .. } = self {
+            if *count < MAX_WELLS {
+                wells[*count] = well;
+                *count += 1;
+            }
         }
     }
 
-    /// The centre this point answers to: the nearest one. With one radius for
-    /// every centre, nearest centre and nearest surface are the same test.
-    fn nearest(centres: &[Vec3; 2], at: Vec3) -> Vec3 {
-        if (at - centres[0]).length_squared() <= (at - centres[1]).length_squared() {
-            centres[0]
-        } else {
-            centres[1]
+    /// Moves a system's orbiting planets -- the first two wells, and only
+    /// those: everything after them stands still -- without touching what
+    /// they weigh. Called every tick by [`crate::orbit::advance`], because in
+    /// the solar system the planets genuinely go somewhere; on any other
+    /// gravity it is a no-op, so the caller does not have to know what kind
+    /// of level is up.
+    pub fn place_system(&mut self, at: [Vec3; 2]) {
+        if let Gravity::System { wells, .. } = self {
+            wells[0].centre = at[0];
+            wells[1].centre = at[1];
         }
+    }
+
+    /// The wells a system answers for, in order, or none on any other shape
+    /// of gravity. What the orrery draws its shells from.
+    pub fn wells(&self) -> &[Well] {
+        match self {
+            Gravity::System { wells, count, .. } => &wells[..*count],
+            _ => &[],
+        }
+    }
+
+    /// Which of a system's wells `at` answers to -- the index the first two
+    /// of which are the orbiting planets, which is what
+    /// [`crate::orbit::advance`] rides players by -- or `None` on any other
+    /// shape of gravity.
+    pub fn well_index(&self, at: Vec3) -> Option<usize> {
+        let wells = self.wells();
+        (0..wells.len()).min_by(|&a, &b| {
+            (at - wells[a].centre)
+                .length_squared()
+                .total_cmp(&(at - wells[b].centre).length_squared())
+        })
+    }
+
+    /// The body this point answers to: the nearest one.
+    fn nearest<'w>(wells: &'w [Well], at: Vec3) -> &'w Well {
+        wells
+            .iter()
+            .min_by(|a, b| {
+                (at - a.centre)
+                    .length_squared()
+                    .total_cmp(&(at - b.centre).length_squared())
+            })
+            .unwrap_or(&Well::EMPTY)
     }
 
     /// Which way is up at `at`. Always unit length.
@@ -141,9 +243,9 @@ impl Gravity {
         match *self {
             Gravity::Down { .. } => Vec3::Y,
             Gravity::Radial { centre, .. } => (at - centre).normalize_or(Vec3::Y),
-            Gravity::System { ref centres, .. } => {
-                (at - Self::nearest(centres, at)).normalize_or(Vec3::Y)
-            }
+            Gravity::System {
+                ref wells, count, ..
+            } => Self::nearest(&wells[..count], at).up(at),
         }
     }
 
@@ -167,11 +269,11 @@ impl Gravity {
         match *self {
             Gravity::Down { accel } | Gravity::Radial { accel, .. } => accel,
             Gravity::System {
-                ref centres,
-                radius,
+                ref wells,
+                count,
                 accel,
             } => {
-                let altitude = (at - Self::nearest(centres, at)).length() - radius;
+                let altitude = Self::nearest(&wells[..count], at).altitude(at);
                 let faded = ((altitude - GRAVITY_RANGE) / GRAVITY_FADE).clamp(0.0, 1.0);
                 accel * (1.0 - faded)
             }
@@ -292,13 +394,48 @@ mod tests {
         assert_eq!(gravity.strength(Vec3::X * (300.0 + GRAVITY_RANGE)), FALL);
         let far = 300.0 + GRAVITY_RANGE + GRAVITY_FADE;
         assert_eq!(gravity.strength(Vec3::X * far), 0.0);
-        assert!(gravity.weightless(Vec3::X * 550.0), "the middle still pulls");
+        assert!(
+            gravity.weightless(Vec3::X * 550.0),
+            "the middle still pulls"
+        );
         assert!(!gravity.weightless(Vec3::X * 310.0));
         // Halfway through the fade is half the pull: continuous, not a cliff.
         let half = gravity.strength(Vec3::X * (300.0 + GRAVITY_RANGE + GRAVITY_FADE * 0.5));
         assert!((half - FALL * 0.5).abs() < 1e-3, "{half}");
         // And the flat level is untouched by any of this.
         assert_eq!(Gravity::default().strength(Vec3::Y * 5000.0), FALL);
+    }
+
+    /// A fixture's well joins the system without moving the planets' own:
+    /// the sphere pulls at its middle like any planet, and the flat platform
+    /// pulls straight down everywhere over it -- level at the rim exactly as
+    /// at the middle, which no radial pull towards a thin disc could be --
+    /// and lets go off its edge and away from its plane.
+    #[test]
+    fn a_flat_well_pulls_straight_down_and_ends_at_its_edge() {
+        let mut gravity = Gravity::binary(Vec3::X * 5200.0, Vec3::Z * 8400.0, 300.0);
+        let platform = Vec3::new(0.0, 0.0, -2600.0);
+        gravity.add_well(Well {
+            centre: platform,
+            radius: 150.0,
+            down: Some(Vec3::NEG_Y),
+        });
+        assert_eq!(gravity.wells().len(), 3);
+        // Straight down at the middle and at the rim both.
+        for spot in [platform, platform + Vec3::X * 149.0] {
+            assert_eq!(gravity.up(spot + Vec3::Y), Vec3::Y, "at {spot}");
+            assert_eq!(gravity.strength(spot + Vec3::Y), FALL, "at {spot}");
+        }
+        // Gone high over it and gone far off its edge.
+        let clear = GRAVITY_RANGE + GRAVITY_FADE + 10.0;
+        assert!(gravity.weightless(platform + Vec3::Y * clear));
+        assert!(gravity.weightless(platform + Vec3::X * (150.0 + clear)));
+        // And the planets still answer for themselves.
+        assert_eq!(gravity.up(Vec3::new(5200.0, 300.0, 0.0)), Vec3::Y);
+        // The ride's bookkeeping: the platform is well 2, past the two
+        // orbiting planets [`crate::orbit::advance`] rides players on.
+        assert_eq!(gravity.well_index(platform + Vec3::Y * 2.0), Some(2));
+        assert_eq!(gravity.well_index(Vec3::new(5200.0, 301.0, 0.0)), Some(0));
     }
 
     #[test]

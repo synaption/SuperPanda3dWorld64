@@ -529,15 +529,21 @@ pub fn attach_graphs(
 
 /// Gathers the player's state for clip selection, including the timers that
 /// only animation cares about.
+///
+/// Speed and rise are measured against the local up rather than the world's
+/// axes: on a planet the ground's own frame is the one the clips describe, and
+/// a world-`Y` reading drifts as the planet spins under the player -- a run
+/// along a meridian reads as a walk, a fall on the far side reads as rising.
 pub fn track_player(
     time: Res<Time>,
-    controller: Query<&Controller, With<crate::player::Player>>,
+    gravity: Res<crate::gravity::Gravity>,
+    controller: Query<(&Transform, &Controller), With<crate::player::Player>>,
     mut animation: ResMut<PlayerAnimation>,
 ) {
-    let Ok(ctrl) = controller.single() else {
+    let Ok((transform, ctrl)) = controller.single() else {
         return;
     };
-    let speed = Vec3::new(ctrl.velocity.x, 0.0, ctrl.velocity.z).length();
+    let (rise, flat) = gravity.split(ctrl.velocity, transform.translation);
     let still = ctrl.motion == Motion::Idle;
     animation.state.still_for = if still {
         animation.state.still_for + time.delta_secs()
@@ -545,8 +551,8 @@ pub fn track_player(
         0.0
     };
     animation.state.motion = ctrl.motion;
-    animation.state.speed = speed;
-    animation.state.rising = ctrl.velocity.y >= 0.0;
+    animation.state.speed = flat.length();
+    animation.state.rising = rise >= 0.0;
     animation.state.combo = ctrl.combo;
 }
 

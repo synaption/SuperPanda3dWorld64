@@ -402,14 +402,22 @@ mod tests {
         // near the floor at nought.
         let spread = placements
             .iter()
-            .flat_map(|&(_, here)| placements.iter().map(move |&(_, there)| here.distance(there)))
+            .flat_map(|&(_, here)| {
+                placements
+                    .iter()
+                    .map(move |&(_, there)| here.distance(there))
+            })
             .fold(0.0f32, f32::max);
-        assert!(spread > 50.0, "the whole level fits in {spread} m: wrong unit?");
+        assert!(
+            spread > 50.0,
+            "the whole level fits in {spread} m: wrong unit?"
+        );
         // Nothing collides with a warp pipe, so its size is the level's to say
         // and this is not pinned either -- but a pipe is a pipe, and the last
         // time this went wrong it went wrong by a hundred.
         for pipe in castle.pipes() {
-            let across = pipe.at.scale.x * enemy::measure(pipe::MODEL).map_or(3.0, |p| p.radius * 2.0);
+            let across =
+                pipe.at.scale.x * enemy::measure(pipe::MODEL).map_or(3.0, |p| p.radius * 2.0);
             assert!(
                 (1.0..12.0).contains(&across),
                 "a warp pipe {across} m across is not a warp pipe"
@@ -421,7 +429,10 @@ mod tests {
         assert_eq!(water.len(), 2, "the moat and the bay");
         for box_ in water {
             assert!(box_.max_x - box_.min_x > 1.0 && box_.max_z - box_.min_z > 1.0);
-            assert!(box_.surface_y < castle.spawn().y, "the spawn is under water");
+            assert!(
+                box_.surface_y < castle.spawn().y,
+                "the spawn is under water"
+            );
         }
     }
 
@@ -498,10 +509,9 @@ mod tests {
     /// does not have must not, for the reason a mistyped `spawns` must not.
     #[test]
     fn a_level_with_no_machines_is_a_level_with_no_machines() {
-        let bare: Furniture = serde_json::from_str(
-            r#"{"level":"test","spawn":[0,0,0],"gravity":{"mode":"down"}}"#,
-        )
-        .expect("that should parse");
+        let bare: Furniture =
+            serde_json::from_str(r#"{"level":"test","spawn":[0,0,0],"gravity":{"mode":"down"}}"#)
+                .expect("that should parse");
         assert!(bare.props().is_empty());
         assert!(bare.trees().is_empty());
         let error = serde_json::from_str::<Furniture>(

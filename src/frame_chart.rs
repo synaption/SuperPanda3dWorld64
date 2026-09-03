@@ -12,6 +12,11 @@ const MAX_MS: f32 = 50.0;
 #[derive(Component)]
 pub(crate) struct FrameBar(usize);
 
+/// The chart's root node, so the console's master `debug` row can put the
+/// whole thing away at once.
+#[derive(Component)]
+pub(crate) struct Chart;
+
 #[derive(Component)]
 pub(crate) struct FrameStats;
 
@@ -49,6 +54,7 @@ pub fn finish(mut times: ResMut<CalculationTimes>) {
 pub fn spawn(commands: &mut Commands) {
     commands
         .spawn((
+            Chart,
             Node {
                 position_type: PositionType::Absolute,
                 right: Val::Px(16.0),
@@ -139,9 +145,24 @@ pub fn spawn(commands: &mut Commands) {
 /// Draws the last four seconds oldest-to-newest, with the newest at right.
 pub fn update(
     times: Res<CalculationTimes>,
+    tuning: Res<crate::console::GameTuning>,
+    mut chart: Query<&mut Visibility, With<Chart>>,
     mut bars: Query<(&FrameBar, &mut Node, &mut BackgroundColor)>,
     mut stats: Query<&mut Text, With<FrameStats>>,
 ) {
+    // The console's master switch: `debug 0` puts the chart away whole, and
+    // the bars are not worth rewriting while nobody can see them.
+    let shown = tuning.debug > 0.5;
+    if let Ok(mut visible) = chart.single_mut() {
+        *visible = if shown {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+    if !shown {
+        return;
+    }
     let Some((newest, _)) = times.samples.back() else {
         return;
     };

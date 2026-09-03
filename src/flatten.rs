@@ -72,11 +72,28 @@ pub const CURVE: Handle<ShaderBuffer> = uuid_handle!("3f9a6c2d-71b5-4e08-8c44-2d
 /// the player's feet on the far side is every direction at once, and the
 /// arithmetic there divides by a sine that has reached zero. Uncapped, a
 /// triangle with one vertex in that last fraction of a degree is flung
-/// millions of metres and drawn as a sliver across the whole sky. Capped, the
-/// far cap folds gently back on itself instead -- at a 300 m radius the cap
-/// only engages inside the last three degrees around the antipode, which is
-/// over 900 map-metres out and several fog depths past visible.
+/// millions of metres and drawn as a sliver across the whole sky. The
+/// [`HORIZON`] fade lets go of everything long before the singularity, so
+/// this cap is a backstop rather than the working guard -- but a backstop
+/// against infinity is still worth one `min`.
 const STRETCH: f32 = 8.0;
+
+/// The polar angle where the map starts giving the sphere its shape back,
+/// and the angle where it has let go entirely -- radians from the zenith.
+///
+/// The exponential map unrolls the *whole* sphere: left alone, the far
+/// hemisphere lands 470 to 940 map-metres out, hanging in plain view over
+/// the flattened plane, because a plane has no horizon to hide it behind.
+/// Fog is no help on the orbiting level -- its haze is pushed out to
+/// `SPACE_FOG` so the second planet stays visible to fly to -- and the far
+/// cap is worse than merely visible: the unrolling multiplies the player's
+/// own motion by up to [`STRETCH`] out there, so continents crawl and swing
+/// as he walks. So past a third of the way round the world the grip fades
+/// with angle, and the far side settles back onto the true sphere -- which
+/// is *below* the flattened plane, under the nearer ground, exactly where a
+/// far side belongs. Over the fade band the terrain rolls off downward like
+/// a proper horizon, and everything beyond it is hidden under the roll.
+const HORIZON: (f32, f32) = (1.1, 1.7);
 
 /// How the round world is being drawn flat this frame.
 ///
@@ -95,9 +112,10 @@ pub struct Curve {
     /// grip, `0..=1` -- zero is the true sphere and one is the full map.
     zenith: Vec4,
     /// `x` metres above sea level where a vertex starts to slip off the map,
-    /// `y` where it is free of it. `zw` unused: a uniform's fields align to
-    /// sixteen bytes whatever their size, the same reasoning as
-    /// [`crate::n64::N64Uniform`].
+    /// `y` where it is free of it. `z` the polar angle where the map starts
+    /// to let the far side back onto the sphere, `w` where it has let go --
+    /// [`HORIZON`], riding along so the shader and [`Curve::bend`] read the
+    /// same pair.
     band: Vec4,
 }
 
@@ -108,7 +126,12 @@ impl Default for Curve {
         Self {
             home: Vec4::ZERO,
             zenith: Vec3::Y.extend(0.0),
-            band: Vec4::new(GRAVITY_RANGE, GRAVITY_RANGE + GRAVITY_FADE, 0.0, 0.0),
+            band: Vec4::new(
+                GRAVITY_RANGE,
+                GRAVITY_RANGE + GRAVITY_FADE,
+                HORIZON.0,
+                HORIZON.1,
+            ),
         }
     }
 }
@@ -143,7 +166,9 @@ impl Curve {
     ///     walk keeps its length -- and `h` up, so towers stay towers;
     ///  4. blend the true position towards that by the grip, faded per vertex
     ///     over the altitude band so only this world's neighbourhood takes
-    ///     part.
+    ///     part, and over the [`HORIZON`] angle band so the far side of the
+    ///     world sinks back to where it truly is instead of hanging unrolled
+    ///     in the sky.
     ///
     /// The horizontal direction comes out of `dir - up·cosθ`, whose length is
     /// exactly `sinθ`, so the unrolling multiplies by `θ/sinθ` -- which is 1
@@ -165,15 +190,31 @@ impl Curve {
             return world;
         }
         let height = reach - radius;
-        let share = grip * (1.0 - smoothstep(self.band.x, self.band.y, height));
-        if share <= 0.0 {
+        let tall = grip * (1.0 - smoothstep(self.band.x, self.band.y, height));
+        if tall <= 0.0 {
             return world;
         }
         let dir = arm / reach;
         let cos_polar = dir.dot(up).clamp(-1.0, 1.0);
-        let polar = cos_polar.acos();
         let level = dir - up * cos_polar;
         let sin_polar = level.length();
+        // `atan2` of the parts, never `acos` of the dot. Near the zenith --
+        // which is exactly where the player and every vertex of his own model
+        // stand -- `acos` divides the dot's `f32` noise by a sine that is
+        // nearly zero, and `stretch` below divides by that sine *again*: at a
+        // hand's width off the axis the noise comes out as half a metre of
+        // per-vertex, per-frame shrapnel, which is what was shredding the
+        // player. `atan2(sin, cos)` reads the angle off the sine instead, so
+        // the ratio `polar / sin_polar` shares its errors between numerator
+        // and denominator and cancels them. The same trap [`crate::sky`]
+        // documents at its `RELIGHT_STEP` measurement, met from the other
+        // side.
+        let polar = sin_polar.atan2(cos_polar);
+        // And the far side fades back onto the true sphere -- see [`HORIZON`].
+        let share = tall * (1.0 - smoothstep(self.band.z, self.band.w, polar));
+        if share <= 0.0 {
+            return world;
+        }
         let stretch = if sin_polar > 1e-6 {
             (polar / sin_polar).min(STRETCH)
         } else {
@@ -353,8 +394,8 @@ mod tests {
     fn the_rest_of_the_system_is_left_alone() {
         let curve = full_grip();
         for far in [
-            Vec3::ZERO,                     // the sun
-            Vec3::new(0.0, 0.0, 4200.0),    // the other world, roughly
+            Vec3::ZERO,                  // the sun
+            Vec3::new(0.0, 0.0, 4200.0), // the other world, roughly
             CENTRE + Vec3::Y * (RADIUS + GRAVITY_RANGE + GRAVITY_FADE + 1.0),
         ] {
             assert_eq!(curve.bend(far), far, "something out of the band moved");
@@ -378,21 +419,38 @@ mod tests {
         assert_eq!(Curve::default().bend(world), world);
     }
 
-    /// The far side of the world folds instead of flying: the exponential
-    /// map's one singular point is capped, so the whole sphere lands within a
-    /// bounded, fog-deep disc and no triangle is flung across the sky.
+    /// The far side of the world stays under the horizon: past the
+    /// [`HORIZON`] fade the map has let go entirely, so the far hemisphere
+    /// is drawn exactly where it truly is -- below the flattened plane,
+    /// hidden under the nearer ground -- instead of unrolled into the sky as
+    /// giant crawling land masses.
     #[test]
-    fn the_antipode_folds_instead_of_flying() {
+    fn the_far_side_stays_under_the_horizon() {
         let curve = full_grip();
-        for nearly in [
+        for far in [
+            on_the_sphere(HORIZON.1 + 0.05, 0.0),
+            on_the_sphere(2.5, 40.0),
             CENTRE - Vec3::Y * RADIUS,
             CENTRE + Quat::from_rotation_z(179.9_f32.to_radians()) * (Vec3::Y * RADIUS),
         ] {
-            let flat = curve.bend(nearly);
-            assert!(flat.is_finite(), "the antipode was not finite: {flat}");
+            assert_eq!(curve.bend(far), far, "the far side left the sphere");
+        }
+    }
+
+    /// The shredder: a vertex a hand's width off the player's own radial
+    /// axis must land within `f32` dust of where it truly stands. With
+    /// `acos` of the dot this came out half a metre wrong, differently per
+    /// vertex per frame, and tore the player's model into slivers.
+    #[test]
+    fn a_vertex_at_the_player_is_not_flung() {
+        let curve = full_grip();
+        for polar in [1e-4, 1e-3, 5e-3] {
+            let close = on_the_sphere(polar, 1.0);
+            let drawn = curve.bend(close);
             assert!(
-                flat.distance(CENTRE) < RADIUS * (1.0 + STRETCH),
-                "the far side flew off the map: {flat}"
+                drawn.distance(close) < 1e-2,
+                "a near vertex was flung {} m at polar {polar}",
+                drawn.distance(close)
             );
         }
     }

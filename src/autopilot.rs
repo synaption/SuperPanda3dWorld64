@@ -24,10 +24,17 @@
 //! works out to is published on [`Autopilot::phase`] for the console and the
 //! overlay, but nothing steers by it.
 //!
-//! It stops *short*: at a planet's weightless boundary, because inside that
-//! the gravity is the better pilot and [`crate::player::movement`] hands the
-//! body to it anyway; at a hop over the sun's surface, because the sun has no
+//! At a planet the boundary is a handover, not an arrival: the crossing
+//! carries a walking pace over the weightless line, and inside it the same
+//! computer rides the descent -- the jet against the fall, held to
+//! [`descent_limit`] -- until the feet are down, where it lets go for good.
+//! Only the sun stops short, a hop over the surface, because the sun has no
 //! gravity to hand over to and flying you into a wall is not arriving.
+//!
+//! Pressing again on the body already locked asks for a **parking orbit**
+//! instead: a ring [`ORBIT_ALTITUDE`] above the stop radius, flown at
+//! [`ORBIT_SPEED`], held until the next press -- the same body back to a
+//! crossing, empty sky to let go.
 
 use crate::{
     console::{ConsoleState, GameTuning},
@@ -55,6 +62,23 @@ const BRAKE_MARGIN: f32 = 0.85;
 /// the plan, near enough. In metres a second.
 const CLOSE_ENOUGH: f32 = 0.5;
 
+/// The pace the crossing carries over a planet's weightless boundary. A plan
+/// that reaches the line at zero hangs there, weightless, forever; a walking
+/// pace across it puts the body in the gravity that finishes the trip.
+const HANDOVER: f32 = 5.0;
+
+/// The descent speed touchdown is aimed at, in metres a second: the floor
+/// under [`descent_limit`], so the last metres are a settle and not a hover
+/// that never lands.
+pub const TOUCHDOWN: f32 = 2.5;
+
+/// How far above the stop radius a parking orbit's ring sits. Clear of the
+/// weightless boundary, so the ring never trades the jet for gravity.
+const ORBIT_ALTITUDE: f32 = 60.0;
+
+/// The pace a parking orbit is flown at, in metres a second.
+const ORBIT_SPEED: f32 = 40.0;
+
 /// The grace round a body's rim the crosshair may miss by and still lock on,
 /// in radians. About three and a half degrees: a distant planet subtends a
 /// few degrees itself, and demanding a dead-centre hit on a moving target at
@@ -67,17 +91,30 @@ pub enum Target {
     /// A body index into [`SolarSystem::bodies`].
     Planet(usize),
     Sun,
+    /// An index into [`crate::world::FIXTURES`]: one of the `test_world`
+    /// diagnostic bodies, when the level was loaded with them. Standing
+    /// still, which makes them the easiest crossings in the system.
+    Fixture(usize),
 }
 
 impl Target {
-    /// In the order X steps through them, before wrapping round to off.
-    pub const ALL: [Target; 3] = [Target::Planet(0), Target::Planet(1), Target::Sun];
+    /// Everything the crosshair can lock, fixtures included -- [`aimed_at`]
+    /// skips the ones the level was loaded without.
+    pub const ALL: [Target; 6] = [
+        Target::Planet(0),
+        Target::Planet(1),
+        Target::Sun,
+        Target::Fixture(0),
+        Target::Fixture(1),
+        Target::Fixture(2),
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Target::Planet(0) => "the first planet",
             Target::Planet(_) => "the second planet",
             Target::Sun => "the sun",
+            Target::Fixture(index) => crate::world::FIXTURES[index.min(2)].name,
         }
     }
 
@@ -88,15 +125,26 @@ impl Target {
             Target::Planet(0) => "PLANET I",
             Target::Planet(_) => "PLANET II",
             Target::Sun => "SUN",
+            Target::Fixture(index) => crate::world::FIXTURES[index.min(2)].tag,
         }
     }
 
     /// Where the target is *now* -- asked every tick, because everything but
-    /// the sun is moving.
+    /// the sun and the fixtures is moving.
     pub fn centre(self, system: &SolarSystem) -> Vec3 {
         match self {
             Target::Planet(index) => system.bodies[index.min(1)].centre,
             Target::Sun => SUN_CENTRE,
+            Target::Fixture(index) => crate::world::FIXTURES[index.min(2)].stands_at,
+        }
+    }
+
+    /// The body's own extent: the disc the crosshair aims at.
+    pub fn body_radius(self, planet_radius: f32) -> f32 {
+        match self {
+            Target::Planet(_) => planet_radius,
+            Target::Sun => SUN_RADIUS,
+            Target::Fixture(index) => crate::world::FIXTURES[index.min(2)].radius,
         }
     }
 
@@ -104,9 +152,11 @@ impl Target {
     /// stationary at.
     pub fn stop_radius(self, planet_radius: f32) -> f32 {
         match self {
-            // The weightless boundary: past here the planet's own pull is
+            // The weightless boundary: past here the body's own pull is
             // the better pilot, and the movement code hands over to it.
-            Target::Planet(_) => planet_radius + GRAVITY_RANGE + GRAVITY_FADE,
+            Target::Planet(_) | Target::Fixture(_) => {
+                self.body_radius(planet_radius) + GRAVITY_RANGE + GRAVITY_FADE
+            }
             Target::Sun => SUN_RADIUS + SUN_ARRIVE,
         }
     }
@@ -120,24 +170,47 @@ pub enum Phase {
     Idle,
     Burn,
     Brake,
+    /// Holding a parking orbit's ring.
+    Orbit,
+}
+
+/// What the lock is *for*: flying there, or staying in a ring round it.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum Mode {
+    #[default]
+    Approach,
+    /// Hold a circle of radius `hold` round the target.
+    Orbit { hold: f32 },
 }
 
 /// The autopilot's whole state: where it is pointed, if anywhere, and what
-/// its burn is doing about it.
+/// its burn is doing about it. `flown` remembers whether this lock has ever
+/// burned -- the difference, on the ground, between a trip that is over and
+/// one still being lined up: touchdown releases the first and keeps the
+/// second.
 #[derive(Resource, Default)]
 pub struct Autopilot {
     pub target: Option<Target>,
     pub phase: Phase,
+    pub mode: Mode,
+    pub flown: bool,
 }
 
 impl Autopilot {
+    /// A fresh lock, pointed at `target` for the crossing.
+    pub fn approach(target: Target) -> Self {
+        Self {
+            target: Some(target),
+            ..Self::default()
+        }
+    }
+
     pub fn engaged(&self) -> bool {
         self.target.is_some()
     }
 
     pub fn disengage(&mut self) {
-        self.target = None;
-        self.phase = Phase::Idle;
+        *self = Self::default();
     }
 }
 
@@ -149,16 +222,21 @@ impl Autopilot {
 pub fn aimed_at(
     system: &SolarSystem,
     planet_radius: f32,
+    fixtures: usize,
     from: Vec3,
     along: Vec3,
 ) -> Option<Target> {
     let along = along.normalize_or(Vec3::Z);
     let mut best: Option<(f32, Target)> = None;
     for target in Target::ALL {
-        let (centre, radius) = match target {
-            Target::Planet(index) => (system.bodies[index.min(1)].centre, planet_radius),
-            Target::Sun => (SUN_CENTRE, SUN_RADIUS),
-        };
+        // A fixture the level was loaded without is not in the sky to aim at.
+        if let Target::Fixture(index) = target {
+            if index >= fixtures {
+                continue;
+            }
+        }
+        let centre = target.centre(system);
+        let radius = target.body_radius(planet_radius);
         let gap = centre - from;
         let distance = gap.length();
         // Standing inside a body is not aiming at it.
@@ -205,15 +283,26 @@ pub fn select(
     let Ok(eye) = camera.single() else {
         return;
     };
+    let radius = planet_radius(&level);
+    let fixtures = level.world_count().saturating_sub(1);
     match aimed_at(
         &system,
-        planet_radius(&level),
+        radius,
+        fixtures,
         eye.translation,
         eye.forward().into(),
     ) {
-        Some(target) => {
-            pilot.target = Some(target);
+        // A second press on the body already locked asks for the parking
+        // orbit instead of the crossing; a third asks the crossing back.
+        Some(target) if pilot.target == Some(target) && matches!(pilot.mode, Mode::Approach) => {
+            pilot.mode = Mode::Orbit {
+                hold: target.stop_radius(radius) + ORBIT_ALTITUDE,
+            };
             pilot.phase = Phase::Idle;
+            console.report(format!("autopilot: parking orbit round {}", target.name()));
+        }
+        Some(target) => {
+            *pilot = Autopilot::approach(target);
             console.report(format!("autopilot: locked on {}", target.name()));
         }
         None if pilot.engaged() => {
@@ -244,24 +333,78 @@ pub fn steer(
     let gap = target.centre(system) - at;
     let distance = gap.length();
     let stop_at = target.stop_radius(planet_radius);
-    if distance <= stop_at {
-        pilot.disengage();
-        return None;
-    }
-    let toward = gap / distance;
-    // The fastest speed, straight at the target, that the remaining distance
-    // can still absorb. Everything the guidance does falls out of pushing
-    // the velocity towards this one vector.
-    let allowed = (2.0 * accel * BRAKE_MARGIN * (distance - stop_at)).sqrt();
-    let correction = toward * allowed - velocity;
+    let toward = gap.normalize_or(Vec3::Z);
+    let desired = match pilot.mode {
+        Mode::Approach => {
+            if distance <= stop_at {
+                match target {
+                    // The sun has no gravity to hand over to: arrival is
+                    // release.
+                    Target::Sun => {
+                        pilot.disengage();
+                        return None;
+                    }
+                    // A planet's boundary is a handover, not an arrival: the
+                    // descent inside it belongs to the same computer riding
+                    // the jet against the pull, in the movement code. Out
+                    // here in the boundary's skin there is nothing to do.
+                    // A fixture's pull hands over the same way.
+                    Target::Planet(_) | Target::Fixture(_) => return None,
+                }
+            }
+            // The fastest speed, straight at the target, that the remaining
+            // distance can still absorb. Everything the guidance does falls
+            // out of pushing the velocity towards this one vector -- floored
+            // at the handover pace on a planet, so the plan crosses the
+            // weightless line instead of parking on it.
+            let allowed = (2.0 * accel * BRAKE_MARGIN * (distance - stop_at)).sqrt();
+            let allowed = match target {
+                Target::Planet(_) | Target::Fixture(_) => allowed.max(HANDOVER),
+                Target::Sun => allowed,
+            };
+            toward * allowed
+        }
+        Mode::Orbit { hold } => {
+            // Close on the ring at the speed the gap can absorb -- the same
+            // braking rule the crossing flies, signed for whichever side of
+            // the ring this is -- while carrying the ring's own pace round
+            // the body, whichever way the flight already leans.
+            let outward = distance - hold;
+            let closing = (2.0 * accel * BRAKE_MARGIN * outward.abs())
+                .sqrt()
+                .copysign(outward);
+            let sideways = velocity - toward * velocity.dot(toward);
+            let round = sideways.normalize_or(
+                toward
+                    .cross(Vec3::Y)
+                    .normalize_or(toward.cross(Vec3::X).normalize_or(Vec3::Z)),
+            );
+            toward * closing + round * ORBIT_SPEED
+        }
+    };
+    let correction = desired - velocity;
     if correction.length() < CLOSE_ENOUGH {
         return None;
     }
-    pilot.phase = match correction.dot(velocity) < 0.0 {
-        true => Phase::Brake,
-        false => Phase::Burn,
+    pilot.flown = true;
+    pilot.phase = match pilot.mode {
+        Mode::Orbit { .. } => Phase::Orbit,
+        Mode::Approach => match correction.dot(velocity) < 0.0 {
+            true => Phase::Brake,
+            false => Phase::Burn,
+        },
     };
     Some(correction / correction.length())
+}
+
+/// The fastest fall the height still under the body can absorb, given the
+/// braking the jet has to spare over gravity -- the descent's own copy of
+/// the crossing's one rule, floored at [`TOUCHDOWN`] so the last metres are
+/// landed rather than hovered. In metres a second, positive down.
+pub fn descent_limit(brake: f32, altitude: f32) -> f32 {
+    (2.0 * brake.max(0.0) * BRAKE_MARGIN * altitude.max(0.0))
+        .sqrt()
+        .max(TOUCHDOWN)
 }
 
 /// How long the flight computer expects the crossing to take, in seconds:
@@ -280,12 +423,16 @@ pub fn eta(
     accel: f32,
 ) -> Option<f32> {
     const STEP: f32 = 0.25;
-    let mut ghost = Autopilot {
-        target: Some(target),
-        phase: Phase::Idle,
-    };
+    let mut ghost = Autopilot::approach(target);
+    let stop_at = target.stop_radius(planet_radius);
     let (mut here, mut velocity) = (at, velocity);
     for tick in 0..(600.0 / STEP) as usize {
+        // Arrived is *reaching* the stop radius: a planet's plan never lets
+        // go out here -- the handover to gravity does that -- so the clock
+        // reads the distance rather than the lock.
+        if (target.centre(system) - here).length() <= stop_at {
+            return Some(tick as f32 * STEP);
+        }
         match steer(&mut ghost, system, planet_radius, here, velocity, accel) {
             Some(push) => velocity += push * (accel * STEP),
             None if !ghost.engaged() => return Some(tick as f32 * STEP),
@@ -411,8 +558,13 @@ pub fn hud(
     // nothing honest to draw, so the lock keeps quietly to itself.
     let blended = system.blended(fixed.overstep_fraction().clamp(0.0, 1.0));
     let (centre, body_radius) = match target {
+        // The planets through the frame's blend, because they move; the sun
+        // and the fixtures stand still.
         Target::Planet(index) => (blended[index.min(1)].0, planet_radius(&level)),
-        Target::Sun => (SUN_CENTRE, SUN_RADIUS),
+        _ => (
+            target.centre(&system),
+            target.body_radius(planet_radius(&level)),
+        ),
     };
     // Bent through the frame's flat-map before projecting, like every world
     // position that has to land where the *picture* is. Today a lockable body
@@ -437,7 +589,7 @@ pub fn hud(
     bracket.height = Val::Px(size);
     let colour = match pilot.phase {
         Phase::Brake => Color::srgba(1.0, 0.65, 0.25, 0.95),
-        Phase::Burn | Phase::Idle => Color::srgba(0.3, 0.9, 1.0, 0.9),
+        Phase::Burn | Phase::Idle | Phase::Orbit => Color::srgba(0.3, 0.9, 1.0, 0.9),
     };
     *border = BorderColor::all(colour);
     tint.0 = colour;
@@ -447,29 +599,36 @@ pub fn hud(
     let gap = centre - pose.translation;
     let range = (gap.length() - body_radius).max(0.0);
     let closing = ctrl.velocity.dot(gap.normalize_or_zero());
-    // The ETA is the plan's own answer, and only the flight has a plan: on
-    // the ground the numbers would be a story about a burn nobody is flying.
-    let seconds = gravity.weightless(pose.translation).then(|| {
-        let accel = tuning.fly_accel
-            * match tuning.infinite_thrust > 0.5 {
-                true => INFINITE_BURN,
-                false => 1.0,
-            };
-        eta(
-            target,
-            &system,
-            planet_radius(&level),
-            pose.translation,
-            ctrl.velocity,
-            accel,
-        )
-    });
+    // The ETA is the plan's own answer, and only a crossing has one: on the
+    // ground the numbers would be a story about a burn nobody is flying, and
+    // a parking orbit never arrives anywhere -- it says what it is instead.
+    let clock = match pilot.mode {
+        Mode::Orbit { .. } => "orbit".to_string(),
+        Mode::Approach => {
+            let seconds = gravity.weightless(pose.translation).then(|| {
+                let accel = tuning.fly_accel
+                    * match tuning.infinite_thrust > 0.5 {
+                        true => INFINITE_BURN,
+                        false => 1.0,
+                    };
+                eta(
+                    target,
+                    &system,
+                    planet_radius(&level),
+                    pose.translation,
+                    ctrl.velocity,
+                    accel,
+                )
+            });
+            format!("eta {}", eta_label(seconds.flatten()))
+        }
+    };
     **text = format!(
-        "{}\n{}  ·  {:+.0} m/s  ·  eta {}",
+        "{}\n{}  ·  {:+.0} m/s  ·  {}",
         target.tag(),
         range_label(range),
         closing,
-        eta_label(seconds.flatten()),
+        clock,
     );
     bracket_shown.set_if_neq(Visibility::Visible);
     tag_shown.set_if_neq(Visibility::Visible);
@@ -532,73 +691,187 @@ mod tests {
         let from = Vec3::new(0.0, 2000.0, 0.0);
         let at_planet = (system.bodies[1].centre - from).normalize();
         assert_eq!(
-            aimed_at(&system, radius, from, at_planet),
+            aimed_at(&system, radius, 0, from, at_planet),
             Some(Target::Planet(1))
         );
         // A near miss inside the slop is the same lock: nobody should have
         // to centre a three-degree disc at five kilometres.
         let brushed = Quat::from_rotation_x(0.04) * at_planet;
         assert_eq!(
-            aimed_at(&system, radius, from, brushed),
+            aimed_at(&system, radius, 0, from, brushed),
             Some(Target::Planet(1))
         );
         let at_sun = (SUN_CENTRE - from).normalize();
-        assert_eq!(aimed_at(&system, radius, from, at_sun), Some(Target::Sun));
+        assert_eq!(
+            aimed_at(&system, radius, 0, from, at_sun),
+            Some(Target::Sun)
+        );
         // Empty sky is nothing, which is the off switch.
-        assert_eq!(aimed_at(&system, radius, from, Vec3::Y), None);
+        assert_eq!(aimed_at(&system, radius, 0, from, Vec3::Y), None);
     }
 
     /// The whole crossing, flown: from rest in the weightless middle, the
-    /// guidance accelerates at the target, comes back down, and lets go
-    /// stationary-ish at the stop radius -- without ever crossing inside it.
-    /// This is the accelerate-then-decelerate the feature asks for, held as
-    /// an outcome rather than as a phase sequence.
+    /// guidance accelerates at the target, comes back down, and crosses the
+    /// stop radius at a walking pace with the lock still on -- the handover
+    /// to the planet's gravity, where the descent code takes the rest. This
+    /// is the accelerate-then-decelerate the feature asks for, held as an
+    /// outcome rather than as a phase sequence.
     #[test]
-    fn the_crossing_burns_out_and_brakes_in() {
+    fn the_crossing_burns_out_and_hands_over_at_a_walk() {
         let system = system();
         let radius = 300.0;
         let accel = 24.0 * 6.0; // the infinite booster's burn
-        let mut pilot = Autopilot {
-            target: Some(Target::Planet(1)),
-            phase: Phase::Idle,
-        };
+        let mut pilot = Autopilot::approach(Target::Planet(1));
         let mut at = system.bodies[0].centre
             + (system.bodies[1].centre - system.bodies[0].centre).normalize() * 800.0;
         let mut velocity = Vec3::ZERO;
         let stop_at = Target::Planet(1).stop_radius(radius);
         let mut top_speed = 0.0f32;
         let mut braked = false;
+        let mut crossed = None;
         for _ in 0..(240.0 / FIXED_DT) as usize {
-            let Some(push) = steer(&mut pilot, &system, radius, at, velocity, accel) else {
-                if !pilot.engaged() {
-                    break;
-                }
-                at += velocity * FIXED_DT;
-                continue;
-            };
-            braked |= pilot.phase == Phase::Brake;
-            velocity += push * (accel * FIXED_DT);
+            if let Some(push) = steer(&mut pilot, &system, radius, at, velocity, accel) {
+                braked |= pilot.phase == Phase::Brake;
+                velocity += push * (accel * FIXED_DT);
+            }
             at += velocity * FIXED_DT;
             top_speed = top_speed.max(velocity.length());
-            let out = (at - system.bodies[1].centre).length();
-            assert!(
-                out > stop_at - 5.0,
-                "the approach carried {} m inside the stop radius",
-                stop_at - out
-            );
+            if (at - system.bodies[1].centre).length() <= stop_at {
+                crossed = Some(velocity.length());
+                break;
+            }
         }
-        assert!(!pilot.engaged(), "four minutes and it never arrived");
+        let crossing = crossed.expect("four minutes and it never arrived");
+        assert!(pilot.engaged(), "the lock let go before the handover");
+        assert!(
+            pilot.flown,
+            "a whole crossing and it never counted as flown"
+        );
         assert!(braked, "it arrived without ever braking");
         assert!(top_speed > 100.0, "it never really burned: {top_speed} m/s");
         assert!(
-            velocity.length() < 20.0,
-            "it let go still doing {} m/s",
-            velocity.length()
+            crossing < HANDOVER + 10.0,
+            "it crossed the boundary doing {crossing} m/s"
         );
-        let out = (at - system.bodies[1].centre).length();
+    }
+
+    /// The fixtures are destinations too: with them filed, the crosshair
+    /// picks the test sphere out of the sky, and the crossing flies there
+    /// and hands over at its boundary exactly the way a planet's does.
+    #[test]
+    fn a_fixture_is_a_destination_like_any_planet() {
+        let system = system();
+        let radius = 300.0;
+        let sphere = crate::world::FIXTURES[0].stands_at;
+        // Aimed straight at it from over the sun, with all three present it
+        // locks; loaded without fixtures the same aim is empty sky.
+        let from = Vec3::new(0.0, 2000.0, 0.0);
+        let at_sphere = (sphere - from).normalize();
+        assert_eq!(
+            aimed_at(&system, radius, 3, from, at_sphere),
+            Some(Target::Fixture(0))
+        );
+        assert_eq!(aimed_at(&system, radius, 0, from, at_sphere), None);
+        // And the crossing arrives: same guidance, same handover.
+        let accel = 24.0 * 6.0;
+        let mut pilot = Autopilot::approach(Target::Fixture(0));
+        let (mut at, mut velocity) = (from, Vec3::ZERO);
+        let stop_at = Target::Fixture(0).stop_radius(radius);
+        let mut crossed = None;
+        for _ in 0..(240.0 / FIXED_DT) as usize {
+            if let Some(push) = steer(&mut pilot, &system, radius, at, velocity, accel) {
+                velocity += push * (accel * FIXED_DT);
+            }
+            at += velocity * FIXED_DT;
+            if (at - sphere).length() <= stop_at {
+                crossed = Some(velocity.length());
+                break;
+            }
+        }
+        let crossing = crossed.expect("four minutes and it never reached the sphere");
+        assert!(pilot.engaged(), "the lock let go before the handover");
         assert!(
-            (out - stop_at).abs() < 60.0,
-            "it let go {out} m out against a stop radius of {stop_at}"
+            crossing < HANDOVER + 10.0,
+            "it crossed the sphere's boundary doing {crossing} m/s"
+        );
+    }
+
+    /// The parking orbit settles onto its ring and stays there, going round:
+    /// engaged well outside the ring, the guidance closes on it, holds the
+    /// radius, and keeps the lock -- an orbit is not a trip that ends.
+    #[test]
+    fn the_parking_orbit_settles_on_its_ring_and_goes_round() {
+        let system = system();
+        let radius = 300.0;
+        let accel = 24.0 * 6.0;
+        let centre = system.bodies[1].centre;
+        let hold = Target::Planet(1).stop_radius(radius) + 60.0;
+        let mut pilot = Autopilot {
+            target: Some(Target::Planet(1)),
+            mode: Mode::Orbit { hold },
+            ..Default::default()
+        };
+        let mut at = centre + Vec3::X * (hold + 900.0);
+        let mut velocity = Vec3::ZERO;
+        let mut swept = 0.0;
+        let mut prev = (at - centre).normalize();
+        let settle = (90.0 / FIXED_DT) as usize;
+        for tick in 0..(120.0 / FIXED_DT) as usize {
+            if let Some(push) = steer(&mut pilot, &system, radius, at, velocity, accel) {
+                velocity += push * (accel * FIXED_DT);
+            }
+            at += velocity * FIXED_DT;
+            let dir = (at - centre).normalize();
+            if tick > settle {
+                let out = (at - centre).length();
+                assert!(
+                    (out - hold).abs() < 40.0,
+                    "the ring wandered to {out} m against a hold of {hold}"
+                );
+                swept += prev.angle_between(dir);
+            }
+            prev = dir;
+        }
+        assert!(pilot.engaged(), "a parking orbit let go of its lock");
+        assert_eq!(pilot.phase, Phase::Orbit);
+        assert!(
+            swept > 1.0,
+            "half a minute on the ring swept only {swept} rad"
+        );
+    }
+
+    /// The descent under gravity is landed rather than hovered: held to
+    /// [`descent_limit`] by the jet, a fall from the handover altitude
+    /// reaches the ground at the touchdown pace, and in seconds rather than
+    /// on a parachute.
+    #[test]
+    fn the_descent_is_landed_rather_than_hovered() {
+        // The profile itself: shrinks with the height left, floored at the
+        // touchdown pace so the last metres do not asymptote.
+        assert!(descent_limit(36.0, 240.0) > descent_limit(36.0, 60.0));
+        assert_eq!(descent_limit(36.0, 0.0), TOUCHDOWN);
+        // And flown, the way the movement code flies it: gravity every tick,
+        // the jet only when the fall outruns the limit.
+        let (gravity, jet_per_tick) = (36.0, 2.4);
+        let brake = jet_per_tick / FIXED_DT - gravity;
+        let mut altitude = 240.0;
+        let mut fall = HANDOVER;
+        let mut ticks = 0;
+        while altitude > 0.0 {
+            ticks += 1;
+            assert!(
+                ticks < (60.0 / FIXED_DT) as usize,
+                "a minute and still aloft"
+            );
+            fall += gravity * FIXED_DT;
+            if fall > descent_limit(brake, altitude) {
+                fall -= jet_per_tick;
+            }
+            altitude -= fall * FIXED_DT;
+        }
+        assert!(
+            fall < TOUCHDOWN + 2.0,
+            "hit the ground doing {fall} m/s against a touchdown of {TOUCHDOWN}"
         );
     }
 
@@ -609,10 +882,7 @@ mod tests {
     fn a_sideways_start_is_straightened_out() {
         let system = system();
         let accel = 24.0 * 6.0;
-        let mut pilot = Autopilot {
-            target: Some(Target::Sun),
-            phase: Phase::Idle,
-        };
+        let mut pilot = Autopilot::approach(Target::Sun);
         let mut at = SUN_CENTRE + Vec3::new(2000.0, 400.0, 0.0);
         let mut velocity = Vec3::Z * 80.0;
         for _ in 0..(240.0 / FIXED_DT) as usize {

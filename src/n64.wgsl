@@ -268,15 +268,28 @@ fn n64_unbend(world: vec3<f32>) -> vec3<f32> {
         return world;
     }
     let height = reach - radius;
-    let share = grip * (1.0 - smoothstep(curve.band.x, curve.band.y, height));
-    if share <= 0.0 {
+    let tall = grip * (1.0 - smoothstep(curve.band.x, curve.band.y, height));
+    if tall <= 0.0 {
         return world;
     }
     let dir = arm / reach;
     let cos_polar = clamp(dot(dir, up), -1.0, 1.0);
-    let polar = acos(cos_polar);
     let level = dir - up * cos_polar;
     let sin_polar = length(level);
+    // atan2 of the parts, never acos of the dot: near the zenith -- the
+    // player himself -- acos divides the dot's f32 noise by a near-zero sine
+    // and `stretch` divides by it again, which shredded the player's model
+    // into half-metre shrapnel. atan2 reads the angle off the sine, so the
+    // ratio below shares its errors top and bottom and cancels them. See
+    // `Curve::bend`.
+    let polar = atan2(sin_polar, cos_polar);
+    // And past the horizon band the far side settles back onto the true
+    // sphere, below the flattened plane where the nearer ground hides it --
+    // see `HORIZON` in flatten.rs.
+    let share = tall * (1.0 - smoothstep(curve.band.z, curve.band.w, polar));
+    if share <= 0.0 {
+        return world;
+    }
     var stretch = 1.0;
     if sin_polar > 1e-6 {
         stretch = min(polar / sin_polar, 8.0);

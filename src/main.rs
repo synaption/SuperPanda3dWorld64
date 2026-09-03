@@ -11,6 +11,7 @@ mod action;
 mod aim;
 mod animation;
 mod audio;
+mod autopilot;
 mod billboard;
 mod camera;
 mod collide;
@@ -29,7 +30,6 @@ mod impostor;
 mod input;
 mod level;
 mod menu;
-mod autopilot;
 mod n64;
 mod nuclonium;
 mod orbit;
@@ -363,7 +363,13 @@ fn main() {
                 ..default()
             }),
     );
+    // The saved console rows, loaded before `add_game`'s `init_resource` can
+    // put the defaults there instead -- and written back as they change.
+    // Only here, in the windowed game: tests, screenshots and benchmarks run
+    // on the defaults, so yesterday's slider cannot change today's numbers.
+    app.insert_resource(console::GameTuning::load_saved());
     add_game(&mut app);
+    app.add_systems(Update, console::persist);
     app.add_systems(PreUpdate, input_pipeline()).run();
 }
 
@@ -412,12 +418,17 @@ pub fn add_game(app: &mut App) {
     // the local-down arrow and the gravity shells then saw back and forth at
     // 30 Hz across a world that glides, which on the orbiting level was a
     // genuinely nauseating thing to stand under.
-    app.add_systems(Startup, path::configure)
-        .add_systems(
-            Update,
-            (path::draw, enemy::draw_crawlers, collide::draw, orrery::draw)
-                .after(player::sync_visual),
-        );
+    app.add_systems(Startup, path::configure).add_systems(
+        Update,
+        (
+            path::draw,
+            enemy::draw_crawlers,
+            collide::draw,
+            orrery::draw,
+            orrery::readout,
+        )
+            .after(player::sync_visual),
+    );
 }
 
 /// Every resource the game's systems expect to find.
@@ -871,6 +882,9 @@ fn overlay() -> ScheduleConfigs<ScheduleSystem> {
         // for this frame is one frame further along by the end of it.
         world::switch,
         world::finish_planet,
+        // And straight after that, so the `test_world` fixtures follow the
+        // planet whose collision and gravity they are filed into.
+        world::finish_fixtures,
         // Out here rather than in `simulation` because the console is open at
         // the moment a `crowd` command is typed, and a field that only arrived
         // once you shut the console is a field you never saw arrive.
@@ -936,6 +950,7 @@ fn setup(
     mut images: ResMut<Assets<Image>>,
     mut console: ResMut<console::ConsoleState>,
     mut load: ResMut<world::LevelLoad>,
+    tuning: Res<console::GameTuning>,
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
     // Made before anything that refers to it: the world camera draws into it,
@@ -990,6 +1005,7 @@ fn setup(
         &mut meshes,
         &mut materials,
         &mut load,
+        &tuning,
     );
     let spawn = Transform::from_translation(world::castle_spawn());
     commands.insert_resource(RenderPose {
@@ -1164,6 +1180,7 @@ fn setup(
     menu::spawn(&mut commands);
     action::spawn(&mut commands);
     autopilot::spawn_hud(&mut commands);
+    orrery::spawn(&mut commands);
     if let Ok(mut cursor) = cursor.single_mut() {
         cursor.grab_mode = CursorGrabMode::Locked;
         cursor.visible = false;
@@ -1220,11 +1237,16 @@ fn update_fps(
     diagnostics: Res<DiagnosticsStore>,
     enemies: Query<(), With<enemy::Enemy>>,
     crowd: Res<impostor::ImpostorStats>,
+    tuning: Res<console::GameTuning>,
     mut text: Query<&mut Text, With<FpsText>>,
 ) {
     let Ok(mut readout) = text.single_mut() else {
         return;
     };
+    if tuning.debug <= 0.5 {
+        **readout = String::new();
+        return;
+    }
     let fps = diagnostics
         .get(&FrameTimeDiagnosticsPlugin::FPS)
         .and_then(|fps| fps.smoothed());
@@ -1316,7 +1338,9 @@ fn update_hud(
     };
     // A single-run text node is written through as a whole string now that
     // extra runs are child entities rather than a `sections` vector.
-    **hud = if state.debug {
+    // F1 toggles the text; the console's `debug 0` overrules it along with
+    // every other piece of standing debug furniture.
+    **hud = if state.debug && tuning.debug > 0.5 {
         let device = if input.pad { "gamepad" } else { "keyboard" };
         let weapon = loadout.equipped.spec().name;
         let following = squad.members.len();

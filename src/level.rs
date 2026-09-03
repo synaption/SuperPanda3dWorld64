@@ -77,6 +77,50 @@ impl PlanetFrame {
     }
 }
 
+/// One round world's worth of filed geometry: its own cells, its own middle,
+/// its own sea, and the places copies of it stand.
+///
+/// The first world in the list is *the* planet -- the terrain glb both
+/// orbiting bodies are copies of, and the one [`LevelData::shape`] speaks
+/// for. Anything after it is a fixture with different geometry standing
+/// somewhere else in the same level: the `test_world` diagnostic bodies, each
+/// filed by [`LevelData::add_world`].
+struct PlanetWorld {
+    centre: Vec3,
+    radius: f32,
+    /// Distance from `centre` out to the water's surface, or `None` on a
+    /// dry planet. A planet ocean is one sphere and not a list of boxes:
+    /// every basin on the world is under the same surface, so "how deep am
+    /// I" is one subtraction wherever it is asked.
+    sea: Option<f32>,
+    /// Whether the inside of it is somewhere a body cannot legitimately be.
+    /// True for a solid ball, whose core the out-of-bounds respawn guards;
+    /// false for a fixture with honest space inside its bounding sphere --
+    /// the hole of the torus, the air under the platform.
+    cored: bool,
+    /// One list of triangles per face cell, `face * FACE_GRID * FACE_GRID`
+    /// plus the cell within the face -- indices into the level's one shared
+    /// triangle list. No floor/wall split, because on a planet that split
+    /// depends on where the triangle is and cannot be decided when it is
+    /// filed.
+    cells: Vec<Vec<u32>>,
+    /// Where copies of this world stand and how far each has turned.
+    ///
+    /// A second planet is not a second set of 786,432 triangles: it is the
+    /// same geometry standing somewhere else, so every query maps its
+    /// question into the nearest copy's frame, asks the one index that
+    /// exists, and maps the answer back. What that costs is the assumption
+    /// that no query spans two worlds at once -- and none does: the bodies
+    /// sit hundreds of metres apart, and every probe in the game reaches
+    /// metres.
+    ///
+    /// A frame and not just an offset, because the solar system's planets
+    /// *spin*: [`crate::orbit::advance`] re-places the first world's list
+    /// every tick, and the rotation is what lets one filed set of triangles
+    /// be a turning world -- the query turns instead of the geometry.
+    instances: Vec<PlanetFrame>,
+}
+
 /// The spatial index, one variant per [`Shape`].
 enum Index {
     Flat {
@@ -87,35 +131,8 @@ enum Index {
         cell: Vec2,
     },
     Planet {
-        centre: Vec3,
-        radius: f32,
-        /// Distance from `centre` out to the water's surface, or `None` on a
-        /// dry planet. A planet ocean is one sphere and not a list of boxes:
-        /// every basin on the world is under the same surface, so "how deep am
-        /// I" is one subtraction wherever it is asked.
-        sea: Option<f32>,
-        /// One list of triangles per face cell, `face * FACE_GRID * FACE_GRID`
-        /// plus the cell within the face. No floor/wall split, because on a
-        /// planet that split depends on where the triangle is and cannot be
-        /// decided when it is filed.
-        cells: Vec<Vec<u32>>,
-        /// Where copies of this planet stand and how far each has turned.
-        /// Always holds the identity frame -- the geometry as filed -- and one
-        /// more per copy.
-        ///
-        /// A second planet is not a second set of 786,432 triangles: it is the
-        /// same geometry standing somewhere else, so every query maps its
-        /// question into the nearest copy's frame, asks the one index that
-        /// exists, and maps the answer back. What that costs is the assumption
-        /// that no query spans two planets at once -- and none does: the
-        /// planets sit hundreds of metres apart, and every probe in the game
-        /// reaches metres.
-        ///
-        /// A frame and not just an offset, because the solar system's planets
-        /// *spin*: [`crate::orbit::advance`] re-places this list every tick,
-        /// and the rotation is what lets one filed set of triangles be a
-        /// turning world -- the query turns instead of the geometry.
-        instances: Vec<PlanetFrame>,
+        /// The planet first, then any fixtures. Never empty.
+        worlds: Vec<PlanetWorld>,
     },
 }
 
@@ -492,15 +509,89 @@ impl LevelData {
             water_boxes: Vec::new(),
             triangles,
             index: Index::Planet {
-                centre,
-                radius,
-                sea,
-                cells,
-                instances: vec![PlanetFrame {
+                worlds: vec![PlanetWorld {
                     centre,
-                    ..PlanetFrame::IDENTITY
+                    radius,
+                    sea,
+                    cored: true,
+                    cells,
+                    instances: vec![PlanetFrame {
+                        centre,
+                        ..PlanetFrame::IDENTITY
+                    }],
                 }],
             },
+        }
+    }
+
+    /// Files one more body's geometry into a planet level, standing at
+    /// `stands_at` and never moving: how the `test_world` fixtures join the
+    /// solar system without becoming a second collision resource. The
+    /// vertices are the glb's own -- centred wherever it was authored, with
+    /// `centre` their measured middle -- and the one instance maps them to
+    /// where the body stands. `cored` says whether the inside of it is
+    /// out-of-bounds the way a solid planet's core is; a torus's hole and a
+    /// platform's underside are honest places to fly.
+    ///
+    /// A no-op on a flat level, which has no frame for another world to
+    /// stand in.
+    pub fn add_world(
+        &mut self,
+        vertices: &[Vec3],
+        indices: &[[u32; 3]],
+        centre: Vec3,
+        radius: f32,
+        cored: bool,
+        stands_at: Vec3,
+    ) {
+        let Index::Planet { worlds } = &mut self.index else {
+            return;
+        };
+        let base = self.triangles.len() as u32;
+        let fresh: Vec<_> = indices
+            .iter()
+            .filter(|tri| tri.iter().all(|&i| (i as usize) < vertices.len()))
+            .map(|tri| {
+                let a = vertices[tri[0] as usize];
+                let b = vertices[tri[1] as usize];
+                let c = vertices[tri[2] as usize];
+                CollisionTriangle {
+                    a,
+                    b,
+                    c,
+                    normal: (b - a).cross(c - a).normalize_or_zero(),
+                    min: Vec2::new(a.x.min(b.x).min(c.x), a.z.min(b.z).min(c.z)),
+                    max: Vec2::new(a.x.max(b.x).max(c.x), a.z.max(b.z).max(c.z)),
+                }
+            })
+            .filter(|tri| !degenerate(tri))
+            .collect();
+        let mut cells = vec![Vec::new(); 6 * FACE_GRID * FACE_GRID];
+        let mut filed = Vec::new();
+        for (index, tri) in fresh.iter().enumerate() {
+            file_triangle(tri, centre, base + index as u32, &mut filed, &mut cells);
+        }
+        self.triangles.extend(fresh);
+        worlds.push(PlanetWorld {
+            centre,
+            radius,
+            sea: None,
+            cored,
+            cells,
+            instances: vec![PlanetFrame {
+                centre,
+                offset: stands_at,
+                rotation: Quat::IDENTITY,
+            }],
+        });
+    }
+
+    /// How many round worlds are filed: the planet plus its fixtures, or zero
+    /// on a flat level. What a test asks to know the fixtures arrived.
+    pub fn world_count(&self) -> usize {
+        match &self.index {
+            Index::Planet { worlds } => worlds.len(),
+            Index::Flat { .. } => 0,
         }
     }
 
@@ -517,44 +608,55 @@ impl LevelData {
     ///
     /// Replaces rather than edits, so the caller's list *is* the truth and a
     /// body it stopped naming is a body that is gone.
-    pub fn place_planets(&mut self, worlds: &[(Vec3, Quat)]) {
-        if let Index::Planet {
-            centre, instances, ..
-        } = &mut self.index
-        {
-            instances.clear();
-            instances.extend(worlds.iter().map(|&(stands_at, rotation)| PlanetFrame {
-                centre: *centre,
-                offset: stands_at - *centre,
-                rotation,
-            }));
+    pub fn place_planets(&mut self, placed: &[(Vec3, Quat)]) {
+        if let Index::Planet { worlds } = &mut self.index {
+            let Some(planet) = worlds.first_mut() else {
+                return;
+            };
+            let centre = planet.centre;
+            planet.instances.clear();
+            planet
+                .instances
+                .extend(placed.iter().map(|&(stands_at, rotation)| PlanetFrame {
+                    centre,
+                    offset: stands_at - centre,
+                    rotation,
+                }));
         }
     }
 
-    /// The frame of the planet copy nearest to `reference`: the one a query
-    /// asked around that point is answered in. The identity on a flat level,
-    /// and the planet's own frame -- wherever [`Self::place_planets`] last put
-    /// it -- everywhere else.
-    fn instance_frame(&self, reference: Vec3) -> PlanetFrame {
-        let Index::Planet { instances, .. } = &self.index else {
-            return PlanetFrame::IDENTITY;
+    /// The world copy nearest to `reference`, as the world itself and the
+    /// frame it stands in: the pair a query asked around that point is
+    /// answered by. `None` on a flat level.
+    fn planet_at(&self, reference: Vec3) -> Option<(&PlanetWorld, PlanetFrame)> {
+        let Index::Planet { worlds } = &self.index else {
+            return None;
         };
-        instances
+        worlds
             .iter()
-            .copied()
-            .min_by(|a, b| {
+            .flat_map(|world| world.instances.iter().map(move |&frame| (world, frame)))
+            .min_by(|(_, a), (_, b)| {
                 (reference - (a.centre + a.offset))
                     .length_squared()
                     .total_cmp(&(reference - (b.centre + b.offset)).length_squared())
             })
-            .unwrap_or(PlanetFrame::IDENTITY)
     }
 
     /// What shape of world this is, and where its middle is if it has one.
+    /// A level holding fixtures beside its planet answers for the planet:
+    /// the first world is the one the level is *about*, and everything that
+    /// asks here -- the visual unbend, the autopilot's approach radius, the
+    /// orbital clockwork's filed centre -- means that one.
     pub fn shape(&self) -> Shape {
-        match self.index {
+        match &self.index {
             Index::Flat { .. } => Shape::Flat,
-            Index::Planet { centre, radius, .. } => Shape::Planet { centre, radius },
+            Index::Planet { worlds } => match worlds.first() {
+                Some(world) => Shape::Planet {
+                    centre: world.centre,
+                    radius: world.radius,
+                },
+                None => Shape::Flat,
+            },
         }
     }
 
@@ -564,12 +666,19 @@ impl LevelData {
     /// planet, which is a hundred metres under the deepest terrain the
     /// generator writes and so cannot be reached by walking into a valley.
     pub fn out_of_bounds(&self, point: Vec3) -> bool {
-        match self.index {
+        match &self.index {
             Index::Flat { .. } => point.y < -20.0,
-            Index::Planet { centre, radius, .. } => {
-                let core = centre + self.instance_frame(point).offset;
-                (point - core).length() < radius - PLANET_REACH * 0.5
-            }
+            Index::Planet { .. } => match self.planet_at(point) {
+                // A hollow fixture -- the torus, the platform -- has honest
+                // space inside its bounding sphere, so nowhere near it is out
+                // of the world.
+                Some((world, frame)) => {
+                    world.cored
+                        && (point - (world.centre + frame.offset)).length()
+                            < world.radius - PLANET_REACH * 0.5
+                }
+                None => false,
+            },
         }
     }
 
@@ -608,7 +717,8 @@ impl LevelData {
         &cells[z * GRID_WIDTH + x]
     }
 
-    /// The face cells a query at `point` could find a triangle in.
+    /// The face cells a query at `point` could find a triangle in, on the
+    /// world whose filed `centre` the point has already been mapped towards.
     ///
     /// The three-by-three patch around the point's own cell, clamped to its
     /// face, plus the cells one cell away along two tangent directions. Those
@@ -618,11 +728,8 @@ impl LevelData {
     /// Perturbing the direction and re-filing it lands on the neighbour
     /// whatever the neighbour happens to be, which is the same trick the
     /// generator's own neighbour table exists to avoid needing.
-    fn near_cells(&self, point: Vec3, out: &mut Vec<usize>) {
+    fn near_cells(centre: Vec3, point: Vec3, out: &mut Vec<usize>) {
         out.clear();
-        let Index::Planet { centre, .. } = self.index else {
-            return;
-        };
         let radial = (point - centre).normalize_or(Vec3::Y);
         let (face, u, v) = face_uv(radial);
         let (column, row) = (cell_index(u) as isize, cell_index(v) as isize);
@@ -655,9 +762,12 @@ impl LevelData {
     /// box would make the field's cell size meaningless rather than merely
     /// empty.
     pub fn bounds(&self) -> (Vec2, Vec2) {
-        match self.index {
-            Index::Flat { min, cell, .. } => (min, min + cell * GRID_WIDTH as f32),
-            Index::Planet { centre, radius, .. } => {
+        match self.shape() {
+            Shape::Flat => match self.index {
+                Index::Flat { min, cell, .. } => (min, min + cell * GRID_WIDTH as f32),
+                Index::Planet { .. } => (Vec2::ZERO, Vec2::ZERO),
+            },
+            Shape::Planet { centre, radius } => {
                 let middle = Vec2::new(centre.x, centre.z);
                 let reach = Vec2::splat(radius + PLANET_REACH * 0.25);
                 (middle - reach, middle + reach)
@@ -670,8 +780,8 @@ impl LevelData {
     /// in are the same sphere, so the renderer asks for its radius here rather
     /// than measuring the mesh a second time and getting a second answer.
     pub fn sea_radius(&self) -> Option<f32> {
-        match self.index {
-            Index::Planet { sea, .. } => sea,
+        match &self.index {
+            Index::Planet { worlds } => worlds.first().and_then(|world| world.sea),
             Index::Flat { .. } => None,
         }
     }
@@ -688,9 +798,9 @@ impl LevelData {
     /// this wet" asks for a positive depth rather than knowing which world it
     /// is standing on.
     pub fn water_depth(&self, point: Vec3) -> Option<f32> {
-        if let Index::Planet { centre, sea, .. } = self.index {
-            let core = centre + self.instance_frame(point).offset;
-            return sea.map(|surface| surface - (point - core).length());
+        if let Some((world, frame)) = self.planet_at(point) {
+            let core = world.centre + frame.offset;
+            return world.sea.map(|surface| surface - (point - core).length());
         }
         self.water_boxes
             .iter()
@@ -845,6 +955,16 @@ impl LevelData {
                 .highest_below(from, 0.0)
                 .map(|(height, normal)| (Vec3::new(from.x, height, from.z), normal)),
             Index::Planet { .. } => {
+                // The raw first hit, wall-steep or not. This once tried to
+                // walk past steep faces so the feet could never settle onto a
+                // face the wall resolution was pushing out of -- but a steep
+                // face lies nearly along the ray, so the re-cast from just
+                // past the hit met the same triangle again, burned its
+                // retries, and answered "no ground" over every steep patch:
+                // vanishing shadows, flickering grounding, worse than the
+                // fight it fixed. The arbitration lives with the caller now:
+                // `player::movement` declines to *stand* on a wall-class hit,
+                // and every other reader wants the surface as it is.
                 let start = from + up * GROUND_SKIN;
                 self.surface_hit(start, from - up * PLANET_REACH)
             }
@@ -891,18 +1011,35 @@ impl LevelData {
     /// plain loop over the candidate list does, makes where a body ends up a
     /// function of how the level was built.
     pub fn resolve_walls(&self, position: Vec3, up: Vec3, radius: f32, height: f32) -> Vec3 {
-        // The whole resolution runs in the nearest copy's frame. Chosen once
-        // rather than per pass: the passes move a body centimetres, and the
-        // copies stand hundreds of metres apart. The up is carried into that
-        // frame too -- on a turned world "vertical" is turned with it.
-        let frame = self.instance_frame(position);
+        // The whole resolution runs in the nearest copy's frame, against that
+        // copy's own world. Chosen once rather than per pass: the passes move
+        // a body centimetres, and the copies stand hundreds of metres apart.
+        // The up is carried into that frame too -- on a turned world
+        // "vertical" is turned with it.
+        let placed = self.planet_at(position);
+        let frame = placed
+            .map(|(_, frame)| frame)
+            .unwrap_or(PlanetFrame::IDENTITY);
+        let world = placed.map(|(world, _)| world);
         let up = frame.direction_to_local(up);
         let mut result = frame.to_local(position);
         let mut candidates = Vec::new();
         let mut cells = Vec::new();
         let mut contacts: Vec<Contact> = Vec::new();
+        // Whether any wall actually did anything. The answer has to be the
+        // caller's own `position`, bit for bit, when none did: the round trip
+        // through a placed copy's frame loses the last float bit, and on a
+        // planet five thousand metres out that bit is half a millimetre --
+        // over the movement code's touch threshold. Handed back as if it were
+        // a push, its direction is rounding noise flattened into a unit
+        // vector, and cancelling velocity along it scrubbed up to two thirds
+        // of a flyer's speed in clear air, every tick, everywhere the frame
+        // was not the identity. The felt symptom was constant "wall push"
+        // jerks on the moving planets and none on the castle or the static
+        // test bodies, whose frames round-trip exactly.
+        let mut pushed = false;
         for _ in 0..WALL_RESOLVE_PASSES {
-            self.walls_near(result, up, &mut cells, &mut candidates);
+            self.walls_near(result, up, world, &mut cells, &mut candidates);
             contacts.clear();
             // The capsule's spine. A body shorter than it is wide -- which no
             // actor here is, but a caller may yet ask for -- degenerates to a
@@ -917,6 +1054,9 @@ impl LevelData {
             if contacts.is_empty() {
                 break;
             }
+            // A contact's depth is never zero -- [`WALL_SKIN`] is baked into
+            // it -- so a pass that found any is a pass that moved the body.
+            pushed = true;
             // Deepest first, with ties broken on the direction itself so that
             // two equally deep walls -- the two faces of a corner, usually --
             // are always taken in the same order however the mesh was built.
@@ -940,6 +1080,9 @@ impl LevelData {
                 }
             }
             result += push;
+        }
+        if !pushed {
+            return position;
         }
         frame.to_world(result)
     }
@@ -1013,19 +1156,26 @@ impl LevelData {
     /// planet the same triangle is a floor on one side of the world and a
     /// ceiling on the other, so the question is asked here, against the `up`
     /// that holds where the query is.
-    fn walls_near(&self, at: Vec3, up: Vec3, cells: &mut Vec<usize>, out: &mut Vec<u32>) {
+    fn walls_near(
+        &self,
+        at: Vec3,
+        up: Vec3,
+        world: Option<&PlanetWorld>,
+        cells: &mut Vec<usize>,
+        out: &mut Vec<u32>,
+    ) {
         out.clear();
-        match &self.index {
-            Index::Flat { .. } => out.extend(
+        match world {
+            None => out.extend(
                 self.cell(at.x, at.z)
                     .walls
                     .iter()
                     .map(|&index| index as u32),
             ),
-            Index::Planet { cells: filed, .. } => {
-                self.near_cells(at, cells);
+            Some(world) => {
+                Self::near_cells(world.centre, at, cells);
                 for &cell in cells.iter() {
-                    for &index in &filed[cell] {
+                    for &index in &world.cells[cell] {
                         if self.triangles[index as usize].normal.dot(up).abs() <= GROUND_NORMAL_Y {
                             out.push(index);
                         }
@@ -1056,10 +1206,14 @@ impl LevelData {
     /// and what a caller probing for a surface wants is the side it arrived
     /// from.
     pub fn surface_hit(&self, start: Vec3, end: Vec3) -> Option<(Vec3, Vec3)> {
-        // Into the nearest copy's frame, judged from the segment's middle so a
-        // probe reaching down towards a planet answers to the planet it is
-        // reaching for. The identity for the castle and for a lone planet.
-        let frame = self.instance_frame((start + end) * 0.5);
+        // Into the nearest copy's frame -- and against that copy's world --
+        // judged from the segment's middle so a probe reaching down towards a
+        // planet answers to the planet it is reaching for. The identity for
+        // the castle and for a lone planet.
+        let placed = self.planet_at((start + end) * 0.5);
+        let frame = placed
+            .map(|(_, frame)| frame)
+            .unwrap_or(PlanetFrame::IDENTITY);
         let (start, end) = (frame.to_local(start), frame.to_local(end));
         let direction = end - start;
         let mut nearest = 1.0_f32;
@@ -1110,12 +1264,9 @@ impl LevelData {
             // Stepping is what keeps a ray fired along the ground -- a bullet,
             // the camera's boom -- from having to open a box the size of the
             // hemisphere it crosses.
-            Index::Planet {
-                centre,
-                radius,
-                cells: filed,
-                ..
-            } => {
+            Index::Planet { .. } => {
+                let (world, _) = placed?;
+                let (centre, radius, filed) = (world.centre, world.radius, &world.cells);
                 let arc = (FACE_CELL_ANGLE * radius).max(0.001);
                 let steps = ((direction.length() / arc).ceil() as usize + 1).min(PLANET_RAY_STEPS);
                 let mut cells_here = Vec::new();
@@ -1125,10 +1276,10 @@ impl LevelData {
                     // Points at the centre itself have no direction to file
                     // under; the ray is still tested against everything the
                     // steps either side of it turn up.
-                    if (along - *centre).length_squared() < 1e-6 {
+                    if (along - centre).length_squared() < 1e-6 {
                         continue;
                     }
-                    self.near_cells(along, &mut cells_here);
+                    Self::near_cells(centre, along, &mut cells_here);
                     for &cell in &cells_here {
                         if walked.contains(&cell) {
                             continue;
@@ -1589,11 +1740,17 @@ impl LevelData {
     /// the filed geometry's.
     pub fn faces_near(&self, at: Vec3, reach: f32, out: &mut Vec<DebugFace>) {
         out.clear();
-        let frame = self.instance_frame(at);
+        let placed = self.planet_at(at);
+        let frame = placed
+            .map(|(_, frame)| frame)
+            .unwrap_or(PlanetFrame::IDENTITY);
         let at = frame.to_local(at);
         let mut found: Vec<u32> = Vec::new();
-        match &self.index {
-            Index::Flat { cells, .. } => {
+        match placed {
+            None => {
+                let Index::Flat { cells, .. } = &self.index else {
+                    return;
+                };
                 let low = self.cell_coords(Vec2::new(at.x - reach, at.z - reach));
                 let high = self.cell_coords(Vec2::new(at.x + reach, at.z + reach));
                 for z in low.1..=high.1 {
@@ -1602,26 +1759,21 @@ impl LevelData {
                     }
                 }
             }
-            Index::Planet {
-                centre,
-                radius,
-                cells,
-                ..
-            } => {
+            Some((world, _)) => {
                 // A patch of face cells around the one the point is over. The
                 // sweep is in angle rather than in metres because that is what
                 // a face cell is measured in; `reach` becomes an arc on the
                 // way in and a handful of cells on the way out.
-                let radial = (at - *centre).normalize_or(Vec3::Y);
+                let radial = (at - world.centre).normalize_or(Vec3::Y);
                 let (along, across) = radial.any_orthonormal_pair();
-                let arc = reach / radius.max(1.0) / FACE_CELL_ANGLE;
+                let arc = reach / world.radius.max(1.0) / FACE_CELL_ANGLE;
                 let steps = (arc.ceil() as isize).clamp(1, DEBUG_FACE_STEPS);
                 for down in -steps..=steps {
                     for right in -steps..=steps {
                         let towards = radial
                             + along * (right as f32 * FACE_CELL_ANGLE)
                             + across * (down as f32 * FACE_CELL_ANGLE);
-                        found.extend(&cells[face_cell(towards)]);
+                        found.extend(&world.cells[face_cell(towards)]);
                     }
                 }
             }
@@ -1629,14 +1781,15 @@ impl LevelData {
         // One triangle spans several cells and is filed in every one of them.
         found.sort_unstable();
         found.dedup();
+        let centre = placed.map(|(world, _)| world.centre);
         for index in found {
             let tri = self.triangles[index as usize];
-            let near = match self.index {
+            let near = match centre {
                 // The filing is by `(x, z)` and so is the range: a triangle is
                 // in reach if its own footprint is. Without this the one big
                 // floor slab under a hall drags its whole outline in from
                 // wherever it happens to start.
-                Index::Flat { .. } => {
+                None => {
                     tri.max.x >= at.x - reach
                         && tri.min.x <= at.x + reach
                         && tri.max.y >= at.z - reach
@@ -1644,10 +1797,10 @@ impl LevelData {
                 }
                 // A face cell is already a patch of surface, so anything filed
                 // in the ones sampled above is near by construction.
-                Index::Planet { .. } => true,
+                Some(_) => true,
             };
             if near {
-                let mut face = self.face(tri);
+                let mut face = Self::face(tri, centre);
                 for corner in &mut face.corners {
                     *corner = frame.to_world(*corner);
                 }
@@ -1673,14 +1826,18 @@ impl LevelData {
         out: &mut Vec<DebugWall>,
     ) {
         out.clear();
-        // The same frame [`Self::resolve_walls`] works in, or the overlay
-        // disagrees with the resolution it exists to explain.
-        let frame = self.instance_frame(at);
+        // The same frame and world [`Self::resolve_walls`] works in, or the
+        // overlay disagrees with the resolution it exists to explain.
+        let placed = self.planet_at(at);
+        let frame = placed
+            .map(|(_, frame)| frame)
+            .unwrap_or(PlanetFrame::IDENTITY);
+        let world = placed.map(|(world, _)| world);
         let at = frame.to_local(at);
         let up = frame.direction_to_local(up);
         let mut cells = Vec::new();
         let mut candidates = Vec::new();
-        self.walls_near(at, up, &mut cells, &mut candidates);
+        self.walls_near(at, up, world, &mut cells, &mut candidates);
         let foot = at + up * radius;
         let head = at + up * (height - radius).max(radius);
         for index in candidates {
@@ -1689,7 +1846,7 @@ impl LevelData {
             let push = self
                 .contact(index, foot, head, up, radius)
                 .map_or(Vec3::ZERO, |contact| contact.direction * contact.depth);
-            let mut face = self.face(tri);
+            let mut face = Self::face(tri, world.map(|world| world.centre));
             for corner in &mut face.corners {
                 *corner = frame.to_world(*corner);
             }
@@ -1717,13 +1874,14 @@ impl LevelData {
     }
 
     /// One triangle, sorted into the same three boxes the filing sorts it
-    /// into -- measured against the up that holds where the triangle is, which
-    /// on a planet is a different direction for every one of them.
-    fn face(&self, tri: CollisionTriangle) -> DebugFace {
+    /// into -- measured against the up that holds where the triangle is:
+    /// `+Y` on a flat level, and away from its own world's `centre` on a
+    /// planet, a different direction for every one of them.
+    fn face(tri: CollisionTriangle, centre: Option<Vec3>) -> DebugFace {
         let middle = (tri.a + tri.b + tri.c) / 3.0;
-        let up = match self.index {
-            Index::Flat { .. } => Vec3::Y,
-            Index::Planet { centre, .. } => (middle - centre).normalize_or(Vec3::Y),
+        let up = match centre {
+            None => Vec3::Y,
+            Some(centre) => (middle - centre).normalize_or(Vec3::Y),
         };
         let lean = tri.normal.dot(up).abs();
         DebugFace {
@@ -2112,6 +2270,53 @@ mod tests {
         assert!(!planet.out_of_bounds(up * radius));
     }
 
+    /// A smooth ball, genuinely spinning the way [`crate::orbit::advance`]
+    /// spins a planet, holds nothing against a body riding twenty metres over
+    /// it: no wall ever pushes, and the ground below is always the surface
+    /// straight down. This is the moving-frame machinery tested with the
+    /// terrain taken out of the experiment -- a push here is a query mapping
+    /// through the wrong rotation, not a mountainside.
+    #[test]
+    fn a_spinning_ball_holds_nothing_against_clear_air() {
+        let radius = 300.0;
+        let mut planet = ball(radius);
+        let centre = Vec3::new(5200.0, 0.0, 1700.0);
+        let spin_step = 1.2_f32.to_radians() / 30.0;
+        // Seats spread from pole to equator, each carried exactly with the
+        // ground the way a full-grip rider is.
+        let seats = [
+            Vec3::new(0.05, 1.0, -0.08).normalize(),
+            Vec3::new(0.5, 0.7, 0.2).normalize(),
+            Vec3::new(1.0, 0.05, 0.0).normalize(),
+        ];
+        for tick in 0..600 {
+            let rotation = Quat::from_rotation_y(spin_step * tick as f32);
+            planet.place_planets(&[(centre, rotation)]);
+            for seat in seats {
+                let at = centre + rotation * (seat * (radius + 20.0));
+                let up = (at - centre).normalize();
+                // Exactly, to the bit: a body no wall touched must come back
+                // untouched. A tolerance here once hid the frame round-trip
+                // losing its last float bit, which the movement code read as
+                // a wall push and paid for in velocity.
+                let resolved = planet.resolve_walls(at, up, 0.42, 1.75);
+                assert!(
+                    resolved == at,
+                    "tick {tick}, seat {seat}: twenty metres of clear air pushed {} m",
+                    (resolved - at).length()
+                );
+                let (ground, _) = planet
+                    .ground_below(at, up)
+                    .unwrap_or_else(|| panic!("tick {tick}, seat {seat}: no ground below"));
+                let clearance = (at - ground).dot(up);
+                assert!(
+                    (clearance - 20.0).abs() < 1.5,
+                    "tick {tick}, seat {seat}: the ground stands {clearance} m down"
+                );
+            }
+        }
+    }
+
     /// Walls on a planet are steep against the local up rather than against
     /// `+Y`, so the same capsule is pushed out of the same slope wherever on
     /// the planet that slope is.
@@ -2177,8 +2382,7 @@ mod tests {
         let lone = ball(radius);
         for local_up in [Vec3::Y, Vec3::X, Vec3::new(1., 1., 1.).normalize()] {
             let local = local_up * (radius - 0.5);
-            let by_the_copy =
-                planet.resolve_walls(local + offset, local_up, 0.42, 1.75) - offset;
+            let by_the_copy = planet.resolve_walls(local + offset, local_up, 0.42, 1.75) - offset;
             let alone = lone.resolve_walls(local, local_up, 0.42, 1.75);
             assert!(
                 (by_the_copy - alone).length() < 1e-4,
@@ -2201,7 +2405,9 @@ mod tests {
         let mut planet = LevelData::planet(&[], &[], Vec3::ZERO, radius, Some(radius));
         planet.place_planets(&[(Vec3::ZERO, Quat::IDENTITY), (offset, Quat::IDENTITY)]);
         let depth_home = planet.water_depth(Vec3::X * (radius - 2.0)).unwrap();
-        let depth_copy = planet.water_depth(offset + Vec3::Y * (radius - 2.0)).unwrap();
+        let depth_copy = planet
+            .water_depth(offset + Vec3::Y * (radius - 2.0))
+            .unwrap();
         assert!((depth_home - 2.0).abs() < 1e-3, "{depth_home}");
         assert!((depth_copy - 2.0).abs() < 1e-3, "{depth_copy}");
         let space = planet.water_depth(Vec3::X * 550.0).unwrap();

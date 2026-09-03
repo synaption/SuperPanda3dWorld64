@@ -243,22 +243,25 @@ pub fn advance(
     // standing in as this tick opens.
     if let Ok((mut transform, mut ctrl, rider)) = player.single_mut() {
         let fraction = gravity.strength(transform.translation) / gravity.accel().max(1e-6);
-        let nearest = (0..2)
-            .min_by(|&a, &b| {
-                (transform.translation - before[a].centre)
-                    .length_squared()
-                    .total_cmp(&(transform.translation - before[b].centre).length_squared())
-            })
-            .unwrap_or(0);
+        // Whose pull he is in -- and only an *orbiting* body's is a ride. The
+        // gravity's first two wells are the two planets in body order;
+        // anything after them is a `test_world` fixture, which stands still
+        // and so carries nobody anywhere.
+        let nearest = gravity
+            .well_index(transform.translation)
+            .filter(|&well| well < 2);
         // The parenting record, kept current in the same breath as the ride
         // it describes. Optional the way `energy` is optional in `movement`:
         // a player assembled without one still rides, he just is not drawn
         // through his parent's frame.
         if let Some(mut rider) = rider {
-            rider.world = (fraction > 0.0).then_some(nearest);
-            rider.hold = fraction;
+            rider.world = nearest.filter(|_| fraction > 0.0);
+            rider.hold = match rider.world {
+                Some(_) => fraction,
+                None => 0.0,
+            };
         }
-        if fraction > 0.0 {
+        if let (Some(nearest), true) = (nearest, fraction > 0.0) {
             let (old, new) = (before[nearest], system.bodies[nearest]);
             let turn = new.rotation * old.rotation.inverse();
             let carried = new.centre + turn * (transform.translation - old.centre);
@@ -393,7 +396,9 @@ mod tests {
 
     fn tick(world: &mut World, ticks: usize) {
         for _ in 0..ticks {
-            world.run_system_once(advance).expect("advance could not run");
+            world
+                .run_system_once(advance)
+                .expect("advance could not run");
         }
     }
 
@@ -413,12 +418,16 @@ mod tests {
             held.hold
         );
         let adrift = world.resource::<SolarSystem>().bodies[0].centre
-            + Vec3::Y * (RADIUS + crate::gravity::GRAVITY_RANGE + crate::gravity::GRAVITY_FADE + 50.0);
+            + Vec3::Y
+                * (RADIUS + crate::gravity::GRAVITY_RANGE + crate::gravity::GRAVITY_FADE + 50.0);
         let mut query = world.query_filtered::<&mut Transform, With<Player>>();
         query.single_mut(&mut world).unwrap().translation = adrift;
         tick(&mut world, 1);
         let let_go = rider(&mut world);
-        assert_eq!(let_go.world, None, "out past the fade band nobody holds him");
+        assert_eq!(
+            let_go.world, None,
+            "out past the fade band nobody holds him"
+        );
         assert_eq!(let_go.hold, 0.0);
     }
 
@@ -468,10 +477,15 @@ mod tests {
         );
         // Gravity pulls towards where the worlds now are.
         let gravity = *world.resource::<Gravity>();
-        let Gravity::System { centres, .. } = gravity else {
-            panic!("the system's gravity is {gravity:?}");
-        };
-        assert_eq!(centres, world.resource::<SolarSystem>().centres());
+        let wells = gravity.wells();
+        assert!(
+            wells.len() >= 2,
+            "the system's gravity is {gravity:?}, not a system"
+        );
+        assert_eq!(
+            [wells[0].centre, wells[1].centre],
+            world.resource::<SolarSystem>().centres()
+        );
         // And the scene roots stand where the bodies do. The authored centre
         // is the origin here, so the root's translation is the body's centre.
         let mut roots = world.query::<(&PlanetBody, &Transform)>();
@@ -589,9 +603,7 @@ mod tests {
         let system = world.resource::<SolarSystem>();
         assert_eq!(system.blended(0.0)[0].0, system.previous[0].centre);
         assert_eq!(system.blended(1.0)[0].0, system.bodies[0].centre);
-        let expected = system.previous[0]
-            .centre
-            .lerp(system.bodies[0].centre, 0.5);
+        let expected = system.previous[0].centre.lerp(system.bodies[0].centre, 0.5);
         assert_eq!(system.blended(0.5)[0].0, expected);
         // A tick genuinely separates the two, or this proves nothing.
         assert_ne!(system.previous[0].centre, system.bodies[0].centre);
