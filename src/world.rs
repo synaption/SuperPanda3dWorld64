@@ -1081,32 +1081,11 @@ mod tests {
     use bevy::ecs::system::RunSystemOnce;
     use bevy::gltf::GltfPlugin;
 
-    /// The real game, headless, with the glTF loader bolted on.
-    ///
-    /// [`crate::tests::headless`] deliberately has no loader: every system that
-    /// waits on an asset is exercised down its not-ready path there, which is
-    /// the path the real game takes on its first frames. This test is the
-    /// opposite one -- its whole subject is what happens when the asset does
-    /// arrive -- so it takes that same game and adds what the loader needs.
+    /// The real game, headless, with the glTF loader bolted on. Moved to
+    /// [`crate::workbench::game`], which the camera workbench shares; the
+    /// local name stays so five dozen tests did not have to change.
     fn with_a_loader() -> App {
-        let mut app = crate::tests::headless();
-        app.add_plugins((
-            bevy::scene::ScenePlugin,
-            bevy::world_serialization::WorldSerializationPlugin,
-            bevy::image::ImagePlugin::default(),
-            bevy::animation::AnimationPlugin,
-            GltfPlugin::default(),
-        ))
-        // Reached for by the glTF loader whenever a mesh has a skeleton, which
-        // every actor in this game does. `bevy_render` provides it in the real
-        // build; here it would be an unexplained panic on an IO thread.
-        .init_asset::<bevy::mesh::skinning::SkinnedMeshInverseBindposes>();
-        // `GltfPlugin` registers its loader in `finish` rather than in `build`,
-        // and `App::update` does not call it -- only `App::run` does. Without
-        // this every asset sits at `Loading` for ever with nothing to say why.
-        app.finish();
-        app.cleanup();
-        app
+        crate::workbench::game()
     }
 
     /// A machine placed in the .blend is standing on the level when it comes

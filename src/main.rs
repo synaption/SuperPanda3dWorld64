@@ -49,6 +49,8 @@ mod stellarator;
 mod structure;
 mod water;
 mod weapon;
+#[cfg(test)]
+mod workbench;
 mod world;
 
 use bevy::{

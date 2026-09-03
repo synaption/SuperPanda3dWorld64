@@ -4,12 +4,12 @@ use crate::{
     input::InputState,
     level::LevelData,
     orbit::{Rider, SolarSystem},
-    player::{Player, RenderPose},
+    player::{Controller, Player, RenderPose},
     GameState,
 };
 use bevy::prelude::*;
 
-#[derive(Component)]
+#[derive(Component, Clone)]
 pub struct FollowCamera {
     pub yaw: f32,
     pub pitch: f32,
@@ -77,6 +77,15 @@ pub struct FollowCamera {
     /// says a fold or a landing is happening this frame rather than every
     /// frame.
     pub free: bool,
+    /// How settled on the ground the player is, eased between 0 (airborne)
+    /// and 1 (standing) over a tenth of a second or so. The focus's height
+    /// follow reads its pace off this: lazy with feet on terrain, where every
+    /// honoured bump is the picture pumping, and brisk in the air, where the
+    /// jump or the jetpack *is* the motion and a camera that ignores it is a
+    /// camera left behind. Eased rather than switched, because a flag that
+    /// flips over every pebble would switch the pace with it -- and a
+    /// switching pace is exactly the 30 Hz chatter this exists to remove.
+    pub footing: f32,
     /// Seconds of grace after a landing during which a large gap between the
     /// view and the ground's frame is *eased* across rather than snapped.
     /// Coming back from free flight upside down is exactly such a gap, and
@@ -114,6 +123,7 @@ impl Default for FollowCamera {
             free: false,
             landing: 0.0,
             ridden: None,
+            footing: 0.0,
         }
     }
 }
@@ -175,13 +185,42 @@ const AIM_SENSITIVITY: f32 = 0.5;
 /// at the speeds it was tuned for and turns into a rigid follow past them.
 const FOCUS_TRAIL: f32 = 2.5;
 
-/// How fast the view's idea of up chases the ground's, per second.
+/// The focus's height channel: the rates its rises and falls settle at, per
+/// second, and the trail that speeds them up.
 ///
-/// A ninth of a second of lag. The prototype in `experimental/ow` uses 20 on
-/// foot and 2.25 in flight; this sits nearer the walking end because there is
-/// no flight mode here to serve, and because it is not the only filter in the
-/// chain -- the body's own levelling in [`crate::player`] runs slower again,
-/// and what reaches the screen is the two of them in series.
+/// The design rule, learnt the hard way on the workbench: **no corners.**
+/// Every earlier shape of this channel put a hard edge somewhere -- a trail
+/// clamp the slope walks ride, a terrain guard that yanks -- and a hard edge
+/// against rough ground does not hold, it *chatters*: constraint one frame,
+/// free ease the next, which reached the screen as the picture ticking at
+/// 30 Hz. So the channel is one smooth law instead. The follow rate starts
+/// from a base and grows with the square of the height trail: near zero
+/// trail the follow is as lazy as the base says, and the further the player
+/// pulls away the harder it is chased, so a sustained slope, a fall or a
+/// jetpack climb each settle at a bounded trail with nothing to bounce off.
+///
+/// The base depends on [`FollowCamera::footing`]. On the ground it is lazy
+/// -- terrain bumps live almost entirely in this channel, and each one
+/// honoured is the picture pumping at the stride's cadence. In the air it is
+/// brisk: a jump or a jetpack climb is the player's own motion, and the
+/// user's words for the lazy base applied to it were "the camera lags way
+/// behind".
+const GROUND_HEIGHT_RATE: f32 = 0.3;
+const AIR_HEIGHT_RATE: f32 = 2.5;
+/// The chase term: this many per second more at a [`HEIGHT_SCALE`]-metre
+/// trail, growing with the trail's square.
+const HEIGHT_CHASE_RATE: f32 = 8.0;
+const HEIGHT_SCALE: f32 = 6.0;
+/// The per-sixtieth blend [`FollowCamera::footing`] eases at.
+const FOOTING_RATE: f32 = 0.2;
+
+/// How fast the view closes a *residual* gap to the ground's frame, per
+/// second.
+///
+/// A ninth of a second of lag -- but only for genuine errors: a landing, a
+/// respawn, a mode switch. The ground's own turning under a walker is
+/// carried into the view in lockstep before this ease runs, so a changing
+/// down never opens a gap here at all and the walk never feels the filter.
 const UP_ALIGN_RATE: f32 = 9.0;
 
 /// How long after leaving free flight a large view-to-ground gap is still
@@ -199,6 +238,35 @@ const LANDING_EASE: f32 = 1.2;
 /// entirely -- a respawn, a warp pipe, the far side of the planet -- and easing
 /// across that is a second of the horizon rolling over for no reason.
 const UP_SNAP: f32 = 0.5;
+
+/// The rotation carrying unit vector `from` onto unit vector `to`, exact
+/// down to arbitrarily small angles.
+///
+/// Not `Quat::from_rotation_arc`, which calls anything within a couple of
+/// float epsilons of parallel *parallel* and answers the identity. A walk on
+/// a planet turns the local up by about a seventh of that cutoff each frame,
+/// so the carry below answered identity four frames out of five and then
+/// turned the whole accumulated error at once -- the horizon advancing in
+/// 0.7-milliradian clicks, a couple of pixels each, at the walk's own
+/// cadence. The workbench measured it; the eye had already reported it.
+///
+/// The half-vector form has no cutoff: the quaternion from `from` to `to`
+/// is exactly (`from × h`, `from · h`) with `h` halfway between them, and
+/// stays well-conditioned down to angles f32 cannot even hold. Antipodal
+/// vectors have no halfway and fall back to the library, whose arbitrary
+/// pick is as good as any -- the camera meets that only through teleports,
+/// which [`UP_SNAP`] owns anyway.
+fn arc(from: Vec3, to: Vec3) -> Quat {
+    let Some(half) = (from + to).try_normalize() else {
+        return Quat::from_rotation_arc(from, to);
+    };
+    Quat::from_xyzw(
+        from.y * half.z - from.z * half.y,
+        from.z * half.x - from.x * half.z,
+        from.x * half.y - from.y * half.x,
+        from.dot(half),
+    )
+}
 
 /// Reshapes a per-frame blend factor to cover `delta` seconds instead.
 ///
@@ -234,6 +302,7 @@ pub fn update(
     system: Res<SolarSystem>,
     fixed: Res<Time<Fixed>>,
     riders: Query<&Rider, With<Player>>,
+    controllers: Query<&Controller, With<Player>>,
     mut state: ResMut<GameState>,
     tuning: Res<GameTuning>,
 ) {
@@ -311,7 +380,21 @@ pub fn update(
         // Carried onto this frame's up before anything is measured in it. On
         // the castle `up` is `+Y`, the correction is the identity, and every
         // line below is the line that was there before.
-        follow.frame = Quat::from_rotation_arc(follow.frame * Vec3::Y, up) * follow.frame;
+        //
+        // The *view* is carried by the same turn, in lockstep. Down changing
+        // under a walker is not an error for the view to chase: chased, the
+        // chase's lag grows and shrinks with every variation in ground speed
+        // and slope, which reached the screen as the camera pumping gently
+        // up and down at the stride's own cadence. Moved in the same breath
+        // as the frame, a turning down never opens a gap at all -- the ease
+        // below is left only what genuinely is an error: a landing, a
+        // respawn, a mode switch.
+        let turned = arc(follow.frame * Vec3::Y, up);
+        // Normalised on every carry: these two accumulate a quaternion
+        // product per frame for as long as a walk lasts, and the drift off
+        // unit length is itself a slow lens distortion.
+        follow.frame = (turned * follow.frame).normalize();
+        follow.view = (turned * follow.view).normalize();
         // And the view eases onto the frame. That is the whole of the lag, and
         // every axis below is measured in `view` rather than `frame`, so the
         // camera answers the ground through a filter while still answering the
@@ -361,17 +444,78 @@ pub fn update(
     };
     let smoothing = blend(tuning.cam_smooth, time.delta_secs());
     follow.distance += (desired_distance - follow.distance) * blend(0.16, time.delta_secs());
+    // How settled the feet are, for the height follow's pace below. In the
+    // absence of a controller to ask -- the unit tests build worlds without
+    // one -- the player counts as standing, which is the lazy, ground-tuned
+    // behaviour every existing test was written against.
+    let grounded = controllers
+        .single()
+        .map(|controller| controller.grounded)
+        .unwrap_or(true);
+    let planted = if grounded && !free { 1.0 } else { 0.0 };
+    let footing = follow.footing;
+    follow.footing = footing + (planted - footing) * blend(FOOTING_RATE, time.delta_secs());
     // The focus eases; the camera does not. On the first frame there is
     // nothing to ease from, so it starts where it belongs.
+    //
+    // On the ground the two directions ease at different paces on purpose.
+    // Across the ground the follow is tight, because falling behind a runner
+    // is the one thing a chase camera must not do. *Height* follows at the
+    // rate law described over [`GROUND_HEIGHT_RATE`]: lazily underfoot, so
+    // terrain bumps stay out of the picture -- the user's words, "it should
+    // not adjust itself, keep aiming at the same place" -- briskly in the
+    // air, and harder the further the player gets, with no clamp and no
+    // corner anywhere for rough ground to chatter against. Weightless there
+    // is no terrain to ignore and the plain ease keeps flight feeling
+    // direct.
     let standing = player.translation + view_up * tuning.cam_height;
     let focus = match follow.focus {
-        Some(previous) => previous.lerp(standing, smoothing),
+        Some(previous) if !free => {
+            let gap = standing - previous;
+            let rise = gap.dot(view_up);
+            let level = gap - view_up * rise;
+            let base = AIR_HEIGHT_RATE + (GROUND_HEIGHT_RATE - AIR_HEIGHT_RATE) * follow.footing;
+            let chase = HEIGHT_CHASE_RATE * (rise / HEIGHT_SCALE) * (rise / HEIGHT_SCALE);
+            let eased = previous
+                + level * smoothing
+                + view_up * (rise * gravity::settle(base + chase, time.delta_secs()));
+            let trail = eased - standing;
+            let trail_level = (trail - view_up * trail.dot(view_up)).clamp_length_max(FOCUS_TRAIL);
+            standing + trail_level + view_up * trail.dot(view_up)
+        }
+        Some(previous) => {
+            // However fast the flight, the focus stays within arm's reach.
+            // See [`FOCUS_TRAIL`]: past the cap the ease has nothing left to
+            // smooth, it is simply behind.
+            let eased = previous.lerp(standing, smoothing);
+            standing + (eased - standing).clamp_length_max(FOCUS_TRAIL)
+        }
         None => standing,
     };
-    // However fast the player is going, the focus stays within arm's reach of
-    // him. See [`FOCUS_TRAIL`]: past the cap the ease has nothing left to
-    // smooth, it is simply behind.
-    let focus = standing + (focus - standing).clamp_length_max(FOCUS_TRAIL);
+    // The lazy height channel can leave the focus underground while the
+    // player climbs: the ground rises at the player's pace and the focus at
+    // its own, and the difference ends up inside the hill. A buried focus is
+    // a boom probe that hits at zero distance -- the camera pulled all the
+    // way in, first person, in the dirt. So the focus never crosses terrain
+    // on its way out from the player: whatever the line from the head to it
+    // hits, it stops in front of, and the ease carries on from there.
+    // The nudge off the surface is millimetres, not [`WALL_GAP`]: it only
+    // keeps the boom probe below from starting exactly on a triangle, and
+    // the camera's own gap is already taken off the probe's answer. Its size
+    // is a stutter dial, because it is also a *step*: while a climb holds
+    // the line against the ground, the ease sinks the focus and the guard
+    // pops it back by exactly this much, a sawtooth at whatever period the
+    // two take to meet. At a third of a metre that was a visible limit
+    // cycle; at five centimetres, a 15 Hz flicker. At five millimetres the
+    // guard re-arms every frame and the focus *rides* the sightline
+    // continuously instead of bouncing along it.
+    let focus = match level.segment_hit(standing, focus) {
+        Some(hit) => {
+            let short = standing - hit;
+            hit + short.normalize_or_zero() * 0.005_f32.min(short.length())
+        }
+        None => focus,
+    };
     follow.focus = Some(focus);
     let orbit =
         follow.view * Quat::from_rotation_y(follow.yaw) * Quat::from_rotation_x(follow.pitch);
@@ -476,11 +620,17 @@ mod tests {
         follow.view * Vec3::Y
     }
 
-    /// The point of the whole exercise: the ground moves and the view arrives
-    /// afterwards. A step of walking is a fraction of the gap, not the gap.
+    /// The view turns *with* the ground, in lockstep, never after it. It
+    /// once eased across the change instead, and the ease's lag grew and
+    /// shrank with every variation of speed and slope -- on the screen, a
+    /// camera pumping gently at the walk's own cadence, the user's "it
+    /// should not adjust itself when the player down changes". Carried in
+    /// the same breath as the ground's frame, a turning down opens no gap
+    /// for any filter to make visible.
     #[test]
-    fn the_view_follows_the_ground_late_and_then_arrives() {
+    fn the_view_turns_with_the_ground_in_lockstep() {
         let mut world = planet_world(Vec3::X * PLANET);
+        frames(&mut world, 1);
         // A sixth of a radian round the planet -- more than any single frame of
         // running covers, and well inside the distance that counts as walking.
         let moved = (Vec3::X * 0.986 + Vec3::Z * 0.166).normalize() * PLANET;
@@ -488,15 +638,9 @@ mod tests {
         let wanted = moved.normalize();
         frames(&mut world, 1);
         let after_one = view_up(&mut world).angle_between(wanted);
-        assert!(after_one > 0.1, "arrived in a single frame");
         assert!(
-            after_one < 0.166,
-            "did not set off at all: {after_one} rad left of 0.166"
-        );
-        frames(&mut world, 30);
-        assert!(
-            view_up(&mut world).angle_between(wanted) < 0.01,
-            "half a second later the view still has not caught up"
+            after_one < 1e-3,
+            "one frame after the ground turned, the view is still {after_one} rad behind"
         );
     }
 
@@ -515,12 +659,13 @@ mod tests {
 
     /// However fast the player goes, the focus stays within arm's reach.
     ///
-    /// The ease is a fraction of the gap per frame, so before the cap its lag
-    /// grew with speed without bound. At jetpack speeds it trailed tens of
-    /// metres -- through the terrain on lift-off, where the boom probe read
-    /// the ground as a wall between camera and player and collapsed the boom
-    /// to zero: first person, uninvited. The cap is the fix, and this holds
-    /// it: one enormous step, and the focus is still beside the player.
+    /// The ease alone is a fraction of the gap per frame, so its lag would
+    /// grow with speed without bound -- at jetpack speeds it once trailed
+    /// tens of metres, through the terrain on lift-off, where the boom probe
+    /// read the ground as a wall between camera and player and collapsed the
+    /// boom to zero: first person, uninvited. The fix is the chase term: the
+    /// follow rate grows with the square of the trail, so one enormous step
+    /// is chased almost rigidly and the focus is still beside the player.
     #[test]
     fn the_focus_cannot_be_outrun() {
         let mut world = planet_world(Vec3::X * PLANET);
@@ -536,9 +681,104 @@ mod tests {
         let standing = bolted + (follow.view * Vec3::Y) * world.resource::<GameTuning>().cam_height;
         let trail = (follow.focus.expect("the focus was never placed") - standing).length();
         assert!(
-            trail <= FOCUS_TRAIL + 1e-3,
+            trail <= HEIGHT_SCALE + 1e-3,
             "the focus trails {trail} m behind a fast player"
         );
+    }
+
+    /// Terrain lives in the focus's height channel, and the height channel
+    /// is deliberately lazy: metre-scale rises and dips passing underfoot at
+    /// a walk barely move the focus at all, where honouring each one pumped
+    /// the whole picture up and down at the terrain's own cadence.
+    #[test]
+    fn terrain_bumps_do_not_pump_the_camera() {
+        let mut world = planet_world(Vec3::X * PLANET);
+        frames(&mut world, 60);
+        let mut heights: Vec<f32> = Vec::new();
+        for frame in 0..300 {
+            // Walking pace along the ground, with a two-metre swell going by
+            // every two seconds -- the size and pace of real terrain relief.
+            let along = 0.0005 * frame as f32;
+            let bump = (frame as f32 / 120.0 * std::f32::consts::TAU).sin();
+            let dir = (Vec3::X * along.cos() + Vec3::Z * along.sin()).normalize();
+            world.resource_mut::<RenderPose>().translation = dir * (PLANET + bump);
+            frames(&mut world, 1);
+            if frame >= 150 {
+                let mut query = world.query::<&FollowCamera>();
+                let follow = query.single(&world).unwrap();
+                heights.push(follow.focus.expect("no focus").length());
+            }
+        }
+        let swing = heights.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+            - heights.iter().cloned().fold(f32::INFINITY, f32::min);
+        assert!(
+            swing < 0.3,
+            "two metres of terrain swell moved the focus {swing} m"
+        );
+    }
+
+    /// The lazy height channel must never leave the focus inside a hill. A
+    /// climb raises the ground at the player's pace and the focus at its own,
+    /// and without a guard the difference is a focus under the terrain -- and
+    /// a boom probe from underground hits at zero distance, which is the
+    /// camera pulled to the player's head, first person, in the dirt.
+    #[test]
+    fn the_focus_is_pulled_out_of_the_ground() {
+        let mut world = planet_world(Vec3::X * (PLANET + 2.0));
+        // A slab of real terrain tangent to the planet under the player.
+        let quad = [
+            Vec3::new(PLANET, -50.0, -50.0),
+            Vec3::new(PLANET, 50.0, -50.0),
+            Vec3::new(PLANET, 50.0, 50.0),
+            Vec3::new(PLANET, -50.0, 50.0),
+        ];
+        world.insert_resource(LevelData::planet(
+            &quad,
+            &[[0, 1, 2], [0, 2, 3]],
+            Vec3::ZERO,
+            PLANET,
+            None,
+        ));
+        frames(&mut world, 10);
+        // The climb, at its worst: the focus has been left below the slab.
+        {
+            let mut query = world.query::<&mut FollowCamera>();
+            query.single_mut(&mut world).unwrap().focus = Some(Vec3::new(PLANET - 3.0, 0.0, 0.0));
+        }
+        frames(&mut world, 1);
+        let mut query = world.query::<&FollowCamera>();
+        let focus = query.single(&world).unwrap().focus.expect("no focus");
+        assert!(
+            focus.x > PLANET - 1e-3,
+            "the focus was left {} m under the terrain",
+            PLANET - focus.x
+        );
+    }
+
+    /// A turn far too small for `Quat::from_rotation_arc` still turns
+    /// [`arc`]. The library treats anything within a couple of float
+    /// epsilons of parallel as parallel and answers identity, which
+    /// quantized a planet walk's view into 0.7-milliradian clicks -- the
+    /// stutter the workbench finally caught. The half-vector form must keep
+    /// answering real rotations all the way down.
+    #[test]
+    fn a_tiny_arc_still_turns() {
+        let from = Vec3::Y;
+        for exponent in 1..7 {
+            let angle = 10.0_f32.powi(-exponent);
+            let to = Quat::from_rotation_x(angle) * from;
+            let turned = arc(from, to);
+            let carried = turned * from;
+            assert!(
+                carried.angle_between(to) < angle * 0.05 + 1e-7,
+                "an arc of {angle} rad missed by {} rad",
+                carried.angle_between(to)
+            );
+            assert!(
+                turned != Quat::IDENTITY || from == to,
+                "an arc of {angle} rad was rounded to no turn at all"
+            );
+        }
     }
 
     /// In space the look has no floor and no ceiling: a held pitch input
