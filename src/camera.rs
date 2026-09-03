@@ -4,7 +4,7 @@ use crate::{
     input::InputState,
     level::LevelData,
     orbit::{Rider, SolarSystem},
-    player::{Controller, Player, RenderPose},
+    player::{Player, RenderPose},
     GameState,
 };
 use bevy::prelude::*;
@@ -77,15 +77,6 @@ pub struct FollowCamera {
     /// says a fold or a landing is happening this frame rather than every
     /// frame.
     pub free: bool,
-    /// How settled on the ground the player is, eased between 0 (airborne)
-    /// and 1 (standing) over a tenth of a second or so. The focus's height
-    /// follow reads its pace off this: lazy with feet on terrain, where every
-    /// honoured bump is the picture pumping, and brisk in the air, where the
-    /// jump or the jetpack *is* the motion and a camera that ignores it is a
-    /// camera left behind. Eased rather than switched, because a flag that
-    /// flips over every pebble would switch the pace with it -- and a
-    /// switching pace is exactly the 30 Hz chatter this exists to remove.
-    pub footing: f32,
     /// Seconds of grace after a landing during which a large gap between the
     /// view and the ground's frame is *eased* across rather than snapped.
     /// Coming back from free flight upside down is exactly such a gap, and
@@ -123,7 +114,6 @@ impl Default for FollowCamera {
             free: false,
             landing: 0.0,
             ridden: None,
-            footing: 0.0,
         }
     }
 }
@@ -184,35 +174,6 @@ const AIM_SENSITIVITY: f32 = 0.5;
 /// moment there was a planet to look back at. Capped, the ease keeps its feel
 /// at the speeds it was tuned for and turns into a rigid follow past them.
 const FOCUS_TRAIL: f32 = 2.5;
-
-/// The focus's height channel: the rates its rises and falls settle at, per
-/// second, and the trail that speeds them up.
-///
-/// The design rule, learnt the hard way on the workbench: **no corners.**
-/// Every earlier shape of this channel put a hard edge somewhere -- a trail
-/// clamp the slope walks ride, a terrain guard that yanks -- and a hard edge
-/// against rough ground does not hold, it *chatters*: constraint one frame,
-/// free ease the next, which reached the screen as the picture ticking at
-/// 30 Hz. So the channel is one smooth law instead. The follow rate starts
-/// from a base and grows with the square of the height trail: near zero
-/// trail the follow is as lazy as the base says, and the further the player
-/// pulls away the harder it is chased, so a sustained slope, a fall or a
-/// jetpack climb each settle at a bounded trail with nothing to bounce off.
-///
-/// The base depends on [`FollowCamera::footing`]. On the ground it is lazy
-/// -- terrain bumps live almost entirely in this channel, and each one
-/// honoured is the picture pumping at the stride's cadence. In the air it is
-/// brisk: a jump or a jetpack climb is the player's own motion, and the
-/// user's words for the lazy base applied to it were "the camera lags way
-/// behind".
-const GROUND_HEIGHT_RATE: f32 = 0.3;
-const AIR_HEIGHT_RATE: f32 = 2.5;
-/// The chase term: this many per second more at a [`HEIGHT_SCALE`]-metre
-/// trail, growing with the trail's square.
-const HEIGHT_CHASE_RATE: f32 = 8.0;
-const HEIGHT_SCALE: f32 = 6.0;
-/// The per-sixtieth blend [`FollowCamera::footing`] eases at.
-const FOOTING_RATE: f32 = 0.2;
 
 /// How fast the view closes a *residual* gap to the ground's frame, per
 /// second.
@@ -302,7 +263,6 @@ pub fn update(
     system: Res<SolarSystem>,
     fixed: Res<Time<Fixed>>,
     riders: Query<&Rider, With<Player>>,
-    controllers: Query<&Controller, With<Player>>,
     mut state: ResMut<GameState>,
     tuning: Res<GameTuning>,
 ) {
@@ -444,57 +404,32 @@ pub fn update(
     };
     let smoothing = blend(tuning.cam_smooth, time.delta_secs());
     follow.distance += (desired_distance - follow.distance) * blend(0.16, time.delta_secs());
-    // How settled the feet are, for the height follow's pace below. In the
-    // absence of a controller to ask -- the unit tests build worlds without
-    // one -- the player counts as standing, which is the lazy, ground-tuned
-    // behaviour every existing test was written against.
-    let grounded = controllers
-        .single()
-        .map(|controller| controller.grounded)
-        .unwrap_or(true);
-    let planted = if grounded && !free { 1.0 } else { 0.0 };
-    let footing = follow.footing;
-    follow.footing = footing + (planted - footing) * blend(FOOTING_RATE, time.delta_secs());
     // The focus eases; the camera does not. On the first frame there is
     // nothing to ease from, so it starts where it belongs.
     //
-    // On the ground the two directions ease at different paces on purpose.
-    // Across the ground the follow is tight, because falling behind a runner
-    // is the one thing a chase camera must not do. *Height* follows at the
-    // rate law described over [`GROUND_HEIGHT_RATE`]: lazily underfoot, so
-    // terrain bumps stay out of the picture -- the user's words, "it should
-    // not adjust itself, keep aiming at the same place" -- briskly in the
-    // air, and harder the further the player gets, with no clamp and no
-    // corner anywhere for rough ground to chatter against. Weightless there
-    // is no terrain to ignore and the plain ease keeps flight feeling
-    // direct.
+    // One tight ease, every axis, grounded or flying -- the user's call,
+    // and the words were exact: "I want the tracking to occur constantly."
+    // The camera's *position* answers the player's position everywhere he
+    // takes it, walking, jumping or jetpacking; what never answers the
+    // terrain is the *angle*, which is the lockstep carry above. A lazy
+    // height channel lived here for a while to filter terrain bumps out of
+    // the picture, and the workbench history around it is worth reading
+    // before ever bringing it back: every hard edge it was given chattered
+    // against rough ground at 30 Hz.
     let standing = player.translation + view_up * tuning.cam_height;
     let focus = match follow.focus {
-        Some(previous) if !free => {
-            let gap = standing - previous;
-            let rise = gap.dot(view_up);
-            let level = gap - view_up * rise;
-            let base = AIR_HEIGHT_RATE + (GROUND_HEIGHT_RATE - AIR_HEIGHT_RATE) * follow.footing;
-            let chase = HEIGHT_CHASE_RATE * (rise / HEIGHT_SCALE) * (rise / HEIGHT_SCALE);
-            let eased = previous
-                + level * smoothing
-                + view_up * (rise * gravity::settle(base + chase, time.delta_secs()));
-            let trail = eased - standing;
-            let trail_level = (trail - view_up * trail.dot(view_up)).clamp_length_max(FOCUS_TRAIL);
-            standing + trail_level + view_up * trail.dot(view_up)
-        }
         Some(previous) => {
-            // However fast the flight, the focus stays within arm's reach.
-            // See [`FOCUS_TRAIL`]: past the cap the ease has nothing left to
-            // smooth, it is simply behind.
+            // However fast the player goes, the focus stays within arm's
+            // reach. See [`FOCUS_TRAIL`]: past the cap the ease has nothing
+            // left to smooth, it is simply behind.
             let eased = previous.lerp(standing, smoothing);
             standing + (eased - standing).clamp_length_max(FOCUS_TRAIL)
         }
         None => standing,
     };
-    // The lazy height channel can leave the focus underground while the
-    // player climbs: the ground rises at the player's pace and the focus at
-    // its own, and the difference ends up inside the hill. A buried focus is
+    // The ease can still leave the focus underground for a moment when the
+    // ground leaps -- a step onto a ledge is the ground rising faster than
+    // any filter follows. A buried focus is
     // a boom probe that hits at zero distance -- the camera pulled all the
     // way in, first person, in the dirt. So the focus never crosses terrain
     // on its way out from the player: whatever the line from the head to it
@@ -659,13 +594,12 @@ mod tests {
 
     /// However fast the player goes, the focus stays within arm's reach.
     ///
-    /// The ease alone is a fraction of the gap per frame, so its lag would
-    /// grow with speed without bound -- at jetpack speeds it once trailed
-    /// tens of metres, through the terrain on lift-off, where the boom probe
+    /// The ease is a fraction of the gap per frame, so before the cap its
+    /// lag grew with speed without bound. At jetpack speeds it trailed tens
+    /// of metres -- through the terrain on lift-off, where the boom probe
     /// read the ground as a wall between camera and player and collapsed the
-    /// boom to zero: first person, uninvited. The fix is the chase term: the
-    /// follow rate grows with the square of the trail, so one enormous step
-    /// is chased almost rigidly and the focus is still beside the player.
+    /// boom to zero: first person, uninvited. The cap is the fix: one
+    /// enormous step, and the focus is still beside the player.
     #[test]
     fn the_focus_cannot_be_outrun() {
         let mut world = planet_world(Vec3::X * PLANET);
@@ -681,20 +615,22 @@ mod tests {
         let standing = bolted + (follow.view * Vec3::Y) * world.resource::<GameTuning>().cam_height;
         let trail = (follow.focus.expect("the focus was never placed") - standing).length();
         assert!(
-            trail <= HEIGHT_SCALE + 1e-3,
+            trail <= FOCUS_TRAIL + 1e-3,
             "the focus trails {trail} m behind a fast player"
         );
     }
 
-    /// Terrain lives in the focus's height channel, and the height channel
-    /// is deliberately lazy: metre-scale rises and dips passing underfoot at
-    /// a walk barely move the focus at all, where honouring each one pumped
-    /// the whole picture up and down at the terrain's own cadence.
+    /// The camera's height tracks the player's position *constantly* -- the
+    /// user's exact request, after a spell in which a lazy height channel
+    /// filtered terrain out of the picture and was felt as the camera taking
+    /// its time. Terrain relief passing underfoot reaches the focus almost
+    /// whole and promptly; what terrain must never reach is the *angle*,
+    /// which the lockstep tests own.
     #[test]
-    fn terrain_bumps_do_not_pump_the_camera() {
+    fn the_height_is_tracked_constantly() {
         let mut world = planet_world(Vec3::X * PLANET);
         frames(&mut world, 60);
-        let mut heights: Vec<f32> = Vec::new();
+        let mut worst = 0.0_f32;
         for frame in 0..300 {
             // Walking pace along the ground, with a two-metre swell going by
             // every two seconds -- the size and pace of real terrain relief.
@@ -706,22 +642,24 @@ mod tests {
             if frame >= 150 {
                 let mut query = world.query::<&FollowCamera>();
                 let follow = query.single(&world).unwrap();
-                heights.push(follow.focus.expect("no focus").length());
+                let lag = (follow.focus.expect("no focus").length() - (PLANET + bump)).abs();
+                worst = worst.max(lag);
             }
         }
-        let swing = heights.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
-            - heights.iter().cloned().fold(f32::INFINITY, f32::min);
+        // `cam_height` above the feet is where the focus belongs; anything
+        // much past that is the follow falling behind the elevation.
+        let cam_height = world.resource::<GameTuning>().cam_height;
         assert!(
-            swing < 0.3,
-            "two metres of terrain swell moved the focus {swing} m"
+            worst < cam_height + 0.5,
+            "the focus fell {worst} m out of step with the player's elevation"
         );
     }
 
-    /// The lazy height channel must never leave the focus inside a hill. A
-    /// climb raises the ground at the player's pace and the focus at its own,
-    /// and without a guard the difference is a focus under the terrain -- and
-    /// a boom probe from underground hits at zero distance, which is the
-    /// camera pulled to the player's head, first person, in the dirt.
+    /// The ease must never leave the focus inside a hill -- a ledge step is
+    /// the ground rising faster than any filter follows, and without a guard
+    /// the difference is a focus under the terrain: a boom probe from
+    /// underground hits at zero distance, which is the camera pulled to the
+    /// player's head, first person, in the dirt.
     #[test]
     fn the_focus_is_pulled_out_of_the_ground() {
         let mut world = planet_world(Vec3::X * (PLANET + 2.0));
@@ -752,6 +690,35 @@ mod tests {
             focus.x > PLANET - 1e-3,
             "the focus was left {} m under the terrain",
             PLANET - focus.x
+        );
+    }
+
+    /// A height trail from anywhere -- a ledge, a landing, a teleport --
+    /// settles in well under a second, because the tracking is constant and
+    /// tight rather than lazy. The half-second here is generous; the point
+    /// pinned is that no slow "settling onto a new elevation" exists any
+    /// more.
+    #[test]
+    fn a_new_elevation_is_taken_up_quickly() {
+        let mut world = planet_world(Vec3::X * (PLANET + 2.0));
+        frames(&mut world, 30);
+        let cam_height = world.resource::<GameTuning>().cam_height;
+        // A stale height, planted by hand.
+        let standing = {
+            let mut query = world.query::<&mut FollowCamera>();
+            let mut follow = query.single_mut(&mut world).unwrap();
+            let view_up = follow.view * Vec3::Y;
+            let standing = Vec3::X * (PLANET + 2.0) + view_up * cam_height;
+            follow.focus = Some(standing - view_up * 2.0);
+            standing
+        };
+        frames(&mut world, 30);
+        let mut query = world.query::<&FollowCamera>();
+        let follow = query.single(&world).unwrap();
+        let leftover = (standing - follow.focus.expect("no focus")).dot(follow.view * Vec3::Y);
+        assert!(
+            leftover < 0.3,
+            "half a second on, the camera is still {leftover} m below the player"
         );
     }
 

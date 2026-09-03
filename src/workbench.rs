@@ -412,19 +412,31 @@ mod tests {
             ("drawn ground", walk.worst_jerk(ahead, true)),
         ] {
             assert!(
-                jerk < 0.006,
+                jerk < 0.003,
                 "walking hitched the {what} by {jerk} screens at frame {frame}"
             );
         }
         let (turn, frame) = walk.worst_aim_step();
         assert!(
-            turn < 0.0025,
+            turn < 0.002,
             "walking ticked the aim {turn} rad in one frame, at frame {frame}"
         );
         let (trail, frame) = walk.worst_player_trail();
         assert!(
-            trail < 5.0,
+            trail < 3.0,
             "walking left the player {trail} m from the focus at frame {frame}"
+        );
+
+        // Stopping at whatever elevation the walk reached: the camera's
+        // height must come to the player rather than drift there -- the
+        // walk-time laziness is a bump filter, not a settling speed.
+        let cam_height = bench.tuning().cam_height;
+        let stop = bench.run(120, |_, _| {});
+        let last = stop.0.last().expect("the stop recorded nothing");
+        let gap = (last.pose + last.up * cam_height - last.focus).dot(last.up);
+        assert!(
+            gap.abs() < 0.4,
+            "two seconds after stopping, the camera height is still {gap} m off the player's"
         );
 
         let jump = bench.run(240, |i, input| {
@@ -433,7 +445,7 @@ mod tests {
         });
         let (trail, frame) = jump.worst_player_trail();
         assert!(
-            trail < 4.0,
+            trail < 3.0,
             "a jump left the player {trail} m from the focus at frame {frame}"
         );
 
@@ -444,7 +456,7 @@ mod tests {
         });
         let (trail, frame) = jet.worst_player_trail();
         assert!(
-            trail < 6.0,
+            trail < 4.0,
             "the jetpack left the player {trail} m from the focus at frame {frame}"
         );
         let sunk = jet
@@ -453,7 +465,7 @@ mod tests {
             .map(|s| (s.pose - s.focus).dot(s.up))
             .fold(f32::MIN, f32::max);
         assert!(
-            sunk < 1.5,
+            sunk < 1.0,
             "the jetpack climb left the focus {sunk} m below the player"
         );
 
@@ -475,12 +487,12 @@ mod tests {
         });
         let (turn, frame) = orbit.worst_aim_step();
         assert!(
-            turn < 0.0025,
+            turn < 0.002,
             "walking the orbiting planet ticked the aim {turn} rad at frame {frame}"
         );
         let (trail, frame) = orbit.worst_player_trail();
         assert!(
-            trail < 5.0,
+            trail < 3.0,
             "the orbiting walk left the player {trail} m from the focus at frame {frame}"
         );
     }
